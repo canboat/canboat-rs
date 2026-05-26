@@ -1,0 +1,16 @@
+[package]
+name        = "canboat-core"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "Sans-I/O NMEA 2000 (canboat) PGN database, parsers, decoder, and formatters."
+
+[dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }
+thiserror  = { workspace = true }
+log        = { workspace = true }
+smallvec   = { workspace = true }

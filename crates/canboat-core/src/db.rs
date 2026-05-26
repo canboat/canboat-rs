@@ -78,7 +78,7 @@ impl PgnDatabase {
     }
 
     /// Load from a JSON string in memory.
-    pub fn from_str(json: &str) -> Result<Self, LoadError> {
+    pub fn from_json_str(json: &str) -> Result<Self, LoadError> {
         let raw: CanboatJson = serde_json::from_str(json)?;
         Ok(Self::from_raw(raw))
     }

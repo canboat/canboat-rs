@@ -6,9 +6,14 @@
 //! (sync) and `canboat-tokio` (async) for adapters.
 
 pub mod db;
+pub mod format;
+pub mod frame;
+pub mod reassembly;
 pub mod types;
 
 pub use db::{LoadError, PgnDatabase};
+pub use frame::{RawFrame, FASTPACKET_MAX_SIZE};
+pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
 pub use types::{
     BitLookupTable, BitLookupValue, FieldInfo, FieldType, LookupTable, LookupValue, PacketType,
     PgnInfo,

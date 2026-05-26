@@ -5,13 +5,16 @@
 //! and bytes come out. The caller drives the I/O — see `canboat-io`
 //! (sync) and `canboat-tokio` (async) for adapters.
 
+pub mod bits;
 pub mod db;
+pub mod decode;
 pub mod format;
 pub mod frame;
 pub mod reassembly;
 pub mod types;
 
 pub use db::{LoadError, PgnDatabase};
+pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use frame::{RawFrame, FASTPACKET_MAX_SIZE};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
 pub use types::{

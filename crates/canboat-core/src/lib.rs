@@ -10,6 +10,7 @@ pub mod db;
 pub mod decode;
 pub mod format;
 pub mod frame;
+pub mod output;
 pub mod reassembly;
 pub mod types;
 

@@ -119,12 +119,34 @@ impl PgnDatabase {
         })
     }
 
-    /// Choose the PGN variant whose `Match` field values all match the
-    /// raw bits in `frame.data`. Falls back to the first variant when
-    /// none has Match constraints.
+    /// Choose the best PGN definition for a frame.
+    ///
+    /// Priority — strict canboat semantics:
+    ///
+    ///   1. **JSON-order scan of variants for this PGN number.** Return
+    ///      the first variant whose every `Match` field equals the raw
+    ///      bits at that field's offset. JSON insertion order encodes
+    ///      author-defined priority; an earlier matching specific
+    ///      variant always beats a later one, and a matching specific
+    ///      variant always beats the per-PGN-number fallback even when
+    ///      the fallback is listed first (as in PGN 126208 etc).
+    ///
+    ///   2. **In-PGN fallback.** If no specific variant matched, return
+    ///      the `Fallback: true` variant for this PGN number, if any.
+    ///      Falls back further to any no-`Match` variant — though in
+    ///      canboat.json those two are the same entry.
+    ///
+    ///   3. **Inter-PGN fallback.** If the PGN number itself is not in
+    ///      the database, return the largest `Fallback: true` entry
+    ///      whose PGN number is `<= frame.pgn`. This is the catch-all
+    ///      that covers the range — e.g. unknown PGNs in
+    ///      `[0x1ef00, 0x1ef00]` get
+    ///      `0x1ef00ManufacturerProprietaryFastPacketAddressed`.
     pub fn pick_variant(&self, frame: &RawFrame) -> Option<&PgnInfo> {
-        let mut fallback = None;
+        let mut in_pgn_fallback: Option<&PgnInfo> = None;
+        let mut saw_variant = false;
         for info in self.pgn_variants(frame.pgn) {
+            saw_variant = true;
             let mut has_match = false;
             let mut all_ok = true;
             for f in &info.fields {
@@ -157,11 +179,41 @@ impl PgnDatabase {
             if has_match && all_ok {
                 return Some(info);
             }
-            if !has_match && fallback.is_none() {
-                fallback = Some(info);
+            // Record the in-PGN fallback. Prefer an explicit
+            // `Fallback: true` over a happenstance no-Match variant if
+            // both exist; otherwise take the first no-Match variant
+            // (canboat keeps at most one no-Match variant per PGN, and
+            // it carries the Fallback flag).
+            if !has_match
+                && (info.fallback.unwrap_or(false) || in_pgn_fallback.is_none())
+            {
+                in_pgn_fallback = Some(info);
             }
         }
-        fallback
+        if let Some(v) = in_pgn_fallback {
+            return Some(v);
+        }
+        if !saw_variant {
+            return self.find_catchall(frame.pgn);
+        }
+        None
+    }
+
+    /// Inter-PGN catch-all: the latest `Fallback: true` definition
+    /// whose PGN number is `<= pgn`. PGN numbers in canboat.json are
+    /// non-decreasing, so a linear scan finds the right one in JSON
+    /// order. Called only when no entry for `pgn` exists at all.
+    fn find_catchall(&self, pgn: u32) -> Option<&PgnInfo> {
+        let mut best: Option<&PgnInfo> = None;
+        for info in self.pgns() {
+            if info.pgn > pgn {
+                break;
+            }
+            if info.fallback.unwrap_or(false) {
+                best = Some(info);
+            }
+        }
+        best
     }
 }
 
@@ -595,19 +647,82 @@ mod tests {
     }
 
     #[test]
-    fn unknown_pgn_returns_error() {
+    fn unknown_pgn_below_any_fallback_returns_error() {
+        // PGN 1 is below the lowest Fallback (59392) so no catchall
+        // applies — decode must report UnknownPgn.
         let frame = RawFrame {
             timestamp: None,
             prio: 6,
-            pgn: 99999,
+            pgn: 1,
             src: 1,
             dst: 255,
             data: smallvec::smallvec![0u8; 8],
         };
         assert!(matches!(
             db().decode(&frame),
-            Err(DecodeError::UnknownPgn { pgn: 99999 })
+            Err(DecodeError::UnknownPgn { pgn: 1 })
         ));
+    }
+
+    #[test]
+    fn match_variant_beats_fallback_listed_first() {
+        // PGN 126208 has the FALLBACK variant first in JSON, then 7
+        // specific variants distinguished by Function Code (field 1,
+        // 8 bits at offset 0). Function Code = 3 must select
+        // nmeaReadFieldsGroupFunction, NOT the leading fallback.
+        let data: smallvec::SmallVec<[u8; 8]> = smallvec::smallvec![
+            3,    // Function Code = 3 → Read Fields
+            0, 0, 0, 0, 0, 0, 0,
+        ];
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 3,
+            pgn: 126208,
+            src: 0,
+            dst: 0,
+            data,
+        };
+        let picked = db().pick_variant(&frame).expect("variant");
+        assert_eq!(picked.id, "nmeaReadFieldsGroupFunction");
+    }
+
+    #[test]
+    fn fallback_when_no_specific_variant_matches() {
+        // PGN 126208 with Function Code = 99 (none of the 0..6
+        // specific variants match) → return the listed fallback.
+        let data: smallvec::SmallVec<[u8; 8]> = smallvec::smallvec![99, 0, 0, 0, 0, 0, 0, 0];
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 3,
+            pgn: 126208,
+            src: 0,
+            dst: 0,
+            data,
+        };
+        let picked = db().pick_variant(&frame).expect("variant");
+        assert!(
+            picked.fallback.unwrap_or(false),
+            "expected Fallback variant, got id={}",
+            picked.id
+        );
+    }
+
+    #[test]
+    fn cross_pgn_catchall_for_unknown_proprietary() {
+        // PGN 65500 is not defined in canboat.json. The latest
+        // Fallback:true PGN with pgn <= 65500 covers it — that's
+        // 65280 / "0xff000xffffManufacturerProprietarySingleFrameNonAddressed".
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 6,
+            pgn: 65500,
+            src: 0,
+            dst: 255,
+            data: smallvec::smallvec![0u8; 8],
+        };
+        let picked = db().pick_variant(&frame).expect("catchall");
+        assert!(picked.fallback.unwrap_or(false));
+        assert_eq!(picked.pgn, 65280);
     }
 
     #[test]

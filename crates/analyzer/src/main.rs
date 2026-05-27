@@ -16,7 +16,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use canboat_core::{
-    format::{parse_plain, plain::ParseError},
+    format::{detect, parse_with, plain::ParseError, InputFormat},
     output::{write_json, write_text, JsonOptions, TextOptions},
     FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
 };
@@ -59,9 +59,27 @@ struct Cli {
     #[arg(long, value_name = "N")]
     dst: Option<u8>,
 
+    /// Force a specific input format instead of auto-detecting.
+    /// Accepted values: plain, actisense, ydwg02, ikonvert.
+    #[arg(long, value_name = "NAME")]
+    format: Option<String>,
+
     /// Filter: only process frames with this PGN number.
     #[arg(value_name = "PGN")]
     pgn: Option<u32>,
+}
+
+fn parse_format_flag(name: &str) -> Result<InputFormat> {
+    Ok(match name.to_ascii_lowercase().as_str() {
+        "plain" | "fast" => InputFormat::Plain,
+        "actisense" | "actisense-ascii" => InputFormat::ActisenseAscii,
+        "ydwg02" | "yden" => InputFormat::Ydwg02,
+        "ikonvert" => InputFormat::Ikonvert,
+        "airmar" => InputFormat::Airmar,
+        "chetco" => InputFormat::Chetco,
+        "garmin" | "garmin-csv" => InputFormat::GarminCsv,
+        other => anyhow::bail!("unknown --format {other:?}"),
+    })
 }
 
 fn main() -> ExitCode {
@@ -96,6 +114,12 @@ fn run(cli: Cli) -> Result<()> {
     let mut line_buf = String::with_capacity(512);
     let mut reasm = Reassembler::new();
 
+    let forced_format = cli
+        .format
+        .as_deref()
+        .map(parse_format_flag)
+        .transpose()?;
+
     // Two distinct input shapes — stdin vs a regular file — but the
     // line-handling is identical. Box one and roll.
     if let Some(path) = cli.file.as_deref() {
@@ -107,6 +131,7 @@ fn run(cli: Cli) -> Result<()> {
             &cli,
             &json_opts,
             &text_opts,
+            forced_format,
             &mut reasm,
             &mut out,
             &mut line_buf,
@@ -119,6 +144,7 @@ fn run(cli: Cli) -> Result<()> {
             &cli,
             &json_opts,
             &text_opts,
+            forced_format,
             &mut reasm,
             &mut out,
             &mut line_buf,
@@ -134,16 +160,26 @@ fn run_loop<R: BufRead, W: Write>(
     cli: &Cli,
     json_opts: &JsonOptions,
     text_opts: &TextOptions,
+    forced_format: Option<InputFormat>,
     reasm: &mut Reassembler,
     out: &mut W,
     line_buf: &mut String,
 ) -> Result<()> {
+    let mut active_format = forced_format;
     while let Some(line) = reader.next_line().context("reading input line")? {
         if line.is_empty() || line.starts_with('#') {
             continue;
         }
-        let frame = match parse_plain(line) {
-            Ok(f) => f,
+        // Auto-detect on the first content line if the user didn't
+        // force a format.
+        if active_format.is_none() {
+            active_format = detect(line).or(Some(InputFormat::Plain));
+            log::debug!("input format: {:?}", active_format);
+        }
+        let format = active_format.expect("active_format set above");
+        let frame = match parse_with(format, line) {
+            Ok(Some(f)) => f,
+            Ok(None) => continue, // iKonvert control sentences etc.
             Err(ParseError::Empty) => continue,
             Err(e) => {
                 log::warn!("skipping malformed input line: {e}");

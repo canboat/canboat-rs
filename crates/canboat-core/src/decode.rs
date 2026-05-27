@@ -1047,6 +1047,9 @@ fn decode_string_fix(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValu
             break;
         }
     }
+    if len == 0 {
+        return FieldValue::NotAvailable;
+    }
     let s = String::from_utf8_lossy(&raw[..len]).into_owned();
     FieldValue::String(s)
 }
@@ -1081,6 +1084,7 @@ fn decode_string_lau(data: &[u8], bit_offset: u32) -> (FieldValue, u32) {
     let body_end = (start + 2 + body_len).min(data.len());
     let body = &data[start + 2..body_end];
 
+    let bits_consumed = (total_len * 8) as u32;
     let s = match encoding {
         0 => {
             // UTF-16LE: pairs of bytes are LE u16 code units.
@@ -1097,10 +1101,23 @@ fn decode_string_lau(data: &[u8], bit_offset: u32) -> (FieldValue, u32) {
             String::from_utf8_lossy(body).into_owned()
         }
     };
-    // Strip the trailing 0xff padding canboat sometimes leaves in.
-    let s = s.trim_end_matches('\u{0}').trim_end_matches('\u{ffff}');
-    let bits_consumed = (total_len * 8) as u32;
-    (FieldValue::String(s.to_string()), bits_consumed)
+    // Canboat's `printString` trims trailing 0xff / NUL / '@' / spaces
+    // *after* the UTF-16→UTF-8 conversion. If nothing's left, the field
+    // is rendered as Unknown via `printEmpty`. Match that — and don't
+    // trim raw UTF-16 bytes (the trailing NUL of a single ASCII glyph
+    // would lose the char).
+    let trimmed = trim_string_padding(&s);
+    if trimmed.is_empty() {
+        return (FieldValue::NotAvailable, bits_consumed);
+    }
+    (FieldValue::String(trimmed.to_string()), bits_consumed)
+}
+
+/// Strip trailing canboat-padding bytes (`\0`, `'@'`, space, `\xff`)
+/// from a string. Matches the trailing-byte loop in `printString` in
+/// analyzer/print.c.
+fn trim_string_padding(s: &str) -> &str {
+    s.trim_end_matches(|c: char| matches!(c, '\0' | '@' | ' ' | '\u{ff}'))
 }
 
 fn decode_string_lz(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {

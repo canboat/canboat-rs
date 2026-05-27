@@ -1,0 +1,18 @@
+[package]
+name        = "pcap2candump"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "Convert libpcap CAN captures to candump -l line format."
+
+[[bin]]
+name = "pcap2candump"
+path = "src/main.rs"
+
+[dependencies]
+canboat-cli = { workspace = true }
+anyhow      = { workspace = true }
+clap        = { workspace = true }

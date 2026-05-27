@@ -11,6 +11,8 @@ members = [
     "crates/maretron-ipg",
     "crates/replay",
     "crates/candump2analyzer",
+    "crates/pcap2candump",
+    "crates/socketcan-writer",
 ]
 
 [workspace.package]

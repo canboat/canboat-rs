@@ -406,7 +406,9 @@ mod tests {
         let r = parse(Format::Tshark, line).unwrap();
         assert_eq!(r.canid, 0x09fd0223);
         assert_eq!(r.data, vec![0x00, 0x49, 0x02, 0x1c, 0xa7, 0xfa, 0xff, 0xff]);
-        assert_eq!(r.timestamp_ms, 29_555); // 29.555750 s → 29555 ms
+        // 29.555750 s → 29555.75 ms → round_ties_even rounds up to
+        // 29556 (matches canboat C `lrint`).
+        assert_eq!(r.timestamp_ms, 29_556);
     }
 
     #[test]

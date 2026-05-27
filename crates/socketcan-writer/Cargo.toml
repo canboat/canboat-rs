@@ -1,0 +1,27 @@
+[package]
+name        = "socketcan-writer"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "Write canboat PLAIN/FAST stdin to a Linux SocketCAN device."
+
+[[bin]]
+name = "socketcan-writer"
+path = "src/main.rs"
+
+[dependencies]
+canboat-core = { workspace = true }
+canboat-cli  = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+env_logger   = { workspace = true }
+log          = { workspace = true }
+
+[dev-dependencies]
+smallvec     = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = "3"

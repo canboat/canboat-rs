@@ -214,6 +214,39 @@ fn short_frame_text_debug() {
     run_case("short-frame.in", "short-frame.out", &["--debug"]);
 }
 
+/// `-geo dd|dm|dms` lat/lon formatting. The canboat reference test
+/// runs the analyzer three times and concatenates the outputs; do
+/// the same here.
+#[test]
+fn dms_format_text() {
+    let Some(dir) = canboat_tests_dir() else {
+        eprintln!("skipping: canboat test directory not available");
+        return;
+    };
+    let input = std::fs::read(dir.join("dms-format.in")).expect("read .in");
+    let expected = std::fs::read(dir.join("dms-format.out")).expect("read .out");
+    let mut combined = Vec::new();
+    for geo in ["dd", "dm", "dms"] {
+        let mut child = Command::new(analyzer_path())
+            .args(["--geo", geo])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("spawn analyzer");
+        child.stdin.as_mut().unwrap().write_all(&input).unwrap();
+        let out = child.wait_with_output().expect("wait analyzer");
+        assert!(out.status.success(), "analyzer failed");
+        combined.extend_from_slice(&out.stdout);
+    }
+    assert_eq!(
+        combined, expected,
+        "dms-format mismatch\nactual:\n{}\nexpected:\n{}",
+        String::from_utf8_lossy(&combined),
+        String::from_utf8_lossy(&expected),
+    );
+}
+
 /// Big multi-scenario fast-packet recombination test. Covers in-order
 /// frames with interspersed short frames, two parallel fast-packets
 /// from the same source, out-of-order frames, a sequence where the

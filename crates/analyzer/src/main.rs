@@ -17,7 +17,7 @@ use clap::Parser;
 
 use canboat_core::{
     format::{detect, parse_with, plain::ParseError, InputFormat},
-    output::{write_json, write_text, JsonOptions, TextOptions},
+    output::{write_json, write_text, GeoFormat, JsonOptions, TextOptions},
     FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
 };
 use canboat_io::LineReader;
@@ -56,6 +56,12 @@ struct Cli {
     /// form (`-debug`).
     #[arg(long)]
     debug: bool,
+
+    /// Lat/lon display format — `dd` (decimal degrees, default),
+    /// `dm` (degrees + decimal minutes), `dms` (degrees + minutes +
+    /// decimal seconds). Matches canboat's `-geo {dd|dm|dms}`.
+    #[arg(long, value_name = "FMT", default_value = "dd")]
+    geo: String,
 
     /// Use the given string in place of any analyzer-generated
     /// timestamps (matches canboat's `-fixtime`). Inputs that carry
@@ -121,9 +127,16 @@ fn run(cli: Cli) -> Result<()> {
         name_value: cli.nv,
         debug: cli.debug,
     };
+    let geo = match cli.geo.as_str() {
+        "dd" => GeoFormat::Dd,
+        "dm" => GeoFormat::Dm,
+        "dms" => GeoFormat::Dms,
+        other => anyhow::bail!("--geo must be one of dd, dm, dms (got {other:?})"),
+    };
     let text_opts = TextOptions {
         show_unavailable: cli.empty,
         debug: cli.debug,
+        geo,
     };
 
     let stdout = io::stdout();

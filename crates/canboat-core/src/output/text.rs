@@ -29,6 +29,20 @@ pub struct TextOptions {
     /// to each field (matches canboat's `-debug`). Unavailable fields
     /// stay in the output and emit as `Unknown (bytes = "...")`.
     pub debug: bool,
+    /// Lat/lon display format — matches canboat's `-geo {dd|dm|dms}`.
+    pub geo: GeoFormat,
+}
+
+/// Latitude/longitude display format.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum GeoFormat {
+    /// `%10.7f` decimal degrees — canboat's default.
+    #[default]
+    Dd,
+    /// `02d 06.3f N` (degrees + decimal minutes + N/S/E/W).
+    Dm,
+    /// `02d 02' 06.3f"N` (degrees + minutes + decimal seconds).
+    Dms,
 }
 
 /// Write one decoded PGN as a canboat text line. Does not append a
@@ -98,7 +112,7 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
         } else {
             write!(w, "{name} = ", name = f.name)?;
         }
-        write_field_value(w, f)?;
+        write_field_value(w, f, opts.geo)?;
         if opts.debug {
             write_text_debug_suffix(w, f, &pgn.data)?;
         }
@@ -179,22 +193,87 @@ fn write_text_debug_suffix<W: fmt::Write>(
     w.write_char(')')
 }
 
-fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result {
+/// `unit == "deg"` and the field name reads like a coordinate axis.
+/// Canboat selects `fieldPrintLatLon` at parser-generation time based
+/// on the field's resolution/range; we don't carry that bit, so match
+/// by name + unit instead. Same `strstr(fieldName, "ongit")` shape.
+fn is_latlon(f: &DecodedField) -> bool {
+    if f.unit.as_deref() != Some("deg") {
+        return false;
+    }
+    let n = f.name.as_str();
+    n.contains("atitude") || n.contains("ongitude") || n.contains("atit") || n.contains("ongit")
+}
+
+/// `%10.7f` (decimal degrees) / `%02ud %6.3f %c` (degrees+minutes) /
+/// `%02ud %02u' %06.3f"%c` (degrees+minutes+seconds). Matches canboat
+/// `fieldPrintLatLon` in print.c. `is_lon` decides the N/S vs E/W
+/// suffix.
+fn write_latlon<W: fmt::Write>(w: &mut W, dd: f64, name: &str, geo: GeoFormat) -> fmt::Result {
+    if matches!(geo, GeoFormat::Dd) {
+        return write!(w, "{:>10.7}", dd);
+    }
+    let is_lon = name.contains("ongit");
+    let dir = if is_lon {
+        if dd >= 0.0 {
+            'E'
+        } else {
+            'W'
+        }
+    } else if dd >= 0.0 {
+        'N'
+    } else {
+        'S'
+    };
+    let abs = dd.abs();
+    let deg = abs.floor();
+    let rem = abs - deg;
+    match geo {
+        GeoFormat::Dm => {
+            let minutes = rem * 60.0;
+            write!(w, "{:02}d {:6.3} {dir}", deg as u32, minutes)
+        }
+        GeoFormat::Dms => {
+            let mut minutes = (rem * 60.0).floor();
+            let mut seconds = rem * 3600.0 - 60.0 * minutes;
+            // canboat caps fractional seconds at 59.9995; round up.
+            if seconds >= 59.9995 {
+                minutes += 1.0;
+                seconds = 0.0;
+            }
+            let mut deg = deg;
+            if minutes >= 60.0 {
+                deg += 1.0;
+                minutes = 0.0;
+            }
+            write!(
+                w,
+                "{:02}d {:02}' {:06.3}\"{dir}",
+                deg as u32, minutes as u32, seconds
+            )
+        }
+        GeoFormat::Dd => unreachable!(),
+    }
+}
+
+fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat) -> fmt::Result {
     match &f.value {
         FieldValue::Number(v) => {
-            let p = effective_precision(f.precision, f.resolution);
             // Lat/lon are width 10, precision 7, and intentionally
             // suppress the `deg` unit (canboat's fieldPrintLatLon
-            // uses `%10.7f` with no unit suffix).
-            if p == 7 && f.unit.as_deref() == Some("deg") {
-                write!(w, "{:>10.7}", v)
-            } else {
-                write!(w, "{:.*}", p, v)?;
-                if let Some(unit) = &f.unit {
-                    write!(w, " {}", unit)?;
-                }
-                Ok(())
+            // uses `%10.7f` with no unit suffix). Detection mirrors
+            // canboat's `fieldPrintLatLon` selection — unit "deg"
+            // with a lat/lon-shaped field name. `-geo dm` / `-geo dms`
+            // switch to compass-style output.
+            if is_latlon(f) {
+                return write_latlon(w, *v, &f.name, geo);
             }
+            let p = effective_precision(f.precision, f.resolution);
+            write!(w, "{:.*}", p, v)?;
+            if let Some(unit) = &f.unit {
+                write!(w, " {}", unit)?;
+            }
+            Ok(())
         }
         FieldValue::Integer(v) => {
             write!(w, "{}", v)?;
@@ -275,7 +354,7 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result 
                     }
                     w.write_str(sep)?;
                     write!(w, " {name} = ", name = sf.name)?;
-                    write_field_value(w, sf)?;
+                    write_field_value(w, sf, geo)?;
                     sep = ";";
                 }
                 w.write_str("]")?;

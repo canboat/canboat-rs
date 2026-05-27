@@ -161,3 +161,16 @@ fn pgn_test_json_nv() {
         &[6],
     );
 }
+
+/// Actisense N2K ASCII input format + `-debug` byte/bit annotation +
+/// `-nv` lookup form. Whole canboat reference output matches byte-
+/// for-byte (no skip needed — the Actisense corpus has nothing that
+/// reads past the payload like PGN 129540 does).
+#[test]
+fn pgn_test_actisense_json_nv_debug() {
+    run_case(
+        "pgn-test-actisense.in",
+        "pgn-test-actisense.out",
+        &["--json", "--nv", "--debug"],
+    );
+}

@@ -30,6 +30,10 @@ pub struct JsonOptions {
     /// Emit lookup values as `{"value":N,"name":"..."}` instead of the
     /// bare name string (matches canboat's `-nv`).
     pub name_value: bool,
+    /// Wrap every field in a `{"value":...,"bytes":"..."[,"bits":"..."]}`
+    /// object with per-field byte/bit-level diagnostics (matches
+    /// canboat's `-debug`).
+    pub debug: bool,
 }
 
 pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions) -> fmt::Result {
@@ -56,11 +60,31 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     let mut current_iter: Option<u32> = None;
 
     for f in &pgn.fields {
-        if !opts.include_empty && matches!(f.value, FieldValue::NotAvailable) {
+        // Under `-debug` we keep unavailable fields so the byte/bit
+        // diagnostic is preserved; otherwise honour the canboat
+        // suppress rule.
+        if !opts.include_empty && !opts.debug && matches!(f.value, FieldValue::NotAvailable) {
             continue;
         }
         if matches!(f.value, FieldValue::Spare { .. }) {
             continue;
+        }
+        // Reserved fields whose raw value is all-ones (the "unused"
+        // default) are skipped entirely — even under -debug, matching
+        // canboat. Other Reserved values flow through and emit their
+        // hex string.
+        if let FieldValue::Reserved {
+            value, bit_length, ..
+        } = &f.value
+        {
+            let max = if *bit_length >= 64 {
+                u64::MAX
+            } else {
+                (1u64 << bit_length) - 1
+            };
+            if *value == max {
+                continue;
+            }
         }
 
         // Determine "where is this field going":
@@ -78,7 +102,7 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
             w.write_str(top_sep)?;
             write_json_string(w, &f.name)?;
             w.write_char(':')?;
-            write_field_value(w, f, opts)?;
+            write_field_value(w, f, opts, &pgn.data)?;
             top_sep = ",";
         } else {
             let iter = f.repeat_index.unwrap_or(0);
@@ -98,18 +122,18 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
                 top_sep = ",";
                 write_json_string(w, &f.name)?;
                 w.write_char(':')?;
-                write_field_value(w, f, opts)?;
+                write_field_value(w, f, opts, &pgn.data)?;
             } else if Some(iter) != current_iter {
                 w.write_str("},{")?;
                 current_iter = Some(iter);
                 write_json_string(w, &f.name)?;
                 w.write_char(':')?;
-                write_field_value(w, f, opts)?;
+                write_field_value(w, f, opts, &pgn.data)?;
             } else {
                 w.write_char(',')?;
                 write_json_string(w, &f.name)?;
                 w.write_char(':')?;
-                write_field_value(w, f, opts)?;
+                write_field_value(w, f, opts, &pgn.data)?;
             }
         }
     }
@@ -121,11 +145,184 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     Ok(())
 }
 
+/// Emit a `bytes` / `bits` suffix for `-debug` output. Caller must
+/// have already opened the wrapping object and written the value (and
+/// any `name`); this appends the diagnostic keys and nothing else.
+///
+/// canboat's `bytes` is the field's *raw value bits placed in their
+/// byte slot* — not the underlying payload bytes. So a 3-bit field at
+/// bit offset 13 with value `4` shows up as `"80"` (4 shifted left by
+/// 5 to land at bits 5–7 of one byte), not `"9F"` (the underlying
+/// payload byte). For whole-byte-aligned fields the two are the same.
+fn write_debug_suffix<W: fmt::Write>(w: &mut W, f: &DecodedField, payload: &[u8]) -> fmt::Result {
+    let (Some(bo), Some(bl)) = (f.bit_offset, f.bit_length) else {
+        return Ok(());
+    };
+    if bl == 0 {
+        return Ok(());
+    }
+    use crate::bits::extract_bits;
+    let signed = matches!(
+        f.value,
+        FieldValue::Number(_) if f.unit.is_some()
+    );
+    let Some(ex) = extract_bits(payload, bo as usize, bl as usize, signed, 0) else {
+        return Ok(());
+    };
+    let raw_unsigned = ex.value as u64;
+    let shift = bo % 8;
+    let byte_span = ((shift + bl).div_ceil(8)) as usize;
+    let shifted: u128 = (raw_unsigned as u128) << shift;
+    w.write_str(",\"bytes\":\"")?;
+    for i in 0..byte_span {
+        if i > 0 {
+            w.write_char(' ')?;
+        }
+        let byte = ((shifted >> (i * 8)) & 0xff) as u8;
+        write!(w, "{:02X}", byte)?;
+    }
+    w.write_char('"')?;
+    // `bits`: only emitted when the field width isn't a whole number
+    // of bytes — diagnostic for sub-byte fields.
+    if bl % 8 != 0 {
+        w.write_str(",\"bits\":\"")?;
+        // LSB-first bit string of length `bl`.
+        for i in (0..bl).rev() {
+            let bit = (raw_unsigned >> i) & 1;
+            w.write_char(if bit == 1 { '1' } else { '0' })?;
+        }
+        w.write_char('"')?;
+    }
+    Ok(())
+}
+
+/// Under `-debug`, every field is wrapped in
+/// `{"value":<bare>,"name":"..."?,"bytes":"...","bits":"..."?,"key":true?}`.
+///
+/// This is canboat's `-debug` JSON form: even Number / String / Float
+/// fields that are normally emitted bare get wrapped so the
+/// per-field byte/bit annotation is attached.
+fn write_field_value_debug<W: fmt::Write>(
+    w: &mut W,
+    f: &DecodedField,
+    opts: &JsonOptions,
+    payload: &[u8],
+) -> fmt::Result {
+    w.write_char('{')?;
+    w.write_str("\"value\":")?;
+    // The "bare value" emission for the inner `value` key.
+    match &f.value {
+        FieldValue::Number(v) => {
+            let p = effective_precision(f.precision, f.resolution);
+            if p == 7 && f.unit.as_deref() == Some("deg") {
+                write!(w, "{:>10.7}", v)?;
+            } else {
+                write!(w, "{:.*}", p, v)?;
+            }
+        }
+        FieldValue::Integer(v) => write!(w, "{}", v)?,
+        FieldValue::Float(v) => write!(w, "{}", v)?,
+        FieldValue::Binary(bytes) => {
+            w.write_char('"')?;
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    w.write_char(' ')?;
+                }
+                write!(w, "{:02X}", b)?;
+            }
+            w.write_char('"')?;
+        }
+        FieldValue::Lookup { value, name } => {
+            write!(w, "{}", value)?;
+            if let Some(n) = name {
+                w.write_str(",\"name\":")?;
+                write_json_string(w, n)?;
+            }
+        }
+        FieldValue::BitField { value, bits } => {
+            if bits.is_empty() {
+                write!(w, "{}", value)?;
+            } else {
+                w.write_char('[')?;
+                for (i, (bv, n)) in bits.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(',')?;
+                    }
+                    write!(w, "{{\"value\":{},\"name\":", bv)?;
+                    write_json_string(w, n)?;
+                    w.write_char('}')?;
+                }
+                w.write_char(']')?;
+            }
+        }
+        FieldValue::String(s) => write_json_string(w, s)?,
+        FieldValue::Date(d) => {
+            let mut buf = String::with_capacity(10);
+            super::format_date(*d, &mut buf)?;
+            write!(w, "{}", d)?;
+            w.write_str(",\"name\":")?;
+            write_json_string(w, &buf)?;
+        }
+        FieldValue::Time { raw, seconds } => {
+            let p = effective_precision(f.precision, f.resolution);
+            let mut buf = String::with_capacity(12);
+            super::format_time(*seconds, p, &mut buf)?;
+            write!(w, "{}", raw)?;
+            w.write_str(",\"name\":")?;
+            write_json_string(w, &buf)?;
+        }
+        FieldValue::Mmsi(v) => write!(w, "\"{:09}\"", v)?,
+        FieldValue::Pgn { value, description } => {
+            write!(w, "{}", value)?;
+            if let Some(desc) = description {
+                w.write_str(",\"name\":")?;
+                write_json_string(w, desc)?;
+            }
+        }
+        FieldValue::IsoName { value, .. } => {
+            // -debug doesn't expand the nested subfields here — it just
+            // shows the raw 64-bit identifier. (canboat does the same.)
+            write!(w, "{}", value)?;
+        }
+        FieldValue::Reserved { bytes, .. } => {
+            // Same shape as canboat's Binary: uppercase hex, space-
+            // separated.
+            w.write_char('"')?;
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    w.write_char(' ')?;
+                }
+                write!(w, "{:02X}", b)?;
+            }
+            w.write_char('"')?;
+        }
+        FieldValue::Spare { .. } | FieldValue::NotAvailable => {
+            w.write_str("null")?;
+        }
+        FieldValue::Unsupported { field_type } => {
+            let mut buf = String::with_capacity(field_type.len() + 16);
+            buf.push_str("<unsupported:");
+            buf.push_str(field_type);
+            buf.push('>');
+            write_json_string(w, &buf)?;
+        }
+    }
+    write_debug_suffix(w, f, payload)?;
+    if opts.name_value && f.part_of_primary_key {
+        w.write_str(",\"key\":true")?;
+    }
+    w.write_char('}')
+}
+
 fn write_field_value<W: fmt::Write>(
     w: &mut W,
     f: &DecodedField,
     opts: &JsonOptions,
+    payload: &[u8],
 ) -> fmt::Result {
+    if opts.debug {
+        return write_field_value_debug(w, f, opts, payload);
+    }
     match &f.value {
         FieldValue::Number(v) => {
             let p = effective_precision(f.precision, f.resolution);
@@ -275,10 +472,14 @@ fn write_field_value<W: fmt::Write>(
             }
         }
         FieldValue::Reserved { bytes, .. } => {
-            // canboat emits Reserved as the field's raw bytes hex-
-            // stringified, uppercase, in JSON (and -nv) output.
+            // canboat emits Reserved as the field's bytes hex-
+            // stringified, uppercase, space-separated (same shape as
+            // Binary).
             w.write_char('"')?;
-            for b in bytes {
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    w.write_char(' ')?;
+                }
                 write!(w, "{:02X}", b)?;
             }
             w.write_char('"')
@@ -305,7 +506,7 @@ fn write_field_value<W: fmt::Write>(
                     w.write_str(sep)?;
                     write_json_string(w, &sf.name)?;
                     w.write_char(':')?;
-                    write_field_value(w, sf, opts)?;
+                    write_field_value(w, sf, opts, payload)?;
                     sep = ",";
                 }
                 w.write_char('}')?;
@@ -361,6 +562,7 @@ mod tests {
             dst: 255,
             description: "Water Depth".into(),
             id: "waterDepth".into(),
+            data: Vec::new(),
             fields: vec![DecodedField {
                 order: 1,
                 id: "depthOffset".into(),
@@ -369,6 +571,8 @@ mod tests {
                 resolution: Some(0.001),
                 precision: 0,
                 repeat_index: None,
+                bit_offset: None,
+                bit_length: None,
                 repeat_set: 0,
                 part_of_primary_key: false,
                 value: FieldValue::Number(0.0),

@@ -53,6 +53,13 @@ pub struct DecodedField {
     /// True if this field participates in the PGN's primary key. The
     /// JSON formatter under `-nv` annotates these with `"key":true`.
     pub part_of_primary_key: bool,
+    /// Bit offset of this field within the PGN payload. The `-debug`
+    /// JSON formatter uses this to extract the matching bytes/bits from
+    /// the parent `DecodedPgn::data`. `None` for synthetic fields.
+    pub bit_offset: Option<u32>,
+    /// Bit length of this field. `None` for variable-length fields whose
+    /// length depends on payload content (STRING_LAU, VARIABLE).
+    pub bit_length: Option<u32>,
     pub value: FieldValue,
 }
 
@@ -130,6 +137,11 @@ pub struct DecodedPgn {
     pub description: String,
     /// canboat.json `Id` — stable camelCase identifier.
     pub id: String,
+    /// The raw payload bytes the fields were decoded from. Kept on
+    /// the DecodedPgn so the `-debug` JSON formatter can extract
+    /// per-field `bytes` / `bits` annotations without holding the
+    /// original `RawFrame`.
+    pub data: Vec<u8>,
     pub fields: Vec<DecodedField>,
 }
 
@@ -162,6 +174,7 @@ impl PgnDatabase {
             dst: frame.dst,
             description: info.description.clone(),
             id: info.id.clone(),
+            data: frame.data.to_vec(),
             fields,
         })
     }
@@ -480,6 +493,8 @@ fn decode_one_field_at(
                 repeat_index: None,
                 repeat_set: 0,
                 part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+                bit_offset: Some(bit_offset),
+                bit_length: Some(bits_consumed),
                 value,
             },
             bits_consumed,
@@ -559,6 +574,8 @@ fn decode_one_field_at(
             repeat_index: None,
             repeat_set: 0,
             part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+            bit_offset: Some(bit_offset),
+            bit_length: Some(bit_length),
             value,
         },
         bit_length,
@@ -614,6 +631,8 @@ fn decode_variable(
             repeat_index: None,
             repeat_set: 0,
             part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+            bit_offset: Some(bit_offset),
+            bit_length: Some(bits_byte_aligned),
             value: sub.value,
         },
         bits_byte_aligned,
@@ -783,9 +802,15 @@ fn decode_reserved(
     };
     let raw = ex.value as u64;
     // canboat skips Reserved fields whose value is all-ones (the
-    // default "this is unused" state). Match that exactly.
+    // default "this is unused" state). Surface that here too — but
+    // formatters do the actual omission so the `-debug` byte/bit
+    // diagnostic survives in callers that care.
     if is_reserved && ex.value == ex.max {
-        return FieldValue::NotAvailable;
+        return FieldValue::Reserved {
+            value: raw,
+            bytes: Vec::new(),
+            bit_length,
+        };
     }
     // Pack just the field's value into bytes (little-endian), one byte
     // per `ceil(bit_length / 8)`. This avoids leaking neighboring

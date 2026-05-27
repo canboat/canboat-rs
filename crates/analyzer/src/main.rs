@@ -51,6 +51,12 @@ struct Cli {
     #[arg(long)]
     nv: bool,
 
+    /// JSON: wrap every field with byte/bit diagnostics — adds
+    /// `"bytes":"FF FF"` and `"bits":"..."` to each field's object
+    /// form (`-debug`).
+    #[arg(long)]
+    debug: bool,
+
     /// Filter: only process frames with this source address.
     #[arg(long, value_name = "N")]
     src: Option<u8>,
@@ -104,6 +110,7 @@ fn run(cli: Cli) -> Result<()> {
     let json_opts = JsonOptions {
         include_empty: cli.empty,
         name_value: cli.nv,
+        debug: cli.debug,
     };
     let text_opts = TextOptions {
         show_unavailable: cli.empty,

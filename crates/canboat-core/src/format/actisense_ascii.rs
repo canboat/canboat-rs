@@ -59,14 +59,30 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
         value: pgn_tok.to_string(),
     })?;
 
-    // Remaining tokens: hex data bytes.
+    // Remaining tokens carry payload data. Actisense packs the bytes
+    // as one contiguous hex string (e.g. "3F9FDCFFFFFFFFFF") so each
+    // remaining token is split into 2-char hex pairs. Multiple tokens
+    // are concatenated to be permissive.
     let mut data: SmallVec<[u8; 8]> = SmallVec::new();
-    for (i, t) in toks.enumerate() {
-        let b = u8::from_str_radix(t, 16).map_err(|_| ParseError::BadHexByte {
-            index: i,
-            value: t.to_string(),
-        })?;
-        data.push(b);
+    for t in toks {
+        let bytes = t.as_bytes();
+        if bytes.len() % 2 != 0 {
+            return Err(ParseError::BadHexByte {
+                index: data.len(),
+                value: t.to_string(),
+            });
+        }
+        for pair in bytes.chunks(2) {
+            let s = std::str::from_utf8(pair).map_err(|_| ParseError::BadHexByte {
+                index: data.len(),
+                value: t.to_string(),
+            })?;
+            let b = u8::from_str_radix(s, 16).map_err(|_| ParseError::BadHexByte {
+                index: data.len(),
+                value: s.to_string(),
+            })?;
+            data.push(b);
+        }
     }
 
     Ok(RawFrame {

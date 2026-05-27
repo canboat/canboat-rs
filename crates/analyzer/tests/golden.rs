@@ -203,3 +203,13 @@ fn actisense_format_text() {
 fn pgn_65379_text_debug() {
     run_case("pgn-65379-test.in", "pgn-65379-test.out", &["--debug"]);
 }
+
+/// Issue #623 regression: a fast-packet first frame with no payload
+/// followed by a single continuation frame produces a 2-frame
+/// reassembly where the analyzer should fill missing bytes with 0xFF
+/// (not read uninitialized memory). Exercises the extract_bits
+/// padding path for fields that start in-bounds and run off the end.
+#[test]
+fn short_frame_text_debug() {
+    run_case("short-frame.in", "short-frame.out", &["--debug"]);
+}

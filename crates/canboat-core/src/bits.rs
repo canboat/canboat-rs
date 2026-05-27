@@ -19,7 +19,11 @@ pub struct Extracted {
 }
 
 /// Extract `bits` bits starting at the bit offset `bit_offset` from
-/// `data`. Returns `None` if `data` is too short.
+/// `data`. Returns `None` if the field starts entirely past the end of
+/// `data`; if the field starts in-bounds but runs off the end (a short
+/// fast-packet payload), missing bytes are padded with `0xFF` so the
+/// caller's `is_unavailable` check still fires. Matches canboat's
+/// reassembly behavior since issue #623.
 ///
 /// Mirrors `extractNumber()` in `analyzer/print.c`.
 pub fn extract_bits(
@@ -47,13 +51,12 @@ pub fn extract_bits(
     let mut remaining = bits;
 
     while remaining > 0 {
-        if data.is_empty() {
-            return None;
-        }
+        // Pad missing trailing bytes with 0xFF (canboat issue #623).
+        let byte = data.first().copied().unwrap_or(0xff);
         let in_this_byte = (8 - first_bit).min(remaining);
         let all_ones = (1u64 << in_this_byte) - 1;
         let mask = all_ones << first_bit;
-        let chunk = ((data[0] as u64) & mask) >> first_bit;
+        let chunk = ((byte as u64) & mask) >> first_bit;
         value |= chunk << magnitude;
         max_v |= all_ones << magnitude;
         magnitude += in_this_byte;
@@ -61,7 +64,9 @@ pub fn extract_bits(
         first_bit += in_this_byte;
         if first_bit >= 8 {
             first_bit -= 8;
-            data = &data[1..];
+            if !data.is_empty() {
+                data = &data[1..];
+            }
         }
     }
 
@@ -182,9 +187,21 @@ mod tests {
     }
 
     #[test]
-    fn returns_none_on_short_data() {
-        // Need 16 bits but only 8 available.
+    fn pads_short_data_with_0xff() {
+        // Field starts in-bounds but runs off the end: missing trailing
+        // bytes are padded with 0xFF (canboat issue #623). 16 bits at
+        // offset 0 with only 1 byte → value = 0xAB | 0xFF<<8 = 0xFFAB.
+        let data = [0xab];
+        let e = extract_bits(&data, 0, 16, false, 0).unwrap();
+        assert_eq!(e.value, 0xffab);
+        assert_eq!(e.max, 0xffff);
+    }
+
+    #[test]
+    fn returns_none_when_starts_past_end() {
+        // Field starts entirely past the buffer end → still None so
+        // callers can drop the field rather than emit a synthetic value.
         let data = [0xff];
-        assert!(extract_bits(&data, 0, 16, false, 0).is_none());
+        assert!(extract_bits(&data, 8, 8, false, 0).is_none());
     }
 }

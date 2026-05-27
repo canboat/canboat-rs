@@ -245,6 +245,20 @@ fn pgn_test_json_nv_debug() {
     );
 }
 
+/// Mixed PLAIN_MIX_FAST capture exercising DYNAMIC_FIELD_KEY /
+/// DYNAMIC_FIELD_LENGTH / DYNAMIC_FIELD_VALUE on PGN 130824 (B&G
+/// key-value data). Two reassembled / coalesced records and three
+/// frames that pass through individually (the format intentionally
+/// interleaves coalesced FAST records with raw 8-byte continuations).
+#[test]
+fn mixed_format_text_debug() {
+    run_case(
+        "mixed-format.in",
+        "mixed-format.out",
+        &["--format", "plain_mix_fast", "--debug"],
+    );
+}
+
 /// Switch-multi capture: exercises the synthetic-PGN range (PGN
 /// 262386 = `ACTISENSE_BEM + 0xf2`, "Actisense: System status",
 /// defined in canboat's `analyzer/pgn.h` but not in canboat.json —

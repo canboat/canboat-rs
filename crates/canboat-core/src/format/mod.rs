@@ -28,7 +28,15 @@ use crate::frame::RawFrame;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFormat {
     /// Canboat PLAIN / FAST line (`<ts>,<prio>,<pgn>,...,<hex>,...`).
+    /// Once any line is wider than 8 payload bytes the parser locks
+    /// into coalesced mode; matches canboat's RAWFORMAT_PLAIN_OR_FAST.
     Plain,
+    /// Like [`Plain`] but with no global lock-in — every frame is
+    /// dispatched on its own width. Matches canboat's
+    /// RAWFORMAT_PLAIN_MIX_FAST, where a single capture interleaves
+    /// pre-coalesced (>8 byte) FAST records with raw 8-byte
+    /// continuation frames that still need reassembly.
+    PlainMixFast,
     /// Actisense N2K ASCII (`A<HHMMSS.mmm> <SDP> <PGN> <data...>`).
     ActisenseAscii,
     /// YDWG-02 / YDEN (`<HH:MM:SS.mmm> R <CANID> <data...>`).
@@ -93,7 +101,7 @@ fn looks_like_ydwg02(line: &str) -> bool {
 /// [`PlainError`].
 pub fn parse_with(format: InputFormat, line: &str) -> Result<Option<RawFrame>, plain::ParseError> {
     match format {
-        InputFormat::Plain => plain::parse_line(line).map(Some),
+        InputFormat::Plain | InputFormat::PlainMixFast => plain::parse_line(line).map(Some),
         InputFormat::ActisenseAscii => actisense_ascii::parse_line(line).map(Some),
         InputFormat::Ydwg02 => ydwg02::parse_line(line).map(Some),
         InputFormat::Ikonvert => match ikonvert::parse_line(line)? {

@@ -10,7 +10,10 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::{BitLookupTable, FieldInfo, IndirectLookupTable, LookupTable, PgnInfo};
+use crate::types::{
+    BitLookupTable, FieldInfo, IndirectLookupTable, LookupFieldTypeTable, LookupFieldTypeValue,
+    LookupTable, PgnInfo,
+};
 
 /// Multiplier to convert radians to degrees.
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
@@ -106,6 +109,52 @@ fn apply_non_si_unit_fixup(f: &mut FieldInfo) {
     }
 }
 
+/// Apply the same non-SI unit fix-ups (rad → deg, K → °C, Pa → bar,
+/// C → Ah) to a [`LookupFieldTypeValue`] entry. DYNAMIC_FIELD_VALUE
+/// fields use these table entries to drive decoding, so the resolution
+/// / unit must already be in display units by the time we read them.
+fn apply_non_si_unit_fixup_lookup(v: &mut LookupFieldTypeValue) {
+    let Some(unit) = v.unit.as_deref() else {
+        return;
+    };
+    // Angle / angular-velocity entries map to ANGLE_FIX16 (signed) in
+    // canboat's C analyzer, but canboat.json strips that to "NUMBER".
+    // Restore the sign via the unit before the rad→deg conversion
+    // clobbers it.
+    if matches!(unit, "rad" | "rad/s") {
+        v.signed = true;
+    }
+    match unit {
+        "rad" => {
+            if let Some(r) = v.resolution.as_mut() {
+                *r *= RAD_TO_DEG;
+            }
+            v.unit = Some("deg".to_string());
+            v.precision = 1;
+        }
+        "rad/s" => {
+            if let Some(r) = v.resolution.as_mut() {
+                *r *= RAD_TO_DEG;
+            }
+            v.unit = Some("deg/s".to_string());
+        }
+        "Pa" => {
+            if let Some(r) = v.resolution.as_mut() {
+                *r /= 100_000.0;
+            }
+            v.unit = Some("bar".to_string());
+            v.precision = 3;
+        }
+        "C" => {
+            if let Some(r) = v.resolution.as_mut() {
+                *r /= 3600.0;
+            }
+            v.unit = Some("Ah".to_string());
+        }
+        _ => {}
+    }
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
     #[error("I/O error reading PGN database: {0}")]
@@ -129,10 +178,8 @@ struct CanboatJson {
     lookup_bit_enumerations: Vec<BitLookupTable>,
     #[serde(default)]
     lookup_indirect_enumerations: Vec<IndirectLookupTable>,
-    /// Stored raw — decoded when the FIELD_TYPE_ENUMERATION decoder
-    /// arrives (deferred to v0.x).
     #[serde(default)]
-    lookup_field_type_enumerations: Vec<serde_json::Value>,
+    lookup_field_type_enumerations: Vec<LookupFieldTypeTable>,
 }
 
 /// The canboat PGN database.
@@ -153,9 +200,8 @@ pub struct PgnDatabase {
     bit_lookups: HashMap<String, BitLookupTable>,
     /// name → indirect (two-key) lookup table.
     indirect_lookups: HashMap<String, IndirectLookupTable>,
-
-    /// Reserved for future use — not yet indexed.
-    _field_type_raw: Vec<serde_json::Value>,
+    /// name → DYNAMIC_FIELD_KEY field-type-enumeration table.
+    field_type_lookups: HashMap<String, LookupFieldTypeTable>,
 }
 
 impl PgnDatabase {
@@ -235,6 +281,13 @@ impl PgnDatabase {
             .into_iter()
             .map(|t| (t.name.clone(), t))
             .collect();
+        let mut ft_tables = raw.lookup_field_type_enumerations;
+        for t in &mut ft_tables {
+            for v in &mut t.values {
+                apply_non_si_unit_fixup_lookup(v);
+            }
+        }
+        let field_type_lookups = ft_tables.into_iter().map(|t| (t.name.clone(), t)).collect();
         Self {
             schema_version: raw.schema_version,
             version: raw.version,
@@ -243,7 +296,7 @@ impl PgnDatabase {
             lookups,
             bit_lookups,
             indirect_lookups,
-            _field_type_raw: raw.lookup_field_type_enumerations,
+            field_type_lookups,
         }
     }
 
@@ -314,5 +367,17 @@ impl PgnDatabase {
             .iter()
             .find(|v| v.value1 == value1 && v.value2 == value2)
             .map(|v| v.name.as_str())
+    }
+
+    /// Resolve a DYNAMIC_FIELD_KEY value through a
+    /// LookupFieldTypeEnumeration. Returns the entry whose `value` ==
+    /// `key`, carrying the field type / bits / resolution / unit that
+    /// the subsequent DYNAMIC_FIELD_VALUE should be decoded as.
+    pub fn field_type_lookup(&self, name: &str, key: u64) -> Option<&LookupFieldTypeValue> {
+        self.field_type_lookups
+            .get(name)?
+            .values
+            .iter()
+            .find(|v| v.value == key)
     }
 }

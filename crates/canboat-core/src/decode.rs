@@ -300,6 +300,14 @@ impl PgnDatabase {
 struct DecodeContext {
     target_pgn: Option<u32>,
     current_param_idx: Option<u32>,
+    /// Resolved DYNAMIC_FIELD_KEY entry — set when a key field is
+    /// decoded, read by the matching DYNAMIC_FIELD_VALUE, cleared
+    /// after. Stored as cloned data so we don't have to thread a
+    /// lifetime through every decoder.
+    dynamic_field_type: Option<crate::types::LookupFieldTypeValue>,
+    /// Byte length from a DYNAMIC_FIELD_LENGTH field. Cleared with
+    /// `dynamic_field_type` after the value is decoded.
+    dynamic_length_bytes: Option<u32>,
 }
 
 fn decode_fields(
@@ -535,6 +543,51 @@ fn decode_one_field_at(
         return decode_variable(f, data, db, bit_offset, ctx);
     }
 
+    // DYNAMIC_FIELD_VALUE has `BitLengthVariable: true` and no
+    // explicit `BitLength` in canboat.json — its width comes from
+    // the matching DYNAMIC_FIELD_LENGTH (or the resolved KEY's table
+    // entry). Handle it before the `bit_length?` check below would
+    // bail out.
+    if matches!(f.field_type, Some(FieldType::DynamicFieldValue)) {
+        // Capture unit / resolution / precision from the resolved key
+        // entry *before* `decode_dynamic_field_value` drains the
+        // context slots.
+        let unit = ctx
+            .dynamic_field_type
+            .as_ref()
+            .and_then(|v| v.unit.clone())
+            .or_else(|| f.unit.clone());
+        let resolution = ctx
+            .dynamic_field_type
+            .as_ref()
+            .and_then(|v| v.resolution)
+            .or(f.resolution);
+        let precision = ctx
+            .dynamic_field_type
+            .as_ref()
+            .map(|v| v.precision)
+            .filter(|&p| p > 0)
+            .unwrap_or(f.precision);
+        let (val, consumed_bits) = decode_dynamic_field_value(data, bit_offset, db, ctx);
+        return Some((
+            DecodedField {
+                order: f.order,
+                id: f.id.clone(),
+                name: f.name.clone(),
+                unit,
+                resolution,
+                precision,
+                repeat_index: None,
+                repeat_set: 0,
+                part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+                bit_offset: Some(bit_offset),
+                bit_length: Some(consumed_bits),
+                value: val,
+            },
+            consumed_bits,
+        ));
+    }
+
     let bit_length = f.bit_length?;
 
     let value = match f.field_type {
@@ -565,15 +618,13 @@ fn decode_one_field_at(
         Some(FieldType::StringLau) => unreachable!("STRING_LAU handled above"),
         Some(FieldType::Variable) => unreachable!("VARIABLE handled above"),
         Some(FieldType::IsoName) => decode_iso_name(data, bit_offset, bit_length, db),
-        Some(FieldType::DynamicFieldKey) => FieldValue::Unsupported {
-            field_type: "DYNAMIC_FIELD_KEY",
-        },
-        Some(FieldType::DynamicFieldLength) => FieldValue::Unsupported {
-            field_type: "DYNAMIC_FIELD_LENGTH",
-        },
-        Some(FieldType::DynamicFieldValue) => FieldValue::Unsupported {
-            field_type: "DYNAMIC_FIELD_VALUE",
-        },
+        Some(FieldType::DynamicFieldKey) => {
+            decode_dynamic_field_key(f, data, db, bit_offset, bit_length, ctx)
+        }
+        Some(FieldType::DynamicFieldLength) => {
+            decode_dynamic_field_length(data, bit_offset, bit_length, ctx)
+        }
+        Some(FieldType::DynamicFieldValue) => unreachable!("DYNAMIC_FIELD_VALUE handled above"),
         Some(FieldType::FieldIndex) => decode_number(f, data, bit_offset, bit_length, signed, 0),
         None => FieldValue::Unsupported {
             field_type: "<no field type>",
@@ -1149,6 +1200,135 @@ fn decode_string_lz(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue
     let stop = nul.map(|n| start + n).unwrap_or(end);
     let s = String::from_utf8_lossy(&data[start..stop]).into_owned();
     FieldValue::String(s)
+}
+
+/// DYNAMIC_FIELD_KEY: decode the integer raw value and resolve it
+/// through the field's `LookupFieldTypeEnumeration`. The resolved
+/// entry is parked on the [`DecodeContext`] so the matching
+/// DYNAMIC_FIELD_VALUE can read its type / bits / resolution / unit.
+/// The output value mirrors a normal Lookup (number + resolved name).
+fn decode_dynamic_field_key(
+    f: &FieldInfo,
+    data: &[u8],
+    db: &PgnDatabase,
+    bit_offset: u32,
+    bit_length: u32,
+    ctx: &mut DecodeContext,
+) -> FieldValue {
+    let Some(ex) = extract_bits(data, bit_offset as usize, bit_length as usize, false, 0) else {
+        return FieldValue::NotAvailable;
+    };
+    let raw = ex.value as u64;
+    let entry = f
+        .lookup_field_type_enumeration
+        .as_deref()
+        .and_then(|n| db.field_type_lookup(n, raw));
+    let name = entry.map(|e| e.name.clone());
+    ctx.dynamic_field_type = entry.cloned();
+    // Carry over canboat's "no resolution + reserved sentinel = N/A"
+    // semantics so out-of-range keys decode as Unknown.
+    if name.is_none() && is_unavailable(ex) {
+        return FieldValue::NotAvailable;
+    }
+    FieldValue::Lookup { value: raw, name }
+}
+
+/// DYNAMIC_FIELD_LENGTH: decode as a plain integer count of bytes
+/// that the next DYNAMIC_FIELD_VALUE consumes.
+fn decode_dynamic_field_length(
+    data: &[u8],
+    bit_offset: u32,
+    bit_length: u32,
+    ctx: &mut DecodeContext,
+) -> FieldValue {
+    let Some(ex) = extract_bits(data, bit_offset as usize, bit_length as usize, false, 0) else {
+        return FieldValue::NotAvailable;
+    };
+    let len = ex.value as u32;
+    ctx.dynamic_length_bytes = Some(len);
+    FieldValue::Integer(len as i64)
+}
+
+/// DYNAMIC_FIELD_VALUE: read the resolved field-type metadata from
+/// the context and decode the value using it. Falls back to a BINARY
+/// dump (mirroring `fieldPrintKeyValue`'s `g_ftf == NULL` branch)
+/// when the key wasn't resolved. Returns the value plus how many bits
+/// it consumed so the iteration walker can advance correctly. Always
+/// clears the dynamic-* slots in the context.
+fn decode_dynamic_field_value(
+    data: &[u8],
+    bit_offset: u32,
+    db: &PgnDatabase,
+    ctx: &mut DecodeContext,
+) -> (FieldValue, u32) {
+    let entry = ctx.dynamic_field_type.take();
+    let length_bits = ctx
+        .dynamic_length_bytes
+        .take()
+        .map(|n| n * 8)
+        .or_else(|| entry.as_ref().and_then(|e| e.bit_length()));
+    let Some(bits) = length_bits else {
+        return (
+            FieldValue::Unsupported {
+                field_type: "DYNAMIC_FIELD_VALUE (no length)",
+            },
+            0,
+        );
+    };
+    let Some(entry) = entry else {
+        // Unresolved key — render as a raw BINARY blob over the
+        // declared length.
+        return (decode_binary(data, bit_offset, bits), bits);
+    };
+    let signed =
+        entry.signed || matches!(entry.field_type.as_deref(), Some(ft) if ft.starts_with("FIX"));
+    let val = match entry.field_type.as_deref() {
+        Some(ft) if ft.starts_with("NUMBER") || ft.starts_with("FIX") || ft.starts_with("UFIX") => {
+            decode_dynamic_number(data, bit_offset, bits, signed, &entry)
+        }
+        Some("LOOKUP") => match entry.lookup_enumeration.as_deref() {
+            Some(name) => {
+                let Some(ex) = extract_bits(data, bit_offset as usize, bits as usize, false, 0)
+                else {
+                    return (FieldValue::NotAvailable, bits);
+                };
+                let raw = ex.value as u64;
+                let nm = db
+                    .lookup(name)
+                    .and_then(|t| t.values.iter().find(|v| v.value == raw))
+                    .map(|v| v.name.clone());
+                FieldValue::Lookup {
+                    value: raw,
+                    name: nm,
+                }
+            }
+            None => decode_binary(data, bit_offset, bits),
+        },
+        _ => decode_binary(data, bit_offset, bits),
+    };
+    (val, bits)
+}
+
+fn decode_dynamic_number(
+    data: &[u8],
+    bit_offset: u32,
+    bit_length: u32,
+    signed: bool,
+    entry: &crate::types::LookupFieldTypeValue,
+) -> FieldValue {
+    let Some(ex) = extract_bits(data, bit_offset as usize, bit_length as usize, signed, 0) else {
+        return FieldValue::NotAvailable;
+    };
+    if is_unavailable(ex) {
+        return FieldValue::NotAvailable;
+    }
+    let raw = ex.value as f64;
+    let res = entry.resolution.unwrap_or(1.0);
+    if res == 1.0 && entry.unit.is_none() {
+        FieldValue::Integer(ex.value)
+    } else {
+        FieldValue::Number(raw * res)
+    }
 }
 
 #[cfg(test)]

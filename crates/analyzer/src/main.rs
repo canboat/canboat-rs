@@ -97,7 +97,8 @@ struct Cli {
 
 fn parse_format_flag(name: &str) -> Result<InputFormat> {
     Ok(match name.to_ascii_lowercase().as_str() {
-        "plain" | "fast" => InputFormat::Plain,
+        "plain" | "fast" | "plain_or_fast" => InputFormat::Plain,
+        "plain_mix_fast" | "plain-mix-fast" => InputFormat::PlainMixFast,
         "actisense" | "actisense-ascii" => InputFormat::ActisenseAscii,
         "ydwg02" | "yden" => InputFormat::Ydwg02,
         "ikonvert" => InputFormat::Ikonvert,
@@ -254,7 +255,11 @@ fn run_loop<R: BufRead, W: Write>(
         // RAWFORMAT_PLAIN_OR_FAST → RAWFORMAT_FAST lock-in
         // (analyzer.c:431) which also flips multiPackets to
         // COALESCED.
-        if frame.data.len() > 8 {
+        //
+        // PLAIN_MIX_FAST opts out — that format intentionally
+        // interleaves coalesced FAST records with raw 8-byte
+        // continuation frames, so we route per-frame instead.
+        if frame.data.len() > 8 && format != InputFormat::PlainMixFast {
             coalesced_mode = true;
         }
 

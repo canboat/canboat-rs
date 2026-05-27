@@ -234,3 +234,62 @@ pub struct IndirectLookupTable {
     #[serde(rename = "EnumValues")]
     pub values: Vec<IndirectLookupValue>,
 }
+
+/// One key→field-type entry inside a [`LookupFieldTypeTable`]. The
+/// upstream `Bits` field is a stringified integer in canboat.json, so
+/// parse via [`de_loose_string`] then convert in the accessor.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LookupFieldTypeValue {
+    #[serde(rename = "value")]
+    pub value: u64,
+    #[serde(rename = "name")]
+    pub name: String,
+    #[serde(rename = "FieldType")]
+    pub field_type: Option<String>,
+    /// Field width in bits — encoded as a string in canboat.json.
+    #[serde(rename = "Bits", default, deserialize_with = "de_loose_string")]
+    pub bits: Option<String>,
+    #[serde(rename = "Resolution")]
+    pub resolution: Option<f64>,
+    #[serde(rename = "Unit")]
+    pub unit: Option<String>,
+    #[serde(rename = "LookupEnumeration")]
+    pub lookup_enumeration: Option<String>,
+    #[serde(rename = "LookupBitEnumeration")]
+    pub lookup_bit_enumeration: Option<String>,
+    /// Signedness inferred from the unit at load time. Canboat.json
+    /// strips the FIX-vs-UFIX distinction from these table entries
+    /// (everything renders as `FieldType: NUMBER`), so we fall back
+    /// to a unit-based heuristic: angle / angular-velocity units are
+    /// signed; the others default to unsigned. Mirrors canboat C's
+    /// ANGLE_FIX16-style underlying type.
+    #[serde(skip, default)]
+    pub signed: bool,
+    /// Display precision override applied at load time by the same
+    /// non-SI unit fix-up that updates [`Self::resolution`] and
+    /// [`Self::unit`] (e.g. rad → deg pins precision at 1). `0` means
+    /// "compute from resolution".
+    #[serde(skip, default)]
+    pub precision: u8,
+}
+
+impl LookupFieldTypeValue {
+    /// Field width in bits parsed from `Bits` (stringly typed upstream).
+    pub fn bit_length(&self) -> Option<u32> {
+        self.bits.as_deref().and_then(|s| s.parse().ok())
+    }
+}
+
+/// A LookupFieldTypeEnumeration — maps a key value to a field type
+/// (and its display metadata). Used by DYNAMIC_FIELD_KEY /
+/// DYNAMIC_FIELD_VALUE pairs in PGNs like 130824 ("B&G: key-value
+/// data") to resolve a heterogeneous value field at decode time.
+#[derive(Debug, Clone, Deserialize)]
+pub struct LookupFieldTypeTable {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "MaxValue")]
+    pub max_value: Option<u64>,
+    #[serde(rename = "EnumFieldTypeValues")]
+    pub values: Vec<LookupFieldTypeValue>,
+}

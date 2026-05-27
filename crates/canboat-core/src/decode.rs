@@ -43,6 +43,9 @@ pub struct DecodedField {
     /// Zero-based iteration index for fields inside a repeating set;
     /// `None` for non-repeating fields.
     pub repeat_index: Option<u32>,
+    /// True if this field participates in the PGN's primary key. The
+    /// JSON formatter under `-nv` annotates these with `"key":true`.
+    pub part_of_primary_key: bool,
     pub value: FieldValue,
 }
 
@@ -59,15 +62,9 @@ pub enum FieldValue {
     /// Raw bytes (BINARY) — uninterpreted.
     Binary(Vec<u8>),
     /// LOOKUP / INDIRECT_LOOKUP result.
-    Lookup {
-        value: u64,
-        name: Option<String>,
-    },
+    Lookup { value: u64, name: Option<String> },
     /// BITLOOKUP result — set-bit list.
-    BitField {
-        value: u64,
-        names: Vec<String>,
-    },
+    BitField { value: u64, names: Vec<String> },
     /// Decoded text (STRING_FIX, STRING_LZ, STRING_LAU).
     String(String),
     /// 16-bit days since 1970-01-01.
@@ -78,15 +75,31 @@ pub enum FieldValue {
     Mmsi(u32),
     /// 24-bit PGN number.
     Pgn(u32),
+    /// ISO_NAME — a 64-bit packed identifier that is also a valid
+    /// PGN 60928 (ISO Address Claim) payload. We carry the raw value
+    /// and the recursively-decoded subfields side by side so the
+    /// formatter can choose either form.
+    IsoName {
+        value: u64,
+        subfields: Vec<DecodedField>,
+    },
     /// RESERVED / SPARE — value preserved but the field is meaningless.
-    Reserved(u64),
-    Spare(u64),
+    /// The raw bytes (in field order, no resolution) ride along so the
+    /// JSON formatter can emit them as hex strings, matching canboat.
+    Reserved {
+        value: u64,
+        bytes: Vec<u8>,
+        bit_length: u32,
+    },
+    Spare {
+        value: u64,
+        bytes: Vec<u8>,
+        bit_length: u32,
+    },
     /// Field exists but raw value is the canboat "not-available" sentinel.
     NotAvailable,
     /// Field decoding not yet implemented for this `FieldType`.
-    Unsupported {
-        field_type: &'static str,
-    },
+    Unsupported { field_type: &'static str },
 }
 
 /// A fully decoded PGN event.
@@ -201,9 +214,7 @@ impl PgnDatabase {
             // both exist; otherwise take the first no-Match variant
             // (canboat keeps at most one no-Match variant per PGN, and
             // it carries the Fallback flag).
-            if !has_match
-                && (info.fallback.unwrap_or(false) || in_pgn_fallback.is_none())
-            {
+            if !has_match && (info.fallback.unwrap_or(false) || in_pgn_fallback.is_none()) {
                 in_pgn_fallback = Some(info);
             }
         }
@@ -300,9 +311,7 @@ fn decode_one_field(
         Some(FieldType::Variable) => FieldValue::Unsupported {
             field_type: "VARIABLE",
         },
-        Some(FieldType::IsoName) => FieldValue::Unsupported {
-            field_type: "ISO_NAME",
-        },
+        Some(FieldType::IsoName) => decode_iso_name(data, bit_offset, bit_length, db),
         Some(FieldType::DynamicFieldKey) => FieldValue::Unsupported {
             field_type: "DYNAMIC_FIELD_KEY",
         },
@@ -325,6 +334,7 @@ fn decode_one_field(
         unit: f.unit.clone(),
         resolution: f.resolution,
         repeat_index: None,
+        part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
         value,
     })
 }
@@ -466,11 +476,54 @@ fn decode_reserved(
         return FieldValue::NotAvailable;
     };
     let raw = ex.value as u64;
-    if is_reserved {
-        FieldValue::Reserved(raw)
-    } else {
-        FieldValue::Spare(raw)
+    // Pack just the field's value into bytes (little-endian), one byte
+    // per `ceil(bit_length / 8)`. This avoids leaking neighboring
+    // fields' bits when the reserved span shares a byte with adjacent
+    // payload (which slicing `data[start..end]` would do).
+    let n_bytes = bit_length.div_ceil(8).max(1) as usize;
+    let mut bytes = Vec::with_capacity(n_bytes);
+    for i in 0..n_bytes {
+        bytes.push(((raw >> (i * 8)) & 0xff) as u8);
     }
+    if is_reserved {
+        FieldValue::Reserved {
+            value: raw,
+            bytes,
+            bit_length,
+        }
+    } else {
+        FieldValue::Spare {
+            value: raw,
+            bytes,
+            bit_length,
+        }
+    }
+}
+
+/// ISO_NAME: 64-bit packed identifier. The same 8 bytes also form a
+/// valid PGN 60928 (ISO Address Claim) payload, so the structured form
+/// is built by re-running the decoder against PGN 60928's field list
+/// on those 8 bytes — matching `fieldPrintName` in `analyzer/print.c`.
+fn decode_iso_name(data: &[u8], bit_offset: u32, bit_length: u32, db: &PgnDatabase) -> FieldValue {
+    if bit_length != 64 || (bit_offset & 7) != 0 {
+        return FieldValue::Unsupported {
+            field_type: "ISO_NAME (unaligned or non-64-bit)",
+        };
+    }
+    let byte_off = (bit_offset / 8) as usize;
+    if byte_off + 8 > data.len() {
+        return FieldValue::NotAvailable;
+    }
+    let mut value: u64 = 0;
+    for i in 0..8 {
+        value |= (data[byte_off + i] as u64) << (i * 8);
+    }
+    let sub = &data[byte_off..byte_off + 8];
+    let subfields = match db.first_pgn(60928) {
+        Some(pgn) => decode_fields(pgn, sub, db).unwrap_or_default(),
+        None => Vec::new(),
+    };
+    FieldValue::IsoName { value, subfields }
 }
 
 fn decode_binary(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
@@ -717,7 +770,7 @@ mod tests {
         // 8 bits at offset 0). Function Code = 3 must select
         // nmeaReadFieldsGroupFunction, NOT the leading fallback.
         let data: smallvec::SmallVec<[u8; 8]> = smallvec::smallvec![
-            3,    // Function Code = 3 → Read Fields
+            3, // Function Code = 3 → Read Fields
             0, 0, 0, 0, 0, 0, 0,
         ];
         let frame = RawFrame {

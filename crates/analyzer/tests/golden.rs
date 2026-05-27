@@ -12,9 +12,9 @@
 //! already render; the rest will be added (with documentation of
 //! missing features) as their support lands.
 
+use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
-use std::io::Write;
 
 /// Where the canboat C repo lives, relative to this crate.
 fn canboat_tests_dir() -> Option<PathBuf> {
@@ -86,4 +86,11 @@ fn run_case(in_name: &str, expected_name: &str, args: &[&str]) {
 fn pgn_60928_json_nv() {
     // The simplest passing case: two PGN 60928 frames, JSON -nv.
     run_case("pgn-60928.in", "pgn-60928-nv.out", &["--json", "--nv"]);
+}
+
+#[test]
+fn pgn_126983_json_nv() {
+    // Exercises ISO_NAME recursive decode, Reserved-as-hex, and
+    // PartOfPrimaryKey "key":true annotation.
+    run_case("pgn-126983.in", "pgn-126983-nv.out", &["--json", "--nv"]);
 }

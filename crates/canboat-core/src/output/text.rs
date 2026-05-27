@@ -29,11 +29,7 @@ pub struct TextOptions {
 
 /// Write one decoded PGN as a canboat text line. Does not append a
 /// trailing newline — the caller decides.
-pub fn write_text<W: fmt::Write>(
-    w: &mut W,
-    pgn: &DecodedPgn,
-    opts: &TextOptions,
-) -> fmt::Result {
+pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions) -> fmt::Result {
     // Header: `<ts> <prio> <src:3> <dst:3> <pgn:6> <description>:`
     if let Some(ts) = &pgn.timestamp {
         w.write_str(ts)?;
@@ -58,7 +54,10 @@ pub fn write_text<W: fmt::Write>(
             continue;
         }
         // Reserved/Spare are noise in text output — drop them.
-        if matches!(f.value, FieldValue::Reserved(_) | FieldValue::Spare(_)) {
+        if matches!(
+            f.value,
+            FieldValue::Reserved { .. } | FieldValue::Spare { .. }
+        ) {
             continue;
         }
         // C format string is `"%s %s = "` (sep + space + name + space
@@ -137,7 +136,31 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result 
         }
         FieldValue::Mmsi(v) => write!(w, "{:09}", v),
         FieldValue::Pgn(v) => write!(w, "{}", v),
-        FieldValue::Reserved(_) | FieldValue::Spare(_) => Ok(()),
+        FieldValue::Reserved { .. } | FieldValue::Spare { .. } => Ok(()),
+        FieldValue::IsoName { value, subfields } => {
+            // canboat text format: 0x<hex> name = [<sub1>;<sub2>;...]
+            write!(w, "0x{:x}", value)?;
+            if !subfields.is_empty() {
+                w.write_str(" name = [")?;
+                let mut sep = "";
+                for sf in subfields {
+                    if matches!(
+                        sf.value,
+                        FieldValue::NotAvailable
+                            | FieldValue::Reserved { .. }
+                            | FieldValue::Spare { .. }
+                    ) {
+                        continue;
+                    }
+                    w.write_str(sep)?;
+                    write!(w, " {name} = ", name = sf.name)?;
+                    write_field_value(w, sf)?;
+                    sep = ";";
+                }
+                w.write_str("]")?;
+            }
+            Ok(())
+        }
         FieldValue::NotAvailable => w.write_str("Unknown"),
         FieldValue::Unsupported { field_type } => write!(w, "<unsupported:{}>", field_type),
     }
@@ -165,6 +188,7 @@ mod tests {
                     unit: None,
                     resolution: Some(1.0),
                     repeat_index: None,
+                    part_of_primary_key: false,
                     value: FieldValue::Integer(1_088_507),
                 },
                 DecodedField {
@@ -174,6 +198,7 @@ mod tests {
                     unit: None,
                     resolution: Some(1.0),
                     repeat_index: None,
+                    part_of_primary_key: false,
                     value: FieldValue::Lookup {
                         value: 275,
                         name: Some("Navico".into()),

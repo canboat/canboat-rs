@@ -32,11 +32,7 @@ pub struct JsonOptions {
     pub name_value: bool,
 }
 
-pub fn write_json<W: fmt::Write>(
-    w: &mut W,
-    pgn: &DecodedPgn,
-    opts: &JsonOptions,
-) -> fmt::Result {
+pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions) -> fmt::Result {
     w.write_char('{')?;
     if let Some(ts) = &pgn.timestamp {
         w.write_str("\"timestamp\":")?;
@@ -58,7 +54,9 @@ pub fn write_json<W: fmt::Write>(
         if !opts.include_empty && matches!(f.value, FieldValue::NotAvailable) {
             continue;
         }
-        if matches!(f.value, FieldValue::Reserved(_) | FieldValue::Spare(_)) {
+        // Reserved is emitted as a hex string in JSON (matches canboat
+        // -json output); Spare is dropped.
+        if matches!(f.value, FieldValue::Spare { .. }) {
             continue;
         }
         w.write_str(sep)?;
@@ -82,7 +80,15 @@ fn write_field_value<W: fmt::Write>(
             let p = precision_for(f.resolution.unwrap_or(1.0));
             write!(w, "{:.*}", p, v)
         }
-        FieldValue::Integer(v) => write!(w, "{}", v),
+        FieldValue::Integer(v) => {
+            // Under -nv, primary-key fields wear an annotation matching
+            // canboat's JSON: {"value":N,"key":true}.
+            if opts.name_value && f.part_of_primary_key {
+                write!(w, "{{\"value\":{},\"key\":true}}", v)
+            } else {
+                write!(w, "{}", v)
+            }
+        }
         FieldValue::Float(v) => {
             // canboat uses %g — Rust's `{}` is acceptably close.
             write!(w, "{}", v)
@@ -151,7 +157,46 @@ fn write_field_value<W: fmt::Write>(
             write!(w, "\"{:09}\"", v)
         }
         FieldValue::Pgn(v) => write!(w, "{}", v),
-        FieldValue::Reserved(_) | FieldValue::Spare(_) => w.write_str("null"),
+        FieldValue::Reserved { bytes, .. } => {
+            // canboat emits Reserved as the field's raw bytes hex-
+            // stringified, uppercase, in JSON (and -nv) output.
+            w.write_char('"')?;
+            for b in bytes {
+                write!(w, "{:02X}", b)?;
+            }
+            w.write_char('"')
+        }
+        FieldValue::Spare { .. } => w.write_str("null"),
+        FieldValue::IsoName { value, subfields } => {
+            // -nv: {"value":N,"name":{<recursive>}}
+            // default: bare N
+            if opts.name_value {
+                w.write_char('{')?;
+                write!(w, "\"value\":{}", value)?;
+                w.write_str(",\"name\":{")?;
+                let mut sep = "";
+                for sf in subfields {
+                    // The recursive sub-decode runs the full field set;
+                    // drop unavailable subfields (unless -empty) and
+                    // collapse Reserved per the parent rules.
+                    if !opts.include_empty && matches!(sf.value, FieldValue::NotAvailable) {
+                        continue;
+                    }
+                    if matches!(sf.value, FieldValue::Spare { .. }) {
+                        continue;
+                    }
+                    w.write_str(sep)?;
+                    write_json_string(w, &sf.name)?;
+                    w.write_char(':')?;
+                    write_field_value(w, sf, opts)?;
+                    sep = ",";
+                }
+                w.write_char('}')?;
+                w.write_char('}')
+            } else {
+                write!(w, "{}", value)
+            }
+        }
         FieldValue::NotAvailable => w.write_str("null"),
         FieldValue::Unsupported { field_type } => {
             // Encode as a string so the JSON stays valid; consumers can
@@ -206,6 +251,7 @@ mod tests {
                 unit: Some("m".into()),
                 resolution: Some(0.001),
                 repeat_index: None,
+                part_of_primary_key: false,
                 value: FieldValue::Number(0.0),
             }],
         }
@@ -280,6 +326,10 @@ mod tests {
         pgn.description = r#"He said "hi""#.into();
         let mut out = String::new();
         write_json(&mut out, &pgn, &JsonOptions::default()).unwrap();
-        assert!(out.contains(r#""description":"He said \"hi\"""#), "got: {}", out);
+        assert!(
+            out.contains(r#""description":"He said \"hi\"""#),
+            "got: {}",
+            out
+        );
     }
 }

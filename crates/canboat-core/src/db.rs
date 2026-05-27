@@ -10,7 +10,7 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::{BitLookupTable, LookupTable, PgnInfo};
+use crate::types::{BitLookupTable, IndirectLookupTable, LookupTable, PgnInfo};
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -33,10 +33,10 @@ struct CanboatJson {
     lookup_enumerations: Vec<LookupTable>,
     #[serde(default)]
     lookup_bit_enumerations: Vec<BitLookupTable>,
-    /// Stored raw — these are decoded lazily by the field types that use
-    /// them (deferred to v0.x).
     #[serde(default)]
-    lookup_indirect_enumerations: Vec<serde_json::Value>,
+    lookup_indirect_enumerations: Vec<IndirectLookupTable>,
+    /// Stored raw — decoded when the FIELD_TYPE_ENUMERATION decoder
+    /// arrives (deferred to v0.x).
     #[serde(default)]
     lookup_field_type_enumerations: Vec<serde_json::Value>,
 }
@@ -57,9 +57,10 @@ pub struct PgnDatabase {
     lookups: HashMap<String, LookupTable>,
     /// name → bit-flag table.
     bit_lookups: HashMap<String, BitLookupTable>,
+    /// name → indirect (two-key) lookup table.
+    indirect_lookups: HashMap<String, IndirectLookupTable>,
 
     /// Reserved for future use — not yet indexed.
-    _indirect_raw: Vec<serde_json::Value>,
     _field_type_raw: Vec<serde_json::Value>,
 }
 
@@ -98,6 +99,11 @@ impl PgnDatabase {
             .into_iter()
             .map(|t| (t.name.clone(), t))
             .collect();
+        let indirect_lookups = raw
+            .lookup_indirect_enumerations
+            .into_iter()
+            .map(|t| (t.name.clone(), t))
+            .collect();
         Self {
             schema_version: raw.schema_version,
             version: raw.version,
@@ -105,7 +111,7 @@ impl PgnDatabase {
             pgn_index,
             lookups,
             bit_lookups,
-            _indirect_raw: raw.lookup_indirect_enumerations,
+            indirect_lookups,
             _field_type_raw: raw.lookup_field_type_enumerations,
         }
     }
@@ -147,5 +153,15 @@ impl PgnDatabase {
     /// Look up a bit-flag table by name.
     pub fn bit_lookup(&self, name: &str) -> Option<&BitLookupTable> {
         self.bit_lookups.get(name)
+    }
+
+    /// Resolve `(value1, value2)` through an INDIRECT_LOOKUP table.
+    pub fn indirect_lookup(&self, name: &str, value1: u64, value2: u64) -> Option<&str> {
+        self.indirect_lookups
+            .get(name)?
+            .values
+            .iter()
+            .find(|v| v.value1 == value1 && v.value2 == value2)
+            .map(|v| v.name.as_str())
     }
 }

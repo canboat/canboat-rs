@@ -19,8 +19,8 @@ pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use frame::{RawFrame, FASTPACKET_MAX_SIZE};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
 pub use types::{
-    BitLookupTable, BitLookupValue, FieldInfo, FieldType, LookupTable, LookupValue, PacketType,
-    PgnInfo,
+    BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable,
+    IndirectLookupValue, LookupTable, LookupValue, PacketType, PgnInfo,
 };
 
 #[cfg(test)]

@@ -199,3 +199,29 @@ pub struct BitLookupTable {
     #[serde(rename = "EnumBitValues")]
     pub values: Vec<BitLookupValue>,
 }
+
+/// One (Value1, Value2) → Name mapping inside an INDIRECT_LOOKUP table.
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndirectLookupValue {
+    #[serde(rename = "Value1")]
+    pub value1: u64,
+    #[serde(rename = "Value2")]
+    pub value2: u64,
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "Id")]
+    pub id: Option<String>,
+}
+
+/// A two-key lookup (INDIRECT_LOOKUP). Resolved by looking up
+/// `(value1, value2)` where `value1` is the raw value of the field
+/// pointed to by [`FieldInfo::lookup_indirect_enumeration_field_order`].
+#[derive(Debug, Clone, Deserialize)]
+pub struct IndirectLookupTable {
+    #[serde(rename = "Name")]
+    pub name: String,
+    #[serde(rename = "MaxValue")]
+    pub max_value: Option<u64>,
+    #[serde(rename = "EnumValues")]
+    pub values: Vec<IndirectLookupValue>,
+}

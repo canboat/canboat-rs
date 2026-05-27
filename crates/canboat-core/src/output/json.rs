@@ -99,10 +99,18 @@ fn write_field_value<W: fmt::Write>(
             if opts.name_value {
                 w.write_char('{')?;
                 write!(w, "\"value\":{}", value)?;
-                w.write_str(",\"name\":")?;
-                match name {
-                    Some(n) => write_json_string(w, n)?,
-                    None => w.write_str("null")?,
+                match (name, opts.include_empty) {
+                    // Resolved → always emit the name.
+                    (Some(n), _) => {
+                        w.write_str(",\"name\":")?;
+                        write_json_string(w, n)?;
+                    }
+                    // Unresolved + -empty: emit null. Matches canboat's
+                    // print.c:725-728 path.
+                    (None, true) => w.write_str(",\"name\":null")?,
+                    // Unresolved + default: omit "name" entirely.
+                    // Matches print.c when showJsonEmpty is false.
+                    (None, false) => {}
                 }
                 w.write_char('}')
             } else {

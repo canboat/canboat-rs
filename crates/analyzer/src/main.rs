@@ -1,7 +1,221 @@
-//! `analyzer`: decode NMEA 2000 PGNs from stdin.
+//! `analyzer`: read canboat PLAIN/FAST lines from stdin (or a file),
+//! decode each PGN against the canboat database, and emit text or
+//! JSON on stdout.
 //!
-//! Stage placeholder — implementation arrives in task #9.
+//! v0 supports the bare-essential CLI surface; flags map 1:1 onto the
+//! C analyzer's behavior. The single-dash spellings the C analyzer
+//! uses (`-json`, `-nv`, …) are accepted as Rust long flags (`--json`,
+//! `--nv`, …) so the golden test harness can drive both.
 
-fn main() {
-    eprintln!("canboat-rs analyzer: not yet implemented");
+use std::fs::File;
+use std::io::{self, BufRead, BufReader, BufWriter, Write};
+use std::path::PathBuf;
+use std::process::ExitCode;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+
+use canboat_core::{
+    format::{parse_plain, plain::ParseError},
+    output::{write_json, write_text, JsonOptions, TextOptions},
+    FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
+};
+use canboat_io::LineReader;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "analyzer",
+    about = "Decode canboat PLAIN/FAST lines from stdin into text or JSON",
+    version
+)]
+struct Cli {
+    /// Path to the canboat PGN database. Defaults to the workspace's
+    /// vendored `data/canboat.json`. Set the `CANBOAT_JSON` env var
+    /// to override.
+    #[arg(long, value_name = "PATH")]
+    db: Option<PathBuf>,
+
+    /// Read input from this file instead of stdin.
+    #[arg(long, value_name = "PATH")]
+    file: Option<PathBuf>,
+
+    /// Emit JSON instead of canboat text.
+    #[arg(long)]
+    json: bool,
+
+    /// JSON: include `null` for unavailable fields (`-empty`).
+    #[arg(long)]
+    empty: bool,
+
+    /// JSON: emit lookup values as `{"value":N,"name":"..."}` (`-nv`).
+    #[arg(long)]
+    nv: bool,
+
+    /// Filter: only process frames with this source address.
+    #[arg(long, value_name = "N")]
+    src: Option<u8>,
+
+    /// Filter: only process frames with this destination address.
+    #[arg(long, value_name = "N")]
+    dst: Option<u8>,
+
+    /// Filter: only process frames with this PGN number.
+    #[arg(value_name = "PGN")]
+    pgn: Option<u32>,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse();
+    if let Err(e) = run(cli) {
+        eprintln!("analyzer: {e:#}");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let db_path = cli
+        .db
+        .clone()
+        .or_else(|| std::env::var_os("CANBOAT_JSON").map(PathBuf::from))
+        .or_else(default_db_path)
+        .context("no canboat.json path supplied (pass --db or set CANBOAT_JSON)")?;
+    let db = PgnDatabase::load(&db_path)
+        .with_context(|| format!("loading PGN database {}", db_path.display()))?;
+
+    let json_opts = JsonOptions {
+        include_empty: cli.empty,
+        name_value: cli.nv,
+    };
+    let text_opts = TextOptions {
+        show_unavailable: cli.empty,
+    };
+
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let mut line_buf = String::with_capacity(512);
+    let mut reasm = Reassembler::new();
+
+    // Two distinct input shapes — stdin vs a regular file — but the
+    // line-handling is identical. Box one and roll.
+    if let Some(path) = cli.file.as_deref() {
+        let file = File::open(path)
+            .with_context(|| format!("opening input file {}", path.display()))?;
+        run_loop(
+            LineReader::new(BufReader::new(file)),
+            &db,
+            &cli,
+            &json_opts,
+            &text_opts,
+            &mut reasm,
+            &mut out,
+            &mut line_buf,
+        )?;
+    } else {
+        let stdin = io::stdin();
+        run_loop(
+            LineReader::new(stdin.lock()),
+            &db,
+            &cli,
+            &json_opts,
+            &text_opts,
+            &mut reasm,
+            &mut out,
+            &mut line_buf,
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_loop<R: BufRead, W: Write>(
+    mut reader: LineReader<R>,
+    db: &PgnDatabase,
+    cli: &Cli,
+    json_opts: &JsonOptions,
+    text_opts: &TextOptions,
+    reasm: &mut Reassembler,
+    out: &mut W,
+    line_buf: &mut String,
+) -> Result<()> {
+    while let Some(line) = reader.next_line().context("reading input line")? {
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let frame = match parse_plain(line) {
+            Ok(f) => f,
+            Err(ParseError::Empty) => continue,
+            Err(e) => {
+                log::warn!("skipping malformed input line: {e}");
+                continue;
+            }
+        };
+
+        if let Some(want) = cli.pgn {
+            if frame.pgn != want {
+                continue;
+            }
+        }
+        if let Some(want) = cli.src {
+            if frame.src != want {
+                continue;
+            }
+        }
+        if let Some(want) = cli.dst {
+            if frame.dst != want {
+                continue;
+            }
+        }
+
+        // Fast-packet reassembly: single-frame PGNs and already-
+        // coalesced frames (len > 8) pass through immediately;
+        // fast-packet PGNs accumulate until complete.
+        let packet_type = db
+            .first_pgn(frame.pgn)
+            .map(|p| match p.packet_type {
+                PacketType::Fast => FramePacketType::Fast,
+                PacketType::Single => FramePacketType::Single,
+                _ => FramePacketType::Other,
+            })
+            .unwrap_or(FramePacketType::Other);
+        let assembled = match reasm.push(frame, packet_type) {
+            Reassembled::PassThrough(f) | Reassembled::Complete(f) => f,
+            Reassembled::Partial => continue,
+            Reassembled::Error(e) => {
+                log::warn!("reassembly error: {e}");
+                continue;
+            }
+        };
+
+        let decoded = match db.decode(&assembled) {
+            Ok(d) => d,
+            Err(e) => {
+                log::warn!("decode error: {e}");
+                continue;
+            }
+        };
+
+        line_buf.clear();
+        if cli.json {
+            write_json(line_buf, &decoded, json_opts).expect("write to String");
+        } else {
+            write_text(line_buf, &decoded, text_opts).expect("write to String");
+        }
+        out.write_all(line_buf.as_bytes()).context("writing line")?;
+        out.write_all(b"\n").context("writing newline")?;
+    }
+    Ok(())
+}
+
+/// Try to find the workspace's vendored `data/canboat.json` next to
+/// the binary or relative to `CARGO_MANIFEST_DIR` in dev builds.
+fn default_db_path() -> Option<PathBuf> {
+    // In a cargo-built dev binary, the workspace root is two levels up
+    // from the crate's manifest.
+    let manifest_dir: PathBuf = env!("CARGO_MANIFEST_DIR").into();
+    let candidate = manifest_dir
+        .parent()
+        .and_then(|p| p.parent())
+        .map(|root| root.join("data").join("canboat.json"));
+    candidate.filter(|p| p.exists())
 }

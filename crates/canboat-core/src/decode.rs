@@ -8,10 +8,27 @@
 //! No I/O. No formatting — the result is a structured event ready for
 //! the output formatter or for direct consumption by merrimac-rs.
 
-use crate::bits::{extract_bits, is_unavailable};
+use crate::bits::{extract_bits, is_unavailable, Extracted};
 use crate::db::PgnDatabase;
 use crate::frame::RawFrame;
 use crate::types::{FieldInfo, FieldType, PgnInfo};
+
+/// canboat-style "not available" check with the RangeMax exception:
+/// if the field's explicit `RangeMax` (after applying resolution) equals
+/// the bit-width max, the entire range is valid and no sentinel
+/// stripping is performed. Matches the threshold logic in
+/// `analyzer/print.c:418`.
+fn unavailable_with_range(f: &FieldInfo, ex: Extracted) -> bool {
+    if let (Some(rmax), Some(res)) = (f.range_max, f.resolution) {
+        if res > 0.0 {
+            let range_max_raw = (rmax / res + 0.5) as i64;
+            if range_max_raw == ex.max {
+                return false;
+            }
+        }
+    }
+    is_unavailable(ex)
+}
 
 /// One decoded field.
 #[derive(Debug, Clone)]
@@ -234,7 +251,7 @@ fn decode_fields(
         if f.condition.is_some() {
             continue;
         }
-        if let Some(decoded) = decode_one_field(f, data, db) {
+        if let Some(decoded) = decode_one_field(f, info, data, db) {
             out.push(decoded);
         }
     }
@@ -243,6 +260,7 @@ fn decode_fields(
 
 fn decode_one_field(
     f: &FieldInfo,
+    info: &PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
 ) -> Option<DecodedField> {
@@ -257,7 +275,9 @@ fn decode_one_field(
         }
         Some(FieldType::Float) => decode_float(data, bit_offset, bit_length),
         Some(FieldType::Lookup) => decode_lookup(f, data, bit_offset, bit_length, db),
-        Some(FieldType::IndirectLookup) => decode_lookup(f, data, bit_offset, bit_length, db),
+        Some(FieldType::IndirectLookup) => {
+            decode_indirect_lookup(f, info, data, bit_offset, bit_length, db)
+        }
         Some(FieldType::BitLookup) => decode_bitlookup(f, data, bit_offset, bit_length, db),
         Some(FieldType::Reserved) => {
             decode_reserved(data, bit_offset, bit_length, signed, offset_k, true)
@@ -326,7 +346,7 @@ fn decode_number(
     ) else {
         return FieldValue::NotAvailable;
     };
-    if is_unavailable(ex) {
+    if unavailable_with_range(f, ex) {
         return FieldValue::NotAvailable;
     }
     let resolution = f.resolution.unwrap_or(1.0);
@@ -365,14 +385,40 @@ fn decode_lookup(
     // pre-filter via is_unavailable here — emit the raw value and let
     // the formatter decide.
     let raw = ex.value as u64;
-    let table_name = f
+    let name = f
         .lookup_enumeration
         .as_deref()
-        .or(f.lookup_indirect_enumeration.as_deref());
-    let name = table_name
         .and_then(|n| db.lookup(n))
         .and_then(|t| t.values.iter().find(|v| v.value == raw))
         .map(|v| v.name.clone());
+    FieldValue::Lookup { value: raw, name }
+}
+
+/// INDIRECT_LOOKUP: resolve `(value1, value2)` where `value1` is
+/// pulled from another field within the same PGN, identified by
+/// `LookupIndirectEnumerationFieldOrder`.
+fn decode_indirect_lookup(
+    f: &FieldInfo,
+    info: &PgnInfo,
+    data: &[u8],
+    bit_offset: u32,
+    bit_length: u32,
+    db: &PgnDatabase,
+) -> FieldValue {
+    let Some(ex) = extract_bits(data, bit_offset as usize, bit_length as usize, false, 0) else {
+        return FieldValue::NotAvailable;
+    };
+    let raw = ex.value as u64;
+    let name = (|| -> Option<String> {
+        let table_name = f.lookup_indirect_enumeration.as_deref()?;
+        let val1_order = f.lookup_indirect_enumeration_field_order?;
+        let val1_field = info.fields.iter().find(|x| x.order == val1_order)?;
+        let val1_off = val1_field.bit_offset?;
+        let val1_len = val1_field.bit_length?;
+        let val1 = extract_bits(data, val1_off as usize, val1_len as usize, false, 0)?;
+        let resolved = db.indirect_lookup(table_name, val1.value as u64, raw)?;
+        Some(resolved.to_string())
+    })();
     FieldValue::Lookup { value: raw, name }
 }
 

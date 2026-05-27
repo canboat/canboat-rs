@@ -122,6 +122,15 @@ pub struct FieldInfo {
     pub match_value: Option<i64>,
     pub part_of_primary_key: Option<bool>,
     pub condition: Option<String>,
+    /// Additive offset applied at decode time AFTER multiplying by
+    /// `resolution`. Set by the load-time unit fix-up (e.g. K → °C
+    /// subtracts 273.15). Not present in canboat.json.
+    #[serde(skip, default)]
+    pub unit_offset: f64,
+    /// Explicit decimal precision override, set by the load-time unit
+    /// fix-up. `0` means "compute from resolution" (canboat default).
+    #[serde(skip, default)]
+    pub precision: u8,
 }
 
 /// A PGN definition.

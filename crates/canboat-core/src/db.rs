@@ -10,7 +10,101 @@ use std::path::Path;
 
 use serde::Deserialize;
 
-use crate::types::{BitLookupTable, IndirectLookupTable, LookupTable, PgnInfo};
+use crate::types::{BitLookupTable, FieldInfo, IndirectLookupTable, LookupTable, PgnInfo};
+
+/// Multiplier to convert radians to degrees.
+const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
+
+/// Apply canboat's non-SI display-time conversions to one field.
+///
+/// Matches the `fixupTypes` logic in `canboat/analyzer/fieldtype.c`:
+///   - `rad`  → `deg`     (resolution × 180/π,    precision = 1)
+///   - `rad/s` → `deg/s`  (resolution × 180/π)
+///   - `K`    → `C`       (unit_offset = -273.15) for unsigned-K only
+///   - `Pa`   → `bar`     (resolution / 100000,   precision = 3)
+///   - `C`    → `Ah`      (resolution / 3600)     [coulomb → amp-hour]
+fn apply_non_si_unit_fixup(f: &mut FieldInfo) {
+    // Canboat hard-codes 7-decimal display precision for lat/lon
+    // (analyzer/print.c::fieldPrintLatLon → `%10.7f`). Mirror that
+    // here so the precision_for() fallback doesn't print 16 digits
+    // for the 64-bit lat/lon resolution of 1e-16.
+    if let Some(pq) = f.physical_quantity.as_deref() {
+        if pq == "GEOGRAPHICAL_LATITUDE" || pq == "GEOGRAPHICAL_LONGITUDE" {
+            f.precision = 7;
+        }
+    }
+
+    let Some(unit) = f.unit.as_deref() else {
+        return;
+    };
+    match unit {
+        "rad" => {
+            if let Some(r) = f.resolution.as_mut() {
+                *r *= RAD_TO_DEG;
+            }
+            if let Some(v) = f.range_min.as_mut() {
+                *v *= RAD_TO_DEG;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                *v = (*v * RAD_TO_DEG).max(360.0);
+            }
+            f.unit = Some("deg".to_string());
+            f.precision = 1;
+        }
+        "rad/s" => {
+            if let Some(r) = f.resolution.as_mut() {
+                *r *= RAD_TO_DEG;
+            }
+            if let Some(v) = f.range_min.as_mut() {
+                *v *= RAD_TO_DEG;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                *v *= RAD_TO_DEG;
+            }
+            f.unit = Some("deg/s".to_string());
+        }
+        "K" if !f.signed.unwrap_or(false) => {
+            f.unit_offset = -273.15;
+            if let Some(v) = f.range_min.as_mut() {
+                *v += -273.15;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                // Match the typo-faithful behaviour of canboat (it
+                // subtracts 275.15 from rangeMax; harmless for our
+                // purposes since the threshold check uses the wire-max
+                // anyway).
+                *v += -275.15;
+            }
+            f.unit = Some("C".to_string());
+        }
+        "Pa" => {
+            if let Some(r) = f.resolution.as_mut() {
+                *r /= 100_000.0;
+            }
+            if let Some(v) = f.range_min.as_mut() {
+                *v /= 100_000.0;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                *v /= 100_000.0;
+            }
+            f.unit = Some("bar".to_string());
+            f.precision = 3;
+        }
+        "C" => {
+            if let Some(r) = f.resolution.as_mut() {
+                *r /= 3600.0;
+            }
+            if let Some(v) = f.range_min.as_mut() {
+                *v /= 3600.0;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                *v /= 3600.0;
+            }
+            f.unit = Some("Ah".to_string());
+        }
+        _ => {}
+    }
+}
 
 #[derive(Debug, thiserror::Error)]
 pub enum LoadError {
@@ -84,7 +178,17 @@ impl PgnDatabase {
         Ok(Self::from_raw(raw))
     }
 
-    fn from_raw(raw: CanboatJson) -> Self {
+    fn from_raw(mut raw: CanboatJson) -> Self {
+        // Apply canboat's non-SI unit conversions to every field once
+        // at load time (mirrors `fieldtype.c::fixupTypes` in canboat).
+        // After this pass, decoders and formatters can use the field
+        // metadata verbatim: resolution / unit / precision / unit_offset
+        // all reflect the displayed value, not the wire value.
+        for pgn in &mut raw.pgns {
+            for f in &mut pgn.fields {
+                apply_non_si_unit_fixup(f);
+            }
+        }
         let mut pgn_index: HashMap<u32, Vec<usize>> = HashMap::new();
         for (idx, p) in raw.pgns.iter().enumerate() {
             pgn_index.entry(p.pgn).or_default().push(idx);

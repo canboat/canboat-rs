@@ -39,6 +39,17 @@ pub(crate) fn precision_for(resolution: f64) -> usize {
     p
 }
 
+/// Effective precision for a decoded field: honors the load-time
+/// override from canboat's unit fix-up when non-zero, otherwise
+/// derives it from the resolution.
+pub(crate) fn effective_precision(precision: u8, resolution: Option<f64>) -> usize {
+    if precision > 0 {
+        precision as usize
+    } else {
+        precision_for(resolution.unwrap_or(1.0))
+    }
+}
+
 /// Format days-since-1970-01-01 as `YYYY.MM.DD` (canboat text style).
 pub(crate) fn format_date(days: u16, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
     let (y, m, d) = days_to_ymd(days as i64);

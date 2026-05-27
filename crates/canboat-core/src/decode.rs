@@ -40,6 +40,10 @@ pub struct DecodedField {
     /// Resolution as carried in canboat.json. The formatter uses this
     /// to pick a sensible number of decimal digits.
     pub resolution: Option<f64>,
+    /// Explicit decimal precision from the canboat unit fix-up (e.g.
+    /// `rad → deg` sets precision = 1). `0` means "derive from
+    /// resolution"; the formatter walks the resolution otherwise.
+    pub precision: u8,
     /// Zero-based iteration index for fields inside a repeating set;
     /// `None` for non-repeating fields.
     pub repeat_index: Option<u32>,
@@ -247,26 +251,93 @@ impl PgnDatabase {
 
 /// Walk a PGN's fields, decoding each in turn.
 ///
-/// v0 does not yet handle repeating field sets — those fields decode
-/// once as if non-repeating, with `repeat_index = None`. Will be added
-/// when the analyzer's golden tests need it.
+/// Handles repeating field sets (`RepeatingFieldSet1`) — when the
+/// walker reaches `repeating_field_set1_start_field`, it pulls the
+/// count from the already-decoded count field, then re-runs the set
+/// of `size` repeating fields N times. Each iteration's fields share
+/// the layout of the first iteration shifted by `iteration_bits`
+/// (the sum of `BitLength` over the set).
+///
+/// `Condition`-gated alternative fields are skipped (full evaluation
+/// is deferred to a later commit).
 fn decode_fields(
     info: &PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
 ) -> Result<Vec<DecodedField>, DecodeError> {
     let mut out = Vec::with_capacity(info.fields.len());
-    for f in &info.fields {
-        // Skip conditional alternative fields (`Condition`) for v0 —
-        // they need cross-field state evaluation.
+    let start1 = info.repeating_field_set1_start_field;
+    let size1 = info.repeating_field_set1_size;
+    let count_field1 = info.repeating_field_set1_count_field;
+
+    let mut i = 0usize;
+    while i < info.fields.len() {
+        let f = &info.fields[i];
+
+        // Repeating set 1 starts here?
+        if let (Some(start), Some(size), Some(cf)) = (start1, size1, count_field1) {
+            if (f.order as u32) == start {
+                decode_repeating(info, data, db, &mut out, i, size as usize, cf);
+                i += size as usize;
+                continue;
+            }
+        }
+
         if f.condition.is_some() {
+            i += 1;
             continue;
         }
         if let Some(decoded) = decode_one_field(f, info, data, db) {
             out.push(decoded);
         }
+        i += 1;
     }
     Ok(out)
+}
+
+fn decode_repeating(
+    info: &PgnInfo,
+    data: &[u8],
+    db: &PgnDatabase,
+    out: &mut Vec<DecodedField>,
+    start_idx: usize,
+    set_size: usize,
+    count_field_order: u32,
+) {
+    // Look up the count from the already-decoded fields. canboat's
+    // count field is always non-repeating and decoded earlier in the
+    // same walk.
+    let count = out
+        .iter()
+        .find(|d| (d.order as u32) == count_field_order)
+        .and_then(|d| match &d.value {
+            FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
+            FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),
+            _ => None,
+        })
+        .unwrap_or(0);
+
+    let set = &info.fields[start_idx..start_idx + set_size];
+    let iter_bits: u32 = set.iter().map(|sf| sf.bit_length.unwrap_or(0)).sum();
+
+    for iter in 0..count {
+        for sf in set {
+            if sf.condition.is_some() {
+                continue;
+            }
+            // Clone the field metadata and shift its bit_offset for
+            // this iteration. Cloning is cheap (mostly Strings that
+            // get re-cloned downstream into the DecodedField anyway).
+            let mut sf_shifted = sf.clone();
+            if let Some(bo) = sf_shifted.bit_offset {
+                sf_shifted.bit_offset = Some(bo + iter * iter_bits);
+            }
+            if let Some(mut d) = decode_one_field(&sf_shifted, info, data, db) {
+                d.repeat_index = Some(iter);
+                out.push(d);
+            }
+        }
+    }
 }
 
 fn decode_one_field(
@@ -333,6 +404,7 @@ fn decode_one_field(
         name: f.name.clone(),
         unit: f.unit.clone(),
         resolution: f.resolution,
+        precision: f.precision,
         repeat_index: None,
         part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
         value,
@@ -361,10 +433,11 @@ fn decode_number(
     }
     let resolution = f.resolution.unwrap_or(1.0);
     let unit = f.unit.as_deref();
-    if resolution == 1.0 && unit.is_none() && f.physical_quantity.is_none() {
+    if resolution == 1.0 && unit.is_none() && f.physical_quantity.is_none() && f.unit_offset == 0.0
+    {
         FieldValue::Integer(ex.value)
     } else {
-        FieldValue::Number(ex.value as f64 * resolution)
+        FieldValue::Number(ex.value as f64 * resolution + f.unit_offset)
     }
 }
 
@@ -401,6 +474,11 @@ fn decode_lookup(
         .and_then(|n| db.lookup(n))
         .and_then(|t| t.values.iter().find(|v| v.value == raw))
         .map(|v| v.name.clone());
+    // canboat: if no name is resolved AND value is in the reserved
+    // sentinel range, treat as unavailable (matches print.c:718).
+    if name.is_none() && is_unavailable(ex) {
+        return FieldValue::NotAvailable;
+    }
     FieldValue::Lookup { value: raw, name }
 }
 
@@ -476,6 +554,11 @@ fn decode_reserved(
         return FieldValue::NotAvailable;
     };
     let raw = ex.value as u64;
+    // canboat skips Reserved fields whose value is all-ones (the
+    // default "this is unused" state). Match that exactly.
+    if is_reserved && ex.value == ex.max {
+        return FieldValue::NotAvailable;
+    }
     // Pack just the field's value into bytes (little-endian), one byte
     // per `ceil(bit_length / 8)`. This avoids leaking neighboring
     // fields' bits when the reserved span shares a byte with adjacent

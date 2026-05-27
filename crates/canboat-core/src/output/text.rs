@@ -15,7 +15,7 @@ use std::fmt;
 
 use crate::decode::{DecodedField, DecodedPgn, FieldValue};
 
-use super::{format_date, format_time, precision_for};
+use super::{effective_precision, format_date, format_time};
 
 /// Knobs for text output. Reserved for `-debug`, `-si`, `-geo`
 /// extensions — for v0 just `show_unavailable`.
@@ -76,7 +76,7 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
 fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result {
     match &f.value {
         FieldValue::Number(v) => {
-            let p = precision_for(f.resolution.unwrap_or(1.0));
+            let p = effective_precision(f.precision, f.resolution);
             write!(w, "{:.*}", p, v)?;
             if let Some(unit) = &f.unit {
                 write!(w, " {}", unit)?;
@@ -131,7 +131,7 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result 
         FieldValue::String(s) => w.write_str(s),
         FieldValue::Date(d) => format_date(*d, w),
         FieldValue::Time(s) => {
-            let p = precision_for(f.resolution.unwrap_or(1.0));
+            let p = effective_precision(f.precision, f.resolution);
             format_time(*s, p, w)
         }
         FieldValue::Mmsi(v) => write!(w, "{:09}", v),
@@ -187,6 +187,7 @@ mod tests {
                     name: "Unique Number".into(),
                     unit: None,
                     resolution: Some(1.0),
+                    precision: 0,
                     repeat_index: None,
                     part_of_primary_key: false,
                     value: FieldValue::Integer(1_088_507),
@@ -197,6 +198,7 @@ mod tests {
                     name: "Manufacturer Code".into(),
                     unit: None,
                     resolution: Some(1.0),
+                    precision: 0,
                     repeat_index: None,
                     part_of_primary_key: false,
                     value: FieldValue::Lookup {

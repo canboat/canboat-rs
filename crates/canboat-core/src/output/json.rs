@@ -19,7 +19,7 @@ use std::fmt;
 
 use crate::decode::{DecodedField, DecodedPgn, FieldValue};
 
-use super::precision_for;
+use super::effective_precision;
 
 /// Knobs for JSON output.
 #[derive(Debug, Default, Clone)]
@@ -49,21 +49,62 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
 
     // Fields object — opens even if empty so consumers always see it.
     w.write_str(",\"fields\":{")?;
-    let mut sep = "";
+    let mut top_sep = "";
+    let mut in_list = false;
+    let mut current_iter: Option<u32> = None;
+
     for f in &pgn.fields {
         if !opts.include_empty && matches!(f.value, FieldValue::NotAvailable) {
             continue;
         }
-        // Reserved is emitted as a hex string in JSON (matches canboat
-        // -json output); Spare is dropped.
         if matches!(f.value, FieldValue::Spare { .. }) {
             continue;
         }
-        w.write_str(sep)?;
-        write_json_string(w, &f.name)?;
-        w.write_char(':')?;
-        write_field_value(w, f, opts)?;
-        sep = ",";
+
+        match f.repeat_index {
+            None => {
+                // Non-repeating field. If we just left a list, close it.
+                if in_list {
+                    w.write_str("}]")?;
+                    in_list = false;
+                    current_iter = None;
+                }
+                w.write_str(top_sep)?;
+                write_json_string(w, &f.name)?;
+                w.write_char(':')?;
+                write_field_value(w, f, opts)?;
+                top_sep = ",";
+            }
+            Some(iter) => {
+                if !in_list {
+                    // First field of the very first iteration.
+                    w.write_str(top_sep)?;
+                    w.write_str("\"list\":[{")?;
+                    in_list = true;
+                    current_iter = Some(iter);
+                    write_json_string(w, &f.name)?;
+                    w.write_char(':')?;
+                    write_field_value(w, f, opts)?;
+                    top_sep = ",";
+                } else if Some(iter) != current_iter {
+                    // New iteration: close previous object, open next.
+                    w.write_str("},{")?;
+                    current_iter = Some(iter);
+                    write_json_string(w, &f.name)?;
+                    w.write_char(':')?;
+                    write_field_value(w, f, opts)?;
+                } else {
+                    // Same iteration: comma-separated.
+                    w.write_str(",")?;
+                    write_json_string(w, &f.name)?;
+                    w.write_char(':')?;
+                    write_field_value(w, f, opts)?;
+                }
+            }
+        }
+    }
+    if in_list {
+        w.write_str("}]")?;
     }
     w.write_char('}')?; // close "fields"
     w.write_char('}')?; // close top
@@ -77,7 +118,7 @@ fn write_field_value<W: fmt::Write>(
 ) -> fmt::Result {
     match &f.value {
         FieldValue::Number(v) => {
-            let p = precision_for(f.resolution.unwrap_or(1.0));
+            let p = effective_precision(f.precision, f.resolution);
             write!(w, "{:.*}", p, v)
         }
         FieldValue::Integer(v) => {
@@ -94,9 +135,13 @@ fn write_field_value<W: fmt::Write>(
             write!(w, "{}", v)
         }
         FieldValue::Binary(bytes) => {
-            // canboat emits binary as an uppercase hex string.
+            // canboat emits binary as uppercase hex with space-separated
+            // bytes (matches fieldPrintBinary's `%s%2.02X` w/ " " sep).
             w.write_char('"')?;
-            for b in bytes {
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    w.write_char(' ')?;
+                }
                 write!(w, "{:02X}", b)?;
             }
             w.write_char('"')
@@ -147,7 +192,7 @@ fn write_field_value<W: fmt::Write>(
             write_json_string(w, &buf)
         }
         FieldValue::Time(s) => {
-            let p = precision_for(f.resolution.unwrap_or(1.0));
+            let p = effective_precision(f.precision, f.resolution);
             let mut buf = String::with_capacity(12);
             super::format_time(*s, p, &mut buf)?;
             write_json_string(w, &buf)
@@ -250,6 +295,7 @@ mod tests {
                 name: "Offset".into(),
                 unit: Some("m".into()),
                 resolution: Some(0.001),
+                precision: 0,
                 repeat_index: None,
                 part_of_primary_key: false,
                 value: FieldValue::Number(0.0),

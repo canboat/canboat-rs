@@ -47,6 +47,9 @@ pub struct DecodedField {
     /// Zero-based iteration index for fields inside a repeating set;
     /// `None` for non-repeating fields.
     pub repeat_index: Option<u32>,
+    /// Which RepeatingFieldSet this field belongs to: 1 → emitted under
+    /// JSON `"list"`, 2 → under `"list2"`. `0` for non-repeating.
+    pub repeat_set: u8,
     /// True if this field participates in the PGN's primary key. The
     /// JSON formatter under `-nv` annotates these with `"key":true`.
     pub part_of_primary_key: bool,
@@ -260,19 +263,38 @@ impl PgnDatabase {
 ///
 /// `Condition`-gated alternative fields are skipped (full evaluation
 /// is deferred to a later commit).
+/// State the decoder threads through fields so VARIABLE-typed fields
+/// can find their target metadata.
+///
+/// - `target_pgn` is updated whenever a [`FieldValue::Pgn`] is emitted
+///   (PGN 126208 group functions carry the target PGN in field 2).
+/// - `current_param_idx` is updated whenever a `FIELD_INDEX` field is
+///   emitted, so the next VARIABLE field knows which target field's
+///   metadata to use.
+#[derive(Default, Debug, Clone)]
+struct DecodeContext {
+    target_pgn: Option<u32>,
+    current_param_idx: Option<u32>,
+}
+
 fn decode_fields(
     info: &PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
 ) -> Result<Vec<DecodedField>, DecodeError> {
     let mut out = Vec::with_capacity(info.fields.len());
+    let mut ctx = DecodeContext::default();
     let start1 = info.repeating_field_set1_start_field;
     let size1 = info.repeating_field_set1_size;
     let count_field1 = info.repeating_field_set1_count_field;
+    let start2 = info.repeating_field_set2_start_field;
+    let size2 = info.repeating_field_set2_size;
+    let count_field2 = info.repeating_field_set2_count_field;
 
     let mut i = 0usize;
-    // Running bit cursor for variable-length fields that lack an
-    // explicit BitOffset (chained STRING_LAU in PGN 126998 etc.).
+    // Running bit cursor — used both for variable-length fields that
+    // lack an explicit BitOffset and as the entry point for repeating
+    // sets that follow other variable-length content.
     let mut cursor_bits: u32 = 0;
     while i < info.fields.len() {
         let f = &info.fields[i];
@@ -282,7 +304,37 @@ fn decode_fields(
         // until the payload runs out.
         if let (Some(start), Some(size)) = (start1, size1) {
             if (f.order as u32) == start {
-                decode_repeating(info, data, db, &mut out, i, size as usize, count_field1);
+                cursor_bits = decode_repeating(
+                    info,
+                    data,
+                    db,
+                    &mut out,
+                    &mut ctx,
+                    i,
+                    size as usize,
+                    count_field1,
+                    cursor_bits,
+                    1,
+                );
+                i += size as usize;
+                continue;
+            }
+        }
+        // Repeating set 2?
+        if let (Some(start), Some(size)) = (start2, size2) {
+            if (f.order as u32) == start {
+                cursor_bits = decode_repeating(
+                    info,
+                    data,
+                    db,
+                    &mut out,
+                    &mut ctx,
+                    i,
+                    size as usize,
+                    count_field2,
+                    cursor_bits,
+                    2,
+                );
                 i += size as usize;
                 continue;
             }
@@ -299,7 +351,7 @@ fn decode_fields(
         // when one is given.
         let effective_offset = f.bit_offset.unwrap_or(cursor_bits);
         if let Some((decoded, bits_consumed)) =
-            decode_one_field_at(f, info, data, db, effective_offset)
+            decode_one_field_at(f, info, data, db, effective_offset, &mut ctx)
         {
             cursor_bits = effective_offset + bits_consumed;
             out.push(decoded);
@@ -309,15 +361,19 @@ fn decode_fields(
     Ok(out)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn decode_repeating(
     info: &PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
     out: &mut Vec<DecodedField>,
+    ctx: &mut DecodeContext,
     start_idx: usize,
     set_size: usize,
     count_field_order: Option<u32>,
-) {
+    base_cursor: u32,
+    set_number: u8,
+) -> u32 {
     // Look up the count from the already-decoded fields when a count
     // field is set; otherwise repeat until the payload runs out
     // (matches canboat's default g_variableFieldRepeat[0] = 255 path).
@@ -334,37 +390,46 @@ fn decode_repeating(
         .unwrap_or(u32::MAX);
 
     let set = &info.fields[start_idx..start_idx + set_size];
-    let iter_bits: u32 = set.iter().map(|sf| sf.bit_length.unwrap_or(0)).sum();
-    if iter_bits == 0 {
-        return;
+    if set.is_empty() {
+        return base_cursor;
     }
     let payload_bits = (data.len() as u32).saturating_mul(8);
 
+    // Use the iteration's first field's BitOffset if available — that
+    // anchors iteration 0 to the canboat.json layout. After that we
+    // run on a per-iteration sub-cursor that advances by each field's
+    // actual `bits_consumed` (handles variable-length VARIABLE fields).
+    let mut iter_cursor = set[0].bit_offset.unwrap_or(base_cursor);
+
     for iter in 0..max_iters {
-        // Bail when the next iteration's first byte is past the
-        // payload. The decoder also returns NotAvailable in that
-        // case but we want to avoid emitting empty objects in the
-        // JSON `list` array.
-        let first_field_offset =
-            set.iter().find_map(|f| f.bit_offset).unwrap_or(0) + iter * iter_bits;
-        if first_field_offset >= payload_bits {
+        if iter_cursor >= payload_bits {
             break;
         }
-
+        let mut sub_cursor = iter_cursor;
         let mut produced_any = false;
         for sf in set {
             if sf.condition.is_some() {
                 continue;
             }
-            // Shift the field's bit_offset for this iteration.
-            let Some(base_off) = sf.bit_offset else {
-                continue;
+            // Iteration 0 honors the explicit BitOffset from JSON;
+            // later iterations follow the running sub_cursor since
+            // bit_offsets aren't repeated per iteration in JSON.
+            let off = if iter == 0 {
+                sf.bit_offset.unwrap_or(sub_cursor)
+            } else {
+                sub_cursor
             };
-            let off = base_off + iter * iter_bits;
-            if let Some((mut d, _)) = decode_one_field_at(sf, info, data, db, off) {
+            if let Some((mut d, bits)) = decode_one_field_at(sf, info, data, db, off, ctx) {
                 d.repeat_index = Some(iter);
+                d.repeat_set = set_number;
                 out.push(d);
+                sub_cursor = off + bits;
                 produced_any = true;
+            } else if let Some(bl) = sf.bit_length {
+                // Field couldn't decode but has a known size; advance
+                // past it so subsequent fields in this iteration still
+                // line up.
+                sub_cursor = off + bl;
             }
         }
         // If this iteration produced nothing decodable, stop — we ran
@@ -372,18 +437,21 @@ fn decode_repeating(
         if !produced_any {
             break;
         }
+        iter_cursor = sub_cursor;
     }
+    iter_cursor
 }
 
 /// Decode one field. Returns the `DecodedField` and the number of
 /// payload bits it actually consumed (which differs from `bit_length`
-/// for variable-length types like STRING_LAU).
+/// for variable-length types like STRING_LAU and VARIABLE).
 fn decode_one_field_at(
     f: &FieldInfo,
     info: &PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
     bit_offset: u32,
+    ctx: &mut DecodeContext,
 ) -> Option<(DecodedField, u32)> {
     let signed = f.signed.unwrap_or(false);
     let offset_k = f.offset.unwrap_or(0);
@@ -400,11 +468,19 @@ fn decode_one_field_at(
                 resolution: f.resolution,
                 precision: f.precision,
                 repeat_index: None,
+                repeat_set: 0,
                 part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
                 value,
             },
             bits_consumed,
         ));
+    }
+
+    // VARIABLE: dynamic field type — look up the target field's
+    // metadata via (ctx.target_pgn, ctx.current_param_idx), then
+    // recursively decode with that metadata at the current cursor.
+    if matches!(f.field_type, Some(FieldType::Variable)) {
+        return decode_variable(f, data, db, bit_offset, ctx);
     }
 
     let bit_length = f.bit_length?;
@@ -435,9 +511,7 @@ fn decode_one_field_at(
         Some(FieldType::StringFix) => decode_string_fix(data, bit_offset, bit_length),
         Some(FieldType::StringLz) => decode_string_lz(data, bit_offset, bit_length),
         Some(FieldType::StringLau) => unreachable!("STRING_LAU handled above"),
-        Some(FieldType::Variable) => FieldValue::Unsupported {
-            field_type: "VARIABLE",
-        },
+        Some(FieldType::Variable) => unreachable!("VARIABLE handled above"),
         Some(FieldType::IsoName) => decode_iso_name(data, bit_offset, bit_length, db),
         Some(FieldType::DynamicFieldKey) => FieldValue::Unsupported {
             field_type: "DYNAMIC_FIELD_KEY",
@@ -454,6 +528,16 @@ fn decode_one_field_at(
         },
     };
 
+    // Update the running context based on what we just decoded so the
+    // next field can interpret VARIABLE / FIELD_INDEX correctly.
+    match &value {
+        FieldValue::Pgn(p) => ctx.target_pgn = Some(*p),
+        FieldValue::Integer(n) if matches!(f.field_type, Some(FieldType::FieldIndex)) => {
+            ctx.current_param_idx = Some(*n as u32);
+        }
+        _ => {}
+    }
+
     Some((
         DecodedField {
             order: f.order,
@@ -463,10 +547,66 @@ fn decode_one_field_at(
             resolution: f.resolution,
             precision: f.precision,
             repeat_index: None,
+            repeat_set: 0,
             part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
             value,
         },
         bit_length,
+    ))
+}
+
+/// Resolve a VARIABLE field by looking up the target field's metadata
+/// in the database, then decoding with that metadata at the current
+/// cursor.
+///
+/// Used by PGN 126208 group functions where a `Parameter` /
+/// `FIELD_INDEX` field picks one of the target PGN's fields, and the
+/// next VARIABLE field carries that field's value in its native shape.
+fn decode_variable(
+    f: &FieldInfo,
+    data: &[u8],
+    db: &PgnDatabase,
+    bit_offset: u32,
+    ctx: &mut DecodeContext,
+) -> Option<(DecodedField, u32)> {
+    let target_pgn = ctx.target_pgn?;
+    let target_idx = ctx.current_param_idx?;
+    let target_info = db.first_pgn(target_pgn)?;
+    let target_field = target_info
+        .fields
+        .iter()
+        .find(|tf| (tf.order as u32) == target_idx)?;
+    // Recurse with the target field's metadata at the current cursor.
+    // The outer field's name (e.g. "Value", "Selection Value") wraps
+    // the decoded result so the JSON keeps the right field label.
+    let mut sub_ctx = DecodeContext::default();
+    let (sub, bits) = decode_one_field_at(
+        target_field,
+        target_info,
+        data,
+        db,
+        bit_offset,
+        &mut sub_ctx,
+    )?;
+    // canboat rounds the VARIABLE field's consumption UP to whole
+    // bytes — `*bits = (*bits + 7) & ~0x07` in `fieldPrintVariable`.
+    // Without this, Set2 in PGN 126208 Read Fields lands 5 bits early
+    // and reads the next Parameter's bits from the wrong nibble.
+    let bits_byte_aligned = bits.div_ceil(8) * 8;
+    Some((
+        DecodedField {
+            order: f.order,
+            id: f.id.clone(),
+            name: f.name.clone(),
+            unit: target_field.unit.clone().or(f.unit.clone()),
+            resolution: target_field.resolution.or(f.resolution),
+            precision: target_field.precision,
+            repeat_index: None,
+            repeat_set: 0,
+            part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+            value: sub.value,
+        },
+        bits_byte_aligned,
     ))
 }
 

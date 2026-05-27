@@ -189,6 +189,7 @@ mod tests {
                     resolution: Some(1.0),
                     precision: 0,
                     repeat_index: None,
+                    repeat_set: 0,
                     part_of_primary_key: false,
                     value: FieldValue::Integer(1_088_507),
                 },
@@ -200,6 +201,7 @@ mod tests {
                     resolution: Some(1.0),
                     precision: 0,
                     repeat_index: None,
+                    repeat_set: 0,
                     part_of_primary_key: false,
                     value: FieldValue::Lookup {
                         value: 275,

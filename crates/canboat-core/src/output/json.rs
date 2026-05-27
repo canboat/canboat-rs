@@ -50,7 +50,9 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     // Fields object — opens even if empty so consumers always see it.
     w.write_str(",\"fields\":{")?;
     let mut top_sep = "";
-    let mut in_list = false;
+    // Active repeating-list state: which set (1 → "list", 2 → "list2")
+    // and which iteration index we're inside.
+    let mut current_set: u8 = 0;
     let mut current_iter: Option<u32> = None;
 
     for f in &pgn.fields {
@@ -61,49 +63,57 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
             continue;
         }
 
-        match f.repeat_index {
-            None => {
-                // Non-repeating field. If we just left a list, close it.
-                if in_list {
+        // Determine "where is this field going":
+        // - non-repeating (repeat_set == 0): top-level field.
+        // - repeat_set == 1: under "list".
+        // - repeat_set == 2: under "list2".
+        // Crossing set boundaries closes the previous list and opens the
+        // next; crossing iterations within the same set inserts "},{".
+        if f.repeat_set == 0 {
+            if current_set != 0 {
+                w.write_str("}]")?;
+                current_set = 0;
+                current_iter = None;
+            }
+            w.write_str(top_sep)?;
+            write_json_string(w, &f.name)?;
+            w.write_char(':')?;
+            write_field_value(w, f, opts)?;
+            top_sep = ",";
+        } else {
+            let iter = f.repeat_index.unwrap_or(0);
+            if current_set != f.repeat_set {
+                if current_set != 0 {
                     w.write_str("}]")?;
-                    in_list = false;
-                    current_iter = None;
                 }
                 w.write_str(top_sep)?;
+                let key = if f.repeat_set == 1 {
+                    "\"list\":[{"
+                } else {
+                    "\"list2\":[{"
+                };
+                w.write_str(key)?;
+                current_set = f.repeat_set;
+                current_iter = Some(iter);
+                top_sep = ",";
                 write_json_string(w, &f.name)?;
                 w.write_char(':')?;
                 write_field_value(w, f, opts)?;
-                top_sep = ",";
-            }
-            Some(iter) => {
-                if !in_list {
-                    // First field of the very first iteration.
-                    w.write_str(top_sep)?;
-                    w.write_str("\"list\":[{")?;
-                    in_list = true;
-                    current_iter = Some(iter);
-                    write_json_string(w, &f.name)?;
-                    w.write_char(':')?;
-                    write_field_value(w, f, opts)?;
-                    top_sep = ",";
-                } else if Some(iter) != current_iter {
-                    // New iteration: close previous object, open next.
-                    w.write_str("},{")?;
-                    current_iter = Some(iter);
-                    write_json_string(w, &f.name)?;
-                    w.write_char(':')?;
-                    write_field_value(w, f, opts)?;
-                } else {
-                    // Same iteration: comma-separated.
-                    w.write_str(",")?;
-                    write_json_string(w, &f.name)?;
-                    w.write_char(':')?;
-                    write_field_value(w, f, opts)?;
-                }
+            } else if Some(iter) != current_iter {
+                w.write_str("},{")?;
+                current_iter = Some(iter);
+                write_json_string(w, &f.name)?;
+                w.write_char(':')?;
+                write_field_value(w, f, opts)?;
+            } else {
+                w.write_char(',')?;
+                write_json_string(w, &f.name)?;
+                w.write_char(':')?;
+                write_field_value(w, f, opts)?;
             }
         }
     }
-    if in_list {
+    if current_set != 0 {
         w.write_str("}]")?;
     }
     w.write_char('}')?; // close "fields"
@@ -306,6 +316,7 @@ mod tests {
                 resolution: Some(0.001),
                 precision: 0,
                 repeat_index: None,
+                repeat_set: 0,
                 part_of_primary_key: false,
                 value: FieldValue::Number(0.0),
             }],

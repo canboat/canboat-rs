@@ -128,7 +128,7 @@ struct Cli {
 }
 
 fn main() -> ExitCode {
-    let cli = Cli::parse();
+    let cli = Cli::parse_from(canboat_cli::canboat_argv());
     if let Err(e) = run(cli) {
         eprintln!("ikonvert-serial: {e:#}");
         return ExitCode::from(1);

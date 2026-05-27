@@ -455,6 +455,7 @@ name = "maretron-ipg"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "canboat-cli",
  "canboat-core",
  "clap",
  "env_logger",

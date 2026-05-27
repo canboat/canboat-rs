@@ -1,0 +1,184 @@
+//! `replay`: pace a captured canboat PLAIN/FAST stream so each line
+//! is emitted at its original wall-clock rhythm.
+//!
+//! Mirrors `canboat/replay/replay.c`. Each input line begins with an
+//! ISO-8601 timestamp `YYYY-MM-DDTHH:MM:SS,mmm` (or `.mmm`). We
+//! compute the delta between this line's timestamp and the previous
+//! one, and sleep that long before forwarding the line. Deltas
+//! outside the `(0, 10 000) ms` range are ignored — the line is
+//! forwarded immediately. That matches canboat: forward jumps and
+//! day-rollovers in the capture don't stall the replay.
+//!
+//! Typical use:
+//!
+//! ```text
+//!   cat capture.raw | replay | analyzer
+//! ```
+
+use std::io::{self, BufRead, BufWriter, Write};
+use std::process::ExitCode;
+use std::thread;
+use std::time::Duration;
+
+use anyhow::Result;
+use clap::Parser;
+
+#[derive(Debug, Parser)]
+#[command(
+    name = "replay",
+    about = "Pace canboat PLAIN/FAST stdin so it replays at real-time speed",
+    version
+)]
+struct Cli {
+    /// Verbose / debug logging — alias of `-d`. Matches canboat's C tool.
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Debug logging.
+    #[arg(short = 'd', long)]
+    debug: bool,
+
+    /// Quiet — only show errors.
+    #[arg(short = 'q', long)]
+    quiet: bool,
+
+    /// Maximum gap to honour, in milliseconds. Gaps larger than this
+    /// are treated as forward jumps and the next line is emitted
+    /// immediately. Matches the hard-coded 10 000 ms cap in
+    /// `replay.c`; exposed here so tests can shrink it.
+    #[arg(long, value_name = "MS", default_value_t = 10_000u64)]
+    max_gap: u64,
+}
+
+fn main() -> ExitCode {
+    let cli = Cli::parse_from(canboat_cli::canboat_argv());
+    if let Err(e) = run(cli) {
+        eprintln!("replay: {e:#}");
+        return ExitCode::from(1);
+    }
+    ExitCode::SUCCESS
+}
+
+fn run(cli: Cli) -> Result<()> {
+    let level = if cli.quiet {
+        "error"
+    } else if cli.debug || cli.verbose {
+        "debug"
+    } else {
+        "info"
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+
+    let stdin = io::stdin();
+    let stdout = io::stdout();
+    let mut out = BufWriter::new(stdout.lock());
+    let mut prev_ms: Option<i64> = None;
+    let mut line = String::with_capacity(512);
+    let mut lock = stdin.lock();
+
+    loop {
+        line.clear();
+        match lock.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => return Err(e.into()),
+        }
+        let now_ms = parse_timestamp_ms(&line);
+        if let (Some(now), Some(prev)) = (now_ms, prev_ms) {
+            let delta = now - prev;
+            if delta > 0 && (delta as u64) < cli.max_gap {
+                log::debug!("sleeping {} ms", delta);
+                thread::sleep(Duration::from_millis(delta as u64));
+            }
+        }
+        prev_ms = now_ms.or(prev_ms);
+        out.write_all(line.as_bytes())?;
+        out.flush()?;
+    }
+    Ok(())
+}
+
+/// Parse the leading `YYYY-MM-DDTHH:MM:SS[.,]mmm` prefix of a canboat
+/// PLAIN line into Unix-epoch milliseconds (UTC). Returns `None`
+/// when the line doesn't carry a recognised timestamp — the caller
+/// treats that as "emit immediately, leave the previous timestamp
+/// as-is".
+fn parse_timestamp_ms(line: &str) -> Option<i64> {
+    let bytes = line.as_bytes();
+    if bytes.len() < 19 {
+        return None;
+    }
+    let take = |range: std::ops::Range<usize>| std::str::from_utf8(&bytes[range]).ok();
+    let y: i64 = take(0..4)?.parse().ok()?;
+    if bytes[4] != b'-' {
+        return None;
+    }
+    let mo: u32 = take(5..7)?.parse().ok()?;
+    if bytes[7] != b'-' {
+        return None;
+    }
+    let d: u32 = take(8..10)?.parse().ok()?;
+    if bytes[10] != b'T' && bytes[10] != b'-' && bytes[10] != b' ' {
+        return None;
+    }
+    let h: u32 = take(11..13)?.parse().ok()?;
+    if bytes[13] != b':' {
+        return None;
+    }
+    let m: u32 = take(14..16)?.parse().ok()?;
+    if bytes[16] != b':' {
+        return None;
+    }
+    let s: u32 = take(17..19)?.parse().ok()?;
+    let mut ms: i64 = 0;
+    if bytes.len() >= 23 && (bytes[19] == b'.' || bytes[19] == b',') {
+        if let Some(v) = take(20..23).and_then(|s| s.parse::<i64>().ok()) {
+            ms = v;
+        }
+    }
+    let days = days_since_epoch(y, mo as i64, d as i64)?;
+    let secs = days * 86_400 + (h as i64) * 3600 + (m as i64) * 60 + s as i64;
+    Some(secs * 1000 + ms)
+}
+
+/// Days from 1970-01-01 (inclusive) to the given civil date.
+/// Howard Hinnant's days-from-civil algorithm. Returns `None` only
+/// on grossly out-of-range inputs (we accept the full canboat date
+/// surface so realistically this never trips).
+fn days_since_epoch(y: i64, m: i64, d: i64) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = (y - era * 400) as u32; // [0, 399]
+    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
+    let doe = yoe as i64 * 365 + (yoe as i64 / 4) - (yoe as i64 / 100) + doy; // [0, 146096]
+    Some(era * 146_097 + doe - 719_468)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_iso_timestamps() {
+        // 1970-01-01T00:00:00.000 = 0 ms.
+        assert_eq!(parse_timestamp_ms("1970-01-01T00:00:00.000 …"), Some(0));
+        // 1970-01-01T00:00:01,500 → 1500 ms.
+        assert_eq!(
+            parse_timestamp_ms("1970-01-01T00:00:01,500 anything"),
+            Some(1_500)
+        );
+        // 2022-09-10T12:10:33.618Z → known epoch ms.
+        let want = 1_662_812_233_618i64;
+        assert_eq!(parse_timestamp_ms("2022-09-10T12:10:33.618Z"), Some(want));
+    }
+
+    #[test]
+    fn ignores_unrecognised_prefixes() {
+        assert_eq!(parse_timestamp_ms("# comment\n"), None);
+        assert_eq!(parse_timestamp_ms("garbage\n"), None);
+        assert_eq!(parse_timestamp_ms("12:34:56.789\n"), None);
+    }
+}

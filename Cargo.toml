@@ -9,6 +9,7 @@ members = [
     "crates/actisense-serial",
     "crates/ikonvert-serial",
     "crates/maretron-ipg",
+    "crates/replay",
 ]
 
 [workspace.package]

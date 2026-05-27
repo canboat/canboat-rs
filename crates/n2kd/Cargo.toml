@@ -1,0 +1,20 @@
+[package]
+name        = "n2kd"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "N2K daemon — multiplex an analyzer JSON stream to TCP clients."
+
+[[bin]]
+name = "n2kd"
+path = "src/main.rs"
+
+[dependencies]
+canboat-cli = { workspace = true }
+anyhow      = { workspace = true }
+clap        = { workspace = true }
+env_logger  = { workspace = true }
+log         = { workspace = true }

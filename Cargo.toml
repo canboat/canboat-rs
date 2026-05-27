@@ -13,6 +13,7 @@ members = [
     "crates/candump2analyzer",
     "crates/pcap2candump",
     "crates/socketcan-writer",
+    "crates/n2kd",
 ]
 
 [workspace.package]

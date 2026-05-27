@@ -557,6 +557,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "n2kd"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "canboat-cli",
+ "clap",
+ "env_logger",
+ "log",
+]
+
+[[package]]
 name = "nb"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"

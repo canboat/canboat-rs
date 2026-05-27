@@ -19,8 +19,8 @@ pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use frame::{RawFrame, FASTPACKET_MAX_SIZE};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
 pub use types::{
-    BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable,
-    IndirectLookupValue, LookupTable, LookupValue, PacketType, PgnInfo,
+    BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable, IndirectLookupValue,
+    LookupTable, LookupValue, PacketType, PgnInfo,
 };
 
 #[cfg(test)]
@@ -65,10 +65,7 @@ mod smoke {
         // Field 2 should be a LOOKUP into MANUFACTURER_CODE.
         let mfr = &pgn.fields[1];
         assert_eq!(mfr.field_type, Some(FieldType::Lookup));
-        assert_eq!(
-            mfr.lookup_enumeration.as_deref(),
-            Some("MANUFACTURER_CODE")
-        );
+        assert_eq!(mfr.lookup_enumeration.as_deref(), Some("MANUFACTURER_CODE"));
     }
 
     #[test]

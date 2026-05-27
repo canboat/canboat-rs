@@ -148,8 +148,7 @@ mod tests {
 
     #[test]
     fn parses_fast_43byte_payload() {
-        let mut line =
-            String::from("2011-04-25-06:25:03.603,3,129029,36,255,43");
+        let mut line = String::from("2011-04-25-06:25:03.603,3,129029,36,255,43");
         for i in 0..43 {
             line.push_str(&format!(",{:02x}", i as u8));
         }

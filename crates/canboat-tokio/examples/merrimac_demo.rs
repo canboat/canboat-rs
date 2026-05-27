@@ -39,8 +39,7 @@ async fn main() -> Result<()> {
 
     let db_path = cli.db.unwrap_or_else(default_db_path);
     let db = Arc::new(
-        PgnDatabase::load(&db_path)
-            .with_context(|| format!("loading {}", db_path.display()))?,
+        PgnDatabase::load(&db_path).with_context(|| format!("loading {}", db_path.display()))?,
     );
 
     let port = tokio_serial::new(&cli.serial, cli.baud)

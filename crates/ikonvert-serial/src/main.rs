@@ -146,30 +146,28 @@ fn run(cli: Cli) -> Result<()> {
     let do_read_stdin = do_write;
     let do_read_device = !cli.write_only;
 
-    let (mut read_handle, write_handle_opt): (
-        Box<dyn Read + Send>,
-        Option<Box<dyn Write + Send>>,
-    ) = match &read_source {
-        InputSource::Serial(path) => {
-            let read_port = open_serial(path, cli.baud)
-                .with_context(|| format!("opening {} at {} bps", path, cli.baud))?;
-            let write_handle: Option<Box<dyn Write + Send>> = if do_write {
-                let wp = read_port
-                    .try_clone()
-                    .with_context(|| format!("cloning {}", path))?;
-                Some(Box::new(SerialWriter(wp)))
-            } else {
-                None
-            };
-            (Box::new(SerialReader(read_port)), write_handle)
-        }
-        InputSource::File(path) => (
-            Box::new(
-                File::open(path).with_context(|| format!("opening file {}", path.display()))?,
+    let (mut read_handle, write_handle_opt): (Box<dyn Read + Send>, Option<Box<dyn Write + Send>>) =
+        match &read_source {
+            InputSource::Serial(path) => {
+                let read_port = open_serial(path, cli.baud)
+                    .with_context(|| format!("opening {} at {} bps", path, cli.baud))?;
+                let write_handle: Option<Box<dyn Write + Send>> = if do_write {
+                    let wp = read_port
+                        .try_clone()
+                        .with_context(|| format!("cloning {}", path))?;
+                    Some(Box::new(SerialWriter(wp)))
+                } else {
+                    None
+                };
+                (Box::new(SerialReader(read_port)), write_handle)
+            }
+            InputSource::File(path) => (
+                Box::new(
+                    File::open(path).with_context(|| format!("opening file {}", path.display()))?,
+                ),
+                None,
             ),
-            None,
-        ),
-    };
+        };
 
     let (write_tx, writer_join) = if let Some(handle) = write_handle_opt {
         let (tx, rx) = mpsc::channel::<TxItem>();
@@ -241,11 +239,7 @@ impl Write for SerialWriter {
     }
 }
 
-fn run_read_loop<R: Read>(
-    reader: &mut R,
-    out: &mut impl Write,
-    timeout_secs: u64,
-) -> Result<()> {
+fn run_read_loop<R: Read>(reader: &mut R, out: &mut impl Write, timeout_secs: u64) -> Result<()> {
     let mut buf = [0u8; 4096];
     let mut acc = String::with_capacity(1024);
     let mut line_buf = String::with_capacity(256);

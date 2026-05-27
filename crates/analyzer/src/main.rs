@@ -114,17 +114,13 @@ fn run(cli: Cli) -> Result<()> {
     let mut line_buf = String::with_capacity(512);
     let mut reasm = Reassembler::new();
 
-    let forced_format = cli
-        .format
-        .as_deref()
-        .map(parse_format_flag)
-        .transpose()?;
+    let forced_format = cli.format.as_deref().map(parse_format_flag).transpose()?;
 
     // Two distinct input shapes — stdin vs a regular file — but the
     // line-handling is identical. Box one and roll.
     if let Some(path) = cli.file.as_deref() {
-        let file = File::open(path)
-            .with_context(|| format!("opening input file {}", path.display()))?;
+        let file =
+            File::open(path).with_context(|| format!("opening input file {}", path.display()))?;
         run_loop(
             LineReader::new(BufReader::new(file)),
             &db,

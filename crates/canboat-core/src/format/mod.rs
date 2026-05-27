@@ -13,8 +13,8 @@ pub mod ydwg02;
 
 pub use ngt1::{
     encode_n2k_send_frame, encode_n2k_send_payload, encode_ngt_message, encode_startup_ping,
-    Ngt1Decoder, NgtError, NgtEvent, NgtMessage, NGT_STARTUP_SEQ, N2K_MSG_RECEIVED, N2K_MSG_SEND,
-    NGT_MSG_RECEIVED, NGT_MSG_SEND,
+    Ngt1Decoder, NgtError, NgtEvent, NgtMessage, N2K_MSG_RECEIVED, N2K_MSG_SEND, NGT_MSG_RECEIVED,
+    NGT_MSG_SEND, NGT_STARTUP_SEQ,
 };
 pub use plain::{parse_line as parse_plain, write_line as write_plain, ParseError as PlainError};
 
@@ -101,12 +101,12 @@ pub fn parse_with(format: InputFormat, line: &str) -> Result<Option<RawFrame>, p
             // Control sentences and stray noise are not frames.
             _ => Ok(None),
         },
-        InputFormat::Airmar | InputFormat::Chetco | InputFormat::GarminCsv => Err(
-            plain::ParseError::BadInteger {
+        InputFormat::Airmar | InputFormat::Chetco | InputFormat::GarminCsv => {
+            Err(plain::ParseError::BadInteger {
                 field: "format",
                 value: format!("{format:?} parser is not yet implemented"),
-            },
-        ),
+            })
+        }
     }
 }
 
@@ -124,7 +124,10 @@ mod tests {
 
     #[test]
     fn detect_actisense_ascii() {
-        assert_eq!(detect("A173321.107 23FF7 1F119 01 02"), Some(InputFormat::ActisenseAscii));
+        assert_eq!(
+            detect("A173321.107 23FF7 1F119 01 02"),
+            Some(InputFormat::ActisenseAscii)
+        );
     }
 
     #[test]

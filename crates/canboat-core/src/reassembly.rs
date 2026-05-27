@@ -317,11 +317,7 @@ mod tests {
         let mut r = Reassembler::new();
         // Total payload 9 bytes: frame 0 carries 6, frame 1 carries 3.
         // Frame 0 header: seq=0, index=0 → 0x00; size byte = 9; then 6 payload bytes.
-        let f0 = frame(
-            129029,
-            0,
-            vec![0x00, 9, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5],
-        );
+        let f0 = frame(129029, 0, vec![0x00, 9, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5]);
         match r.push(f0, FramePacketType::Fast) {
             Reassembled::Partial => (),
             other => panic!("expected partial, got {other:?}"),
@@ -349,17 +345,9 @@ mod tests {
         // Two interleaved sequences with different seq numbers should
         // not corrupt each other.
         // Sequence A: seq=0x00
-        let a0 = frame(
-            129029,
-            0,
-            vec![0x00, 7, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5],
-        );
+        let a0 = frame(129029, 0, vec![0x00, 7, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5]);
         // Sequence B: seq=0x20
-        let b0 = frame(
-            129029,
-            0,
-            vec![0x20, 7, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5],
-        );
+        let b0 = frame(129029, 0, vec![0x20, 7, 0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5]);
         assert_eq!(r.push(a0, FramePacketType::Fast), Reassembled::Partial);
         assert_eq!(r.push(b0, FramePacketType::Fast), Reassembled::Partial);
         let a1 = frame(
@@ -387,9 +375,11 @@ mod tests {
     #[test]
     fn detects_duplicate_frame() {
         let mut r = Reassembler::new();
-        let f0 =
-            frame(129029, 0, vec![0x00, 14, 0, 0, 0, 0, 0, 0]);
-        assert_eq!(r.push(f0.clone(), FramePacketType::Fast), Reassembled::Partial);
+        let f0 = frame(129029, 0, vec![0x00, 14, 0, 0, 0, 0, 0, 0]);
+        assert_eq!(
+            r.push(f0.clone(), FramePacketType::Fast),
+            Reassembled::Partial
+        );
         // Same frame index again — should error and reset the slot.
         match r.push(f0, FramePacketType::Fast) {
             Reassembled::Error(ReassemblyError::DuplicateFrame { frame: 0, .. }) => (),

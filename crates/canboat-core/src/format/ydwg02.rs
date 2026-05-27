@@ -19,8 +19,8 @@
 
 use smallvec::SmallVec;
 
-use crate::frame::RawFrame;
 use crate::format::plain::ParseError;
+use crate::frame::RawFrame;
 
 pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -37,11 +37,10 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
         expected: 3,
         found: 2,
     })?;
-    let canid =
-        u32::from_str_radix(canid_tok, 16).map_err(|_| ParseError::BadInteger {
-            field: "canid",
-            value: canid_tok.to_string(),
-        })?;
+    let canid = u32::from_str_radix(canid_tok, 16).map_err(|_| ParseError::BadInteger {
+        field: "canid",
+        value: canid_tok.to_string(),
+    })?;
     let (prio, pgn, src, dst) = iso11783_decompose(canid);
 
     let mut data: SmallVec<[u8; 8]> = SmallVec::new();

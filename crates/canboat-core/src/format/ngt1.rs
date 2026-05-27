@@ -497,14 +497,17 @@ mod tests {
         //         ts=0, dlen=8, data=[0xE6 .. 0xB3].
         let pgn = 129025u32;
         let mut payload = vec![
-            3,                            // prio
-            (pgn & 0xff) as u8,           // pgn LE
+            3,                  // prio
+            (pgn & 0xff) as u8, // pgn LE
             ((pgn >> 8) & 0xff) as u8,
             ((pgn >> 16) & 0xff) as u8,
-            0xff,                         // dst
-            36,                           // src
-            0, 0, 0, 0,                   // ts (4 bytes)
-            8,                            // dlen
+            0xff, // dst
+            36,   // src
+            0,
+            0,
+            0,
+            0, // ts (4 bytes)
+            8, // dlen
         ];
         payload.extend_from_slice(&[0xe6, 0xf1, 0x3a, 0x80, 0x9c, 0xc6, 0x0d, 0xb3]);
         let frame = encode_frame(N2K_MSG_RECEIVED, &payload);

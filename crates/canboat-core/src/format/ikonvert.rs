@@ -15,8 +15,8 @@
 
 use smallvec::SmallVec;
 
-use crate::frame::RawFrame;
 use crate::format::plain::ParseError;
+use crate::frame::RawFrame;
 
 /// One parsed line from an iKonvert stream.
 #[derive(Debug, Clone)]
@@ -93,13 +93,11 @@ fn parse_int<T: std::str::FromStr>(
 /// Companion to [`b64_decode`]; kept inline for the same minimal-deps
 /// reason.
 pub(crate) fn b64_encode(bytes: &[u8], out: &mut String) {
-    const TABLE: &[u8; 64] =
-        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    const TABLE: &[u8; 64] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
     let mut i = 0;
     while i + 3 <= bytes.len() {
-        let n = (u32::from(bytes[i]) << 16)
-            | (u32::from(bytes[i + 1]) << 8)
-            | u32::from(bytes[i + 2]);
+        let n =
+            (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8) | u32::from(bytes[i + 2]);
         out.push(TABLE[((n >> 18) & 63) as usize] as char);
         out.push(TABLE[((n >> 12) & 63) as usize] as char);
         out.push(TABLE[((n >> 6) & 63) as usize] as char);

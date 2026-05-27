@@ -16,8 +16,8 @@
 
 use smallvec::SmallVec;
 
-use crate::frame::RawFrame;
 use crate::format::plain::ParseError;
+use crate::frame::RawFrame;
 
 pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -41,11 +41,10 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
         expected: 3,
         found: 1,
     })?;
-    let sdp =
-        u32::from_str_radix(sdp_tok, 16).map_err(|_| ParseError::BadInteger {
-            field: "sdp",
-            value: sdp_tok.to_string(),
-        })?;
+    let sdp = u32::from_str_radix(sdp_tok, 16).map_err(|_| ParseError::BadInteger {
+        field: "sdp",
+        value: sdp_tok.to_string(),
+    })?;
     let prio = (sdp & 0xf) as u8;
     let dst = ((sdp >> 4) & 0xff) as u8;
     let src = ((sdp >> 12) & 0xff) as u8;

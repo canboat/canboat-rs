@@ -44,8 +44,8 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use canboat_core::format::{
-    ngt1::NgtEvent, parse_plain, plain::ParseError, Ngt1Decoder,
-    encode_n2k_send_frame, encode_startup_ping, write_plain,
+    encode_n2k_send_frame, encode_startup_ping, ngt1::NgtEvent, parse_plain, plain::ParseError,
+    write_plain, Ngt1Decoder,
 };
 use canboat_core::RawFrame;
 use canboat_io::{open_serial, BytePump};
@@ -175,8 +175,7 @@ fn run(cli: Cli) -> Result<()> {
             }
             InputSource::File(path) => (
                 Box::new(
-                    File::open(path)
-                        .with_context(|| format!("opening file {}", path.display()))?,
+                    File::open(path).with_context(|| format!("opening file {}", path.display()))?,
                 ),
                 None,
             ),
@@ -260,11 +259,7 @@ impl Write for SerialWriter {
     }
 }
 
-fn run_read_loop<R: Read>(
-    reader: &mut R,
-    out: &mut impl Write,
-    timeout_secs: u64,
-) -> Result<()> {
+fn run_read_loop<R: Read>(reader: &mut R, out: &mut impl Write, timeout_secs: u64) -> Result<()> {
     let mut pump = BytePump::new(reader);
     let mut decoder = Ngt1Decoder::new();
     let mut line = String::with_capacity(256);
@@ -396,4 +391,3 @@ fn stdin_pump_thread(
         }
     }
 }
-

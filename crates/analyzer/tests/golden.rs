@@ -40,6 +40,14 @@ fn analyzer_path() -> PathBuf {
 /// Drive the analyzer binary on `<test_dir>/<in_name>` with `args`,
 /// then byte-diff stdout against `<test_dir>/<expected_name>`.
 fn run_case(in_name: &str, expected_name: &str, args: &[&str]) {
+    run_case_skipping(in_name, expected_name, args, &[]);
+}
+
+/// Same as [`run_case`] but allow specific line indices (0-based) to
+/// differ. Used for canboat-reference outputs that contain
+/// canboat-specific quirks (e.g. reading uninitialized memory past
+/// the declared payload) we deliberately don't replicate.
+fn run_case_skipping(in_name: &str, expected_name: &str, args: &[&str], skip_lines: &[usize]) {
     let Some(dir) = canboat_tests_dir() else {
         eprintln!("skipping: canboat test directory not available");
         return;
@@ -67,18 +75,45 @@ fn run_case(in_name: &str, expected_name: &str, args: &[&str]) {
         out.status,
         String::from_utf8_lossy(&out.stderr)
     );
-    if out.stdout != expected {
-        let actual = String::from_utf8_lossy(&out.stdout);
-        let expected_str = String::from_utf8_lossy(&expected);
-        panic!(
-            "Golden mismatch for {in_name} → {expected_name}\n\
-             --- expected ({} bytes) ---\n{}\n\
-             --- actual ({} bytes) ---\n{}\n",
-            expected.len(),
-            expected_str,
-            out.stdout.len(),
-            actual,
-        );
+
+    if skip_lines.is_empty() {
+        if out.stdout != expected {
+            let actual = String::from_utf8_lossy(&out.stdout);
+            let expected_str = String::from_utf8_lossy(&expected);
+            panic!(
+                "Golden mismatch for {in_name} → {expected_name}\n\
+                 --- expected ({} bytes) ---\n{}\n\
+                 --- actual ({} bytes) ---\n{}\n",
+                expected.len(),
+                expected_str,
+                out.stdout.len(),
+                actual,
+            );
+        }
+        return;
+    }
+
+    // Line-by-line compare with allowed skips.
+    let actual_str = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    let expected_str = String::from_utf8(expected).expect("utf-8 expected");
+    let actual_lines: Vec<&str> = actual_str.lines().collect();
+    let expected_lines: Vec<&str> = expected_str.lines().collect();
+    assert_eq!(
+        actual_lines.len(),
+        expected_lines.len(),
+        "line count differs: actual={} expected={}",
+        actual_lines.len(),
+        expected_lines.len(),
+    );
+    for (i, (a, e)) in actual_lines.iter().zip(expected_lines.iter()).enumerate() {
+        if skip_lines.contains(&i) {
+            continue;
+        }
+        if a != e {
+            panic!(
+                "Golden mismatch at {in_name}:{i}\n--- expected ---\n{e}\n--- actual ---\n{a}\n",
+            );
+        }
     }
 }
 
@@ -93,4 +128,21 @@ fn pgn_126983_json_nv() {
     // Exercises ISO_NAME recursive decode, Reserved-as-hex, and
     // PartOfPrimaryKey "key":true annotation.
     run_case("pgn-126983.in", "pgn-126983-nv.out", &["--json", "--nv"]);
+}
+
+/// Big multi-PGN regression test (24 PGNs covering most field types,
+/// repeating sets 1 and 2, ISO_NAME, STRING_LAU, DYNAMIC fields,
+/// unit conversions, lat/lon width padding). Skips one line at the
+/// end of the GNSS Sats in View payload where canboat C reads from
+/// uninitialized memory past the declared payload length — that
+/// behavior is a canboat-specific quirk we deliberately don't
+/// replicate, see analyzer/print.c::extractNumber and the static
+/// `RawMessage::data[FASTPACKET_MAX_SIZE]` buffer reuse.
+#[test]
+fn pgn_test_json() {
+    // Line 6 (0-based) in pgn-test-json.out is the PGN 129540 "GNSS
+    // Sats in View" frame. The last sat's `Range residuals` field
+    // crosses the payload-end boundary; canboat extracts whatever was
+    // in memory (happens to be `0.00000`), we correctly drop it.
+    run_case_skipping("pgn-test.in", "pgn-test-json.out", &["--json"], &[6]);
 }

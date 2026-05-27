@@ -1036,9 +1036,15 @@ fn decode_string_fix(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValu
     if end > data.len() {
         return FieldValue::NotAvailable;
     }
-    // Canboat strips trailing '@', '\0', spaces, and 0xff padding.
+    // Canboat's `printString` first finds an embedded NUL and shortens
+    // the string at that point (matches the C-string convention some
+    // devices use to terminate inside a fixed-width buffer — e.g. a
+    // Mastervolt Product Information field that has two records
+    // separated by NULs), then trims trailing '@' / NUL / space /
+    // 0xFF. Apply both passes here so STRING_FIX renders the leading
+    // C-string portion only.
     let raw = &data[start..end];
-    let mut len = raw.len();
+    let mut len = raw.iter().position(|&b| b == 0).unwrap_or(raw.len());
     while len > 0 {
         let b = raw[len - 1];
         if b == 0 || b == b'@' || b == b' ' || b == 0xff {
@@ -1117,7 +1123,7 @@ fn decode_string_lau(data: &[u8], bit_offset: u32) -> (FieldValue, u32) {
 /// from a string. Matches the trailing-byte loop in `printString` in
 /// analyzer/print.c.
 fn trim_string_padding(s: &str) -> &str {
-    s.trim_end_matches(|c: char| matches!(c, '\0' | '@' | ' ' | '\u{ff}'))
+    s.trim_end_matches(['\0', '@', ' ', '\u{ff}'])
 }
 
 fn decode_string_lz(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {

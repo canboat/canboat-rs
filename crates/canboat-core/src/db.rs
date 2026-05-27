@@ -178,6 +178,36 @@ impl PgnDatabase {
         Ok(Self::from_raw(raw))
     }
 
+    /// Merge additional PGN entries from a canboat-shaped JSON blob
+    /// into the loaded database. Used for the synthetic PGN range
+    /// (CANBOAT_BEM / ACTISENSE_BEM / IKONVERT_BEM, starting at
+    /// 0x40000) that canboat's C analyzer defines in `analyzer/pgn.h`
+    /// rather than `docs/canboat.json`. Each new PGN goes through the
+    /// same non-SI unit fix-up the loader applies on first load, then
+    /// is appended to the `pgns` list and indexed.
+    pub fn merge_pgns_from_json(&mut self, json: &str) -> Result<(), LoadError> {
+        #[derive(Deserialize)]
+        struct PgnList {
+            #[serde(rename = "PGNs")]
+            pgns: Vec<PgnInfo>,
+        }
+        let mut list: PgnList = serde_json::from_str(json)?;
+        for pgn in &mut list.pgns {
+            for f in &mut pgn.fields {
+                apply_non_si_unit_fixup(f);
+            }
+        }
+        let base = self.pgns.len();
+        for (offset, p) in list.pgns.iter().enumerate() {
+            self.pgn_index
+                .entry(p.pgn)
+                .or_default()
+                .push(base + offset);
+        }
+        self.pgns.extend(list.pgns);
+        Ok(())
+    }
+
     fn from_raw(mut raw: CanboatJson) -> Self {
         // Apply canboat's non-SI unit conversions to every field once
         // at load time (mirrors `fieldtype.c::fixupTypes` in canboat).

@@ -22,6 +22,12 @@ use canboat_core::{
 };
 use canboat_io::LineReader;
 
+/// Synthetic PGN definitions (CANBOAT_BEM range) embedded at build
+/// time. Sourced from `data/synthetic-pgns.json`, which mirrors the
+/// hand-coded entries in canboat's `analyzer/pgn.h`.
+const SYNTHETIC_PGNS_JSON: &str =
+    include_str!("../../../data/synthetic-pgns.json");
+
 #[derive(Debug, Parser)]
 #[command(
     name = "analyzer",
@@ -119,8 +125,15 @@ fn run(cli: Cli) -> Result<()> {
         .or_else(|| std::env::var_os("CANBOAT_JSON").map(PathBuf::from))
         .or_else(default_db_path)
         .context("no canboat.json path supplied (pass --db or set CANBOAT_JSON)")?;
-    let db = PgnDatabase::load(&db_path)
+    let mut db = PgnDatabase::load(&db_path)
         .with_context(|| format!("loading PGN database {}", db_path.display()))?;
+    // Synthetic PGNs (CANBOAT_BEM / ACTISENSE_BEM / IKONVERT_BEM
+    // range, 0x40000+) live in canboat's analyzer/pgn.h, not in
+    // canboat.json. Merge the workspace-vendored mirror so output
+    // for synthetic PGNs (e.g. PGN 262386 Actisense System status)
+    // matches the canboat reference.
+    db.merge_pgns_from_json(SYNTHETIC_PGNS_JSON)
+        .context("merging synthetic PGN definitions")?;
 
     let json_opts = JsonOptions {
         include_empty: cli.empty,

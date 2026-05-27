@@ -214,6 +214,21 @@ fn short_frame_text_debug() {
     run_case("short-frame.in", "short-frame.out", &["--debug"]);
 }
 
+/// Switch-multi capture: exercises the synthetic-PGN range (PGN
+/// 262386 = `ACTISENSE_BEM + 0xf2`, "Actisense: System status",
+/// defined in canboat's `analyzer/pgn.h` but not in canboat.json —
+/// loaded from `data/synthetic-pgns.json`), plus STRING_FIX's
+/// embedded-NUL truncation on a Mastervolt Product Information
+/// field that packs two C-strings into one fixed-width slot.
+#[test]
+fn switch_multi_text_debug() {
+    run_case(
+        "switch-multi-to-one-line.in",
+        "switch-multi-to-one-line.out",
+        &["--debug"],
+    );
+}
+
 /// `-geo dd|dm|dms` lat/lon formatting. The canboat reference test
 /// runs the analyzer three times and concatenates the outputs; do
 /// the same here.

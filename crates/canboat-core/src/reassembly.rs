@@ -383,7 +383,11 @@ mod tests {
         // ends up placed (i.e., the slot still says it's partial, not
         // an error variant).
         let mut r = Reassembler::new();
-        let f0 = frame(129029, 0, vec![0x00, 14, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5]);
+        let f0 = frame(
+            129029,
+            0,
+            vec![0x00, 14, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5],
+        );
         assert_eq!(
             r.push(f0.clone(), FramePacketType::Fast),
             Reassembled::Partial

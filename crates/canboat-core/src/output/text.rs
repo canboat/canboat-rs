@@ -102,13 +102,8 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
         // belongs to a forced count=0 iteration past its first field —
         // canboat's `repetition` counter resets to 0 there, so the
         // suffix is suppressed for these fields only.
-        if f.repeat_set != 0 && f.repeat_index.is_some() {
-            write!(
-                w,
-                "{name} {iter} = ",
-                name = f.name,
-                iter = f.repeat_index.unwrap() + 1,
-            )?;
+        if let (Some(iter), true) = (f.repeat_index, f.repeat_set != 0) {
+            write!(w, "{name} {iter} = ", name = f.name, iter = iter + 1)?;
         } else {
             write!(w, "{name} = ", name = f.name)?;
         }

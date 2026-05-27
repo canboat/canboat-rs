@@ -255,7 +255,8 @@ fn dms_format_text() {
         combined.extend_from_slice(&out.stdout);
     }
     assert_eq!(
-        combined, expected,
+        combined,
+        expected,
         "dms-format mismatch\nactual:\n{}\nexpected:\n{}",
         String::from_utf8_lossy(&combined),
         String::from_utf8_lossy(&expected),

@@ -25,8 +25,7 @@ use canboat_io::LineReader;
 /// Synthetic PGN definitions (CANBOAT_BEM range) embedded at build
 /// time. Sourced from `data/synthetic-pgns.json`, which mirrors the
 /// hand-coded entries in canboat's `analyzer/pgn.h`.
-const SYNTHETIC_PGNS_JSON: &str =
-    include_str!("../../../data/synthetic-pgns.json");
+const SYNTHETIC_PGNS_JSON: &str = include_str!("../../../data/synthetic-pgns.json");
 
 #[derive(Debug, Parser)]
 #[command(

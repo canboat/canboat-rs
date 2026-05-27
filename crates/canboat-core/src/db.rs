@@ -199,10 +199,7 @@ impl PgnDatabase {
         }
         let base = self.pgns.len();
         for (offset, p) in list.pgns.iter().enumerate() {
-            self.pgn_index
-                .entry(p.pgn)
-                .or_default()
-                .push(base + offset);
+            self.pgn_index.entry(p.pgn).or_default().push(base + offset);
         }
         self.pgns.extend(list.pgns);
         Ok(())

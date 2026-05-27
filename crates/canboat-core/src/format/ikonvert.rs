@@ -89,6 +89,75 @@ fn parse_int<T: std::str::FromStr>(
     })
 }
 
+/// Encode `bytes` as RFC 4648 Base64 with `=` padding into `out`.
+/// Companion to [`b64_decode`]; kept inline for the same minimal-deps
+/// reason.
+pub(crate) fn b64_encode(bytes: &[u8], out: &mut String) {
+    const TABLE: &[u8; 64] =
+        b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut i = 0;
+    while i + 3 <= bytes.len() {
+        let n = (u32::from(bytes[i]) << 16)
+            | (u32::from(bytes[i + 1]) << 8)
+            | u32::from(bytes[i + 2]);
+        out.push(TABLE[((n >> 18) & 63) as usize] as char);
+        out.push(TABLE[((n >> 12) & 63) as usize] as char);
+        out.push(TABLE[((n >> 6) & 63) as usize] as char);
+        out.push(TABLE[(n & 63) as usize] as char);
+        i += 3;
+    }
+    match bytes.len() - i {
+        0 => {}
+        1 => {
+            let n = u32::from(bytes[i]) << 16;
+            out.push(TABLE[((n >> 18) & 63) as usize] as char);
+            out.push(TABLE[((n >> 12) & 63) as usize] as char);
+            out.push('=');
+            out.push('=');
+        }
+        2 => {
+            let n = (u32::from(bytes[i]) << 16) | (u32::from(bytes[i + 1]) << 8);
+            out.push(TABLE[((n >> 18) & 63) as usize] as char);
+            out.push(TABLE[((n >> 12) & 63) as usize] as char);
+            out.push(TABLE[((n >> 6) & 63) as usize] as char);
+            out.push('=');
+        }
+        _ => unreachable!(),
+    }
+}
+
+/// Build the line to send to the device for a transmit request.
+///
+/// iKonvert's TX format is intentionally shorter than the RX format:
+/// `!PDGY,<pgn>,<dst>,<base64-data>\r\n`. The device fills in prio
+/// and src from its own state. CRLF terminator matches the C code.
+pub fn encode_tx_frame(frame: &crate::frame::RawFrame) -> String {
+    let mut out = String::with_capacity(32 + frame.data.len() * 4 / 3 + 4);
+    out.push_str("!PDGY,");
+    out.push_str(&frame.pgn.to_string());
+    out.push(',');
+    out.push_str(&frame.dst.to_string());
+    out.push(',');
+    b64_encode(&frame.data, &mut out);
+    out.push_str("\r\n");
+    out
+}
+
+/// `$PDGY,N2NET_INIT,ALL\r\n` — bring the device online with all PGNs.
+pub const TX_ONLINE_ALL: &str = "$PDGY,N2NET_INIT,ALL\r\n";
+
+/// `$PDGY,N2NET_INIT,NORMAL\r\n` — bring the device online filtered by RX list.
+pub const TX_ONLINE_NORMAL: &str = "$PDGY,N2NET_INIT,NORMAL\r\n";
+
+/// `$PDGY,N2NET_OFFLINE\r\n` — take the device offline.
+pub const TX_OFFLINE: &str = "$PDGY,N2NET_OFFLINE\r\n";
+
+/// `$PDGY,N2NET_RESET\r\n` — clear RX/TX lists.
+pub const TX_RESET: &str = "$PDGY,N2NET_RESET\r\n";
+
+/// `$PDGY,TX_LIMIT,OFF\r\n` — disable the rate limiter.
+pub const TX_LIMIT_OFF: &str = "$PDGY,TX_LIMIT,OFF\r\n";
+
 /// Minimal RFC 4648 Base64 decoder for the iKonvert payload. Returns
 /// `None` on any malformed input. We carry the table inline rather
 /// than depend on the `base64` crate to keep canboat-core's dep tree
@@ -176,5 +245,38 @@ mod tests {
     fn classifies_control_sentence() {
         let ev = parse_line("$PDGY,,000000,,,,,").unwrap();
         assert!(matches!(ev, IkonvertLine::Control(_)));
+    }
+
+    #[test]
+    fn tx_frame_format_matches_canboat() {
+        use crate::frame::RawFrame;
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 6,
+            pgn: 60928,
+            src: 0,
+            dst: 255,
+            data: smallvec::smallvec![0x01, 0x02, 0x03],
+        };
+        // canboat C uses TX_PGN_MSG_PREFIX "!PDGY,%u,%u," (pgn, dst)
+        // then base64 then CRLF. prio and src are NOT included on TX.
+        let line = encode_tx_frame(&frame);
+        assert_eq!(line, "!PDGY,60928,255,AQID\r\n");
+    }
+
+    #[test]
+    fn b64_encode_round_trips_known_vectors() {
+        let mut out = String::new();
+        b64_encode(b"foobar", &mut out);
+        assert_eq!(out, "Zm9vYmFy");
+        out.clear();
+        b64_encode(b"fooba", &mut out);
+        assert_eq!(out, "Zm9vYmE=");
+        out.clear();
+        b64_encode(b"foob", &mut out);
+        assert_eq!(out, "Zm9vYg==");
+        out.clear();
+        b64_encode(b"", &mut out);
+        assert_eq!(out, "");
     }
 }

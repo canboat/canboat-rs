@@ -7,6 +7,7 @@ members = [
     "crates/canboat-cli",
     "crates/analyzer",
     "crates/actisense-serial",
+    "crates/ikonvert-serial",
 ]
 
 [workspace.package]

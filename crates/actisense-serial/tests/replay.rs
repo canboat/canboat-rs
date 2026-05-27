@@ -74,9 +74,12 @@ fn replays_synthetic_ngt1_into_plain_line() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
+    // The binary emits "# format=FAST" header line first, then frames.
+    let mut lines = stdout.lines();
+    assert_eq!(lines.next(), Some("# format=FAST"));
     assert_eq!(
-        stdout.trim(),
-        "12345,6,60928,5,255,8,fb,9b,70,22,00,9b,50,c0",
+        lines.next(),
+        Some("12345,6,60928,5,255,8,fb,9b,70,22,00,9b,50,c0"),
         "stderr: {}",
         String::from_utf8_lossy(&out.stderr)
     );
@@ -87,4 +90,40 @@ fn replays_synthetic_ngt1_into_plain_line() {
 fn test_binary_path() -> PathBuf {
     // CARGO_BIN_EXE_<name> is set by Cargo for integration tests.
     PathBuf::from(env!("CARGO_BIN_EXE_actisense-serial"))
+}
+
+/// Encoder smoke test: the canboat-core helpers used by the writer
+/// thread produce valid NGT-1 frames that decode back to the same
+/// payload contents. The binary itself isn't spawned here — that path
+/// needs a real serial port to drive end-to-end. This locks in the
+/// stdin → write encode contract used by canboat's parseAndWriteIn.
+#[test]
+fn stdin_line_encodes_to_n2k_send_payload() {
+    use canboat_core::format::{
+        encode_n2k_send_payload, encode_ngt_message, parse_plain, Ngt1Decoder, NgtEvent,
+        N2K_MSG_SEND,
+    };
+
+    let line = "12345,6,60928,5,255,8,fb,9b,70,22,00,9b,50,c0";
+    let frame = parse_plain(line).expect("parse PLAIN line");
+
+    let mut wire = Vec::new();
+    encode_ngt_message(N2K_MSG_SEND, &encode_n2k_send_payload(&frame), &mut wire);
+    let mut d = Ngt1Decoder::new();
+    let events = d.push_bytes(&wire);
+    assert_eq!(events.len(), 1);
+    match &events[0] {
+        NgtEvent::Message(m) => {
+            assert_eq!(m.command, N2K_MSG_SEND);
+            // Header layout: prio, pgn(LE) x3, dst, dlen, data...
+            assert_eq!(m.payload[0], 6);
+            assert_eq!(m.payload[1], 0x00); // 60928 LE
+            assert_eq!(m.payload[2], 0xee);
+            assert_eq!(m.payload[3], 0x00);
+            assert_eq!(m.payload[4], 255);
+            assert_eq!(m.payload[5], 8);
+            assert_eq!(&m.payload[6..], &frame.data[..]);
+        }
+        other => panic!("expected Message, got {other:?}"),
+    }
 }

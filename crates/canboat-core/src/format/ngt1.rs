@@ -197,6 +197,82 @@ impl Ngt1Decoder {
     }
 }
 
+/// Wrap `(cmd, payload)` in NGT-1 framing for transmission to the
+/// device: `DLE STX <cmd> <len> <payload...> <checksum> DLE ETX`,
+/// with DLE-stuffing inside the framed region and an 8-bit checksum
+/// such that `(cmd + len + payload + checksum) ≡ 0 (mod 256)`.
+///
+/// The output is appended to `out`. `payload.len()` must be ≤ 255.
+pub fn encode_ngt_message(cmd: u8, payload: &[u8], out: &mut Vec<u8>) {
+    assert!(
+        payload.len() <= u8::MAX as usize,
+        "NGT payload exceeds 255 bytes"
+    );
+    out.push(DLE);
+    out.push(STX);
+    write_stuffed(out, cmd);
+    write_stuffed(out, payload.len() as u8);
+    let mut sum = cmd.wrapping_add(payload.len() as u8);
+    for &b in payload {
+        write_stuffed(out, b);
+        sum = sum.wrapping_add(b);
+    }
+    let checksum = 0u8.wrapping_sub(sum);
+    write_stuffed(out, checksum);
+    out.push(DLE);
+    out.push(ETX);
+}
+
+fn write_stuffed(out: &mut Vec<u8>, b: u8) {
+    out.push(b);
+    if b == DLE {
+        out.push(DLE);
+    }
+}
+
+/// Build the inner payload of a `N2K_MSG_SEND` (0x94) command from a
+/// [`RawFrame`]. The NGT-1 transmit format is six header bytes —
+/// `prio, pgn[0..2] (LE), dst, dlen` — followed by the data bytes.
+/// Unlike the receive direction there is no `src` field (the NGT-1
+/// supplies its own claimed source address) and no NGT timestamp.
+///
+/// `frame.data.len()` must be ≤ 223 (canboat's `FASTPACKET_MAX_SIZE`).
+pub fn encode_n2k_send_payload(frame: &RawFrame) -> Vec<u8> {
+    let mut out = Vec::with_capacity(6 + frame.data.len());
+    out.push(frame.prio);
+    out.push((frame.pgn & 0xff) as u8);
+    out.push(((frame.pgn >> 8) & 0xff) as u8);
+    out.push(((frame.pgn >> 16) & 0xff) as u8);
+    out.push(frame.dst);
+    out.push(frame.data.len() as u8);
+    out.extend_from_slice(&frame.data);
+    out
+}
+
+/// Build a complete NGT-1 transmit byte string from a `RawFrame`:
+/// `encode_ngt_message(N2K_MSG_SEND, encode_n2k_send_payload(...))`.
+/// Caller writes the bytes verbatim to the serial port.
+pub fn encode_n2k_send_frame(frame: &RawFrame) -> Vec<u8> {
+    let payload = encode_n2k_send_payload(frame);
+    let mut out = Vec::with_capacity(payload.len() + 8);
+    encode_ngt_message(N2K_MSG_SEND, &payload, &mut out);
+    out
+}
+
+/// The reverse-engineered NGT-1 startup sequence (3 bytes wrapped in an
+/// `NGT_MSG_SEND` command). Sent on connect and periodically afterwards
+/// to keep the NGT-1's TX queue unlocked. Magic comes from canboat's
+/// `actisense-serial.c` (originally from Actisense NMEAreader).
+pub const NGT_STARTUP_SEQ: [u8; 3] = [0x11, 0x02, 0x00];
+
+/// Encode the NGT-1 startup / keepalive ping as a ready-to-write byte
+/// string.
+pub fn encode_startup_ping() -> Vec<u8> {
+    let mut out = Vec::with_capacity(NGT_STARTUP_SEQ.len() + 8);
+    encode_ngt_message(NGT_MSG_SEND, &NGT_STARTUP_SEQ, &mut out);
+    out
+}
+
 impl NgtMessage {
     /// Convert a `N2K_MSG_RECEIVED` (0x93) message into a [`RawFrame`].
     /// Other commands return `None` — they carry NGT-1-internal state,
@@ -334,6 +410,85 @@ mod tests {
         let events = d.push_bytes(&bytes);
         assert_eq!(events.len(), 1);
         assert!(matches!(events[0], NgtEvent::Message(_)));
+    }
+
+    #[test]
+    fn encoder_round_trips_through_decoder() {
+        // Build a frame with a DLE byte in payload, encode it, then
+        // feed back through the decoder and confirm we get the same
+        // (cmd, payload) out.
+        let payload = vec![0x00, 0x10, 0xff, 0x10, 0xab];
+        let mut wire = Vec::new();
+        encode_ngt_message(0x42, &payload, &mut wire);
+
+        let mut d = Ngt1Decoder::new();
+        let events = d.push_bytes(&wire);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            NgtEvent::Message(m) => {
+                assert_eq!(m.command, 0x42);
+                assert_eq!(m.payload, payload);
+            }
+            other => panic!("expected Message, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn encoder_handles_dle_in_length_and_checksum() {
+        // Exercise the DLE-stuffing path for the length byte and the
+        // checksum byte (both can equal 0x10 for some payload sizes /
+        // contents). Pick a payload of 16 bytes — length = 0x10 = DLE.
+        let payload = vec![0u8; 0x10];
+        let mut wire = Vec::new();
+        encode_ngt_message(0x42, &payload, &mut wire);
+        let mut d = Ngt1Decoder::new();
+        let events = d.push_bytes(&wire);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            NgtEvent::Message(m) => {
+                assert_eq!(m.command, 0x42);
+                assert_eq!(m.payload.len(), 0x10);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn n2k_send_payload_layout_matches_canboat() {
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 6,
+            pgn: 60928,
+            src: 0, // ignored in send
+            dst: 255,
+            data: smallvec::smallvec![0xfb, 0x9b, 0x70, 0x22, 0x00, 0x9b, 0x50, 0xc0],
+        };
+        let payload = encode_n2k_send_payload(&frame);
+        // prio (1) + pgn LE (3) + dst (1) + dlen (1) + data (8) = 14 bytes.
+        assert_eq!(payload.len(), 14);
+        // 60928 = 0xEE00 → LE bytes 0x00, 0xee, 0x00.
+        assert_eq!(payload[0], 6);
+        assert_eq!(payload[1], 0x00);
+        assert_eq!(payload[2], 0xee);
+        assert_eq!(payload[3], 0x00);
+        assert_eq!(payload[4], 0xff);
+        assert_eq!(payload[5], 8);
+        assert_eq!(&payload[6..], &frame.data[..]);
+    }
+
+    #[test]
+    fn startup_ping_decodes_to_ngt_msg_send() {
+        let bytes = encode_startup_ping();
+        let mut d = Ngt1Decoder::new();
+        let events = d.push_bytes(&bytes);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            NgtEvent::Message(m) => {
+                assert_eq!(m.command, NGT_MSG_SEND);
+                assert_eq!(m.payload, NGT_STARTUP_SEQ);
+            }
+            other => panic!("got {other:?}"),
+        }
     }
 
     #[test]

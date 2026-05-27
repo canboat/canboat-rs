@@ -6,6 +6,9 @@
 //! when the user forces it with `--format`.
 
 pub mod actisense_ascii;
+pub mod airmar;
+pub mod chetco;
+pub mod garmin_csv;
 pub mod ikonvert;
 pub mod ngt1;
 pub mod plain;
@@ -22,9 +25,6 @@ use crate::frame::RawFrame;
 
 /// One of the canboat-supported ASCII line formats.
 ///
-/// `Airmar`, `Chetco`, and `GarminCsv` are placeholders in v0 — their
-/// parsers return [`PlainError::BadInteger`] for now and will be filled
-/// in driven by user need / golden-test failures.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InputFormat {
     /// Canboat PLAIN / FAST line (`<ts>,<prio>,<pgn>,...,<hex>,...`).
@@ -43,12 +43,15 @@ pub enum InputFormat {
     Ydwg02,
     /// Digital Yacht iKonvert (`!PDGY,...` or `$PDGY,...`).
     Ikonvert,
-    /// Airmar (deferred — parser stub returns an error in v0).
+    /// Airmar (`<ts> - <pgn> <canid> <data>`).
     Airmar,
-    /// Chetco `$PCDIN,...` (deferred).
+    /// Chetco `$PCDIN,...` checksummed sentence.
     Chetco,
-    /// Garmin CSV exports (deferred).
+    /// Garmin CSV1 (relative-ms timestamps).
     GarminCsv,
+    /// Garmin CSV2 (absolute `M_D_Y_H_M_S_ms` timestamps + an extra
+    /// `Processed PGN` column).
+    GarminCsv2,
 }
 
 /// Auto-detect the line format from a single representative line.
@@ -65,6 +68,14 @@ pub fn detect(line: &str) -> Option<InputFormat> {
     if t.starts_with("$PCDIN") {
         return Some(InputFormat::Chetco);
     }
+    // Garmin CSV header lines stand out — both flavours expose a
+    // distinct prefix. Matches `detectFormat` in canboat/analyzer.c.
+    if t.starts_with("Sequence #,Timestamp,PGN,") {
+        return Some(InputFormat::GarminCsv);
+    }
+    if t.starts_with("Sequence #,Month_Day_Year_Hours_Minutes_Seconds_msTicks,") {
+        return Some(InputFormat::GarminCsv2);
+    }
     if t.starts_with('A') && t.as_bytes().get(1).is_some_and(u8::is_ascii_digit) {
         return Some(InputFormat::ActisenseAscii);
     }
@@ -72,11 +83,28 @@ pub fn detect(line: &str) -> Option<InputFormat> {
     if looks_like_ydwg02(t) {
         return Some(InputFormat::Ydwg02);
     }
+    // Airmar: any timestamp followed by ` - ` (a single dash with
+    // surrounding spaces). Canboat's detect checks `p[1] == '-' ||
+    // p[2] == '-'` after the first space — both forms get caught
+    // here.
+    if looks_like_airmar(t) {
+        return Some(InputFormat::Airmar);
+    }
     // PLAIN/FAST: ISO-like timestamp + `,prio,pgn,…`.
     if t.contains(',') {
         return Some(InputFormat::Plain);
     }
     None
+}
+
+fn looks_like_airmar(line: &str) -> bool {
+    // Mirror canboat: the first space marks the end of the timestamp
+    // and the next byte (or the one after) starts a literal `-`.
+    let bytes = line.as_bytes();
+    let Some(space) = bytes.iter().position(|&c| c == b' ') else {
+        return false;
+    };
+    matches!(bytes.get(space + 1), Some(&b'-')) || matches!(bytes.get(space + 2), Some(&b'-'))
 }
 
 fn looks_like_ydwg02(line: &str) -> bool {
@@ -109,11 +137,21 @@ pub fn parse_with(format: InputFormat, line: &str) -> Result<Option<RawFrame>, p
             // Control sentences and stray noise are not frames.
             _ => Ok(None),
         },
-        InputFormat::Airmar | InputFormat::Chetco | InputFormat::GarminCsv => {
-            Err(plain::ParseError::BadInteger {
-                field: "format",
-                value: format!("{format:?} parser is not yet implemented"),
-            })
+        InputFormat::Airmar => airmar::parse_line(line).map(Some),
+        InputFormat::Chetco => chetco::parse_line(line).map(Some),
+        InputFormat::GarminCsv | InputFormat::GarminCsv2 => {
+            let variant = if format == InputFormat::GarminCsv2 {
+                garmin_csv::Variant::Absolute
+            } else {
+                garmin_csv::Variant::Relative
+            };
+            match garmin_csv::parse_line(line, variant)? {
+                garmin_csv::GarminCsvLine::Frame(f) => Ok(Some(f)),
+                // Header lines are dropped before reaching the
+                // decoder — same as canboat's `continue` on the
+                // first line.
+                garmin_csv::GarminCsvLine::Header => Ok(None),
+            }
         }
     }
 }

@@ -99,12 +99,13 @@ fn parse_format_flag(name: &str) -> Result<InputFormat> {
     Ok(match name.to_ascii_lowercase().as_str() {
         "plain" | "fast" | "plain_or_fast" => InputFormat::Plain,
         "plain_mix_fast" | "plain-mix-fast" => InputFormat::PlainMixFast,
-        "actisense" | "actisense-ascii" => InputFormat::ActisenseAscii,
+        "actisense" | "actisense-ascii" | "actisense_n2k_ascii" => InputFormat::ActisenseAscii,
         "ydwg02" | "yden" => InputFormat::Ydwg02,
         "ikonvert" => InputFormat::Ikonvert,
         "airmar" => InputFormat::Airmar,
         "chetco" => InputFormat::Chetco,
-        "garmin" | "garmin-csv" => InputFormat::GarminCsv,
+        "garmin" | "garmin-csv" | "garmin_csv1" => InputFormat::GarminCsv,
+        "garmin-csv2" | "garmin_csv2" => InputFormat::GarminCsv2,
         other => anyhow::bail!("unknown --format {other:?}"),
     })
 }

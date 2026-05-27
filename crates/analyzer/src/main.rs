@@ -57,6 +57,15 @@ struct Cli {
     #[arg(long)]
     debug: bool,
 
+    /// Use the given string in place of any analyzer-generated
+    /// timestamps (matches canboat's `-fixtime`). Inputs that carry
+    /// their own timestamps (PLAIN/FAST, Actisense ASCII) pass them
+    /// through verbatim — only formats that fabricate a date (YDWG02,
+    /// etc.) are affected. Accepted unconditionally for CLI
+    /// compatibility with the canboat C analyzer.
+    #[arg(long, value_name = "STRING")]
+    fixtime: Option<String>,
+
     /// Filter: only process frames with this source address.
     #[arg(long, value_name = "N")]
     src: Option<u8>,

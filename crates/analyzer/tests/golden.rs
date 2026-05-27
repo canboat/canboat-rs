@@ -188,3 +188,18 @@ fn pgn_test_actisense_json_nv_debug() {
 fn pgn_test_text_debug() {
     run_case_skipping("pgn-test.in", "pgn-test.out", &["--debug"], &[6]);
 }
+
+/// Actisense N2K ASCII input, plain text output (no -debug). Tests
+/// the basic parse path plus canboat's "Unknown" display for
+/// `NotAvailable` numeric fields.
+#[test]
+fn actisense_format_text() {
+    run_case("actisense-format.in", "actisense-format.out", &[]);
+}
+
+/// Text + `-debug` of a Seatalk PGN-65379 capture. Exercises the
+/// fast-packet PGN-65379 corner cases.
+#[test]
+fn pgn_65379_text_debug() {
+    run_case("pgn-65379-test.in", "pgn-65379-test.out", &["--debug"]);
+}

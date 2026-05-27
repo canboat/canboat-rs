@@ -54,11 +54,10 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
     // separators are "; ".
     let mut sep = " ";
     for f in &pgn.fields {
-        // Under -debug, unavailable fields stay so the byte/bit
-        // annotation shows up; canboat does the same.
-        if !opts.show_unavailable && !opts.debug && matches!(f.value, FieldValue::NotAvailable) {
-            continue;
-        }
+        // canboat text mode always emits unavailable fields as
+        // `Unknown` (see `printEmpty` in print.c). We keep them too,
+        // regardless of -debug / -empty.
+        // Reserved/Spare drop unconditionally (handled below).
         // Reserved/Spare are noise in text output — drop them
         // unconditionally (canboat does too).
         if matches!(
@@ -398,12 +397,14 @@ mod tests {
     }
 
     #[test]
-    fn omits_unavailable_by_default() {
+    fn unavailable_renders_as_unknown() {
+        // canboat text mode emits unavailable fields as "Unknown"
+        // (rather than dropping them, which is the JSON behaviour).
         let mut pgn = sample_pgn();
         pgn.fields[1].value = FieldValue::NotAvailable;
         let mut out = String::new();
         write_text(&mut out, &pgn, &TextOptions::default()).unwrap();
-        assert!(!out.contains("Manufacturer Code"));
+        assert!(out.contains("Manufacturer Code = Unknown"));
         assert!(out.contains("Unique Number = 1088507"));
     }
 }

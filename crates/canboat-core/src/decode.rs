@@ -70,18 +70,28 @@ pub enum FieldValue {
     Binary(Vec<u8>),
     /// LOOKUP / INDIRECT_LOOKUP result.
     Lookup { value: u64, name: Option<String> },
-    /// BITLOOKUP result — set-bit list.
-    BitField { value: u64, names: Vec<String> },
+    /// BITLOOKUP result — list of set bits with the bit-flag value
+    /// (1 << bit) and resolved name for each.
+    BitField {
+        value: u64,
+        bits: Vec<(u64, String)>,
+    },
     /// Decoded text (STRING_FIX, STRING_LZ, STRING_LAU).
     String(String),
     /// 16-bit days since 1970-01-01.
     Date(u16),
-    /// Seconds since midnight (post-resolution scaling).
-    Time(f64),
+    /// Seconds since midnight (post-resolution scaling) plus the raw
+    /// integer the decoder extracted. The raw is needed for `-nv`
+    /// output `{"value":raw,"name":"HH:MM:SS.SSSS"}`.
+    Time { raw: i64, seconds: f64 },
     /// MMSI as a 9-digit identifier.
     Mmsi(u32),
-    /// 24-bit PGN number.
-    Pgn(u32),
+    /// 24-bit PGN number. `description` is the target PGN's
+    /// human-readable name from the database, if known.
+    Pgn {
+        value: u32,
+        description: Option<String>,
+    },
     /// ISO_NAME — a 64-bit packed identifier that is also a valid
     /// PGN 60928 (ISO Address Claim) payload. We carry the raw value
     /// and the recursively-decoded subfields side by side so the
@@ -503,7 +513,7 @@ fn decode_one_field_at(
         }
         Some(FieldType::Binary) => decode_binary(data, bit_offset, bit_length),
         Some(FieldType::Mmsi) => decode_mmsi(data, bit_offset, bit_length),
-        Some(FieldType::Pgn) => decode_pgn_field(data, bit_offset, bit_length),
+        Some(FieldType::Pgn) => decode_pgn_field(data, bit_offset, bit_length, db),
         Some(FieldType::Date) => decode_date(data, bit_offset, bit_length),
         Some(FieldType::Time) | Some(FieldType::Duration) => {
             decode_time(f, data, bit_offset, bit_length, signed)
@@ -531,7 +541,7 @@ fn decode_one_field_at(
     // Update the running context based on what we just decoded so the
     // next field can interpret VARIABLE / FIELD_INDEX correctly.
     match &value {
-        FieldValue::Pgn(p) => ctx.target_pgn = Some(*p),
+        FieldValue::Pgn { value: p, .. } => ctx.target_pgn = Some(*p),
         FieldValue::Integer(n) if matches!(f.field_type, Some(FieldType::FieldIndex)) => {
             ctx.current_param_idx = Some(*n as u32);
         }
@@ -739,7 +749,7 @@ fn decode_bitlookup(
     if raw == 0 {
         return FieldValue::NotAvailable;
     }
-    let mut names = Vec::new();
+    let mut bits = Vec::new();
     if let Some(t) = f
         .lookup_bit_enumeration
         .as_deref()
@@ -747,11 +757,11 @@ fn decode_bitlookup(
     {
         for v in &t.values {
             if raw & (1u64 << v.bit) != 0 {
-                names.push(v.name.clone());
+                bits.push((1u64 << v.bit, v.name.clone()));
             }
         }
     }
-    FieldValue::BitField { value: raw, names }
+    FieldValue::BitField { value: raw, bits }
 }
 
 fn decode_reserved(
@@ -874,7 +884,7 @@ fn decode_mmsi(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
     FieldValue::Mmsi(ex.value as u32)
 }
 
-fn decode_pgn_field(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
+fn decode_pgn_field(data: &[u8], bit_offset: u32, bit_length: u32, db: &PgnDatabase) -> FieldValue {
     if bit_length != 24 {
         return FieldValue::Unsupported {
             field_type: "PGN (non-24-bit)",
@@ -892,7 +902,24 @@ fn decode_pgn_field(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue
     } else {
         raw & 0x00ff_ffff
     };
-    FieldValue::Pgn(pgn)
+    // canboat only emits a name for the PGN field when there's
+    // unambiguously one variant *without* `Match` constraints — that
+    // is, the PGN number alone is enough to identify the message. PGN
+    // 130820 (42 manufacturer variants, all match-gated) and PGN 65410
+    // (one Airmar-only variant gated on Manufacturer Code) both fall
+    // back to "value only" because we can't tell which variant applies
+    // without actually decoding payload data.
+    let variants: Vec<&PgnInfo> = db.pgn_variants(pgn).collect();
+    let description =
+        if variants.len() == 1 && !variants[0].fields.iter().any(|f| f.match_value.is_some()) {
+            Some(variants[0].description.clone())
+        } else {
+            None
+        };
+    FieldValue::Pgn {
+        value: pgn,
+        description,
+    }
 }
 
 fn decode_date(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
@@ -930,7 +957,10 @@ fn decode_time(
         return FieldValue::NotAvailable;
     }
     let resolution = f.resolution.unwrap_or(1.0);
-    FieldValue::Time(ex.value as f64 * resolution)
+    FieldValue::Time {
+        raw: ex.value,
+        seconds: ex.value as f64 * resolution,
+    }
 }
 
 fn decode_string_fix(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {

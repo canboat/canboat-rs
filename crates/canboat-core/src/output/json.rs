@@ -182,6 +182,10 @@ fn write_field_value<W: fmt::Write>(
                     // Matches print.c when showJsonEmpty is false.
                     (None, false) => {}
                 }
+                // Same primary-key annotation rule as Integer.
+                if f.part_of_primary_key {
+                    w.write_str(",\"key\":true")?;
+                }
                 w.write_char('}')
             } else {
                 match name {
@@ -190,12 +194,25 @@ fn write_field_value<W: fmt::Write>(
                 }
             }
         }
-        FieldValue::BitField { names, value } => {
-            if names.is_empty() {
+        FieldValue::BitField { bits, value } => {
+            if bits.is_empty() {
                 write!(w, "{}", value)
-            } else {
+            } else if opts.name_value {
+                // -nv: [{"value":bit_value,"name":"..."},...]
                 w.write_char('[')?;
-                for (i, n) in names.iter().enumerate() {
+                for (i, (bv, n)) in bits.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(',')?;
+                    }
+                    write!(w, "{{\"value\":{},\"name\":", bv)?;
+                    write_json_string(w, n)?;
+                    w.write_char('}')?;
+                }
+                w.write_char(']')
+            } else {
+                // Plain JSON: bare-string array.
+                w.write_char('[')?;
+                for (i, (_, n)) in bits.iter().enumerate() {
                     if i > 0 {
                         w.write_char(',')?;
                     }
@@ -208,19 +225,55 @@ fn write_field_value<W: fmt::Write>(
         FieldValue::Date(d) => {
             let mut buf = String::with_capacity(10);
             super::format_date(*d, &mut buf)?;
-            write_json_string(w, &buf)
+            if opts.name_value {
+                // canboat -nv: {"value":<days>,"name":"YYYY.MM.DD"}
+                w.write_str("{\"value\":")?;
+                write!(w, "{}", d)?;
+                w.write_str(",\"name\":")?;
+                write_json_string(w, &buf)?;
+                w.write_char('}')
+            } else {
+                write_json_string(w, &buf)
+            }
         }
-        FieldValue::Time(s) => {
+        FieldValue::Time { raw, seconds } => {
             let p = effective_precision(f.precision, f.resolution);
             let mut buf = String::with_capacity(12);
-            super::format_time(*s, p, &mut buf)?;
-            write_json_string(w, &buf)
+            super::format_time(*seconds, p, &mut buf)?;
+            if opts.name_value {
+                // canboat -nv: {"value":<raw>,"name":"HH:MM:SS.SSSS"}
+                w.write_str("{\"value\":")?;
+                write!(w, "{}", raw)?;
+                w.write_str(",\"name\":")?;
+                write_json_string(w, &buf)?;
+                w.write_char('}')
+            } else {
+                write_json_string(w, &buf)
+            }
         }
         FieldValue::Mmsi(v) => {
-            // canboat emits MMSI as a 9-digit zero-padded string.
-            write!(w, "\"{:09}\"", v)
+            // canboat emits MMSI as a 9-digit zero-padded string. Under
+            // -nv, primary-key MMSI fields wear the same {"value":...,
+            // "key":true} annotation as primary-key integers.
+            if opts.name_value && f.part_of_primary_key {
+                write!(w, "{{\"value\":\"{:09}\",\"key\":true}}", v)
+            } else {
+                write!(w, "\"{:09}\"", v)
+            }
         }
-        FieldValue::Pgn(v) => write!(w, "{}", v),
+        FieldValue::Pgn { value, description } => {
+            if opts.name_value {
+                w.write_char('{')?;
+                write!(w, "\"value\":{}", value)?;
+                if let Some(desc) = description {
+                    w.write_str(",\"name\":")?;
+                    write_json_string(w, desc)?;
+                }
+                w.write_char('}')
+            } else {
+                write!(w, "{}", value)
+            }
+        }
         FieldValue::Reserved { bytes, .. } => {
             // canboat emits Reserved as the field's raw bytes hex-
             // stringified, uppercase, in JSON (and -nv) output.

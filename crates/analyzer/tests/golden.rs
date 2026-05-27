@@ -146,3 +146,18 @@ fn pgn_test_json() {
     // in memory (happens to be `0.00000`), we correctly drop it.
     run_case_skipping("pgn-test.in", "pgn-test-json.out", &["--json"], &[6]);
 }
+
+/// Same corpus as `pgn_test_json` but with `--nv`, exercising the
+/// `{"value":N,"name":"..."}` lookup-object form, `"key":true`
+/// annotation on primary-key Lookup / MMSI fields, the bit-flag
+/// object form for BITLOOKUP, and the {value,name} wrappers for
+/// Date / Time / Pgn fields.
+#[test]
+fn pgn_test_json_nv() {
+    run_case_skipping(
+        "pgn-test.in",
+        "pgn-test-json-nv.out",
+        &["--json", "--nv"],
+        &[6],
+    );
+}

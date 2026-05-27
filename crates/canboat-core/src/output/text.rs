@@ -115,11 +115,11 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result 
                 write!(w, "{}", value)
             }
         }
-        FieldValue::BitField { names, value } => {
-            if names.is_empty() {
+        FieldValue::BitField { bits, value } => {
+            if bits.is_empty() {
                 write!(w, "{}", value)
             } else {
-                for (i, n) in names.iter().enumerate() {
+                for (i, (_, n)) in bits.iter().enumerate() {
                     if i > 0 {
                         w.write_str(", ")?;
                     }
@@ -130,12 +130,12 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result 
         }
         FieldValue::String(s) => w.write_str(s),
         FieldValue::Date(d) => format_date(*d, w),
-        FieldValue::Time(s) => {
+        FieldValue::Time { seconds, .. } => {
             let p = effective_precision(f.precision, f.resolution);
-            format_time(*s, p, w)
+            format_time(*seconds, p, w)
         }
         FieldValue::Mmsi(v) => write!(w, "{:09}", v),
-        FieldValue::Pgn(v) => write!(w, "{}", v),
+        FieldValue::Pgn { value, .. } => write!(w, "{}", value),
         FieldValue::Reserved { .. } | FieldValue::Spare { .. } => Ok(()),
         FieldValue::IsoName { value, subfields } => {
             // canboat text format: 0x<hex> name = [<sub1>;<sub2>;...]

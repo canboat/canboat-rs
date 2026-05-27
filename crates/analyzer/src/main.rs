@@ -235,11 +235,16 @@ fn run_loop<R: BufRead, W: Write>(
 
         // Fast-packet reassembly: single-frame PGNs and already-
         // coalesced frames (len > 8) pass through immediately;
-        // fast-packet PGNs accumulate until complete.
+        // fast-packet PGNs accumulate until complete. Unknown PGNs
+        // fall through to a `Fallback: true` catch-all (e.g. the
+        // `0x1FF00-0x1FFFF: Manufacturer Specific fast-packet
+        // non-addressed` stub) so proprietary PGNs that aren't in
+        // canboat.json still reassemble correctly.
         let packet_type = if coalesced_mode {
             FramePacketType::Other
         } else {
             db.first_pgn(frame.pgn)
+                .or_else(|| db.fallback_pgn(frame.pgn))
                 .map(|p| match p.packet_type {
                     PacketType::Fast => FramePacketType::Fast,
                     PacketType::Single => FramePacketType::Single,

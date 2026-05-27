@@ -204,9 +204,7 @@ impl PgnDatabase {
     ///      `0x1ef00ManufacturerProprietaryFastPacketAddressed`.
     pub fn pick_variant(&self, frame: &RawFrame) -> Option<&PgnInfo> {
         let mut in_pgn_fallback: Option<&PgnInfo> = None;
-        let mut saw_variant = false;
         for info in self.pgn_variants(frame.pgn) {
-            saw_variant = true;
             let mut has_match = false;
             let mut all_ok = true;
             for f in &info.fields {
@@ -251,10 +249,14 @@ impl PgnDatabase {
         if let Some(v) = in_pgn_fallback {
             return Some(v);
         }
-        if !saw_variant {
-            return self.find_catchall(frame.pgn);
-        }
-        None
+        // Either there were no entries for this PGN at all, or every
+        // entry had `Match` fields that didn't match the frame's bits
+        // (Maretron-specific PGN 130823 seen on a Navico bus, etc.).
+        // Mirror canboat's `searchForUnknownPgn` — walk the load order
+        // and return the most recent `Fallback: true` entry whose PGN
+        // is <= the unknown one. Same range stub used for PGNs that
+        // aren't in canboat.json.
+        self.find_catchall(frame.pgn)
     }
 
     /// Inter-PGN catch-all: the latest `Fallback: true` definition
@@ -400,17 +402,31 @@ fn decode_repeating(
     // Look up the count from the already-decoded fields when a count
     // field is set; otherwise repeat until the payload runs out
     // (matches canboat's default g_variableFieldRepeat[0] = 255 path).
-    let max_iters: u32 = count_field_order
-        .and_then(|cf| {
-            out.iter()
-                .find(|d| (d.order as u32) == cf)
-                .and_then(|d| match &d.value {
-                    FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
-                    FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),
-                    _ => None,
-                })
-        })
-        .unwrap_or(u32::MAX);
+    // Canboat's `printFields` always enters the repeat block with
+    // `repetition = 1` once it reaches the set's start field, even
+    // when the count field decoded to zero (see analyzer.c:1284 vs
+    // 1300). The decremented `variableFields` counter only triggers
+    // *additional* loops, so count=0 yields exactly one iteration as
+    // long as payload remains. Match that here: floor count at 1
+    // when it's set, fall back to "iterate until payload runs out"
+    // when the count field is NotAvailable or otherwise unresolved.
+    let raw_count: Option<u32> = count_field_order.and_then(|cf| {
+        out.iter()
+            .find(|d| (d.order as u32) == cf)
+            .and_then(|d| match &d.value {
+                FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
+                FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),
+                _ => None,
+            })
+    });
+    // count=0 still produces exactly one (truncated) iteration — see
+    // the long comment above the call site. Track this case so the text
+    // formatter only labels the *first* field with " 1".
+    let count_was_zero = raw_count == Some(0);
+    let max_iters: u32 = match raw_count {
+        Some(n) => n.max(1),
+        None => u32::MAX,
+    };
 
     let set = &info.fields[start_idx..start_idx + set_size];
     if set.is_empty() {
@@ -430,6 +446,7 @@ fn decode_repeating(
         }
         let mut sub_cursor = iter_cursor;
         let mut produced_any = false;
+        let mut first_field_of_iter = true;
         for sf in set {
             if sf.condition.is_some() {
                 continue;
@@ -443,8 +460,18 @@ fn decode_repeating(
                 sub_cursor
             };
             if let Some((mut d, bits)) = decode_one_field_at(sf, info, data, db, off, ctx) {
-                d.repeat_index = Some(iter);
+                // Canboat's `repetition` counter is reset to 0 at the
+                // top of each loop iteration when `*variableFields == 0`
+                // — so a forced count=0 iteration only labels its first
+                // field. Drop `repeat_index` (but keep `repeat_set` for
+                // JSON list-grouping) on later fields to match.
                 d.repeat_set = set_number;
+                d.repeat_index = if count_was_zero && !first_field_of_iter {
+                    None
+                } else {
+                    Some(iter)
+                };
+                first_field_of_iter = false;
                 out.push(d);
                 sub_cursor = off + bits;
                 produced_any = true;
@@ -868,13 +895,18 @@ fn decode_iso_name(data: &[u8], bit_offset: u32, bit_length: u32, db: &PgnDataba
 fn decode_binary(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
     let bit_offset = bit_offset as usize;
     let bit_length = bit_length as usize;
-    // Whole-byte aligned: take a clean slice.
+    // Whole-byte aligned: take a clean slice. Fallback PGNs like the
+    // proprietary catch-alls declare BINARY widths well past the
+    // actual payload (e.g. 1768 bits for `Data` in PGN 126720) —
+    // canboat just renders whatever bytes are present, so clamp to
+    // the available range rather than emitting NotAvailable.
     if bit_offset & 7 == 0 && bit_length & 7 == 0 {
         let start = bit_offset / 8;
-        let end = start + bit_length / 8;
-        if end > data.len() {
+        if start >= data.len() {
             return FieldValue::NotAvailable;
         }
+        let declared_end = start + bit_length / 8;
+        let end = declared_end.min(data.len());
         return FieldValue::Binary(data[start..end].to_vec());
     }
     // Bit-aligned binary: pack into bytes LSB-first to keep round-trip

@@ -249,6 +249,26 @@ impl PgnDatabase {
             .map(|&i| &self.pgns[i])
     }
 
+    /// Find a catch-all "fallback" PGN definition for an unknown
+    /// `pgn`. Mirrors canboat's `searchForUnknownPgn` (analyzer/pgn.c):
+    /// walk the load-ordered list, remember the most recent entry with
+    /// `Fallback: true`, and stop once we pass `pgn`. The accumulated
+    /// fallback is returned — these definitions describe the generic
+    /// "0x1FF00-0x1FFFF: Manufacturer Specific fast-packet
+    /// non-addressed"–style stubs.
+    pub fn fallback_pgn(&self, pgn: u32) -> Option<&PgnInfo> {
+        let mut fallback: Option<&PgnInfo> = None;
+        for info in &self.pgns {
+            if info.fallback == Some(true) {
+                fallback = Some(info);
+            }
+            if info.pgn >= pgn {
+                break;
+            }
+        }
+        fallback
+    }
+
     /// Look up an enum table by name (e.g. `"MANUFACTURER_CODE"`).
     pub fn lookup(&self, name: &str) -> Option<&LookupTable> {
         self.lookups.get(name)

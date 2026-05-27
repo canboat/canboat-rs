@@ -47,8 +47,6 @@ pub enum Reassembled {
 pub enum ReassemblyError {
     #[error("fast-packet frame received with empty data")]
     EmptyData,
-    #[error("duplicate frame index {frame} for pgn {pgn} src {src}")]
-    DuplicateFrame { pgn: u32, src: u8, frame: u32 },
     #[error("no reassembly slot available; dropped pgn {pgn} src {src}")]
     OutOfSlots { pgn: u32, src: u8 },
 }
@@ -153,16 +151,20 @@ impl Reassembler {
             },
         };
 
-        // Detect duplicate frame index within this sequence.
+        // Detect duplicate frame index within this sequence — same
+        // (pgn, src, seq) saw this frame index before, so the previous
+        // assembly was incomplete. Log the incident (canboat emits an
+        // ERROR line on stderr here) but still place this frame as the
+        // start of a *fresh* attempt: zero the bitmask, keep `size` /
+        // `all_frames` from frame 0 so the in-flight non-zero indices
+        // can still complete a payload. Matches analyzer.c:811-815.
         if self.slots[slot_idx].frames & (1u32 << frame_index) != 0 {
-            // Discard the existing partial assembly and start over.
+            log::warn!(
+                "Received incomplete fast packet PGN {} from source {}",
+                frame.pgn,
+                frame.src,
+            );
             self.slots[slot_idx].frames = 0;
-            self.slots[slot_idx].size = 0;
-            return Reassembled::Error(ReassemblyError::DuplicateFrame {
-                pgn: frame.pgn,
-                src: frame.src,
-                frame: frame_index,
-            });
         }
 
         // Frame 0 carries the total payload size in data[1].
@@ -373,17 +375,20 @@ mod tests {
     }
 
     #[test]
-    fn detects_duplicate_frame() {
+    fn duplicate_frame_resets_slot_and_keeps_processing() {
+        // Canboat treats a duplicate frame index as "the previous
+        // partial was lost"; it logs an incomplete-fast-packet warning,
+        // zeroes the bitmask and treats the new frame as the start of
+        // a fresh attempt within the same slot. Verify the new frame
+        // ends up placed (i.e., the slot still says it's partial, not
+        // an error variant).
         let mut r = Reassembler::new();
-        let f0 = frame(129029, 0, vec![0x00, 14, 0, 0, 0, 0, 0, 0]);
+        let f0 = frame(129029, 0, vec![0x00, 14, 0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5]);
         assert_eq!(
             r.push(f0.clone(), FramePacketType::Fast),
             Reassembled::Partial
         );
-        // Same frame index again — should error and reset the slot.
-        match r.push(f0, FramePacketType::Fast) {
-            Reassembled::Error(ReassemblyError::DuplicateFrame { frame: 0, .. }) => (),
-            other => panic!("expected duplicate-frame error, got {other:?}"),
-        }
+        // Duplicate frame index — must not return an Error variant.
+        assert_eq!(r.push(f0, FramePacketType::Fast), Reassembled::Partial);
     }
 }

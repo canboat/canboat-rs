@@ -84,13 +84,16 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
         w.write_char(' ')?;
         // Repeating fields get their 1-based iteration index appended
         // to disambiguate at the top level (text mode can't nest like
-        // JSON's "list":[{...}]).
-        if f.repeat_set != 0 {
+        // JSON's "list":[{...}]). When `repeat_index` is None the field
+        // belongs to a forced count=0 iteration past its first field —
+        // canboat's `repetition` counter resets to 0 there, so the
+        // suffix is suppressed for these fields only.
+        if f.repeat_set != 0 && f.repeat_index.is_some() {
             write!(
                 w,
                 "{name} {iter} = ",
                 name = f.name,
-                iter = f.repeat_index.unwrap_or(0) + 1,
+                iter = f.repeat_index.unwrap() + 1,
             )?;
         } else {
             write!(w, "{name} = ", name = f.name)?;

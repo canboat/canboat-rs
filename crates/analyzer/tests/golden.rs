@@ -213,3 +213,16 @@ fn pgn_65379_text_debug() {
 fn short_frame_text_debug() {
     run_case("short-frame.in", "short-frame.out", &["--debug"]);
 }
+
+/// Big multi-scenario fast-packet recombination test. Covers in-order
+/// frames with interspersed short frames, two parallel fast-packets
+/// from the same source, out-of-order frames, a sequence where the
+/// duplicate-frame-index recovery has to discard a partial and
+/// continue, and a 32-frame (max-size) fast-packet from an unknown
+/// PGN that has to fall through to the `0x1FF00-0x1FFFF` catch-all.
+/// Exercises: reassembly slot reuse, fallback PGN lookup, the count=0
+/// repeating-set quirk, BINARY field width clamping.
+#[test]
+fn recombine_frames_text_debug() {
+    run_case("recombine-frames.in", "recombine-frames.out", &["--debug"]);
+}

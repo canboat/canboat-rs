@@ -162,6 +162,13 @@ fn run_loop<R: BufRead, W: Write>(
     line_buf: &mut String,
 ) -> Result<()> {
     let mut active_format = forced_format;
+    // Canboat's PLAIN_OR_FAST mode locks into "coalesced" once any
+    // line carries more than 8 payload bytes — from then on every
+    // frame is assumed to be pre-assembled and the reassembler is
+    // skipped. We do the same so single-line FAST captures (e.g.
+    // pgn-test.in's mix of 8-byte and 43-byte payloads) decode
+    // identically to the C analyzer.
+    let mut coalesced_mode = false;
     while let Some(line) = reader.next_line().context("reading input line")? {
         if line.is_empty() || line.starts_with('#') {
             continue;
@@ -199,17 +206,30 @@ fn run_loop<R: BufRead, W: Write>(
             }
         }
 
+        // Once any line has > 8 payload bytes, assume the rest of
+        // the stream is also pre-assembled FAST and skip reassembly
+        // for everything that follows. Matches canboat's
+        // RAWFORMAT_PLAIN_OR_FAST → RAWFORMAT_FAST lock-in
+        // (analyzer.c:431) which also flips multiPackets to
+        // COALESCED.
+        if frame.data.len() > 8 {
+            coalesced_mode = true;
+        }
+
         // Fast-packet reassembly: single-frame PGNs and already-
         // coalesced frames (len > 8) pass through immediately;
         // fast-packet PGNs accumulate until complete.
-        let packet_type = db
-            .first_pgn(frame.pgn)
-            .map(|p| match p.packet_type {
-                PacketType::Fast => FramePacketType::Fast,
-                PacketType::Single => FramePacketType::Single,
-                _ => FramePacketType::Other,
-            })
-            .unwrap_or(FramePacketType::Other);
+        let packet_type = if coalesced_mode {
+            FramePacketType::Other
+        } else {
+            db.first_pgn(frame.pgn)
+                .map(|p| match p.packet_type {
+                    PacketType::Fast => FramePacketType::Fast,
+                    PacketType::Single => FramePacketType::Single,
+                    _ => FramePacketType::Other,
+                })
+                .unwrap_or(FramePacketType::Other)
+        };
         let assembled = match reasm.push(frame, packet_type) {
             Reassembled::PassThrough(f) | Reassembled::Complete(f) => f,
             Reassembled::Partial => continue,

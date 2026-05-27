@@ -119,7 +119,16 @@ fn write_field_value<W: fmt::Write>(
     match &f.value {
         FieldValue::Number(v) => {
             let p = effective_precision(f.precision, f.resolution);
-            write!(w, "{:.*}", p, v)
+            // canboat's fieldPrintLatLon uses `%10.7f` — width 10
+            // + precision 7 — which left-pads short longitudes
+            // (`5.1815566` → ` 5.1815566`). We detect that field type
+            // by the load-time precision=7 + unit=deg signal set in
+            // db.rs.
+            if p == 7 && f.unit.as_deref() == Some("deg") {
+                write!(w, "{:>10.7}", v)
+            } else {
+                write!(w, "{:.*}", p, v)
+            }
         }
         FieldValue::Integer(v) => {
             // Under -nv, primary-key fields wear an annotation matching

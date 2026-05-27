@@ -274,10 +274,12 @@ fn decode_fields(
     while i < info.fields.len() {
         let f = &info.fields[i];
 
-        // Repeating set 1 starts here?
-        if let (Some(start), Some(size), Some(cf)) = (start1, size1, count_field1) {
+        // Repeating set 1 starts here? `count_field1` can be absent
+        // (e.g. PGN 126464 PGN List) — in that case canboat repeats
+        // until the payload runs out.
+        if let (Some(start), Some(size)) = (start1, size1) {
             if (f.order as u32) == start {
-                decode_repeating(info, data, db, &mut out, i, size as usize, cf);
+                decode_repeating(info, data, db, &mut out, i, size as usize, count_field1);
                 i += size as usize;
                 continue;
             }
@@ -302,32 +304,48 @@ fn decode_repeating(
     out: &mut Vec<DecodedField>,
     start_idx: usize,
     set_size: usize,
-    count_field_order: u32,
+    count_field_order: Option<u32>,
 ) {
-    // Look up the count from the already-decoded fields. canboat's
-    // count field is always non-repeating and decoded earlier in the
-    // same walk.
-    let count = out
-        .iter()
-        .find(|d| (d.order as u32) == count_field_order)
-        .and_then(|d| match &d.value {
-            FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
-            FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),
-            _ => None,
+    // Look up the count from the already-decoded fields when a count
+    // field is set; otherwise repeat until the payload runs out
+    // (matches canboat's default g_variableFieldRepeat[0] = 255 path).
+    let max_iters: u32 = count_field_order
+        .and_then(|cf| {
+            out.iter()
+                .find(|d| (d.order as u32) == cf)
+                .and_then(|d| match &d.value {
+                    FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
+                    FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),
+                    _ => None,
+                })
         })
-        .unwrap_or(0);
+        .unwrap_or(u32::MAX);
 
     let set = &info.fields[start_idx..start_idx + set_size];
     let iter_bits: u32 = set.iter().map(|sf| sf.bit_length.unwrap_or(0)).sum();
+    if iter_bits == 0 {
+        return;
+    }
+    let payload_bits = (data.len() as u32).saturating_mul(8);
 
-    for iter in 0..count {
+    for iter in 0..max_iters {
+        // Bail when the next iteration's first byte is past the
+        // payload. The decoder also returns NotAvailable in that
+        // case but we want to avoid emitting empty objects in the
+        // JSON `list` array.
+        let first_field_offset =
+            set.iter().find_map(|f| f.bit_offset).unwrap_or(0) + iter * iter_bits;
+        if first_field_offset >= payload_bits {
+            break;
+        }
+
+        let mut produced_any = false;
         for sf in set {
             if sf.condition.is_some() {
                 continue;
             }
             // Clone the field metadata and shift its bit_offset for
-            // this iteration. Cloning is cheap (mostly Strings that
-            // get re-cloned downstream into the DecodedField anyway).
+            // this iteration.
             let mut sf_shifted = sf.clone();
             if let Some(bo) = sf_shifted.bit_offset {
                 sf_shifted.bit_offset = Some(bo + iter * iter_bits);
@@ -335,7 +353,13 @@ fn decode_repeating(
             if let Some(mut d) = decode_one_field(&sf_shifted, info, data, db) {
                 d.repeat_index = Some(iter);
                 out.push(d);
+                produced_any = true;
             }
+        }
+        // If this iteration produced nothing decodable, stop — we ran
+        // off the end of the payload.
+        if !produced_any {
+            break;
         }
     }
 }
@@ -417,14 +441,23 @@ fn decode_number(
     bit_offset: u32,
     bit_length: u32,
     signed: bool,
-    offset_k: i64,
+    _offset_k: i64,
 ) -> FieldValue {
+    // canboat.json's `Offset` is in DISPLAY units (e.g. PEUKERT_EXPONENT
+    // Offset=1 means "add 1.0 to the displayed exponent"), NOT a raw
+    // J1939 Excess-K shift on the integer extraction. canboat C also
+    // forces unsigned extraction when `Offset != 0` regardless of the
+    // field's nominal Signed flag — see extractNumber's
+    // `if (hasSign && field->offset)` path. Replicate both here.
+    let display_offset = f.offset.map(|o| o as f64).unwrap_or(0.0);
+    let has_display_offset = f.offset.unwrap_or(0) != 0;
+    let effective_signed = if has_display_offset { false } else { signed };
     let Some(ex) = extract_bits(
         data,
         bit_offset as usize,
         bit_length as usize,
-        signed,
-        offset_k,
+        effective_signed,
+        0,
     ) else {
         return FieldValue::NotAvailable;
     };
@@ -433,11 +466,15 @@ fn decode_number(
     }
     let resolution = f.resolution.unwrap_or(1.0);
     let unit = f.unit.as_deref();
-    if resolution == 1.0 && unit.is_none() && f.physical_quantity.is_none() && f.unit_offset == 0.0
+    if resolution == 1.0
+        && unit.is_none()
+        && f.physical_quantity.is_none()
+        && f.unit_offset == 0.0
+        && display_offset == 0.0
     {
         FieldValue::Integer(ex.value)
     } else {
-        FieldValue::Number(ex.value as f64 * resolution + f.unit_offset)
+        FieldValue::Number(ex.value as f64 * resolution + display_offset + f.unit_offset)
     }
 }
 
@@ -521,6 +558,12 @@ fn decode_bitlookup(
         return FieldValue::NotAvailable;
     };
     let raw = ex.value as u64;
+    // canboat drops BITLOOKUP fields whose value is zero (no flags set)
+    // in JSON output. Map them to NotAvailable so the formatter's
+    // omit-empty logic kicks in.
+    if raw == 0 {
+        return FieldValue::NotAvailable;
+    }
     let mut names = Vec::new();
     if let Some(t) = f
         .lookup_bit_enumeration

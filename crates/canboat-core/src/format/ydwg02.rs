@@ -29,6 +29,11 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     }
     let mut toks = line.split_whitespace();
     let time_tok = toks.next().ok_or(ParseError::MissingTimestamp)?;
+    // YDWG02 carries time-of-day only — synthesize an ISO date from
+    // the host's local clock so downstream emitters can produce the
+    // same `<YYYY-MM-DD>T<HH:MM:SS.mmm>` shape canboat C does
+    // (`parse.c:parseRawFormatYDWG02`).
+    let timestamp = synth_iso_timestamp(time_tok);
     let _dir = toks.next().ok_or(ParseError::BadHeader {
         expected: 3,
         found: 1,
@@ -53,7 +58,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     }
 
     Ok(RawFrame {
-        timestamp: Some(time_tok.to_string()),
+        timestamp: Some(timestamp),
         prio,
         pgn,
         src,
@@ -62,18 +67,65 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     })
 }
 
+/// Synthesize `<YYYY-MM-DD>T<time>` from the host clock. Falls back
+/// to just `time` if the system clock isn't readable (e.g. the test
+/// environment freezes time). Mirrors canboat's `parseRawFormatYDWG02`
+/// which does `localtime_r + strftime("%Y-%m-%dT")` then appends the
+/// parsed time-of-day verbatim.
+fn synth_iso_timestamp(time: &str) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    // We don't pull in chrono here — compute the civil date from the
+    // Howard-Hinnant days→YMD algorithm we already have in
+    // `output/mod.rs`. Keep it inlined to avoid widening the
+    // pub(crate) surface.
+    let days = secs.div_euclid(86_400);
+    let (y, m, d) = days_to_ymd(days);
+    format!("{y:04}-{m:02}-{d:02}T{time}")
+}
+
+/// Days-since-1970-01-01 → `(year, month, day)`. Public-domain
+/// civil-from-days algorithm (Howard Hinnant). Duplicated here so the
+/// YDWG02 parser doesn't depend on `output/`.
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 /// Decompose an ISO 11783 29-bit CAN identifier into (prio, pgn, src, dst).
-/// PDU1 (PF < 240): PGN = PF << 8; dst = PS.
-/// PDU2 (PF ≥ 240): PGN = (PF << 8) | PS; dst = 255 (broadcast).
+/// Matches `getISO11783BitsFromCanId` in canboat/common/common.c.
+///
+///   priority (3 bits) | reserved+dp (2 bits) | PF (8) | PS (8) | SA (8)
+///
+/// - PDU1 (PF < 240): PGN = (RDP << 16) | (PF << 8); dst = PS.
+/// - PDU2 (PF ≥ 240): PGN = (RDP << 16) | (PF << 8) | PS; dst = 255.
+///
+/// The RDP (Reserved + DataPage) bits are the two just below the
+/// priority bits — they push PGNs above 0x10000 into the data-page-1
+/// range (e.g. CAN-id 0x09FD020D → PGN 130306 = 0x1FD02, not 0xFD02).
 pub(crate) fn iso11783_decompose(id: u32) -> (u8, u32, u8, u8) {
     let prio = ((id >> 26) & 0x7) as u8;
+    let rdp = (id >> 24) & 0x3;
     let pf = ((id >> 16) & 0xff) as u8;
     let ps = ((id >> 8) & 0xff) as u8;
     let src = (id & 0xff) as u8;
     let (pgn, dst) = if pf < 240 {
-        ((pf as u32) << 8, ps)
+        ((rdp << 16) | ((pf as u32) << 8), ps)
     } else {
-        ((pf as u32) << 8 | ps as u32, 0xff)
+        ((rdp << 16) | ((pf as u32) << 8) | ps as u32, 0xff)
     };
     (prio, pgn, src, dst)
 }
@@ -84,14 +136,26 @@ mod tests {
 
     #[test]
     fn parses_ydwg02_pdu2_frame() {
-        // CAN id 0x0DF50B23: prio=3, PF=0xF5, PS=0x0B → PGN 0xF50B (62731).
-        // Wait — PF=0xF5 >= 240 → PDU2, PGN = 0xF50B = 62731, dst=255.
-        // src = 0x23 = 35.
+        // CAN id 0x0DF50B23 — bits laid out as
+        //   prio (3) | RDP (2) | PF (8) | PS (8) | SA (8)
+        // = 011_01_11110101_00001011_00100011
+        //   prio=3, RDP=1, PF=0xF5, PS=0x0B, SA=0x23.
+        // PF >= 240 → PDU2; PGN = (RDP<<16) | (PF<<8) | PS = 0x1F50B
+        // = 128267 (canboat's "Position, Rapid Update"); dst=255.
         let line = "00:17:55.475 R 0DF50B23 FF FF FF FF FF 00 00 FF";
         let f = parse_line(line).unwrap();
-        assert_eq!(f.timestamp.as_deref(), Some("00:17:55.475"));
+        // YDWG02 synthesises an ISO date from the host clock; the time
+        // portion must round-trip verbatim regardless of which day the
+        // test runs.
+        assert!(
+            f.timestamp
+                .as_deref()
+                .is_some_and(|t| t.ends_with("T00:17:55.475")),
+            "timestamp: {:?}",
+            f.timestamp
+        );
         assert_eq!(f.prio, 3);
-        assert_eq!(f.pgn, 0xf50b);
+        assert_eq!(f.pgn, 0x1f50b);
         assert_eq!(f.src, 0x23);
         assert_eq!(f.dst, 0xff);
         assert_eq!(f.data.len(), 8);

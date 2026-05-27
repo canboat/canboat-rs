@@ -157,6 +157,22 @@ fn run(cli: Cli) -> Result<()> {
     let mut line_buf = String::with_capacity(512);
     let mut reasm = Reassembler::new();
 
+    // canboat's analyzer leads with a one-line JSON banner declaring
+    // the database version and the active output knobs (see
+    // analyzer.c:354-365). `-fixtime` suppresses it — *unless* the
+    // fixed timestamp string contains "n2kd", in which case n2kd
+    // still wants the banner upstream of the PGN stream.
+    let suppress_banner = cli.fixtime.as_deref().is_some_and(|s| !s.contains("n2kd"));
+    if cli.json && !suppress_banner {
+        writeln!(
+            out,
+            "{{\"version\":\"{}\",\"units\":\"std\",\"showLookupValues\":{}}}",
+            db.version,
+            if cli.nv { "true" } else { "false" },
+        )
+        .context("writing JSON banner")?;
+    }
+
     let forced_format = cli.format.as_deref().map(parse_format_flag).transpose()?;
 
     // Two distinct input shapes — stdin vs a regular file — but the

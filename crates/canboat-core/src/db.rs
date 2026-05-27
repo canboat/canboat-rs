@@ -117,11 +117,12 @@ fn apply_non_si_unit_fixup_lookup(v: &mut LookupFieldTypeValue) {
     let Some(unit) = v.unit.as_deref() else {
         return;
     };
-    // Angle / angular-velocity entries map to ANGLE_FIX16 (signed) in
-    // canboat's C analyzer, but canboat.json strips that to "NUMBER".
-    // Restore the sign via the unit before the rad→deg conversion
-    // clobbers it.
-    if matches!(unit, "rad" | "rad/s") {
+    // Angle / angular-velocity / geo-coordinate entries map to a
+    // signed FIX type in canboat's C analyzer (ANGLE_FIX16,
+    // GEO_LAT_FIX32, etc.), but canboat.json strips that to plain
+    // "NUMBER". Restore the sign from the unit before the rad → deg
+    // conversion below clobbers it.
+    if matches!(unit, "rad" | "rad/s" | "deg" | "deg/s") {
         v.signed = true;
     }
     match unit {

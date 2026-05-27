@@ -15,7 +15,7 @@
 //! output bytes match canboat exactly (number formatting, key order,
 //! lack of whitespace, escape handling).
 
-use std::fmt;
+use std::fmt::{self, Write as _};
 
 use crate::decode::{DecodedField, DecodedPgn, FieldValue};
 
@@ -51,8 +51,13 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     w.write_str(",\"description\":")?;
     write_json_string(w, &pgn.description)?;
 
-    // Fields object — opens even if empty so consumers always see it.
-    w.write_str(",\"fields\":{")?;
+    // Build the body of the `fields` object into a buffer so we can
+    // skip the wrapping `,"fields":{ ... }` entirely when no field
+    // ends up emitted (canboat's `printPgn` defers the open separator
+    // until the first field — when every field is suppressed it just
+    // closes the top-level object without ever opening fields).
+    let mut fields_buf = String::new();
+    let w_fields = &mut fields_buf;
     let mut top_sep = "";
     // Active repeating-list state: which set (1 → "list", 2 → "list2")
     // and which iteration index we're inside.
@@ -117,52 +122,56 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
         // next; crossing iterations within the same set inserts "},{".
         if f.repeat_set == 0 {
             if current_set != 0 {
-                w.write_str("}]")?;
+                w_fields.write_str("}]")?;
                 current_set = 0;
                 current_iter = None;
             }
-            w.write_str(top_sep)?;
-            write_json_string(w, &f.name)?;
-            w.write_char(':')?;
-            write_field_value(w, f, opts, &pgn.data)?;
+            w_fields.write_str(top_sep)?;
+            write_json_string(w_fields, &f.name)?;
+            w_fields.write_char(':')?;
+            write_field_value(w_fields, f, opts, &pgn.data)?;
             top_sep = ",";
         } else {
             let iter = f.repeat_index.unwrap_or(0);
             if current_set != f.repeat_set {
                 if current_set != 0 {
-                    w.write_str("}]")?;
+                    w_fields.write_str("}]")?;
                 }
-                w.write_str(top_sep)?;
+                w_fields.write_str(top_sep)?;
                 let key = if f.repeat_set == 1 {
                     "\"list\":[{"
                 } else {
                     "\"list2\":[{"
                 };
-                w.write_str(key)?;
+                w_fields.write_str(key)?;
                 current_set = f.repeat_set;
                 current_iter = Some(iter);
                 top_sep = ",";
-                write_json_string(w, &f.name)?;
-                w.write_char(':')?;
-                write_field_value(w, f, opts, &pgn.data)?;
+                write_json_string(w_fields, &f.name)?;
+                w_fields.write_char(':')?;
+                write_field_value(w_fields, f, opts, &pgn.data)?;
             } else if Some(iter) != current_iter {
-                w.write_str("},{")?;
+                w_fields.write_str("},{")?;
                 current_iter = Some(iter);
-                write_json_string(w, &f.name)?;
-                w.write_char(':')?;
-                write_field_value(w, f, opts, &pgn.data)?;
+                write_json_string(w_fields, &f.name)?;
+                w_fields.write_char(':')?;
+                write_field_value(w_fields, f, opts, &pgn.data)?;
             } else {
-                w.write_char(',')?;
-                write_json_string(w, &f.name)?;
-                w.write_char(':')?;
-                write_field_value(w, f, opts, &pgn.data)?;
+                w_fields.write_char(',')?;
+                write_json_string(w_fields, &f.name)?;
+                w_fields.write_char(':')?;
+                write_field_value(w_fields, f, opts, &pgn.data)?;
             }
         }
     }
     if current_set != 0 {
-        w.write_str("}]")?;
+        w_fields.write_str("}]")?;
     }
-    w.write_char('}')?; // close "fields"
+    if !fields_buf.is_empty() {
+        w.write_str(",\"fields\":{")?;
+        w.write_str(&fields_buf)?;
+        w.write_char('}')?;
+    }
     w.write_char('}')?; // close top
     Ok(())
 }
@@ -689,12 +698,19 @@ mod tests {
     }
 
     #[test]
-    fn empty_fields_object_when_all_unavailable() {
+    fn fields_object_omitted_when_all_unavailable() {
+        // Canboat suppresses the `,"fields":{...}` wrapper entirely
+        // when no field actually prints — matches `printPgn`'s lazy
+        // open of the fields object. We do the same.
         let mut pgn = sample_pgn();
         pgn.fields[0].value = FieldValue::NotAvailable;
         let mut out = String::new();
         write_json(&mut out, &pgn, &JsonOptions::default()).unwrap();
-        assert!(out.ends_with(r#""fields":{}}"#), "got: {}", out);
+        assert!(
+            !out.contains("\"fields\""),
+            "fields wrapper leaked through: {out}"
+        );
+        assert!(out.ends_with("}"), "got: {out}");
     }
 
     #[test]

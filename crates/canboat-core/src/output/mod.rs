@@ -85,24 +85,30 @@ pub(crate) fn format_time(
     trim_zero_fraction: bool,
     w: &mut dyn std::fmt::Write,
 ) -> std::fmt::Result {
-    if !seconds.is_finite() || seconds < 0.0 {
+    if !seconds.is_finite() {
         return w.write_str("00:00:00");
     }
-    let whole = seconds.trunc() as u64;
+    // Negative values render as DURATION-style negatives (canboat does
+    // the same for DURATION_FIX*_MS-typed fields, e.g. a B&G key-value
+    // Race Timer at "-00:05:00.000").
+    let neg = seconds < 0.0;
+    let abs = seconds.abs();
+    let sign = if neg { "-" } else { "" };
+    let whole = abs.trunc() as u64;
     let h = whole / 3600;
     let m = (whole / 60) % 60;
     let s = whole % 60;
     if precision == 0 {
-        return write!(w, "{:02}:{:02}:{:02}", h, m, s);
+        return write!(w, "{sign}{:02}:{:02}:{:02}", h, m, s);
     }
-    let frac = (seconds - whole as f64) * 10f64.powi(precision as i32);
+    let frac = (abs - whole as f64) * 10f64.powi(precision as i32);
     let frac_rounded = frac.round() as u64;
     if trim_zero_fraction && frac_rounded == 0 {
-        write!(w, "{:02}:{:02}:{:02}", h, m, s)
+        write!(w, "{sign}{:02}:{:02}:{:02}", h, m, s)
     } else {
         write!(
             w,
-            "{:02}:{:02}:{:02}.{:0width$}",
+            "{sign}{:02}:{:02}:{:02}.{:0width$}",
             h,
             m,
             s,

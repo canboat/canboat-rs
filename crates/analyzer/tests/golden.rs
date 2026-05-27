@@ -120,14 +120,22 @@ fn run_case_skipping(in_name: &str, expected_name: &str, args: &[&str], skip_lin
 #[test]
 fn pgn_60928_json_nv() {
     // The simplest passing case: two PGN 60928 frames, JSON -nv.
-    run_case("pgn-60928.in", "pgn-60928-nv.out", &["--json", "--nv"]);
+    run_case(
+        "pgn-60928.in",
+        "pgn-60928-nv.out",
+        &["--json", "--nv", "--fixtime", "pgn-test"],
+    );
 }
 
 #[test]
 fn pgn_126983_json_nv() {
     // Exercises ISO_NAME recursive decode, Reserved-as-hex, and
     // PartOfPrimaryKey "key":true annotation.
-    run_case("pgn-126983.in", "pgn-126983-nv.out", &["--json", "--nv"]);
+    run_case(
+        "pgn-126983.in",
+        "pgn-126983-nv.out",
+        &["--json", "--nv", "--fixtime", "pgn-test"],
+    );
 }
 
 /// Big multi-PGN regression test (24 PGNs covering most field types,
@@ -144,7 +152,12 @@ fn pgn_test_json() {
     // Sats in View" frame. The last sat's `Range residuals` field
     // crosses the payload-end boundary; canboat extracts whatever was
     // in memory (happens to be `0.00000`), we correctly drop it.
-    run_case_skipping("pgn-test.in", "pgn-test-json.out", &["--json"], &[6]);
+    run_case_skipping(
+        "pgn-test.in",
+        "pgn-test-json.out",
+        &["--json", "--fixtime", "pgn-test"],
+        &[6],
+    );
 }
 
 /// Same corpus as `pgn_test_json` but with `--nv`, exercising the
@@ -157,7 +170,7 @@ fn pgn_test_json_nv() {
     run_case_skipping(
         "pgn-test.in",
         "pgn-test-json-nv.out",
-        &["--json", "--nv"],
+        &["--json", "--nv", "--fixtime", "pgn-test"],
         &[6],
     );
 }
@@ -171,7 +184,7 @@ fn pgn_test_actisense_json_nv_debug() {
     run_case(
         "pgn-test-actisense.in",
         "pgn-test-actisense.out",
-        &["--json", "--nv", "--debug"],
+        &["--json", "--nv", "--debug", "--fixtime", "pgn-test"],
     );
 }
 
@@ -226,7 +239,7 @@ fn pgn_test_json_debug() {
     run_case_skipping(
         "pgn-test.in",
         "pgn-test-json-debug.out",
-        &["--json", "--debug"],
+        &["--json", "--debug", "--fixtime", "pgn-test"],
         &[6],
     );
 }
@@ -240,7 +253,7 @@ fn pgn_test_json_nv_debug() {
     run_case_skipping(
         "pgn-test.in",
         "pgn-test-json-nv-debug.out",
-        &["--json", "--nv", "--debug"],
+        &["--json", "--nv", "--debug", "--fixtime", "pgn-test"],
         &[6],
     );
 }

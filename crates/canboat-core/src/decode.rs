@@ -588,6 +588,42 @@ fn decode_one_field_at(
         ));
     }
 
+    // STRING_LZ / BINARY with `BitLengthVariable: true` and no
+    // explicit `BitLength` — read to the payload end (canboat's
+    // equivalent: `if (*bits == 0)` in `fieldPrintBinary` /
+    // `printString`). Falls through to the normal decode path with a
+    // zero bit_length so the decoders know to consume what's left.
+    if matches!(
+        f.field_type,
+        Some(FieldType::StringLz) | Some(FieldType::Binary)
+    ) && f.bit_length.is_none()
+    {
+        let payload_bits = (data.len() as u32).saturating_mul(8);
+        let avail = payload_bits.saturating_sub(bit_offset);
+        let avail = avail - (avail & 7); // round down to whole bytes
+        let value = match f.field_type {
+            Some(FieldType::StringLz) => decode_string_lz(data, bit_offset, avail),
+            _ => decode_binary(data, bit_offset, avail),
+        };
+        return Some((
+            DecodedField {
+                order: f.order,
+                id: f.id.clone(),
+                name: f.name.clone(),
+                unit: f.unit.clone(),
+                resolution: f.resolution,
+                precision: f.precision,
+                repeat_index: None,
+                repeat_set: 0,
+                part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+                bit_offset: Some(bit_offset),
+                bit_length: Some(avail),
+                value,
+            },
+            avail,
+        ));
+    }
+
     let bit_length = f.bit_length?;
 
     let value = match f.field_type {
@@ -1186,20 +1222,30 @@ fn decode_string_lz(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue
         };
     }
     let start = bo / 8;
-    let mut end = start
-        + if bl == 0 {
-            data.len().saturating_sub(start)
-        } else {
-            bl / 8
-        };
-    end = end.min(data.len());
     if start >= data.len() {
         return FieldValue::NotAvailable;
     }
-    let nul = data[start..end].iter().position(|&b| b == 0);
-    let stop = nul.map(|n| start + n).unwrap_or(end);
-    let s = String::from_utf8_lossy(&data[start..stop]).into_owned();
-    FieldValue::String(s)
+    // STRING_LZ format (canboat `fieldPrintStringLZ`): first byte is
+    // the byte length of the content, then `len` bytes of payload,
+    // then a NUL terminator. `bl` here is either the field's
+    // declared bit width or 0 (BitLengthVariable → read to payload
+    // end). Cap the embedded length to whatever's actually present.
+    let region_end = if bl == 0 {
+        data.len()
+    } else {
+        (start + bl / 8).min(data.len())
+    };
+    let len_byte = data[start] as usize;
+    let content_start = start + 1;
+    let max_avail = region_end.saturating_sub(content_start);
+    let content_end = content_start + len_byte.min(max_avail);
+    let raw = String::from_utf8_lossy(&data[content_start..content_end]);
+    let trimmed = trim_string_padding(&raw);
+    if trimmed.is_empty() {
+        FieldValue::NotAvailable
+    } else {
+        FieldValue::String(trimmed.to_string())
+    }
 }
 
 /// DYNAMIC_FIELD_KEY: decode the integer raw value and resolve it
@@ -1304,6 +1350,35 @@ fn decode_dynamic_field_value(
             }
             None => decode_binary(data, bit_offset, bits),
         },
+        Some("DURATION") | Some("TIME") => {
+            // Canboat C lifts DURATION entries to DURATION_FIX32_MS
+            // (signed); TIME to UTIME_*. Treat DURATION as signed and
+            // TIME as unsigned by default.
+            let want_signed = matches!(entry.field_type.as_deref(), Some("DURATION")) || signed;
+            let Some(ex) = extract_bits(data, bit_offset as usize, bits as usize, want_signed, 0)
+            else {
+                return (FieldValue::NotAvailable, bits);
+            };
+            if is_unavailable(ex) {
+                FieldValue::NotAvailable
+            } else {
+                let res = entry.resolution.unwrap_or(1.0);
+                FieldValue::Time {
+                    raw: ex.value,
+                    seconds: ex.value as f64 * res,
+                }
+            }
+        }
+        Some("DATE") => {
+            let Some(ex) = extract_bits(data, bit_offset as usize, bits as usize, false, 0) else {
+                return (FieldValue::NotAvailable, bits);
+            };
+            if is_unavailable(ex) {
+                FieldValue::NotAvailable
+            } else {
+                FieldValue::Date(ex.value as u16)
+            }
+        }
         _ => decode_binary(data, bit_offset, bits),
     };
     (val, bits)

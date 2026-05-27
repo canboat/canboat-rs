@@ -632,7 +632,13 @@ fn decode_variable(
             repeat_set: 0,
             part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
             bit_offset: Some(bit_offset),
-            bit_length: Some(bits_byte_aligned),
+            // For VARIABLE fields, the `-debug` formatter wants the
+            // diagnostic to reflect the sub-field's actual width when
+            // it has one (so a 3-bit LOOKUP target shows
+            // `bits = "010"`). When the sub-field is itself variable-
+            // length (e.g. STRING_LAU), fall back to the consumed
+            // byte-aligned size so we still emit the bytes annotation.
+            bit_length: target_field.bit_length.or(Some(bits_byte_aligned)),
             value: sub.value,
         },
         bits_byte_aligned,
@@ -762,12 +768,9 @@ fn decode_bitlookup(
         return FieldValue::NotAvailable;
     };
     let raw = ex.value as u64;
-    // canboat drops BITLOOKUP fields whose value is zero (no flags set)
-    // in JSON output. Map them to NotAvailable so the formatter's
-    // omit-empty logic kicks in.
-    if raw == 0 {
-        return FieldValue::NotAvailable;
-    }
+    // Keep the BitField even when no bits are set — formatters
+    // handle the empty case themselves: JSON drops it, text emits
+    // "None" (matches canboat).
     let mut bits = Vec::new();
     if let Some(t) = f
         .lookup_bit_enumeration

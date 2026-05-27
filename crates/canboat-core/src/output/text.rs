@@ -17,14 +17,18 @@ use crate::decode::{DecodedField, DecodedPgn, FieldValue};
 
 use super::{effective_precision, format_date, format_time};
 
-/// Knobs for text output. Reserved for `-debug`, `-si`, `-geo`
-/// extensions — for v0 just `show_unavailable`.
+/// Knobs for text output. Reserved for `-si`, `-geo` extensions —
+/// for now `show_unavailable` and `debug` only.
 #[derive(Debug, Default, Clone)]
 pub struct TextOptions {
     /// When true, emit fields whose value is
     /// [`FieldValue::NotAvailable`] (matches `-empty` semantics in the
     /// C analyzer). Default: omit them entirely.
     pub show_unavailable: bool,
+    /// When true, append `(bytes = "...", bits = "...")` diagnostic
+    /// to each field (matches canboat's `-debug`). Unavailable fields
+    /// stay in the output and emit as `Unknown (bytes = "...")`.
+    pub debug: bool,
 }
 
 /// Write one decoded PGN as a canboat text line. Does not append a
@@ -50,15 +54,28 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
     // separators are "; ".
     let mut sep = " ";
     for f in &pgn.fields {
-        if !opts.show_unavailable && matches!(f.value, FieldValue::NotAvailable) {
+        // Under -debug, unavailable fields stay so the byte/bit
+        // annotation shows up; canboat does the same.
+        if !opts.show_unavailable && !opts.debug && matches!(f.value, FieldValue::NotAvailable) {
             continue;
         }
-        // Reserved/Spare are noise in text output — drop them.
+        // Reserved/Spare are noise in text output — drop them
+        // unconditionally (canboat does too).
         if matches!(
             f.value,
             FieldValue::Reserved { .. } | FieldValue::Spare { .. }
         ) {
             continue;
+        }
+        // Fields whose first byte is past the payload end are dropped —
+        // canboat's text mode doesn't emit "Manufacturer Information =
+        // Unknown" when the payload ran out before the field could
+        // start.
+        if let Some(bo) = f.bit_offset {
+            let payload_bits = (pgn.data.len() as u32).saturating_mul(8);
+            if bo >= payload_bits {
+                continue;
+            }
         }
         // C format string is `"%s %s = "` (sep + space + name + space
         // + = + space). With sep=" " on the first field that yields two
@@ -66,22 +83,116 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
         // fields it's "; Name = ".
         w.write_str(sep)?;
         w.write_char(' ')?;
-        write!(w, "{name} = ", name = f.name)?;
+        // Repeating fields get their 1-based iteration index appended
+        // to disambiguate at the top level (text mode can't nest like
+        // JSON's "list":[{...}]).
+        if f.repeat_set != 0 {
+            write!(
+                w,
+                "{name} {iter} = ",
+                name = f.name,
+                iter = f.repeat_index.unwrap_or(0) + 1,
+            )?;
+        } else {
+            write!(w, "{name} = ", name = f.name)?;
+        }
         write_field_value(w, f)?;
+        if opts.debug {
+            write_text_debug_suffix(w, f, &pgn.data)?;
+        }
         sep = ";";
     }
     Ok(())
+}
+
+/// Append the canboat text-mode `(bytes = "FF FF"[, bits = "..."])`
+/// diagnostic for one field. Mirrors the JSON `-debug` output —
+/// `bytes` is the field's value positioned within its byte slot
+/// (uppercase, space-separated), `bits` is the LSB-padded bit string
+/// only emitted for fields whose width isn't a whole number of bytes.
+fn write_text_debug_suffix<W: fmt::Write>(
+    w: &mut W,
+    f: &DecodedField,
+    payload: &[u8],
+) -> fmt::Result {
+    let (Some(bo), Some(bl)) = (f.bit_offset, f.bit_length) else {
+        return Ok(());
+    };
+    if bl == 0 {
+        return Ok(());
+    }
+    // Whole-byte-aligned fields (start and length both byte-aligned)
+    // emit their underlying payload bytes directly. This is the only
+    // way to handle STRING_LAU and other multi-byte fields whose total
+    // width exceeds 64 bits; it also matches canboat's behaviour.
+    if bo % 8 == 0 && bl % 8 == 0 {
+        let start = (bo / 8) as usize;
+        let end = ((bo + bl) / 8) as usize;
+        let end_clamped = end.min(payload.len());
+        if start >= end_clamped {
+            return Ok(());
+        }
+        w.write_str(" (bytes = \"")?;
+        for (i, b) in payload[start..end_clamped].iter().enumerate() {
+            if i > 0 {
+                w.write_char(' ')?;
+            }
+            write!(w, "{:02X}", b)?;
+        }
+        w.write_str("\")")?;
+        return Ok(());
+    }
+    use crate::bits::extract_bits;
+    let signed = matches!(
+        f.value,
+        FieldValue::Number(_) if f.unit.is_some()
+    );
+    let Some(ex) = extract_bits(payload, bo as usize, bl as usize, signed, 0) else {
+        return Ok(());
+    };
+    let raw = ex.value as u64;
+    let shift = bo % 8;
+    let byte_span = (shift + bl).div_ceil(8) as usize;
+    let shifted: u128 = (raw as u128) << shift;
+    w.write_str(" (bytes = \"")?;
+    for i in 0..byte_span {
+        if i > 0 {
+            w.write_char(' ')?;
+        }
+        let byte = ((shifted >> (i * 8)) & 0xff) as u8;
+        write!(w, "{:02X}", byte)?;
+    }
+    w.write_char('"')?;
+    if bl % 8 != 0 {
+        w.write_str(", bits = \"")?;
+        // Matches canboat's `showBytesOrBits` byte-indexed bit-shift
+        // — see the JSON-side comment for the gory details.
+        for i in (0..bl).rev() {
+            let byte = (raw >> (i / 8)) & 0xff;
+            let bit = (byte >> (i % 8)) & 1;
+            w.write_char(if bit == 1 { '1' } else { '0' })?;
+        }
+        w.write_char('"')?;
+    }
+    w.write_char(')')
 }
 
 fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result {
     match &f.value {
         FieldValue::Number(v) => {
             let p = effective_precision(f.precision, f.resolution);
-            write!(w, "{:.*}", p, v)?;
-            if let Some(unit) = &f.unit {
-                write!(w, " {}", unit)?;
+            // Lat/lon are width 10, precision 7, and intentionally
+            // suppress the `deg` unit (canboat's fieldPrintLatLon
+            // uses `%10.7f` with no unit suffix).
+            if p == 7 && f.unit.as_deref() == Some("deg") {
+                write!(w, "{:>10.7}", v)
+            } else {
+                write!(w, "{:.*}", p, v)?;
+                if let Some(unit) = &f.unit {
+                    write!(w, " {}", unit)?;
+                }
+                Ok(())
             }
-            Ok(())
         }
         FieldValue::Integer(v) => {
             write!(w, "{}", v)?;
@@ -104,7 +215,7 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result 
                 if i > 0 {
                     w.write_char(' ')?;
                 }
-                write!(w, "{:02x}", b)?;
+                write!(w, "{:02X}", b)?;
             }
             Ok(())
         }
@@ -115,13 +226,15 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result 
                 write!(w, "{}", value)
             }
         }
-        FieldValue::BitField { bits, value } => {
+        FieldValue::BitField { bits, .. } => {
             if bits.is_empty() {
-                write!(w, "{}", value)
+                // canboat text-mode prints `None` for a zero-bitmap
+                // BITLOOKUP rather than omitting the field.
+                w.write_str("None")
             } else {
                 for (i, (_, n)) in bits.iter().enumerate() {
                     if i > 0 {
-                        w.write_str(", ")?;
+                        w.write_char(',')?;
                     }
                     w.write_str(n)?;
                 }
@@ -132,10 +245,16 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result 
         FieldValue::Date(d) => format_date(*d, w),
         FieldValue::Time { seconds, .. } => {
             let p = effective_precision(f.precision, f.resolution);
-            format_time(*seconds, p, w)
+            format_time(*seconds, p, true, w)
         }
-        FieldValue::Mmsi(v) => write!(w, "{:09}", v),
-        FieldValue::Pgn { value, .. } => write!(w, "{}", value),
+        FieldValue::Mmsi(v) => write!(w, "\"{:09}\"", v),
+        FieldValue::Pgn { value, description } => {
+            write!(w, "{}", value)?;
+            if let Some(desc) = description {
+                write!(w, " ({})", desc)?;
+            }
+            Ok(())
+        }
         FieldValue::Reserved { .. } | FieldValue::Spare { .. } => Ok(()),
         FieldValue::IsoName { value, subfields } => {
             // canboat text format: 0x<hex> name = [<sub1>;<sub2>;...]

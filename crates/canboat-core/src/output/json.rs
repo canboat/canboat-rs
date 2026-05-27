@@ -86,6 +86,17 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
                 continue;
             }
         }
+        // Empty BITLOOKUPs (no bits set) are dropped in JSON output —
+        // canboat doesn't emit them either. The text formatter, by
+        // contrast, prints "None" for these (see write_field_value
+        // in output/text.rs).
+        if !opts.include_empty && !opts.debug {
+            if let FieldValue::BitField { bits, .. } = &f.value {
+                if bits.is_empty() {
+                    continue;
+                }
+            }
+        }
 
         // Determine "where is this field going":
         // - non-repeating (repeat_set == 0): top-level field.
@@ -186,9 +197,16 @@ fn write_debug_suffix<W: fmt::Write>(w: &mut W, f: &DecodedField, payload: &[u8]
     // of bytes — diagnostic for sub-byte fields.
     if bl % 8 != 0 {
         w.write_str(",\"bits\":\"")?;
-        // LSB-first bit string of length `bl`.
+        // Reproduce canboat's `showBytesOrBits` bit-emission verbatim:
+        //   for i in bits-1 .. 0:
+        //       byte = (value >> (i / 8)) & 0xff   // shift by BYTE INDEX, not *8
+        //       emit (byte >> (i % 8)) & 1
+        // The single-bit shifts per byte-index produce a peculiar
+        // ordering that doesn't quite represent the value MSB-first,
+        // but matches canboat's golden output exactly.
         for i in (0..bl).rev() {
-            let bit = (raw_unsigned >> i) & 1;
+            let byte = (raw_unsigned >> (i / 8)) & 0xff;
+            let bit = (byte >> (i % 8)) & 1;
             w.write_char(if bit == 1 { '1' } else { '0' })?;
         }
         w.write_char('"')?;
@@ -266,7 +284,7 @@ fn write_field_value_debug<W: fmt::Write>(
         FieldValue::Time { raw, seconds } => {
             let p = effective_precision(f.precision, f.resolution);
             let mut buf = String::with_capacity(12);
-            super::format_time(*seconds, p, &mut buf)?;
+            super::format_time(*seconds, p, false, &mut buf)?;
             write!(w, "{}", raw)?;
             w.write_str(",\"name\":")?;
             write_json_string(w, &buf)?;
@@ -436,7 +454,7 @@ fn write_field_value<W: fmt::Write>(
         FieldValue::Time { raw, seconds } => {
             let p = effective_precision(f.precision, f.resolution);
             let mut buf = String::with_capacity(12);
-            super::format_time(*seconds, p, &mut buf)?;
+            super::format_time(*seconds, p, false, &mut buf)?;
             if opts.name_value {
                 // canboat -nv: {"value":<raw>,"name":"HH:MM:SS.SSSS"}
                 w.write_str("{\"value\":")?;

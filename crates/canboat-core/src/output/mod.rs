@@ -74,11 +74,15 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     (y, m, d)
 }
 
-/// Format seconds-since-midnight as `HH:MM:SS[.fff]`. Fractional digits
-/// follow `precision`.
+/// Format seconds-since-midnight as `HH:MM:SS[.fff]`. Fractional
+/// digits follow `precision`. When `trim_zero_fraction` is set and
+/// the fractional part is zero, the `.fff` suffix is omitted — this
+/// matches canboat's text-mode `fieldPrintTime`, where the JSON path
+/// always shows the fraction and the text path skips it when zero.
 pub(crate) fn format_time(
     seconds: f64,
     precision: usize,
+    trim_zero_fraction: bool,
     w: &mut dyn std::fmt::Write,
 ) -> std::fmt::Result {
     if !seconds.is_finite() || seconds < 0.0 {
@@ -89,10 +93,13 @@ pub(crate) fn format_time(
     let m = (whole / 60) % 60;
     let s = whole % 60;
     if precision == 0 {
+        return write!(w, "{:02}:{:02}:{:02}", h, m, s);
+    }
+    let frac = (seconds - whole as f64) * 10f64.powi(precision as i32);
+    let frac_rounded = frac.round() as u64;
+    if trim_zero_fraction && frac_rounded == 0 {
         write!(w, "{:02}:{:02}:{:02}", h, m, s)
     } else {
-        let frac = (seconds - whole as f64) * 10f64.powi(precision as i32);
-        let frac_rounded = frac.round() as u64;
         write!(
             w,
             "{:02}:{:02}:{:02}.{:0width$}",
@@ -136,10 +143,10 @@ mod tests {
     #[test]
     fn time_formats() {
         let mut out = String::new();
-        format_time(3661.0, 0, &mut out).unwrap();
+        format_time(3661.0, 0, false, &mut out).unwrap();
         assert_eq!(out, "01:01:01");
         let mut out = String::new();
-        format_time(3661.5, 3, &mut out).unwrap();
+        format_time(3661.5, 3, false, &mut out).unwrap();
         assert_eq!(out, "01:01:01.500");
     }
 }

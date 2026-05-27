@@ -114,6 +114,7 @@ fn run(cli: Cli) -> Result<()> {
     };
     let text_opts = TextOptions {
         show_unavailable: cli.empty,
+        debug: cli.debug,
     };
 
     let stdout = io::stdout();

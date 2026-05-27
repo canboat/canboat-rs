@@ -174,3 +174,17 @@ fn pgn_test_actisense_json_nv_debug() {
         &["--json", "--nv", "--debug"],
     );
 }
+
+/// Text mode + `-debug` byte/bit annotation against the canboat
+/// reference. Exercises everything the JSON tests do plus the
+/// canboat text-mode quirks: repeating-field iteration suffixes
+/// (`PRN 1 =`, `PRN 2 =`), uppercase Binary, "None" for empty
+/// BITLOOKUPs, MMSI with quotes, PGN with description in parens.
+///
+/// Same line-6 skip as `pgn_test_json` — the PGN 129540 final-sat
+/// short-payload extraction differs from canboat's uninitialised-
+/// memory read.
+#[test]
+fn pgn_test_text_debug() {
+    run_case_skipping("pgn-test.in", "pgn-test.out", &["--debug"], &[6]);
+}

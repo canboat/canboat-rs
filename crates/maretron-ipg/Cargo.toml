@@ -1,0 +1,20 @@
+[package]
+name        = "maretron-ipg"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "Bridge a Maretron IPG100/200 TCP feed to canboat PLAIN/FAST format."
+
+[[bin]]
+name = "maretron-ipg"
+path = "src/main.rs"
+
+[dependencies]
+canboat-core = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+env_logger   = { workspace = true }
+log          = { workspace = true }

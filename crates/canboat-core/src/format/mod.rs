@@ -10,6 +10,7 @@ pub mod airmar;
 pub mod chetco;
 pub mod garmin_csv;
 pub mod ikonvert;
+pub mod maretron_ipg;
 pub mod ngt1;
 pub mod plain;
 pub mod ydwg02;

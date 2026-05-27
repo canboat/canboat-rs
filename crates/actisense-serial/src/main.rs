@@ -71,8 +71,9 @@ const CANBOAT_FORMAT_FAST_HEADER: &str = "# format=FAST\n";
     version
 )]
 struct Cli {
-    /// Path to the serial device (e.g. /dev/ttyUSB0). Required unless
-    /// `--file` is set.
+    /// Path to the serial device (e.g. /dev/ttyUSB0). Use `-` to read
+    /// raw NGT-1 bytes from stdin instead. Required unless `--file`
+    /// is set.
     device: Option<String>,
 
     /// Replay raw NGT-1 bytes from a captured file instead of a
@@ -81,7 +82,7 @@ struct Cli {
     file: Option<PathBuf>,
 
     /// Baud rate. NGT-1's default is 115200; W2K-1 USB is similar.
-    #[arg(short = 'b', long, default_value_t = DEFAULT_BAUD)]
+    #[arg(short = 'b', long = "baud", alias = "speed", short_alias = 's', default_value_t = DEFAULT_BAUD)]
     baud: u32,
 
     /// Read-only mode — never read stdin, never write to device.
@@ -107,9 +108,17 @@ struct Cli {
     #[arg(short = 't', long, default_value_t = 0u64)]
     timeout: u64,
 
-    /// Verbose / debug logging.
+    /// Verbose logging — alias of `-d`. Matches canboat's C tool.
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Debug logging.
     #[arg(short = 'd', long)]
     debug: bool,
+
+    /// Quiet — only show errors.
+    #[arg(short = 'q', long)]
+    quiet: bool,
 }
 
 fn main() -> ExitCode {
@@ -125,12 +134,14 @@ fn run(cli: Cli) -> Result<()> {
     if cli.read_only && cli.write_only {
         anyhow::bail!("-r and -w are mutually exclusive");
     }
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(if cli.debug {
+    let level = if cli.quiet {
+        "error"
+    } else if cli.debug || cli.verbose {
         "debug"
     } else {
         "info"
-    }))
-    .init();
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
@@ -139,15 +150,17 @@ fn run(cli: Cli) -> Result<()> {
     out.flush()?;
 
     // Decide what kind of input we're reading. A `--file` always
-    // forces read-only.
+    // forces read-only. The literal `-` is treated as stdin (Unix
+    // convention) — read-only.
     let read_source = match (cli.device.as_deref(), cli.file.as_deref()) {
         (None, None) => anyhow::bail!("specify a serial device or --file"),
         (Some(_), Some(_)) => anyhow::bail!("specify either a device or --file, not both"),
         (None, Some(path)) => InputSource::File(path.to_path_buf()),
+        (Some("-"), None) => InputSource::Stdin,
         (Some(dev), None) => InputSource::Serial(dev.to_string()),
     };
 
-    let do_write = !cli.read_only && !matches!(read_source, InputSource::File(_));
+    let do_write = !cli.read_only && matches!(read_source, InputSource::Serial(_));
     // Only consume stdin when there's actually a writer to forward to;
     // otherwise the stdin-pump thread would block on read_line forever
     // and prevent clean shutdown when the device read loop ends (e.g.
@@ -179,6 +192,11 @@ fn run(cli: Cli) -> Result<()> {
                 ),
                 None,
             ),
+            InputSource::Stdin => {
+                let stdin = io::stdin();
+                let reader: Box<dyn Read + Send> = Box::new(StdinReader(stdin));
+                (reader, None)
+            }
         };
 
     // --- Spawn the writer thread if we're going to transmit.
@@ -227,6 +245,18 @@ fn run(cli: Cli) -> Result<()> {
 enum InputSource {
     Serial(String),
     File(PathBuf),
+    /// `-` on the command line — read NGT-1 bytes from stdin.
+    Stdin,
+}
+
+/// `io::Stdin` exposes `Read` but the call holds a lock per `read`;
+/// wrap it in a struct so we can drop it into a `Box<dyn Read + Send>`
+/// without per-call locking ceremony at the call site.
+struct StdinReader(io::Stdin);
+impl Read for StdinReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.lock().read(buf)
+    }
 }
 
 /// Wrapper that gives `Box<dyn serialport::SerialPort>` a `Read` impl

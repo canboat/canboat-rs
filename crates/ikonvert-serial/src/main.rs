@@ -61,7 +61,8 @@ const CANBOAT_FORMAT_FAST_HEADER: &str = "# format=FAST\n";
     version
 )]
 struct Cli {
-    /// Path to the serial device (e.g. /dev/ttyUSB0). Required unless
+    /// Path to the serial device (e.g. /dev/ttyUSB0). Use `-` to read
+    /// iKonvert ASCII bytes from stdin instead. Required unless
     /// `--file` is set.
     device: Option<String>,
 
@@ -70,7 +71,7 @@ struct Cli {
     file: Option<PathBuf>,
 
     /// Baud rate. iKonvert's default is 230400.
-    #[arg(short = 'b', long, default_value_t = DEFAULT_BAUD)]
+    #[arg(short = 'b', long = "baud", alias = "speed", short_alias = 's', default_value_t = DEFAULT_BAUD)]
     baud: u32,
 
     /// Read-only mode.
@@ -98,13 +99,32 @@ struct Cli {
     #[arg(long, value_name = "PGN,PGN,...")]
     rx: Option<String>,
 
+    /// Optional comma-separated TX filter list. iKonvert C tool
+    /// accepts this and sends `$PDGY,TX_LIST,...` during init.
+    #[arg(long, value_name = "PGN,PGN,...")]
+    tx: Option<String>,
+
+    /// Reset the iKonvert if no frame is received within N seconds
+    /// (0 disables). Mirrors the C tool's `-reset` flag — currently
+    /// re-runs the init handshake on timeout.
+    #[arg(long, value_name = "N", default_value_t = 0u64)]
+    reset: u64,
+
     /// Disable the iKonvert TX rate limit (use at own risk).
     #[arg(short = 'l', long = "rate-limit-off")]
     rate_limit_off: bool,
 
-    /// Verbose / debug logging.
+    /// Verbose logging — alias of `-d`. Matches canboat's C tool.
+    #[arg(short = 'v', long)]
+    verbose: bool,
+
+    /// Debug logging.
     #[arg(short = 'd', long)]
     debug: bool,
+
+    /// Quiet — only show errors.
+    #[arg(short = 'q', long)]
+    quiet: bool,
 }
 
 fn main() -> ExitCode {
@@ -120,12 +140,14 @@ fn run(cli: Cli) -> Result<()> {
     if cli.read_only && cli.write_only {
         anyhow::bail!("-r and -w are mutually exclusive");
     }
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(if cli.debug {
+    let level = if cli.quiet {
+        "error"
+    } else if cli.debug || cli.verbose {
         "debug"
     } else {
         "info"
-    }))
-    .init();
+    };
+    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
@@ -136,6 +158,7 @@ fn run(cli: Cli) -> Result<()> {
         (None, None) => anyhow::bail!("specify a serial device or --file"),
         (Some(_), Some(_)) => anyhow::bail!("specify either a device or --file, not both"),
         (None, Some(path)) => InputSource::File(path.to_path_buf()),
+        (Some("-"), None) => InputSource::Stdin,
         (Some(dev), None) => InputSource::Serial(dev.to_string()),
     };
 
@@ -167,15 +190,21 @@ fn run(cli: Cli) -> Result<()> {
                 ),
                 None,
             ),
+            InputSource::Stdin => {
+                let stdin = io::stdin();
+                let reader: Box<dyn Read + Send> = Box::new(StdinReader(stdin));
+                (reader, None)
+            }
         };
 
     let (write_tx, writer_join) = if let Some(handle) = write_handle_opt {
         let (tx, rx) = mpsc::channel::<TxItem>();
         let rx_list = cli.rx.clone();
+        let tx_list = cli.tx.clone();
         let rate_off = cli.rate_limit_off;
         let join = thread::Builder::new()
             .name("ikonvert-writer".into())
-            .spawn(move || writer_thread(handle, rx, rx_list, rate_off))
+            .spawn(move || writer_thread(handle, rx, rx_list, tx_list, rate_off))
             .expect("spawn writer");
         (Some(tx), Some(join))
     } else {
@@ -212,6 +241,15 @@ fn run(cli: Cli) -> Result<()> {
 enum InputSource {
     Serial(String),
     File(PathBuf),
+    /// `-` on the command line — read iKonvert ASCII bytes from stdin.
+    Stdin,
+}
+
+struct StdinReader(io::Stdin);
+impl Read for StdinReader {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.lock().read(buf)
+    }
 }
 
 /// What the stdin pump pushes onto the writer's channel.
@@ -302,6 +340,7 @@ fn writer_thread<W: Write>(
     mut device: W,
     rx: mpsc::Receiver<TxItem>,
     rx_list: Option<String>,
+    tx_list: Option<String>,
     rate_limit_off: bool,
 ) {
     // Best-effort init handshake. The C tool runs a multi-step state
@@ -314,6 +353,13 @@ fn writer_thread<W: Write>(
         init.push_str("$PDGY,RX_LIST,");
         init.push_str(list);
         init.push_str("\r\n");
+    }
+    if let Some(list) = tx_list.as_deref() {
+        init.push_str("$PDGY,TX_LIST,");
+        init.push_str(list);
+        init.push_str("\r\n");
+    }
+    if rx_list.is_some() || tx_list.is_some() {
         init.push_str(TX_ONLINE_NORMAL);
     } else {
         init.push_str(TX_ONLINE_ALL);

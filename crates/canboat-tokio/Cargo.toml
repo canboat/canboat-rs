@@ -14,3 +14,9 @@ log          = { workspace = true }
 tokio        = { workspace = true }
 tokio-serial = { workspace = true }
 futures      = { workspace = true }
+
+[dev-dependencies]
+anyhow     = { workspace = true }
+clap       = { workspace = true }
+env_logger = { workspace = true }
+tokio      = { workspace = true, features = ["macros", "rt"] }

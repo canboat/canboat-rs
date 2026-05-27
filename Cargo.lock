@@ -147,7 +147,10 @@ dependencies = [
 name = "canboat-tokio"
 version = "0.1.0"
 dependencies = [
+ "anyhow",
  "canboat-core",
+ "clap",
+ "env_logger",
  "futures",
  "log",
  "tokio",

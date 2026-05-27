@@ -59,7 +59,18 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     let mut current_set: u8 = 0;
     let mut current_iter: Option<u32> = None;
 
+    let payload_bits = (pgn.data.len() as u32).saturating_mul(8);
     for f in &pgn.fields {
+        // Fields whose first byte sits entirely past the payload are
+        // dropped — canboat suppresses them regardless of `-empty` /
+        // `-debug` (e.g. PGN 126998's third STRING_LAU when only two
+        // descriptions fit in the wire). Same gate the text formatter
+        // already applies.
+        if let Some(bo) = f.bit_offset {
+            if bo >= payload_bits {
+                continue;
+            }
+        }
         // Under `-debug` we keep unavailable fields so the byte/bit
         // diagnostic is preserved; otherwise honour the canboat
         // suppress rule.
@@ -172,6 +183,27 @@ fn write_debug_suffix<W: fmt::Write>(w: &mut W, f: &DecodedField, payload: &[u8]
     if bl == 0 {
         return Ok(());
     }
+    // Whole-byte-aligned fields (STRING_LAU, BINARY, fixed strings)
+    // emit their underlying payload bytes directly — matching the
+    // text formatter's same-named branch. extract_bits below tops out
+    // at 64 bits, so without this fall-through wide string/binary
+    // fields would render no `bytes` annotation at all.
+    if bo % 8 == 0 && bl % 8 == 0 {
+        let start = (bo / 8) as usize;
+        let end = ((bo + bl) / 8) as usize;
+        let end_clamped = end.min(payload.len());
+        if start < end_clamped {
+            w.write_str(",\"bytes\":\"")?;
+            for (i, b) in payload[start..end_clamped].iter().enumerate() {
+                if i > 0 {
+                    w.write_char(' ')?;
+                }
+                write!(w, "{:02X}", b)?;
+            }
+            w.write_char('"')?;
+        }
+        return Ok(());
+    }
     use crate::bits::extract_bits;
     let signed = matches!(
         f.value,
@@ -251,16 +283,34 @@ fn write_field_value_debug<W: fmt::Write>(
             w.write_char('"')?;
         }
         FieldValue::Lookup { value, name } => {
-            write!(w, "{}", value)?;
-            if let Some(n) = name {
-                w.write_str(",\"name\":")?;
-                write_json_string(w, n)?;
+            // Without -nv, -debug puts the lookup *string* directly as
+            // `value` (matches canboat's `fieldPrintLookup` JSON path
+            // when `showJsonValue` is false). With -nv, the full
+            // {value, name} object form is kept, and the `name` key is
+            // present even when the lookup didn't resolve (so
+            // out-of-range values still emit `"name":null`).
+            if opts.name_value {
+                write!(w, "{},\"name\":", value)?;
+                match name {
+                    Some(n) => write_json_string(w, n)?,
+                    None => w.write_str("null")?,
+                }
+            } else {
+                match name {
+                    Some(n) => write_json_string(w, n)?,
+                    None => write!(w, "{}", value)?,
+                }
             }
         }
         FieldValue::BitField { value, bits } => {
             if bits.is_empty() {
-                write!(w, "{}", value)?;
-            } else {
+                // Empty BITLOOKUP → null in JSON. Matches canboat's
+                // `printEmpty` path for `value == 0` in
+                // `fieldPrintBitLookup` (print.c:940-945).
+                let _ = value;
+                w.write_str("null")?;
+            } else if opts.name_value {
+                // -nv: array of `{value, name}` objects.
                 w.write_char('[')?;
                 for (i, (bv, n)) in bits.iter().enumerate() {
                     if i > 0 {
@@ -271,30 +321,57 @@ fn write_field_value_debug<W: fmt::Write>(
                     w.write_char('}')?;
                 }
                 w.write_char(']')?;
+            } else {
+                // Plain JSON: array of bare strings.
+                w.write_char('[')?;
+                for (i, (_, n)) in bits.iter().enumerate() {
+                    if i > 0 {
+                        w.write_char(',')?;
+                    }
+                    write_json_string(w, n)?;
+                }
+                w.write_char(']')?;
             }
         }
         FieldValue::String(s) => write_json_string(w, s)?,
         FieldValue::Date(d) => {
             let mut buf = String::with_capacity(10);
             super::format_date(*d, &mut buf)?;
-            write!(w, "{}", d)?;
-            w.write_str(",\"name\":")?;
-            write_json_string(w, &buf)?;
+            // -nv keeps the numeric raw + textual name; without -nv the
+            // textual name is emitted directly as `value`.
+            if opts.name_value {
+                write!(w, "{}", d)?;
+                w.write_str(",\"name\":")?;
+                write_json_string(w, &buf)?;
+            } else {
+                write_json_string(w, &buf)?;
+            }
         }
         FieldValue::Time { raw, seconds } => {
             let p = effective_precision(f.precision, f.resolution);
             let mut buf = String::with_capacity(12);
             super::format_time(*seconds, p, false, &mut buf)?;
-            write!(w, "{}", raw)?;
-            w.write_str(",\"name\":")?;
-            write_json_string(w, &buf)?;
+            if opts.name_value {
+                write!(w, "{}", raw)?;
+                w.write_str(",\"name\":")?;
+                write_json_string(w, &buf)?;
+            } else {
+                write_json_string(w, &buf)?;
+            }
         }
         FieldValue::Mmsi(v) => write!(w, "\"{:09}\"", v)?,
         FieldValue::Pgn { value, description } => {
+            // -debug emits the numeric PGN as `value`. The `name` key
+            // is only present with -nv — canboat omits it entirely in
+            // non-nv even when the PGN is known (and emits `"name":null`
+            // for unknown PGNs *only* with -nv).
             write!(w, "{}", value)?;
-            if let Some(desc) = description {
+            if opts.name_value {
                 w.write_str(",\"name\":")?;
-                write_json_string(w, desc)?;
+                match description {
+                    Some(desc) => write_json_string(w, desc)?,
+                    None => w.write_str("null")?,
+                }
             }
         }
         FieldValue::IsoName { value, .. } => {
@@ -411,7 +488,9 @@ fn write_field_value<W: fmt::Write>(
         }
         FieldValue::BitField { bits, value } => {
             if bits.is_empty() {
-                write!(w, "{}", value)
+                // Empty BITLOOKUP → null (canboat's `printEmpty`).
+                let _ = value;
+                w.write_str("null")
             } else if opts.name_value {
                 // -nv: [{"value":bit_value,"name":"..."},...]
                 w.write_char('[')?;

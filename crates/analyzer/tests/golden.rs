@@ -214,6 +214,37 @@ fn short_frame_text_debug() {
     run_case("short-frame.in", "short-frame.out", &["--debug"]);
 }
 
+/// Same pgn-test corpus through `-json -debug` (no -nv). Exercises
+/// the debug-mode bytes annotation across every JSON path that's
+/// shaped differently from -nv: Lookup as string (not {value,name}),
+/// BitField as array of strings (not array of objects), Date/Time
+/// as named strings, PGN as bare numeric value (name only with -nv).
+/// Same line-6 skip as `pgn_test_json` for the canboat-uninitialized-
+/// memory read on the GNSS Sats in View last sat.
+#[test]
+fn pgn_test_json_debug() {
+    run_case_skipping(
+        "pgn-test.in",
+        "pgn-test-json-debug.out",
+        &["--json", "--debug"],
+        &[6],
+    );
+}
+
+/// pgn-test corpus through `-json -nv -debug`. Exercises the full
+/// debug JSON output: every field wrapped, lookup objects keep
+/// {value, name} form with name nullable, PGN reference fields
+/// keyed with name even when unresolved. Same line-6 skip.
+#[test]
+fn pgn_test_json_nv_debug() {
+    run_case_skipping(
+        "pgn-test.in",
+        "pgn-test-json-nv-debug.out",
+        &["--json", "--nv", "--debug"],
+        &[6],
+    );
+}
+
 /// Switch-multi capture: exercises the synthetic-PGN range (PGN
 /// 262386 = `ACTISENSE_BEM + 0xf2`, "Actisense: System status",
 /// defined in canboat's `analyzer/pgn.h` but not in canboat.json —

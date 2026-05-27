@@ -159,6 +159,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "candump2analyzer"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "canboat-cli",
+ "canboat-core",
+ "clap",
+ "env_logger",
+ "log",
+]
+
+[[package]]
 name = "cfg-if"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"

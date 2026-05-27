@@ -116,7 +116,7 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 /// The RDP (Reserved + DataPage) bits are the two just below the
 /// priority bits — they push PGNs above 0x10000 into the data-page-1
 /// range (e.g. CAN-id 0x09FD020D → PGN 130306 = 0x1FD02, not 0xFD02).
-pub(crate) fn iso11783_decompose(id: u32) -> (u8, u32, u8, u8) {
+pub fn iso11783_decompose(id: u32) -> (u8, u32, u8, u8) {
     let prio = ((id >> 26) & 0x7) as u8;
     let rdp = (id >> 24) & 0x3;
     let pf = ((id >> 16) & 0xff) as u8;

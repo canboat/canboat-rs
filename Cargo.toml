@@ -10,6 +10,7 @@ members = [
     "crates/ikonvert-serial",
     "crates/maretron-ipg",
     "crates/replay",
+    "crates/candump2analyzer",
 ]
 
 [workspace.package]
@@ -18,7 +19,7 @@ edition = "2021"
 license = "Apache-2.0"
 authors = ["Kees Verruijt <kees@verruijt.net>"]
 repository = "https://github.com/canboat/canboat-rs"
-rust-version = "1.74"
+rust-version = "1.77"
 
 [workspace.dependencies]
 canboat-core = { path = "crates/canboat-core", version = "0.1.0" }

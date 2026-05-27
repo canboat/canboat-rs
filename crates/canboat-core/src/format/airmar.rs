@@ -87,13 +87,14 @@ mod tests {
 
     #[test]
     fn parses_airmar_line() {
-        // CAN id 0x09FD020D — RDP=0, PF=0xFD, PS=0x02, SA=0x0D.
-        // PF >= 240 → PDU2; PGN = 0xFD02 = 64770; dst=255; prio=2.
+        // CAN id 0x09FD020D — prio=2, RDP=1, PF=0xFD, PS=0x02, SA=0x0D.
+        // PF >= 240 → PDU2; PGN = (RDP<<16) | (PF<<8) | PS = 0x1FD02
+        // = 130306 ("Wind Data"); dst=255.
         let line = "20:11:00 - 130306 09FD020D FF 8B 72 FF FF FF FF FF";
         let f = parse_line(line).unwrap();
         assert_eq!(f.timestamp.as_deref(), Some("20:11:00"));
         assert_eq!(f.prio, 2);
-        assert_eq!(f.pgn, 0xfd02);
+        assert_eq!(f.pgn, 130306);
         assert_eq!(f.src, 0x0d);
         assert_eq!(f.dst, 0xff);
         assert_eq!(

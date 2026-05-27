@@ -156,8 +156,10 @@ mod tests {
     fn parses_chetco_sentence() {
         // Synthesised from canboat's own parse comment:
         //   $PCDIN,01F801,FB12345,07,A0B1C2D3E4F506*XX
-        // PGN = 0x01F801 = 129025, tstamp = 0xFB12345 ms = 263275845 ms,
-        // src = 7, 7 data bytes.
+        // PGN = 0x01F801 = 129025; src = 7; 7 data bytes;
+        // tstamp = 0xFB12345 = 263 267 141 ms = 263 267 s + 141 ms
+        //                    = 3d + 1h 7m 47s + 141 ms
+        //                    → 1970-01-04T01:07:47,141.
         let line = "$PCDIN,01F801,FB12345,07,A0B1C2D3E4F506*55";
         let f = parse_line(line).unwrap();
         assert_eq!(f.pgn, 0x1f801);
@@ -168,8 +170,7 @@ mod tests {
             f.data.as_slice(),
             &[0xa0, 0xb1, 0xc2, 0xd3, 0xe4, 0xf5, 0x06]
         );
-        // 263275845 ms = 263275 s + 845 ms = 1970-01-04T01:07:55,845.
-        assert_eq!(f.timestamp.as_deref(), Some("1970-01-04T01:07:55,845"));
+        assert_eq!(f.timestamp.as_deref(), Some("1970-01-04T01:07:47,141"));
     }
 
     #[test]

@@ -271,6 +271,9 @@ fn decode_fields(
     let count_field1 = info.repeating_field_set1_count_field;
 
     let mut i = 0usize;
+    // Running bit cursor for variable-length fields that lack an
+    // explicit BitOffset (chained STRING_LAU in PGN 126998 etc.).
+    let mut cursor_bits: u32 = 0;
     while i < info.fields.len() {
         let f = &info.fields[i];
 
@@ -289,7 +292,16 @@ fn decode_fields(
             i += 1;
             continue;
         }
-        if let Some(decoded) = decode_one_field(f, info, data, db) {
+        // Variable-length fields (STRING_LAU and friends) after the
+        // first one have no `BitOffset` in canboat.json — they sit at
+        // the byte after the previous variable field ends. Use a
+        // running `cursor_bits` for those; honor an explicit BitOffset
+        // when one is given.
+        let effective_offset = f.bit_offset.unwrap_or(cursor_bits);
+        if let Some((decoded, bits_consumed)) =
+            decode_one_field_at(f, info, data, db, effective_offset)
+        {
+            cursor_bits = effective_offset + bits_consumed;
             out.push(decoded);
         }
         i += 1;
@@ -344,13 +356,12 @@ fn decode_repeating(
             if sf.condition.is_some() {
                 continue;
             }
-            // Clone the field metadata and shift its bit_offset for
-            // this iteration.
-            let mut sf_shifted = sf.clone();
-            if let Some(bo) = sf_shifted.bit_offset {
-                sf_shifted.bit_offset = Some(bo + iter * iter_bits);
-            }
-            if let Some(mut d) = decode_one_field(&sf_shifted, info, data, db) {
+            // Shift the field's bit_offset for this iteration.
+            let Some(base_off) = sf.bit_offset else {
+                continue;
+            };
+            let off = base_off + iter * iter_bits;
+            if let Some((mut d, _)) = decode_one_field_at(sf, info, data, db, off) {
                 d.repeat_index = Some(iter);
                 out.push(d);
                 produced_any = true;
@@ -364,16 +375,39 @@ fn decode_repeating(
     }
 }
 
-fn decode_one_field(
+/// Decode one field. Returns the `DecodedField` and the number of
+/// payload bits it actually consumed (which differs from `bit_length`
+/// for variable-length types like STRING_LAU).
+fn decode_one_field_at(
     f: &FieldInfo,
     info: &PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
-) -> Option<DecodedField> {
-    let bit_offset = f.bit_offset?;
-    let bit_length = f.bit_length?;
+    bit_offset: u32,
+) -> Option<(DecodedField, u32)> {
     let signed = f.signed.unwrap_or(false);
     let offset_k = f.offset.unwrap_or(0);
+
+    // STRING_LAU figures out its own length from the data byte.
+    if matches!(f.field_type, Some(FieldType::StringLau)) {
+        let (value, bits_consumed) = decode_string_lau(data, bit_offset);
+        return Some((
+            DecodedField {
+                order: f.order,
+                id: f.id.clone(),
+                name: f.name.clone(),
+                unit: f.unit.clone(),
+                resolution: f.resolution,
+                precision: f.precision,
+                repeat_index: None,
+                part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+                value,
+            },
+            bits_consumed,
+        ));
+    }
+
+    let bit_length = f.bit_length?;
 
     let value = match f.field_type {
         Some(FieldType::Number) | Some(FieldType::Decimal) => {
@@ -400,9 +434,7 @@ fn decode_one_field(
         }
         Some(FieldType::StringFix) => decode_string_fix(data, bit_offset, bit_length),
         Some(FieldType::StringLz) => decode_string_lz(data, bit_offset, bit_length),
-        Some(FieldType::StringLau) => FieldValue::Unsupported {
-            field_type: "STRING_LAU",
-        },
+        Some(FieldType::StringLau) => unreachable!("STRING_LAU handled above"),
         Some(FieldType::Variable) => FieldValue::Unsupported {
             field_type: "VARIABLE",
         },
@@ -422,17 +454,20 @@ fn decode_one_field(
         },
     };
 
-    Some(DecodedField {
-        order: f.order,
-        id: f.id.clone(),
-        name: f.name.clone(),
-        unit: f.unit.clone(),
-        resolution: f.resolution,
-        precision: f.precision,
-        repeat_index: None,
-        part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
-        value,
-    })
+    Some((
+        DecodedField {
+            order: f.order,
+            id: f.id.clone(),
+            name: f.name.clone(),
+            unit: f.unit.clone(),
+            resolution: f.resolution,
+            precision: f.precision,
+            repeat_index: None,
+            part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+            value,
+        },
+        bit_length,
+    ))
 }
 
 fn decode_number(
@@ -784,6 +819,58 @@ fn decode_string_fix(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValu
     }
     let s = String::from_utf8_lossy(&raw[..len]).into_owned();
     FieldValue::String(s)
+}
+
+/// STRING_LAU — length + encoding + payload, where the first byte is the
+/// total size of the field (`len` including the header), the second byte
+/// is an encoding control (`0` = UTF-16LE, `1` = ASCII / UTF-8), and the
+/// remaining `len - 2` bytes are the payload.
+///
+/// Returns the decoded value plus the number of bits this field
+/// consumed — variable, so callers must use this to advance the cursor.
+fn decode_string_lau(data: &[u8], bit_offset: u32) -> (FieldValue, u32) {
+    let bo = bit_offset as usize;
+    if bo & 7 != 0 {
+        return (
+            FieldValue::Unsupported {
+                field_type: "STRING_LAU (unaligned)",
+            },
+            8,
+        );
+    }
+    let start = bo / 8;
+    if start + 2 > data.len() {
+        return (FieldValue::NotAvailable, 16);
+    }
+    let total_len = data[start] as usize;
+    let encoding = data[start + 1];
+    if total_len < 2 {
+        return (FieldValue::NotAvailable, (total_len.max(2) * 8) as u32);
+    }
+    let body_len = total_len - 2;
+    let body_end = (start + 2 + body_len).min(data.len());
+    let body = &data[start + 2..body_end];
+
+    let s = match encoding {
+        0 => {
+            // UTF-16LE: pairs of bytes are LE u16 code units.
+            let mut code_units = Vec::with_capacity(body.len() / 2);
+            let mut i = 0;
+            while i + 1 < body.len() {
+                code_units.push(u16::from_le_bytes([body[i], body[i + 1]]));
+                i += 2;
+            }
+            String::from_utf16_lossy(&code_units)
+        }
+        _ => {
+            // 1 = ASCII / UTF-8 (canboat doesn't differentiate).
+            String::from_utf8_lossy(body).into_owned()
+        }
+    };
+    // Strip the trailing 0xff padding canboat sometimes leaves in.
+    let s = s.trim_end_matches('\u{0}').trim_end_matches('\u{ffff}');
+    let bits_consumed = (total_len * 8) as u32;
+    (FieldValue::String(s.to_string()), bits_consumed)
 }
 
 fn decode_string_lz(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {

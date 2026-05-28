@@ -170,9 +170,13 @@ mod tests {
             parse_timestamp_ms("1970-01-01T00:00:01,500 anything"),
             Some(1_500)
         );
-        // 2022-09-10T12:10:33.618Z → known epoch ms.
-        let want = 1_662_812_233_618i64;
-        assert_eq!(parse_timestamp_ms("2022-09-10T12:10:33.618Z"), Some(want));
+        // 2022-09-10T12:10:33.618 UTC → 1_662_811_833_618 ms.
+        // (Cross-check with Python:
+        //  `int(datetime.datetime.fromisoformat('2022-09-10T12:10:33.618+00:00').timestamp()*1000)`.)
+        assert_eq!(
+            parse_timestamp_ms("2022-09-10T12:10:33.618Z"),
+            Some(1_662_811_833_618)
+        );
     }
 
     #[test]

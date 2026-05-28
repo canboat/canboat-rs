@@ -700,6 +700,22 @@ fn decode_one_field_at(
         }
         _ => {}
     }
+    // canboat C also picks up dynamic field lengths by FIELD NAME
+    // (`analyzer/analyzer.c::fillGlobalsBasedOnFieldName`): any field
+    // literally named `Length` updates `g_length`, which the next
+    // DYNAMIC_FIELD_VALUE then consumes. Several PGNs use a regular
+    // NUMBER field for this rather than the explicit
+    // `DYNAMIC_FIELD_LENGTH` type (e.g. Simnet Parameter Set 130846).
+    if f.name == "Length" {
+        let raw_len = match &value {
+            FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
+            FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),
+            _ => None,
+        };
+        if let Some(n) = raw_len {
+            ctx.dynamic_length_bytes = Some(n);
+        }
+    }
 
     Some((
         DecodedField {
@@ -906,6 +922,13 @@ fn decode_indirect_lookup(
         let resolved = db.indirect_lookup(table_name, val1.value as u64, raw)?;
         Some(resolved.to_string())
     })();
+    // Same print.c:718 rule we apply to plain LOOKUP — unknown values
+    // in the top sentinel range drop the field rather than emitting a
+    // bare integer. Without this, PGN 60928's Device Function comes
+    // through as `"Device Function":255` where canboat C drops it.
+    if name.is_none() && is_lookup_unavailable(ex, bit_length as usize) {
+        return FieldValue::NotAvailable;
+    }
     FieldValue::Lookup { value: raw, name }
 }
 
@@ -1387,10 +1410,20 @@ fn decode_dynamic_field_value(
             None => decode_binary(data, bit_offset, bits),
         },
         Some("DURATION") | Some("TIME") => {
-            // Canboat C lifts DURATION entries to DURATION_FIX32_MS
-            // (signed); TIME to UTIME_*. Treat DURATION as signed and
-            // TIME as unsigned by default.
-            let want_signed = matches!(entry.field_type.as_deref(), Some("DURATION")) || signed;
+            // canboat C's lookup.h is what really decides DURATION
+            // signedness: most entries are `DURATION_UFIX*` (unsigned,
+            // e.g. Layline Time, Sailing Time to Waypoint, Sailing
+            // ETA, Trip Time), with `DURATION_FIX*` (signed) reserved
+            // for fields that genuinely carry negative values like
+            // Race Timer / Timezone offset. The canboat.json
+            // simplifies all of these to `"FieldType":"DURATION"`,
+            // so we default to UNSIGNED and only flip to signed when
+            // the lookup carries an explicit `Signed:true` or the
+            // name is in the small set known to be signed in
+            // canboat's pgn.h.
+            let known_signed_duration =
+                matches!(entry.name.as_str(), "Race Timer" | "Timezone offset");
+            let want_signed = signed || known_signed_duration;
             // Always sentinel-check against the unsigned bit pattern,
             // even when the display interpretation is signed — canboat's
             // "all-ones" N/A marker is 0xFF..FF in the raw bytes,

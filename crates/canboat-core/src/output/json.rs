@@ -82,8 +82,15 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
         if !opts.include_empty && !opts.debug && matches!(f.value, FieldValue::NotAvailable) {
             continue;
         }
-        if matches!(f.value, FieldValue::Spare { .. }) {
-            continue;
+        // SPARE fields: canboat C's `fieldPrintSpare` (print.c:900)
+        // drops them when zero but renders the bytes as BINARY when
+        // non-zero — the comment there calls a non-zero SPARE "an
+        // incorrect PGN definition". The field will then be emitted
+        // by the value writer's `Spare { bytes, .. }` arm.
+        if let FieldValue::Spare { value, .. } = &f.value {
+            if *value == 0 {
+                continue;
+            }
         }
         // Reserved fields whose raw value is all-ones (the "unused"
         // default) are skipped entirely — even under -debug, matching
@@ -179,8 +186,10 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     // pushes NotAvailable fields onto the decoded set but the JSON
     // emits none of them.
     let renderable = |f: &DecodedField| {
-        if matches!(f.value, FieldValue::Spare { .. }) {
-            return false;
+        if let FieldValue::Spare { value, .. } = &f.value {
+            if *value == 0 {
+                return false;
+            }
         }
         if matches!(f.value, FieldValue::NotAvailable) && !opts.include_empty && !opts.debug {
             return false;
@@ -382,7 +391,7 @@ fn write_field_value_debug<W: fmt::Write>(
                 w.write_char(']')?;
             }
         }
-        FieldValue::String(s) => write_json_string(w, s)?,
+        FieldValue::String(s) => write_field_json_string(w, s)?,
         FieldValue::Date(d) => {
             let mut buf = String::with_capacity(10);
             super::format_date(*d, &mut buf)?;
@@ -564,7 +573,7 @@ fn write_field_value<W: fmt::Write>(
                 w.write_char(']')
             }
         }
-        FieldValue::String(s) => write_json_string(w, s),
+        FieldValue::String(s) => write_field_json_string(w, s),
         FieldValue::Date(d) => {
             let mut buf = String::with_capacity(10);
             super::format_date(*d, &mut buf)?;
@@ -630,7 +639,19 @@ fn write_field_value<W: fmt::Write>(
             }
             w.write_char('"')
         }
-        FieldValue::Spare { .. } => w.write_str("null"),
+        FieldValue::Spare { bytes, .. } => {
+            // canboat C falls into `fieldPrintBinary` for non-zero
+            // SPARE fields (print.c:920), emitting them as the same
+            // space-separated uppercase hex string used for Reserved.
+            w.write_char('"')?;
+            for (i, b) in bytes.iter().enumerate() {
+                if i > 0 {
+                    w.write_char(' ')?;
+                }
+                write!(w, "{:02X}", b)?;
+            }
+            w.write_char('"')
+        }
         FieldValue::IsoName { value, subfields } => {
             // -nv: {"value":N,"name":{<recursive>}}
             // default: bare N
@@ -681,6 +702,34 @@ fn write_json_string<W: fmt::Write>(w: &mut W, s: &str) -> fmt::Result {
         match c {
             '"' => w.write_str("\\\"")?,
             '\\' => w.write_str("\\\\")?,
+            '\u{0008}' => w.write_str("\\b")?,
+            '\u{000c}' => w.write_str("\\f")?,
+            '\n' => w.write_str("\\n")?,
+            '\r' => w.write_str("\\r")?,
+            '\t' => w.write_str("\\t")?,
+            c if (c as u32) < 0x20 => write!(w, "\\u{:04x}", c as u32)?,
+            c => w.write_char(c)?,
+        }
+    }
+    w.write_char('"')?;
+    Ok(())
+}
+
+/// canboat C's `print_ascii_json_escaped` (analyzer/print.c:1255)
+/// is only used for decoded STRING field values, and it escapes `/`
+/// as `\/` alongside the usual JSON escapes. Descriptions / field
+/// names come from `pgn.h` C-string literals and skip that function,
+/// so their `/` characters stay bare. We keep the same split: the
+/// standard [`write_json_string`] is unchanged, and this variant —
+/// used only by `FieldValue::String` formatters — adds the `/`
+/// escape for byte-for-byte parity.
+fn write_field_json_string<W: fmt::Write>(w: &mut W, s: &str) -> fmt::Result {
+    w.write_char('"')?;
+    for c in s.chars() {
+        match c {
+            '"' => w.write_str("\\\"")?,
+            '\\' => w.write_str("\\\\")?,
+            '/' => w.write_str("\\/")?,
             '\u{0008}' => w.write_str("\\b")?,
             '\u{000c}' => w.write_str("\\f")?,
             '\n' => w.write_str("\\n")?,

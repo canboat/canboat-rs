@@ -50,9 +50,24 @@ pub fn extract_bits(
     let mut magnitude: usize = 0;
     let mut remaining = bits;
 
+    // canboat C's `analyzer.c:1009` truncates the field's bit length
+    // to whatever fits in the remaining payload before calling
+    // `extractNumber`:
+    //
+    //   bytes = min(bytes_needed, dataLen - startBit/8);
+    //   bits = min(bytes * 8, bits);
+    //
+    // So a 32-bit DISTANCE_FIX32_MMM at the truncated tail of a
+    // fast-packet becomes a 16-bit extract instead of a decode error.
+    // Mirror that truncation here — earlier behaviour padded with
+    // 0xFF (gave wrong values like -0.65536) and the previous fix
+    // returned None (dropped the field, but C emits the truncated
+    // value). Both diverged from canboat's actual output.
+    let mut bits_extracted = 0usize;
     while remaining > 0 {
-        // Pad missing trailing bytes with 0xFF (canboat issue #623).
-        let byte = data.first().copied().unwrap_or(0xff);
+        let Some(byte) = data.first().copied() else {
+            break;
+        };
         let in_this_byte = (8 - first_bit).min(remaining);
         let all_ones = (1u64 << in_this_byte) - 1;
         let mask = all_ones << first_bit;
@@ -62,6 +77,7 @@ pub fn extract_bits(
         magnitude += in_this_byte;
         remaining -= in_this_byte;
         first_bit += in_this_byte;
+        bits_extracted += in_this_byte;
         if first_bit >= 8 {
             first_bit -= 8;
             if !data.is_empty() {
@@ -69,6 +85,15 @@ pub fn extract_bits(
             }
         }
     }
+    // No bytes at all → caller treats as NotAvailable; same as before.
+    if bits_extracted == 0 {
+        return None;
+    }
+    // Note: if `bits_extracted < bits`, the canboat C behaviour is
+    // to interpret the value over the *truncated* field width. The
+    // `bits` shadow we use below for sign extension reflects the
+    // actual width we managed to read.
+    let bits = bits_extracted;
 
     let mut value_signed = value as i64;
     let mut max_signed = max_v as i64;
@@ -187,14 +212,16 @@ mod tests {
     }
 
     #[test]
-    fn pads_short_data_with_0xff() {
-        // Field starts in-bounds but runs off the end: missing trailing
-        // bytes are padded with 0xFF (canboat issue #623). 16 bits at
-        // offset 0 with only 1 byte → value = 0xAB | 0xFF<<8 = 0xFFAB.
+    fn truncates_field_when_data_runs_out() {
+        // Field starts in-bounds but runs off the end: canboat C
+        // (`analyzer.c:1009`) shrinks the field's bit-length to fit
+        // the remaining payload. We mirror that — 16 bits requested
+        // at offset 0 with only 1 byte gives value=0xAB extracted
+        // over 8 bits, max=0xff (not the full 16-bit max).
         let data = [0xab];
         let e = extract_bits(&data, 0, 16, false, 0).unwrap();
-        assert_eq!(e.value, 0xffab);
-        assert_eq!(e.max, 0xffff);
+        assert_eq!(e.value, 0xab);
+        assert_eq!(e.max, 0xff);
     }
 
     #[test]

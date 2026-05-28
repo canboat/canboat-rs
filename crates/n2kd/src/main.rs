@@ -87,26 +87,37 @@ struct Cli {
     src_filter: Option<String>,
 
     /// Rate-limit each (src, kind) of NMEA 0183 sentence to at most
-    /// one per second. Mirrors canboat's `-r`.
-    #[arg(short = 'r', long)]
+    /// one per second. Mirrors canboat's `--rate-limit`.
+    #[arg(long)]
     rate_limit: bool,
+
+    /// Restrict mode: suppress all stdout output (claim requests in
+    /// normal mode, NMEA sentences in `--nmea0183` mode). Matches
+    /// canboat's `-r`.
+    #[arg(short = 'r', long)]
+    restrict: bool,
 
     /// Bind on `0.0.0.0` instead of `127.0.0.1`.
     #[arg(long)]
     public: bool,
 
     /// Also UDP-broadcast each NMEA 0183 sentence to `<host:port>`
-    /// (matches canboat `-udp183`). Useful for OpenCPN / Navionics
-    /// receivers listening on the LAN.
-    #[arg(long, value_name = "HOST:PORT")]
+    /// (matches canboat `-u`/`-udp183`). Useful for OpenCPN /
+    /// Navionics receivers listening on the LAN.
+    #[arg(short = 'u', long, value_name = "HOST:PORT", alias = "udp183")]
     udp183: Option<String>,
 
-    /// Emit periodic ISO Address Claim / Product Info requests on
-    /// stdout for every device we've seen on the bus. Off by default
-    /// because it pollutes the stdout PLAIN stream when not wired
-    /// back to a writeable bridge.
+    /// Start no TCP servers and send NMEA 0183 / AIVDM data on
+    /// stdout. Mirrors canboat's `--nmea0183` flag — mainly for
+    /// pipeline / debug use.
     #[arg(long)]
-    request_claims: bool,
+    nmea0183: bool,
+
+    /// Suppress the periodic ISO Address Claim / Product Info request
+    /// engine. By default it's on (matching canboat C); `-r` /
+    /// `--restrict` also turns it off.
+    #[arg(long)]
+    no_request_claims: bool,
 
     /// Verbose / debug logging — alias of `-d`.
     #[arg(short = 'v', long)]
@@ -151,41 +162,47 @@ fn run(cli: Cli) -> Result<()> {
         None => None,
     };
 
-    let hub = Arc::new(Hub::new(src_filter, cli.rate_limit, udp));
+    let mut hub = Hub::new(src_filter, cli.rate_limit, udp);
+    hub.nmea_to_stdout = cli.nmea0183 && !cli.restrict;
+    let hub = Arc::new(hub);
 
-    spawn_listener(
-        bind_addr,
-        cli.port + 1,
-        "json-stream",
-        Arc::clone(&hub),
-        Subscription::JsonStream,
-    )?;
-    spawn_listener(
-        bind_addr,
-        cli.port + 2,
-        "nmea0183-stream",
-        Arc::clone(&hub),
-        Subscription::Nmea0183Stream,
-    )?;
-    spawn_listener(
-        bind_addr,
-        cli.port + 3,
-        "ais-stream",
-        Arc::clone(&hub),
-        Subscription::AisStream,
-    )?;
-    spawn_listener(
-        bind_addr,
-        cli.port + 4,
-        "status",
-        Arc::clone(&hub),
-        Subscription::StatusStream,
-    )?;
-    spawn_snapshot_listener(bind_addr, cli.port, Arc::clone(&hub))?;
-    spawn_raw_input_listener(bind_addr, cli.port + 5)?;
-
-    spawn_status_emitter(Arc::clone(&hub));
-    if cli.request_claims {
+    if !cli.nmea0183 {
+        spawn_listener(
+            bind_addr,
+            cli.port + 1,
+            "json-stream",
+            Arc::clone(&hub),
+            Subscription::JsonStream,
+        )?;
+        spawn_listener(
+            bind_addr,
+            cli.port + 2,
+            "nmea0183-stream",
+            Arc::clone(&hub),
+            Subscription::Nmea0183Stream,
+        )?;
+        spawn_listener(
+            bind_addr,
+            cli.port + 3,
+            "ais-stream",
+            Arc::clone(&hub),
+            Subscription::AisStream,
+        )?;
+        spawn_listener(
+            bind_addr,
+            cli.port + 4,
+            "status",
+            Arc::clone(&hub),
+            Subscription::StatusStream,
+        )?;
+        spawn_snapshot_listener(bind_addr, cli.port, Arc::clone(&hub))?;
+        spawn_raw_input_listener(bind_addr, cli.port + 5)?;
+        spawn_status_emitter(Arc::clone(&hub));
+    }
+    // Default-on like canboat C; `-r` / `--restrict` and the explicit
+    // `--no-request-claims` opt-out both turn it off. Skip in
+    // `--nmea0183` debug mode too — stdout is already busy.
+    if !cli.restrict && !cli.no_request_claims && !cli.nmea0183 {
         spawn_claim_request_engine(Arc::clone(&hub));
     }
 
@@ -533,6 +550,12 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         if n_sentences > 0 {
             hub.broadcast(Subscription::Nmea0183Stream, &nmea);
             hub.udp_broadcast(nmea.as_bytes());
+            if hub.nmea_to_stdout {
+                let stdout = io::stdout();
+                let mut lock = stdout.lock();
+                let _ = lock.write_all(nmea.as_bytes());
+                let _ = lock.flush();
+            }
         }
     }
     Ok(())
@@ -592,6 +615,9 @@ struct Hub {
     src_filter: Option<SrcFilter>,
     rate_limiter: Mutex<RateLimiter>,
     udp: Option<UdpBroadcast>,
+    /// `--nmea0183` mode: NMEA / AIVDM sentences are also written to
+    /// the process's stdout. Off in the normal TCP-multiplex mode.
+    nmea_to_stdout: bool,
 }
 
 struct CacheEntry {
@@ -617,6 +643,7 @@ impl Hub {
             src_filter,
             rate_limiter: Mutex::new(RateLimiter::new(rate_limit)),
             udp,
+            nmea_to_stdout: false,
         }
     }
 

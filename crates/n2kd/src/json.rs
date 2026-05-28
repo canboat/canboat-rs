@@ -126,6 +126,19 @@ pub fn lookup_int(msg: &str, field: &str) -> Option<i64> {
     None
 }
 
+/// Pull the rendered text of a field. For `-nv` lookup objects this
+/// is the `name`; for plain JSON it's the bare value. Returns the
+/// substring unchanged when the analyzer has already rendered it as
+/// a string (e.g. dates / times in `-nv` mode are `{"value":N,"name":"…"}`
+/// where the canonical text is in `name`).
+pub fn value_or_name<'a>(msg: &'a str, field: &str) -> Option<&'a str> {
+    let v = value(msg, field)?;
+    if v.starts_with('{') {
+        return value(v, "name");
+    }
+    Some(v)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

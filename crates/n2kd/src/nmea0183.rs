@@ -354,8 +354,11 @@ fn position(out: &mut String, src: u8, msg: &str) {
 }
 
 fn gps_dop(out: &mut String, src: u8, msg: &str) {
-    let mode = json::value(msg, "Actual Mode")
-        .map(|s| s.chars().next().unwrap_or(' '))
+    // GSA mode is the integer code (1/2/3) rendered as a single digit,
+    // matching canboat's getNmea0183ModeChar — `-nv` wraps it in a
+    // `{value,name}` object, so unwrap it first.
+    let mode = json::lookup_int(msg, "Actual Mode")
+        .and_then(|n| char::from_digit(n as u32, 10))
         .unwrap_or(' ');
     let p = json::value(msg, "PDOP").unwrap_or("");
     let h = json::value(msg, "HDOP").unwrap_or("");
@@ -364,8 +367,8 @@ fn gps_dop(out: &mut String, src: u8, msg: &str) {
 }
 
 fn system_time(out: &mut String, src: u8, msg: &str) {
-    let date = json::value(msg, "Date").unwrap_or("");
-    let time = json::value(msg, "Time").unwrap_or("");
+    let date = json::value_or_name(msg, "Date").unwrap_or("");
+    let time = json::value_or_name(msg, "Time").unwrap_or("");
     // Expect `YYYY.MM.DD` and `HH:MM:SS[.SSSS]`.
     let mut date_parts = date.split('.');
     let (y, mo, d) = match (date_parts.next(), date_parts.next(), date_parts.next()) {

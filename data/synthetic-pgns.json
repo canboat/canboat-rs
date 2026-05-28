@@ -98,7 +98,7 @@
         {"Order": 1, "Id": "canNetworkLoad",     "Name": "CAN network load",     "BitLength": 8,  "BitOffset": 0,   "FieldType": "NUMBER", "Resolution": 1},
         {"Order": 2, "Id": "errors",             "Name": "Errors",               "BitLength": 32, "BitOffset": 8,   "FieldType": "NUMBER", "Resolution": 1},
         {"Order": 3, "Id": "deviceCount",        "Name": "Device count",         "BitLength": 8,  "BitOffset": 40,  "FieldType": "NUMBER", "Resolution": 1},
-        {"Order": 4, "Id": "uptime",             "Name": "Uptime",               "BitLength": 32, "BitOffset": 48,  "FieldType": "NUMBER", "Resolution": 1, "Unit": "s"},
+        {"Order": 4, "Id": "uptime",             "Name": "Uptime",               "BitLength": 32, "BitOffset": 48,  "FieldType": "DURATION", "Resolution": 1, "Unit": "s"},
         {"Order": 5, "Id": "gatewayAddress",     "Name": "Gateway address",      "BitLength": 8,  "BitOffset": 80,  "FieldType": "NUMBER", "Resolution": 1},
         {"Order": 6, "Id": "rejectedTxRequests", "Name": "Rejected TX requests", "BitLength": 32, "BitOffset": 88,  "FieldType": "NUMBER", "Resolution": 1}
       ]

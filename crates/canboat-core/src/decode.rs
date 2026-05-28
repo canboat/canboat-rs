@@ -836,11 +836,25 @@ fn decode_lookup(
         .and_then(|t| t.values.iter().find(|v| v.value == raw))
         .map(|v| v.name.clone());
     // canboat: if no name is resolved AND value is in the reserved
-    // sentinel range, treat as unavailable (matches print.c:718).
-    if name.is_none() && is_unavailable(ex) {
+    // sentinel range, drop the field (matches print.c:718). The
+    // lookup check is one off from `is_unavailable`: canboat uses
+    // `>=` against the threshold and a `bits>2 ? 2 : 1` reserved
+    // count, both of which include one more sentinel than the NUMBER
+    // path would.
+    if name.is_none() && is_lookup_unavailable(ex, bit_length as usize) {
         return FieldValue::NotAvailable;
     }
     FieldValue::Lookup { value: raw, name }
+}
+
+/// `print.c:718` rule for unknown LOOKUP values: in a `bits>1` field,
+/// drop the top `bits>2 ? 2 : 1` raw values (`value >= max - reserved`).
+fn is_lookup_unavailable(ex: crate::bits::Extracted, bits: usize) -> bool {
+    if bits <= 1 {
+        return false;
+    }
+    let reserved: i64 = if bits > 2 { 2 } else { 1 };
+    ex.value >= ex.max - reserved
 }
 
 /// INDIRECT_LOOKUP: resolve `(value1, value2)` where `value1` is
@@ -1355,13 +1369,26 @@ fn decode_dynamic_field_value(
             // (signed); TIME to UTIME_*. Treat DURATION as signed and
             // TIME as unsigned by default.
             let want_signed = matches!(entry.field_type.as_deref(), Some("DURATION")) || signed;
-            let Some(ex) = extract_bits(data, bit_offset as usize, bits as usize, want_signed, 0)
+            // Always sentinel-check against the unsigned bit pattern,
+            // even when the display interpretation is signed — canboat's
+            // "all-ones" N/A marker is 0xFF..FF in the raw bytes,
+            // regardless of how the value is shown.
+            let Some(ex_unsigned) =
+                extract_bits(data, bit_offset as usize, bits as usize, false, 0)
             else {
                 return (FieldValue::NotAvailable, bits);
             };
-            if is_unavailable(ex) {
+            if is_unavailable(ex_unsigned) {
                 FieldValue::NotAvailable
             } else {
+                let ex = if want_signed {
+                    match extract_bits(data, bit_offset as usize, bits as usize, true, 0) {
+                        Some(e) => e,
+                        None => return (FieldValue::NotAvailable, bits),
+                    }
+                } else {
+                    ex_unsigned
+                };
                 let res = entry.resolution.unwrap_or(1.0);
                 FieldValue::Time {
                     raw: ex.value,

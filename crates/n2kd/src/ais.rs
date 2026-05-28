@@ -608,25 +608,31 @@ fn draft(msg: &str) -> i64 {
 }
 
 fn comm_state(msg: &str) -> i64 {
-    // canboat default: 393222.
     let Some(s) = json::value(msg, "Communication State") else {
+        // canboat C's default when the field isn't present at all.
         return 393_222;
     };
-    if s.starts_with('"') {
-        // Hex-encoded string like "F8 08 00" — re-parse.
-        // canboat's analyzer emits Communication State as hex bytes
-        // in JSON. Pack the three bytes LE into the 19-bit slot.
-        let trimmed = s.trim_matches(['"', ' ']);
-        let bytes: Vec<u8> = trimmed
-            .split_whitespace()
-            .filter_map(|t| u8::from_str_radix(t, 16).ok())
-            .collect();
-        if bytes.len() >= 3 {
-            let v = (bytes[0] as i64) | ((bytes[1] as i64) << 8) | ((bytes[2] as i64) << 16);
-            return v & ((1 << 19) - 1);
-        }
+    let trimmed = s.trim_matches([' ', '"']);
+    // canboat's analyzer emits Communication State as either a bare
+    // integer or as a hex-byte string like "E4 10 01" (BINARY field
+    // rendering). Try integer first; if that fails, parse hex bytes
+    // and pack them little-endian into the 19-bit slot.
+    if let Ok(v) = trimmed.parse::<i64>() {
+        return v & ((1 << 19) - 1);
     }
-    s.trim().parse().unwrap_or(393_222)
+    let bytes: Vec<u8> = trimmed
+        .split_whitespace()
+        .filter_map(|t| u8::from_str_radix(t, 16).ok())
+        .collect();
+    if bytes.len() >= 3 {
+        let v = (bytes[0] as i64) | ((bytes[1] as i64) << 8) | ((bytes[2] as i64) << 16);
+        return v & ((1 << 19) - 1);
+    }
+    // Neither integer nor hex-bytes parsed. canboat C falls through
+    // to `atol(...)` which returns 0 on parse failure (treated as
+    // in-range by the C code's [0, 524287] range check). Mirror that
+    // so the AIVDM bit pattern matches the C output verbatim.
+    0
 }
 
 /// `Position Date` is `YYYY.MM.DD` in canboat JSON. Packed as

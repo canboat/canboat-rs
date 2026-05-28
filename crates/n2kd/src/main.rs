@@ -101,17 +101,37 @@ struct Cli {
     #[arg(long)]
     public: bool,
 
-    /// Also UDP-broadcast each NMEA 0183 sentence to `<host:port>`
-    /// (matches canboat `-u`/`-udp183`). Useful for OpenCPN /
-    /// Navionics receivers listening on the LAN.
-    #[arg(short = 'u', long, value_name = "HOST:PORT", alias = "udp183")]
-    udp183: Option<String>,
+    /// UDP-broadcast each NMEA 0183 sentence. Canboat's C tool takes
+    /// two positional args (`-u <host> <port>`); we accept that form
+    /// for drop-in script compatibility, plus a single-arg
+    /// `<host:port>` shorthand. Either way, the value lands in the
+    /// LAN where OpenCPN / Navionics receivers can pick it up.
+    #[arg(
+        short = 'u',
+        long = "udp183",
+        value_names = &["HOST", "PORT"],
+        num_args = 1..=2,
+    )]
+    udp183: Vec<String>,
 
     /// Start no TCP servers and send NMEA 0183 / AIVDM data on
     /// stdout. Mirrors canboat's `--nmea0183` flag — mainly for
     /// pipeline / debug use.
     #[arg(long)]
     nmea0183: bool,
+
+    /// Copy data received from TCP clients on the raw-input port back
+    /// to stdout (as well as forwarding to the analyzer pipeline).
+    /// Matches canboat C's `-o` flag. Off by default to keep stdout
+    /// clean for downstream consumers.
+    #[arg(short = 'o', long = "output")]
+    output_copy: bool,
+
+    /// Pin the log timestamp string. Matches canboat C's `-fixtime`,
+    /// used by deterministic-output tests. Accepted but currently
+    /// inert in Rust's `env_logger` setup.
+    #[arg(long = "fixtime", value_name = "STR")]
+    fixtime: Option<String>,
 
     /// Suppress the periodic ISO Address Claim / Product Info request
     /// engine. By default it's on (matching canboat C); `-r` /
@@ -157,10 +177,18 @@ fn run(cli: Cli) -> Result<()> {
     } else {
         Ipv4Addr::LOCALHOST
     };
-    let udp = match cli.udp183.as_deref() {
-        Some(addr) => Some(open_udp_broadcast(addr)?),
-        None => None,
+    // `-u host port` (canboat C) and `-u host:port` (ergonomic) both
+    // arrive as `Vec<String>` here. Re-stitch into a single
+    // `host:port` for `open_udp_broadcast` to resolve.
+    let udp = match cli.udp183.as_slice() {
+        [] => None,
+        [one] => Some(open_udp_broadcast(one)?),
+        [host, port] => Some(open_udp_broadcast(&format!("{host}:{port}"))?),
+        _ => anyhow::bail!("--udp183 / -u accepts at most 2 args (host [port])"),
     };
+    if let Some(ts) = cli.fixtime.as_deref() {
+        log::debug!("--fixtime accepted but not applied to logging: {ts}");
+    }
 
     let mut hub = Hub::new(src_filter, cli.rate_limit, udp);
     hub.nmea_to_stdout = cli.nmea0183 && !cli.restrict;
@@ -196,7 +224,7 @@ fn run(cli: Cli) -> Result<()> {
             Subscription::StatusStream,
         )?;
         spawn_snapshot_listener(bind_addr, cli.port, Arc::clone(&hub))?;
-        spawn_raw_input_listener(bind_addr, cli.port + 5)?;
+        spawn_raw_input_listener(bind_addr, cli.port + 5, cli.output_copy && !cli.restrict)?;
         spawn_status_emitter(Arc::clone(&hub));
     }
     // Default-on like canboat C; `-r` / `--restrict` and the explicit
@@ -345,7 +373,7 @@ fn spawn_snapshot_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<(
     Ok(())
 }
 
-fn spawn_raw_input_listener(bind: Ipv4Addr, port: u16) -> Result<()> {
+fn spawn_raw_input_listener(bind: Ipv4Addr, port: u16, copy_to_stdout: bool) -> Result<()> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding raw-input on {bind}:{port}"))?;
     log::info!("listening on {bind}:{port} (raw-input)");
@@ -360,7 +388,7 @@ fn spawn_raw_input_listener(bind: Ipv4Addr, port: u16) -> Result<()> {
                 }
             };
             thread::Builder::new()
-                .spawn(move || run_raw_input_client(stream))
+                .spawn(move || run_raw_input_client(stream, copy_to_stdout))
                 .ok();
         })
         .context("spawning raw-input listener")?;
@@ -486,8 +514,14 @@ fn run_snapshot_client(mut stream: TcpStream, hub: Arc<Hub>) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
-fn run_raw_input_client(stream: TcpStream) {
+fn run_raw_input_client(stream: TcpStream, copy_to_stdout: bool) {
     let reader = BufReader::new(stream);
+    if !copy_to_stdout {
+        // Drain the connection to keep the client side healthy, but
+        // discard — matches canboat C's default (echo only with `-o`).
+        for _line in reader.lines().map_while(|r| r.ok()) {}
+        return;
+    }
     let stdout = io::stdout();
     let mut lock = stdout.lock();
     for line in reader.lines().map_while(|r| r.ok()) {

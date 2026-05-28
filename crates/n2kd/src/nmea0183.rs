@@ -6,15 +6,14 @@
 //!
 //! Coverage (the ones canboat C ships and we replicate):
 //!
-//!   126992 System Time         → ZDA
 //!   127245 Rudder              → RSA
 //!   127250 Vessel Heading      → HDG / HDT / HDM
 //!   128259 Water Speed         → VHW
 //!   128267 Water Depth         → DPT
 //!   128275 Distance Log        → VLW
-//!   129026 SOG / COG           → VTG
-//!   129029 GNSS Position       → GLL (+ RMC when SOG/COG were
-//!                                  recently cached)
+//!   129026 SOG / COG           → VTG (also caches sog/cog for RMC)
+//!   129029 GNSS Position       → GLL + RMC (RMC reuses sog/cog
+//!                                  cached from a recent 129026)
 //!   129539 GPS DOP             → GSA
 //!   130306 Wind Data           → MWV
 //!   130311 Environmental       → MTW
@@ -71,9 +70,16 @@ const WIND_REF_NAMES: &[(&str, i64)] = &[
 
 /// Per-(src, rate-type) "this is the last time we let one through"
 /// timestamps. Mirrors canboat's `rateLimitPassed[256][RATE_COUNT]`.
+///
+/// Also carries the single-slot SOG/COG cache that canboat C keeps as
+/// `g_sog` / `g_cog` globals — refreshed on PGN 129026 and consumed by
+/// the PGN 129029 handler when emitting RMC.
 pub struct RateLimiter {
     last_passed: [[Option<Instant>; RATE_COUNT]; 256],
     enabled: bool,
+    /// `(sog_ms, cog_deg, captured_at)` — None until we've seen at
+    /// least one PGN 129026. Only honoured for ≤ 1s after capture.
+    last_sog_cog: Option<(f64, f64, Instant)>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -88,15 +94,15 @@ enum Rate {
     GpsPosition,
     Environmental,
     DistanceLog,
-    SystemTime,
 }
-const RATE_COUNT: usize = 11;
+const RATE_COUNT: usize = 10;
 
 impl RateLimiter {
     pub fn new(enabled: bool) -> Self {
         Self {
             last_passed: [[None; RATE_COUNT]; 256],
             enabled,
+            last_sog_cog: None,
         }
     }
 
@@ -135,17 +141,19 @@ pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> u
     }
     let before = out.len();
     match pgn {
-        126992 => system_time(out, src, msg),
         127245 => rudder(out, src, msg),
         127250 => vessel_heading(out, src, msg),
         128259 => water_speed(out, src, msg),
         128267 => water_depth(out, src, msg),
         128275 => distance_log(out, src, msg),
-        129026 => sog_cog(out, src, msg),
-        129029 => position(out, src, msg),
+        129026 => sog_cog(out, src, msg, rate_limiter),
+        129029 => position(out, src, msg, rate_limiter),
         129539 => gps_dop(out, src, msg),
         130306 => wind_data(out, src, msg),
         130311 => environmental(out, src, msg),
+        // PGN 126992 (System Time) intentionally has no handler:
+        // canboat C never emits ZDA either, opting to emit
+        // date/time through RMC alongside the GPS position fix.
         _ => {}
     }
     if out.len() > before {
@@ -167,7 +175,6 @@ fn pgn_to_rate(pgn: i64) -> Option<Rate> {
         129029 => Rate::GpsPosition,
         130311 => Rate::Environmental,
         128275 => Rate::DistanceLog,
-        126992 => Rate::SystemTime,
         _ => return None,
     })
 }
@@ -268,12 +275,14 @@ fn water_speed(out: &mut String, src: u8, msg: &str) {
     let Some(s) = json::number(msg, "Speed Water Referenced") else {
         return;
     };
-    // canboat C formats the knots field with `%1f` which is a typo —
-    // it ends up with no width / precision. We use `%.1f` for sanity.
+    // canboat C formats the knots field with `%1f`, which is a typo
+    // for `%.1f` — `%1f` is just "min width 1, default precision 6",
+    // so C emits e.g. `0.000000`. Mirror that for byte-for-byte parity
+    // even though it's clearly unintended in the C source.
     create(
         out,
         src,
-        &format!("VHW,,T,,M,{:.1},N,{:.1},K", s * MS_TO_KNOTS, s * MS_TO_KMH),
+        &format!("VHW,,T,,M,{:.6},N,{:.1},K", s * MS_TO_KNOTS, s * MS_TO_KMH),
     );
 }
 
@@ -317,13 +326,16 @@ fn rudder(out: &mut String, src: u8, msg: &str) {
     create(out, src, &format!("RSA,{:.1},A,,F", -pos));
 }
 
-fn sog_cog(out: &mut String, src: u8, msg: &str) {
+fn sog_cog(out: &mut String, src: u8, msg: &str, rl: &mut RateLimiter) {
     let Some(sog) = json::number(msg, "SOG") else {
         return;
     };
     let Some(cog) = json::number(msg, "COG") else {
         return;
     };
+    // Cache for the next 129029 RMC. Single slot, latest-wins —
+    // matches canboat C's `g_sog` / `g_cog` globals.
+    rl.last_sog_cog = Some((sog, cog, Instant::now()));
     create(
         out,
         src,
@@ -336,7 +348,7 @@ fn sog_cog(out: &mut String, src: u8, msg: &str) {
     );
 }
 
-fn position(out: &mut String, src: u8, msg: &str) {
+fn position(out: &mut String, src: u8, msg: &str, rl: &RateLimiter) {
     let Some(lat) = json::number(msg, "Latitude") else {
         return;
     };
@@ -345,55 +357,93 @@ fn position(out: &mut String, src: u8, msg: &str) {
     };
     let (lat_str, lat_hem) = latlon_to_nmea(lat, true);
     let (lon_str, lon_hem) = latlon_to_nmea(lon, false);
-    // Plain GLL (no time / status fields).
+
+    // Time is `HH:MM:SS.SSSS` (or `:SS` with no fractional). Strip
+    // colons and cap to 2 decimal places for the NMEA `hhmmss.ss` slot.
+    let time_str = nmea_time_string(json::value_or_name(msg, "Time").unwrap_or(""));
+    // Date is `YYYY.MM.DD` from canboat. Format as `DDMMYY`.
+    let date_str = nmea_date_string(json::value_or_name(msg, "Date").unwrap_or(""));
+
+    // GLL: $...GLL,llll.llll,N,yyyyy.yyyy,E,hhmmss.ss,A
     create(
         out,
         src,
-        &format!("GLL,{lat_str},{lat_hem},{lon_str},{lon_hem},,A"),
+        &format!("GLL,{lat_str},{lat_hem},{lon_str},{lon_hem},{time_str},A"),
     );
+
+    // RMC: time, status, lat, NS, lon, EW, sog(knots), cog, date, var, varhem, mode.
+    // Only fill in SOG / COG if we saw a 129026 within the last second.
+    let (sog_str, cog_str) = match rl.last_sog_cog {
+        Some((sog, cog, ts)) if ts.elapsed() < Duration::from_secs(1) => {
+            (format!("{:.2}", sog * MS_TO_KNOTS), format!("{:.1}", cog))
+        }
+        _ => (String::new(), String::new()),
+    };
+    create(
+        out,
+        src,
+        &format!(
+            "RMC,{time_str},A,{lat_str},{lat_hem},{lon_str},{lon_hem},{sog_str},{cog_str},{date_str},,,A"
+        ),
+    );
+}
+
+/// `12:06:58.0000` → `120658`. Strips colons and then trims trailing
+/// zeros plus the bare decimal point, mirroring canboat's
+/// `cleanupTimeString` in `gps_ais.c`. So `120657.0000` → `120657`,
+/// `120657.5000` → `120657.5`.
+fn nmea_time_string(time: &str) -> String {
+    if time.is_empty() {
+        return String::new();
+    }
+    let mut s: String = time.chars().filter(|c| *c != ':').collect();
+    while s.ends_with('0') {
+        s.pop();
+    }
+    if s.ends_with('.') {
+        s.pop();
+    }
+    s
+}
+
+/// `2022.09.10` → `100922`. Day-month-year, two digits each.
+fn nmea_date_string(date: &str) -> String {
+    let mut parts = date.split('.');
+    let y = parts.next().unwrap_or("");
+    let mo = parts.next().unwrap_or("");
+    let d = parts.next().unwrap_or("");
+    if y.is_empty() || mo.is_empty() || d.is_empty() {
+        return String::new();
+    }
+    let y2 = &y[y.len().saturating_sub(2)..];
+    format!("{d:0>2}{mo:0>2}{y2:0>2}")
 }
 
 fn gps_dop(out: &mut String, src: u8, msg: &str) {
     // GSA mode is the integer code (1/2/3) rendered as a single digit,
     // matching canboat's getNmea0183ModeChar — `-nv` wraps it in a
-    // `{value,name}` object, so unwrap it first.
-    let mode = json::lookup_int(msg, "Actual Mode")
+    // `{value,name}` object, so unwrap it first. Missing field → empty
+    // (canboat C leaves the slot blank rather than emitting a space).
+    let mode: String = json::lookup_int(msg, "Actual Mode")
         .and_then(|n| char::from_digit(n as u32, 10))
-        .unwrap_or(' ');
+        .map(|c| c.to_string())
+        .unwrap_or_default();
     let p = json::value(msg, "PDOP").unwrap_or("");
     let h = json::value(msg, "HDOP").unwrap_or("");
     let v = json::value(msg, "VDOP").unwrap_or("");
     create(out, src, &format!("GSA,M,{mode},,,,,,,,,,,,,{p},{h},{v}"));
 }
 
-fn system_time(out: &mut String, src: u8, msg: &str) {
-    let date = json::value_or_name(msg, "Date").unwrap_or("");
-    let time = json::value_or_name(msg, "Time").unwrap_or("");
-    // Expect `YYYY.MM.DD` and `HH:MM:SS[.SSSS]`.
-    let mut date_parts = date.split('.');
-    let (y, mo, d) = match (date_parts.next(), date_parts.next(), date_parts.next()) {
-        (Some(y), Some(m), Some(d)) => (y, m, d),
-        _ => return,
-    };
-    let mut time_parts = time.split(':');
-    let (h, mi, s) = match (time_parts.next(), time_parts.next(), time_parts.next()) {
-        (Some(h), Some(m), Some(s)) => (h, m, s),
-        _ => return,
-    };
-    create(
-        out,
-        src,
-        &format!("ZDA,{h:0>2}{mi:0>2}{s},{d},{mo},{y:0>4},,"),
-    );
-}
-
-/// `±DDD.dddddd` decimal degrees → `DDMM.mmmm`/`DDDMM.mmmm` plus a
-/// hemisphere character. Matches canboat's `convert2kCoordinateToNMEA0183`.
+/// `±DDD.dddddd` decimal degrees → `DDMM.mmmm` (no zero-padded
+/// degrees — matches canboat's `convert2kCoordinateToNMEA0183`, which
+/// formats `degrees * 100 + minutes` with `%.4f` and lets `printf`
+/// trim leading zeros). Per the NMEA 0183 spec, longitude should be
+/// `DDDMM.mmmm` (3-digit degrees, zero-padded) — canboat C's
+/// formatter doesn't pad, and we follow it for byte parity.
 fn latlon_to_nmea(decimal: f64, is_lat: bool) -> (String, char) {
     let abs = decimal.abs();
-    let deg = abs.floor() as u32;
-    let minutes = (abs - deg as f64) * 60.0;
-    let width = if is_lat { 2 } else { 3 };
+    let deg = abs.floor();
+    let combined = deg * 100.0 + (abs - deg) * 60.0;
     let hem = if is_lat {
         if decimal < 0.0 {
             'S'
@@ -405,10 +455,7 @@ fn latlon_to_nmea(decimal: f64, is_lat: bool) -> (String, char) {
     } else {
         'E'
     };
-    (
-        format!("{deg:0>width$}{:07.4}", minutes, width = width),
-        hem,
-    )
+    (format!("{combined:.4}"), hem)
 }
 
 #[cfg(test)]

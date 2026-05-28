@@ -409,6 +409,7 @@ mod tests {
                     },
                 },
             ],
+            has_repeating_set: [false, false],
         }
     }
 

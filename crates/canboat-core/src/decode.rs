@@ -143,6 +143,15 @@ pub struct DecodedPgn {
     /// original `RawFrame`.
     pub data: Vec<u8>,
     pub fields: Vec<DecodedField>,
+    /// `[set1, set2]` — true when the decoder reached the start
+    /// field of the corresponding repeating set during this decode.
+    /// False when the payload ran out before the set's start field
+    /// or the PGN doesn't define a set at that index. The JSON
+    /// formatter uses these to emit canboat's empty-`"list":[{}]`
+    /// placeholder when the count is zero — matching the
+    /// `"list":[{` opener that analyzer/analyzer.c:1276 emits the
+    /// moment it sees the start field.
+    pub has_repeating_set: [bool; 2],
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -164,7 +173,7 @@ impl PgnDatabase {
             .pick_variant(frame)
             .ok_or(DecodeError::UnknownPgn { pgn: frame.pgn })?;
 
-        let fields = decode_fields(info, &frame.data, self)?;
+        let (fields, has_repeating_set) = decode_fields(info, &frame.data, self)?;
 
         Ok(DecodedPgn {
             timestamp: frame.timestamp.clone(),
@@ -176,6 +185,7 @@ impl PgnDatabase {
             id: info.id.clone(),
             data: frame.data.to_vec(),
             fields,
+            has_repeating_set,
         })
     }
 
@@ -314,7 +324,7 @@ fn decode_fields(
     info: &PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
-) -> Result<Vec<DecodedField>, DecodeError> {
+) -> Result<(Vec<DecodedField>, [bool; 2]), DecodeError> {
     let mut out = Vec::with_capacity(info.fields.len());
     let mut ctx = DecodeContext::default();
     let start1 = info.repeating_field_set1_start_field;
@@ -323,6 +333,7 @@ fn decode_fields(
     let start2 = info.repeating_field_set2_start_field;
     let size2 = info.repeating_field_set2_size;
     let count_field2 = info.repeating_field_set2_count_field;
+    let mut entered = [false, false];
 
     let mut i = 0usize;
     // Running bit cursor — used both for variable-length fields that
@@ -337,6 +348,15 @@ fn decode_fields(
         // until the payload runs out.
         if let (Some(start), Some(size)) = (start1, size1) {
             if (f.order as u32) == start {
+                // Only mark as "entered" if the start field is
+                // actually within the payload — canboat C's main
+                // loop stops once `startBit >> 3 >= length`, so a
+                // truncated PGN payload never reaches the start
+                // field and never emits the list opener.
+                let bit_offset = f.bit_offset.unwrap_or(cursor_bits);
+                if (bit_offset as usize) < data.len() * 8 {
+                    entered[0] = true;
+                }
                 cursor_bits = decode_repeating(
                     info,
                     data,
@@ -356,6 +376,10 @@ fn decode_fields(
         // Repeating set 2?
         if let (Some(start), Some(size)) = (start2, size2) {
             if (f.order as u32) == start {
+                let bit_offset = f.bit_offset.unwrap_or(cursor_bits);
+                if (bit_offset as usize) < data.len() * 8 {
+                    entered[1] = true;
+                }
                 cursor_bits = decode_repeating(
                     info,
                     data,
@@ -391,7 +415,7 @@ fn decode_fields(
         }
         i += 1;
     }
-    Ok(out)
+    Ok((out, entered))
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -987,7 +1011,7 @@ fn decode_iso_name(data: &[u8], bit_offset: u32, bit_length: u32, db: &PgnDataba
     }
     let sub = &data[byte_off..byte_off + 8];
     let subfields = match db.first_pgn(60928) {
-        Some(pgn) => decode_fields(pgn, sub, db).unwrap_or_default(),
+        Some(pgn) => decode_fields(pgn, sub, db).map(|x| x.0).unwrap_or_default(),
         None => Vec::new(),
     };
     FieldValue::IsoName { value, subfields }
@@ -1327,17 +1351,15 @@ fn decode_dynamic_field_value(
         .take()
         .map(|n| n * 8)
         .or_else(|| entry.as_ref().and_then(|e| e.bit_length()));
-    let Some(bits) = length_bits else {
-        return (
-            FieldValue::Unsupported {
-                field_type: "DYNAMIC_FIELD_VALUE (no length)",
-            },
-            0,
-        );
-    };
+    // Mirror canboat's fieldPrintKeyValue: no resolved length and
+    // no resolved field type → emit an empty BINARY blob (the
+    // `g_length = 0, g_ftf = NULL, fieldPrintBinary(bits=0)` path
+    // in print.c). Better than erroring out — this is how PGN
+    // 130845 with an unknown SIMNET_KEY_VALUE key renders.
+    let bits = length_bits.unwrap_or(0);
     let Some(entry) = entry else {
         // Unresolved key — render as a raw BINARY blob over the
-        // declared length.
+        // declared length (zero bytes is fine, comes out as "").
         return (decode_binary(data, bit_offset, bits), bits);
     };
     let signed =

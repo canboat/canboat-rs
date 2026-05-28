@@ -167,6 +167,46 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     if current_set != 0 {
         w_fields.write_str("}]")?;
     }
+    // Empty-list placeholder: canboat C unconditionally emits
+    // `"list":[{` the moment it sees the repeating set's start field,
+    // regardless of how many iterations the count produces. When the
+    // count is 0 the result is `"list":[{}]`. Mirror that here so
+    // `Reference Stations: 0` style records line up byte-for-byte.
+    // "Did we actually emit any list fields?" — match the same
+    // filtering the JSON walker applies (NotAvailable / Spare are
+    // dropped in default mode). pgn.fields.iter().any(...) by itself
+    // would over-count, because the count=0 + truncated case still
+    // pushes NotAvailable fields onto the decoded set but the JSON
+    // emits none of them.
+    let renderable = |f: &DecodedField| {
+        if matches!(f.value, FieldValue::Spare { .. }) {
+            return false;
+        }
+        if matches!(f.value, FieldValue::NotAvailable) && !opts.include_empty && !opts.debug {
+            return false;
+        }
+        true
+    };
+    let saw_set1 = pgn
+        .fields
+        .iter()
+        .any(|f| f.repeat_set == 1 && renderable(f));
+    let saw_set2 = pgn
+        .fields
+        .iter()
+        .any(|f| f.repeat_set == 2 && renderable(f));
+    if pgn.has_repeating_set[0] && !saw_set1 {
+        if !fields_buf.is_empty() && current_set == 0 {
+            fields_buf.push_str(top_sep);
+        }
+        fields_buf.push_str("\"list\":[{}]");
+    }
+    if pgn.has_repeating_set[1] && !saw_set2 {
+        if !fields_buf.is_empty() {
+            fields_buf.push(',');
+        }
+        fields_buf.push_str("\"list2\":[{}]");
+    }
     if !fields_buf.is_empty() {
         w.write_str(",\"fields\":{")?;
         w.write_str(&fields_buf)?;
@@ -683,6 +723,7 @@ mod tests {
                 part_of_primary_key: false,
                 value: FieldValue::Number(0.0),
             }],
+            has_repeating_set: [false, false],
         }
     }
 

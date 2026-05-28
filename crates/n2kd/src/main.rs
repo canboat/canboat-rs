@@ -21,6 +21,7 @@
 //! PGNs flow unchanged through the AIS port; the NMEA stream simply
 //! doesn't emit AIVDM sentences yet.
 
+mod ais;
 mod json;
 mod nmea0183;
 
@@ -519,9 +520,13 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
             hub.broadcast(Subscription::AisStream, &line);
         }
         // NMEA 0183 conversion: append each generated sentence to a
-        // small buffer and ship it once.
+        // small buffer and ship it once. AIS PGNs get the AIVDM
+        // encoder; everything else goes through the simple-sentence
+        // table.
         let mut nmea = String::new();
-        let n_sentences = {
+        let n_sentences = if AIS_PGNS.contains(&meta.pgn) {
+            ais::convert(&mut nmea, trimmed)
+        } else {
             let mut rl = hub.rate_limiter.lock().unwrap();
             nmea0183::convert(&mut nmea, trimmed, &mut rl)
         };

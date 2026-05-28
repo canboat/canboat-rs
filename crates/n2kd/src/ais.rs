@@ -120,7 +120,7 @@ impl Default for BitVector {
 /// the canboat-style 8-bit src used to encode the two-letter talker
 /// (we always emit `AI` regardless, matching canboat: `'I'-'A'=8`,
 /// the second char). Returns the number of sentences emitted.
-pub fn convert(out: &mut String, msg: &str) -> usize {
+pub fn convert(out: &mut String, msg: &str, seq_counter: &mut u8) -> usize {
     let Some(pgn) = json::int(msg, "pgn") else {
         return 0;
     };
@@ -134,7 +134,7 @@ pub fn convert(out: &mut String, msg: &str) -> usize {
     if !encode_payload(&mut bv, msgid, pgn, msg) {
         return 0;
     }
-    emit_sentences(out, &bv, talker, channel)
+    emit_sentences(out, &bv, talker, channel, seq_counter)
 }
 
 /// Derive the AIVDM message ID from the JSON, falling back to a
@@ -237,7 +237,7 @@ fn encode_class_a_position(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(latitude(msg, "Latitude"), 27);
     bv.add_int(cog(msg, "COG"), 12);
     bv.add_int(heading(msg, "Heading"), 9);
-    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 60), 6);
+    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(enum_or_name(msg, "Special Maneuver Indicator", &[]), 2);
     bv.add_int(0, 3); // Spare
     bv.add_int(enum_or_name(msg, "RAIM", RAIM_NAMES), 1);
@@ -293,7 +293,7 @@ fn encode_sar_aircraft(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(longitude(msg, "Longitude"), 28);
     bv.add_int(latitude(msg, "Latitude"), 27);
     bv.add_int(cog(msg, "COG"), 12);
-    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 60), 6);
+    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(0, 8); // Regional reserved
     bv.add_int(enum_or_name(msg, "DTE", &[]), 1);
     bv.add_int(0, 3); // Spare
@@ -358,7 +358,7 @@ fn encode_class_b_position(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(latitude(msg, "Latitude"), 27);
     bv.add_int(cog(msg, "COG"), 12);
     bv.add_int(heading(msg, "Heading"), 9);
-    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 60), 6);
+    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(0, 2); // Regional reserved
     bv.add_int(enum_or_name(msg, "Unit type", &[]), 1);
     bv.add_int(enum_or_name(msg, "Integrated Display", &[]), 1);
@@ -385,7 +385,7 @@ fn encode_class_b_extended(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(latitude(msg, "Latitude"), 27);
     bv.add_int(cog(msg, "COG"), 12);
     bv.add_int(heading(msg, "True Heading"), 9);
-    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 60), 6);
+    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(0, 4); // Regional reserved
     bv.add_string(json::value(msg, "Name").unwrap_or(""), 120);
     bv.add_int(enum_or_name(msg, "Type of ship", &[]), 8);
@@ -413,7 +413,7 @@ fn encode_aton(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(latitude(msg, "Latitude"), 27);
     bv.add_int(ship_dimensions(msg, false), 30);
     bv.add_int(enum_or_name(msg, "GNSS type", &[]), 4);
-    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 60), 6);
+    bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(enum_or_name(msg, "Off Position Indicator", &[]), 1);
     bv.add_int(0, 8); // Regional reserved
     bv.add_int(enum_or_name(msg, "RAIM", RAIM_NAMES), 1);
@@ -628,10 +628,8 @@ fn comm_state(msg: &str) -> i64 {
         let v = (bytes[0] as i64) | ((bytes[1] as i64) << 8) | ((bytes[2] as i64) << 16);
         return v & ((1 << 19) - 1);
     }
-    // Neither integer nor hex-bytes parsed. canboat C falls through
-    // to `atol(...)` which returns 0 on parse failure (treated as
-    // in-range by the C code's [0, 524287] range check). Mirror that
-    // so the AIVDM bit pattern matches the C output verbatim.
+    // Neither integer nor hex-bytes parsed: fall through to 0, same
+    // as canboat C's atol-fallback on a malformed input.
     0
 }
 
@@ -748,17 +746,24 @@ fn split_aton_name(s: &str) -> (&str, &str) {
 /// emit each as `!AIVDM,…*XX\r\n`. Returns the number of sentences
 /// emitted. The talker is always `AI` (matches canboat C); only the
 /// `<type>` (VDM/VDO) varies.
-fn emit_sentences(out: &mut String, bv: &BitVector, talker: &str, channel: char) -> usize {
+fn emit_sentences(
+    out: &mut String,
+    bv: &BitVector,
+    talker: &str,
+    channel: char,
+    seq_counter: &mut u8,
+) -> usize {
     let total_bits = bv.pos;
     if total_bits == 0 {
         return 0;
     }
     let fragments = total_bits.div_ceil(360);
     let seq = if fragments > 1 {
-        // Cycle 0..9 across multi-fragment messages. We don't keep
-        // global state — using `0` is fine for OpenCPN / Navionics
-        // (they don't reuse the sequence id across sources).
-        Some('0')
+        // Cycle 0..9 across multi-fragment messages. Matches
+        // canboat C's `sequenceId` static in `gps_ais.c`: bump
+        // before use, wrap at 10, render as an ASCII digit.
+        *seq_counter = (*seq_counter + 1) % 10;
+        Some((b'0' + *seq_counter) as char)
     } else {
         None
     };
@@ -849,7 +854,8 @@ mod tests {
         bv.add_int(1, 6);
         bv.add_int(63, 6);
         let mut out = String::new();
-        emit_sentences(&mut out, &bv, "VDM", 'A');
+        let mut seq = 0;
+        emit_sentences(&mut out, &bv, "VDM", 'A', &mut seq);
         assert!(out.contains("AIVDM,1,1,,A,01w,0*"), "got {out}");
     }
 
@@ -858,7 +864,8 @@ mod tests {
         // Synthetic JSON resembling the dirona AIS PGN 129039 line.
         let msg = r#"{"pgn":129039,"src":23,"fields":{"Message ID":"Standard Class B position report","Repeat Indicator":"Initial","User ID":"244180106","Longitude":5.3134516,"Latitude":52.9061666,"Position Accuracy":"High","RAIM":"in use","Time Stamp":29,"COG":171.7,"SOG":1.80,"Heading":null,"Unit type":"SOTDMA","Integrated Display":"No","DSC":"Yes","Band":"Entire marine band","Can handle Msg 22":"Yes","AIS mode":"Autonomous","AIS communication state":"SOTDMA","Communication State":"F8 08 00","AIS Transceiver information":"Channel A VDL reception"}}"#;
         let mut out = String::new();
-        let n = convert(&mut out, msg);
+        let mut seq = 0;
+        let n = convert(&mut out, msg, &mut seq);
         assert_eq!(n, 1, "expected one AIVDM sentence");
         assert!(out.starts_with("!AIVDM,1,1,,A,"), "got {out}");
         assert!(out.ends_with("\r\n"));

@@ -576,7 +576,8 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         // table.
         let mut nmea = String::new();
         let n_sentences = if AIS_PGNS.contains(&meta.pgn) {
-            ais::convert(&mut nmea, trimmed)
+            let mut rl = hub.rate_limiter.lock().unwrap();
+            ais::convert(&mut nmea, trimmed, &mut rl.ais_seq)
         } else {
             let mut rl = hub.rate_limiter.lock().unwrap();
             nmea0183::convert(&mut nmea, trimmed, &mut rl)

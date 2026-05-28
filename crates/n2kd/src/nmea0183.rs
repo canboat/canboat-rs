@@ -73,13 +73,18 @@ const WIND_REF_NAMES: &[(&str, i64)] = &[
 ///
 /// Also carries the single-slot SOG/COG cache that canboat C keeps as
 /// `g_sog` / `g_cog` globals — refreshed on PGN 129026 and consumed by
-/// the PGN 129029 handler when emitting RMC.
+/// the PGN 129029 handler when emitting RMC — and the cycling
+/// multi-fragment AIVDM sequence id counter (`gps_ais.c::sequenceId`).
 pub struct RateLimiter {
     last_passed: [[Option<Instant>; RATE_COUNT]; 256],
     enabled: bool,
     /// `(sog_ms, cog_deg, captured_at)` — None until we've seen at
     /// least one PGN 129026. Only honoured for ≤ 1s after capture.
     last_sog_cog: Option<(f64, f64, Instant)>,
+    /// Cycling 0..9 — the next multi-fragment AIVDM message bumps
+    /// this and uses the resulting digit as its sequence id, matching
+    /// canboat C's `sequenceId` static in `gps_ais.c::aisToNmea0183`.
+    pub ais_seq: u8,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -103,6 +108,7 @@ impl RateLimiter {
             last_passed: [[None; RATE_COUNT]; 256],
             enabled,
             last_sog_cog: None,
+            ais_seq: 0,
         }
     }
 
@@ -275,14 +281,10 @@ fn water_speed(out: &mut String, src: u8, msg: &str) {
     let Some(s) = json::number(msg, "Speed Water Referenced") else {
         return;
     };
-    // canboat C formats the knots field with `%1f`, which is a typo
-    // for `%.1f` — `%1f` is just "min width 1, default precision 6",
-    // so C emits e.g. `0.000000`. Mirror that for byte-for-byte parity
-    // even though it's clearly unintended in the C source.
     create(
         out,
         src,
-        &format!("VHW,,T,,M,{:.6},N,{:.1},K", s * MS_TO_KNOTS, s * MS_TO_KMH),
+        &format!("VHW,,T,,M,{:.1},N,{:.1},K", s * MS_TO_KNOTS, s * MS_TO_KMH),
     );
 }
 

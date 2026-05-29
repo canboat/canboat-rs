@@ -722,24 +722,41 @@ fn write_field_value<W: fmt::Write>(
     }
 }
 
+/// Per-byte escape table. Each entry is `Some(replacement)` for
+/// bytes that need quoting in a JSON string; `None` for bytes that
+/// pass through unchanged. UTF-8 continuation bytes (>= 0x80) all
+/// pass through since the escapes are ASCII-only.
+const ESCAPE_TABLE: [Option<&str>; 256] = build_escape_table(false);
+const ESCAPE_TABLE_WITH_SLASH: [Option<&str>; 256] = build_escape_table(true);
+
+const fn build_escape_table(slash: bool) -> [Option<&'static str>; 256] {
+    let mut t: [Option<&'static str>; 256] = [None; 256];
+    t[b'"' as usize] = Some("\\\"");
+    t[b'\\' as usize] = Some("\\\\");
+    t[0x08] = Some("\\b");
+    t[0x09] = Some("\\t");
+    t[0x0a] = Some("\\n");
+    t[0x0c] = Some("\\f");
+    t[0x0d] = Some("\\r");
+    // Other control characters (< 0x20) use \u00XX form — handled by
+    // the slow path. Mark them with a single-char sentinel "*" that
+    // the caller treats as "use \uXXXX".
+    let mut i = 0u8;
+    while i < 0x20 {
+        if t[i as usize].is_none() {
+            t[i as usize] = Some("*"); // sentinel for "\u00XX"
+        }
+        i += 1;
+    }
+    if slash {
+        t[b'/' as usize] = Some("\\/");
+    }
+    t
+}
+
 /// Write `s` as a JSON-quoted string, escaping per RFC 8259.
 fn write_json_string<W: fmt::Write>(w: &mut W, s: &str) -> fmt::Result {
-    w.write_char('"')?;
-    for c in s.chars() {
-        match c {
-            '"' => w.write_str("\\\"")?,
-            '\\' => w.write_str("\\\\")?,
-            '\u{0008}' => w.write_str("\\b")?,
-            '\u{000c}' => w.write_str("\\f")?,
-            '\n' => w.write_str("\\n")?,
-            '\r' => w.write_str("\\r")?,
-            '\t' => w.write_str("\\t")?,
-            c if (c as u32) < 0x20 => write!(w, "\\u{:04x}", c as u32)?,
-            c => w.write_char(c)?,
-        }
-    }
-    w.write_char('"')?;
-    Ok(())
+    write_json_string_with_table(w, s, &ESCAPE_TABLE)
 }
 
 /// canboat C's `print_ascii_json_escaped` (analyzer/print.c:1255)
@@ -751,20 +768,46 @@ fn write_json_string<W: fmt::Write>(w: &mut W, s: &str) -> fmt::Result {
 /// used only by `FieldValue::String` formatters — adds the `/`
 /// escape for byte-for-byte parity.
 fn write_field_json_string<W: fmt::Write>(w: &mut W, s: &str) -> fmt::Result {
+    write_json_string_with_table(w, s, &ESCAPE_TABLE_WITH_SLASH)
+}
+
+/// Body of both `write_json_string` flavours. Walks `s` as bytes and
+/// emits the longest unescaped run via a single `write_str` call,
+/// inserting escape sequences only at the boundaries — replaces a
+/// per-char `match` + virtual `write_char` dispatch + UTF-8 decode
+/// with a tight ASCII byte loop. Multibyte UTF-8 sequences pass
+/// through because every byte of every escape-needing character is
+/// in the ASCII range (< 0x80) and continuation bytes are >= 0x80,
+/// so they never match an escape table entry.
+#[inline]
+fn write_json_string_with_table<W: fmt::Write>(
+    w: &mut W,
+    s: &str,
+    table: &[Option<&str>; 256],
+) -> fmt::Result {
     w.write_char('"')?;
-    for c in s.chars() {
-        match c {
-            '"' => w.write_str("\\\"")?,
-            '\\' => w.write_str("\\\\")?,
-            '/' => w.write_str("\\/")?,
-            '\u{0008}' => w.write_str("\\b")?,
-            '\u{000c}' => w.write_str("\\f")?,
-            '\n' => w.write_str("\\n")?,
-            '\r' => w.write_str("\\r")?,
-            '\t' => w.write_str("\\t")?,
-            c if (c as u32) < 0x20 => write!(w, "\\u{:04x}", c as u32)?,
-            c => w.write_char(c)?,
+    let bytes = s.as_bytes();
+    let mut start = 0usize;
+    for (i, &b) in bytes.iter().enumerate() {
+        if let Some(esc) = table[b as usize] {
+            // Flush any pending unescaped run.
+            if i > start {
+                // SAFETY: `start..i` is a valid char boundary because
+                // we never escape continuation bytes (escapes are all
+                // < 0x80, continuations are >= 0x80).
+                w.write_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..i]) })?;
+            }
+            if esc.as_bytes() == b"*" {
+                // \u00XX form for non-special control codes.
+                write!(w, "\\u{:04x}", b as u32)?;
+            } else {
+                w.write_str(esc)?;
+            }
+            start = i + 1;
         }
+    }
+    if start < bytes.len() {
+        w.write_str(unsafe { std::str::from_utf8_unchecked(&bytes[start..]) })?;
     }
     w.write_char('"')?;
     Ok(())

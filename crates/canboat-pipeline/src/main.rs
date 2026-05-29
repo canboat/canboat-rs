@@ -113,8 +113,11 @@ struct Cli {
     #[arg(long)]
     ikonvert_rate_limit_off: bool,
 
-    /// Bind address for all TCP listeners.
-    #[arg(long, default_value = "127.0.0.1")]
+    /// Bind address for all TCP listeners. Defaults to `0.0.0.0` so
+    /// clients on the LAN (chartplotters, OpenCPN, etc.) can
+    /// connect. Pass `127.0.0.1` to restrict access to the local
+    /// host.
+    #[arg(long, default_value = "0.0.0.0")]
     bind: Ipv4Addr,
 
     /// Port for the snapshot server — on connect, dumps the latest

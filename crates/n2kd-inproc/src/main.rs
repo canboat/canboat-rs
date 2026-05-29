@@ -27,9 +27,22 @@ use canboat_core::{FramePacketType, PgnDatabase, Reassembled, Reassembler};
 
 const SYNTHETIC_PGNS_JSON: &str = include_str!("../../../data/synthetic-pgns.json");
 
-const AIS_PGNS: &[u32] = &[
-    129038, 129039, 129040, 129041, 129793, 129794, 129798, 129801, 129802, 129809, 129810,
-];
+fn is_ais_pgn(pgn: u32) -> bool {
+    matches!(
+        pgn,
+        129038
+            | 129039
+            | 129040
+            | 129041
+            | 129793
+            | 129794
+            | 129798
+            | 129801
+            | 129802
+            | 129809
+            | 129810
+    )
+}
 
 #[derive(Debug, Parser)]
 #[command(
@@ -154,13 +167,8 @@ fn run(cli: Cli) -> Result<()> {
         let pgn = decoded.pgn;
         let n_emitted = if n2kd::decoded::Handles::supports(pgn) {
             n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles)
-        } else if AIS_PGNS.contains(&pgn) {
-            JSON_BUF.with(|c| {
-                let mut buf = c.borrow_mut();
-                buf.clear();
-                let _ = write_json(&mut *buf, &decoded, &json_opts);
-                n2kd::ais::convert(&mut nmea_buf, &buf, &mut ais_seq)
-            })
+        } else if is_ais_pgn(pgn) {
+            n2kd::ais_decoded::convert(&mut nmea_buf, &decoded, &mut ais_seq)
         } else {
             JSON_BUF.with(|c| {
                 let mut buf = c.borrow_mut();

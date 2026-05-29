@@ -266,6 +266,19 @@ impl DecodedPgn {
         }
         self.fields.get(idx as usize)
     }
+
+    /// Look up a top-level field by name. `O(n)` linear scan over
+    /// the decoded fields — fine for callers that don't have a
+    /// pre-resolved [`crate::FieldHandle`] (e.g. AIS encoders that
+    /// would otherwise need dozens of handles), since records
+    /// typically have well under 20 fields. Faster than the
+    /// JSON-substring-search alternative by a wide margin.
+    #[inline]
+    pub fn field_by_name(&self, name: &str) -> Option<&DecodedField> {
+        self.fields
+            .iter()
+            .find(|f| f.repeat_set == 0 && &*f.name == name)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

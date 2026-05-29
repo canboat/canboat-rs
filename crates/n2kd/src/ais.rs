@@ -38,7 +38,7 @@ use crate::json;
 /// 226 bytes = 1808 bits = 301 6-bit groups — same upper bound canboat
 /// C uses. The longest AIVDM payload we emit (type 5, Class A static)
 /// is 424 bits.
-const BITVEC_BYTES: usize = 226;
+pub(crate) const BITVEC_BYTES: usize = 226;
 
 pub struct BitVector {
     pub bytes: [u8; BITVEC_BYTES],
@@ -268,14 +268,14 @@ fn encode_class_a_static(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(user_id(msg, "User ID", 0), 30);
     bv.add_int(enum_or_name(msg, "AIS version indicator", &[]), 2);
     bv.add_int(user_id(msg, "IMO number", 0), 30);
-    bv.add_string(json::value(msg, "Callsign").unwrap_or(""), 42);
-    bv.add_string(json::value(msg, "Name").unwrap_or(""), 120);
+    bv.add_string(&string_field(msg, "Callsign"), 42);
+    bv.add_string(&string_field(msg, "Name"), 120);
     bv.add_int(enum_or_name(msg, "Type of ship", &[]), 8);
     bv.add_int(ship_dimensions(msg, true), 30);
     bv.add_int(enum_or_name(msg, "GNSS type", &[]), 4);
     bv.add_int(ais_eta(msg), 20);
     bv.add_int(draft(msg), 8);
-    bv.add_string(json::value(msg, "Destination").unwrap_or(""), 120);
+    bv.add_string(&string_field(msg, "Destination"), 120);
     bv.add_int(enum_or_name(msg, "DTE", &[]), 1);
     bv.add_int(0, 1); // Spare
 }
@@ -317,7 +317,7 @@ fn encode_addressed_safety(bv: &mut BitVector, msgid: i64, msg: &str) {
         1,
     );
     bv.add_int(0, 1); // Spare
-    let text = json::value(msg, "Safety Related Text").unwrap_or("");
+    let text = &string_field(msg, "Safety Related Text");
     let mut bits = text.chars().count() * 6;
     if bits > 156 {
         bits = 156;
@@ -333,7 +333,7 @@ fn encode_broadcast_safety(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(repeat_indicator(msg), 2);
     bv.add_int(user_id(msg, "Source ID", 0), 30);
     bv.add_int(0, 2); // Spare
-    let text = json::value(msg, "Safety Related Text").unwrap_or("");
+    let text = &string_field(msg, "Safety Related Text");
     let mut bits = text.chars().count() * 6;
     if bits > 161 {
         bits = 161;
@@ -387,7 +387,7 @@ fn encode_class_b_extended(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(heading(msg, "True Heading"), 9);
     bv.add_int(json::int(msg, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(0, 4); // Regional reserved
-    bv.add_string(json::value(msg, "Name").unwrap_or(""), 120);
+    bv.add_string(&string_field(msg, "Name"), 120);
     bv.add_int(enum_or_name(msg, "Type of ship", &[]), 8);
     bv.add_int(ship_dimensions(msg, true), 30);
     bv.add_int(enum_or_name(msg, "GNSS type", &[]), 4);
@@ -402,8 +402,8 @@ fn encode_aton(bv: &mut BitVector, msgid: i64, msg: &str) {
     bv.add_int(repeat_indicator(msg), 2);
     bv.add_int(user_id(msg, "User ID", 0), 30);
     bv.add_int(enum_or_name(msg, "AtoN Type", &[]), 5);
-    let aton_name = json::value(msg, "AtoN Name").unwrap_or("");
-    let (name20, ext) = split_aton_name(aton_name);
+    let aton_name = string_field(msg, "AtoN Name");
+    let (name20, ext) = split_aton_name(&aton_name);
     bv.add_string(name20, 120);
     bv.add_int(
         enum_or_name(msg, "Position Accuracy", POSITION_ACCURACY_NAMES),
@@ -434,14 +434,14 @@ fn encode_class_b_static(bv: &mut BitVector, msgid: i64, pgn: i64, msg: &str) {
     match pgn {
         129809 => {
             bv.add_int(0, 2); // Part number = A
-            bv.add_string(json::value(msg, "Name").unwrap_or(""), 120);
+            bv.add_string(&string_field(msg, "Name"), 120);
             bv.add_int(0, 8); // Spare
         }
         129810 => {
             bv.add_int(1, 2); // Part number = B
             bv.add_int(enum_or_name(msg, "Type of ship", &[]), 8);
-            bv.add_string(json::value(msg, "Vendor ID").unwrap_or(""), 42);
-            bv.add_string(json::value(msg, "Callsign").unwrap_or(""), 42);
+            bv.add_string(&string_field(msg, "Vendor ID"), 42);
+            bv.add_string(&string_field(msg, "Callsign"), 42);
             bv.add_int(ship_dimensions(msg, true), 30);
             bv.add_int(user_id(msg, "Mothership User ID", 0), 30);
             bv.add_int(0, 6); // Spare
@@ -451,6 +451,54 @@ fn encode_class_b_static(bv: &mut BitVector, msgid: i64, pgn: i64, msg: &str) {
 }
 
 // ---------- helpers ----------
+
+/// Pull a string field out of the JSON, decoding JSON `\x` escapes so
+/// the AIS encoder sees the original payload bytes. canboat C's
+/// `getJSONValue` performs the same unescape pass; without it,
+/// names like `"F\/V MIRANDA"` (escaped solidus) would emit the
+/// literal backslash, padding the field by one extra 6-bit slot
+/// and corrupting downstream alignment.
+fn string_field(msg: &str, field: &str) -> String {
+    json::value(msg, field).map_or(String::new(), unescape_json)
+}
+
+fn unescape_json(s: &str) -> String {
+    if !s.contains('\\') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c != '\\' {
+            out.push(c);
+            continue;
+        }
+        match chars.next() {
+            Some('/') => out.push('/'),
+            Some('"') => out.push('"'),
+            Some('\\') => out.push('\\'),
+            Some('b') => out.push('\u{0008}'),
+            Some('f') => out.push('\u{000C}'),
+            Some('n') => out.push('\n'),
+            Some('r') => out.push('\r'),
+            Some('t') => out.push('\t'),
+            Some('u') => {
+                let hex: String = chars.by_ref().take(4).collect();
+                if let Ok(code) = u32::from_str_radix(&hex, 16) {
+                    if let Some(ch) = char::from_u32(code) {
+                        out.push(ch);
+                    }
+                }
+            }
+            Some(other) => {
+                out.push('\\');
+                out.push(other);
+            }
+            None => out.push('\\'),
+        }
+    }
+    out
+}
 
 fn repeat_indicator(msg: &str) -> i64 {
     enum_or_name(msg, "Repeat Indicator", REPEAT_NAMES).clamp(0, 3)
@@ -485,18 +533,18 @@ fn enum_or_name(msg: &str, field: &str, names: &[(&str, i64)]) -> i64 {
     -1
 }
 
-const REPEAT_NAMES: &[(&str, i64)] = &[
+pub(crate) const REPEAT_NAMES: &[(&str, i64)] = &[
     ("Initial", 0),
     ("First retransmission", 1),
     ("Second retransmission", 2),
     ("Final retransmission", 3),
 ];
 
-const POSITION_ACCURACY_NAMES: &[(&str, i64)] = &[("Low", 0), ("High", 1)];
+pub(crate) const POSITION_ACCURACY_NAMES: &[(&str, i64)] = &[("Low", 0), ("High", 1)];
 
-const RAIM_NAMES: &[(&str, i64)] = &[("not in use", 0), ("in use", 1)];
+pub(crate) const RAIM_NAMES: &[(&str, i64)] = &[("not in use", 0), ("in use", 1)];
 
-const AIS_TRANSCEIVER_NAMES: &[(&str, i64)] = &[
+pub(crate) const AIS_TRANSCEIVER_NAMES: &[(&str, i64)] = &[
     ("Channel A VDL reception", 0),
     ("Channel B VDL reception", 1),
     ("Channel A VDL transmission", 2),
@@ -671,12 +719,21 @@ fn ais_time(msg: &str) -> i64 {
     ((h as i64) << 12) | ((m as i64) << 6) | sec_int as i64
 }
 
-/// `ETA Date` (`YYYY-MM-DD`) and `ETA Time` (`HH:MM:SS`) packed into
-/// the AIVDM type 5 ETA field: month/day/hour/minute.
+/// `ETA Date` (`YYYY.MM.DD`) and `ETA Time` (`HH:MM:SS[.SSSS]`) packed
+/// into the AIVDM type 5 ETA field: month/day/hour/minute.
+///
+/// Uses `value_or_name` to pick the rendered `"YYYY.MM.DD"` /
+/// `"HH:MM:SS"` text out of the `-nv` `{"value":N,"name":"…"}`
+/// wrapper. canboat C reads only the raw integer here (via
+/// `getJSONLookupValue` → `"value"`) and then mis-byte-indexes
+/// it — we instead read the human-formatted `name`, which is the
+/// shape this packer actually needs. The split accepts either
+/// `.` or `-` as a date separator and either `:` or `.` as a time
+/// separator so we keep working if the formatter ever changes.
 fn ais_eta(msg: &str) -> i64 {
     let (mut month, mut day) = (0u32, 0u32);
-    if let Some(s) = json::value(msg, "ETA Date") {
-        let mut parts = s.split('-');
+    if let Some(s) = json::value_or_name(msg, "ETA Date") {
+        let mut parts = s.split(['.', '-']);
         let _y = parts.next();
         month = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
         day = parts.next().and_then(|p| p.parse().ok()).unwrap_or(0);
@@ -688,7 +745,7 @@ fn ais_eta(msg: &str) -> i64 {
         }
     }
     let (mut hour, mut minute) = (24u32, 60u32);
-    if let Some(s) = json::value(msg, "ETA Time") {
+    if let Some(s) = json::value_or_name(msg, "ETA Time") {
         let mut parts = s.split(':');
         hour = parts.next().and_then(|p| p.parse().ok()).unwrap_or(24);
         minute = parts.next().and_then(|p| p.parse().ok()).unwrap_or(60);
@@ -746,7 +803,7 @@ fn split_aton_name(s: &str) -> (&str, &str) {
 /// emit each as `!AIVDM,…*XX\r\n`. Returns the number of sentences
 /// emitted. The talker is always `AI` (matches canboat C); only the
 /// `<type>` (VDM/VDO) varies.
-fn emit_sentences(
+pub(crate) fn emit_sentences(
     out: &mut String,
     bv: &BitVector,
     talker: &str,

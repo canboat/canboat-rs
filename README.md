@@ -41,17 +41,26 @@ tracks.
 
 ## Performance
 
-Wall-clock numbers on an M1 Pro, release build, running over the
-`n2kd_raw_50x` corpus — 1.26 M PGN frames synthesised by replaying
-canboat's `dirona-actisense-serial.raw` sample 50× through the
-analyzer to give a sustained input. Each step also produces 1.26 M
-NMEA 0183 sentences as output:
+Same decode work — `-json -nv` over 1.26 M PGN frames (canboat's
+`dirona-actisense-serial.raw` × 50) on an M1 Pro, release build:
+
+| Implementation         | Wall time | vs canboat-rs |
+|------------------------|----------:|--------------:|
+| canboatjs (Node 25)    |  27.8 s   |   **8.1 ×**   |
+| canboat C              |   9.1 s   |   **2.6 ×**   |
+| canboat-rs `analyzer`  |   3.4 s   |       1.0 ×   |
+
+The Rust analyzer is ~8 × faster than canboatjs and ~2.6 × faster
+than the canboat C analyzer on the same input. canboat-rs also
+goes one step further — `canboat-pipeline` collapses the
+`analyzer | n2kd` pipeline into a single process with no JSON
+text serialisation between stages:
 
 | Pipeline                                | Wall time | Throughput            |
 |-----------------------------------------|----------:|-----------------------|
-| `analyzer` alone (PGN decode only)      |  3.32 s   | 380 k frames / s      |
-| `analyzer \| n2kd` (piped, two procs)   |  6.50 s   | 194 k sentences / s   |
-| `canboat-pipeline` (single proc)        |  3.50 s   | 360 k sentences / s   |
+| `analyzer` alone (PGN decode only)      |   3.3 s   | 380 k frames / s      |
+| `analyzer \| n2kd` (piped, two procs)   |   6.5 s   | 194 k sentences / s   |
+| `canboat-pipeline` (single proc)        |   3.5 s   | 360 k sentences / s   |
 
 `canboat-pipeline` is **46 % faster wall-time** than the equivalent
 piped `analyzer | n2kd` setup, while doing strictly more work
@@ -82,7 +91,7 @@ the piped pipeline). The savings come from a few design choices:
 Enabling the canboat-C-compatible snapshot port (`--snapshot-port
 N`, default 2597) forces JSON to be serialised for every decoded
 record so the cache stays warm, costing about **50 %** more wall
-time (3.50 s → 4.50 s on the same corpus). Disable with
+time (3.5 s → 4.5 s on the same corpus). Disable with
 `--snapshot-port 0` to get back to the lazy hot path.
 
 End-to-end on real iKonvert hardware (Pi 4, ~50 frames / s of

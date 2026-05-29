@@ -21,6 +21,40 @@ use crate::decode::{DecodedField, DecodedPgn, FieldValue};
 
 use super::{effective_precision, write_fixed_float};
 
+/// Display name for a field under the current camelCase mode.
+/// Off → human-readable `name`; Lower → camelCase `id` (already
+/// pre-camelized in canboat.json); Upper → `id` with the first
+/// character capitalised.
+fn field_display_name(field: &DecodedField, mode: CamelCase) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match mode {
+        CamelCase::Off => Cow::Borrowed(field.name.as_ref()),
+        CamelCase::Lower => Cow::Borrowed(field.id.as_ref()),
+        CamelCase::Upper => Cow::Owned(upper_camel(field.id.as_ref())),
+    }
+}
+
+/// Display description for a PGN. canboat uses `id` as the camelized
+/// form (e.g. `isoAddressClaim`), so the same id maps cleanly.
+fn pgn_display_description(pgn: &DecodedPgn, mode: CamelCase) -> std::borrow::Cow<'_, str> {
+    use std::borrow::Cow;
+    match mode {
+        CamelCase::Off => Cow::Borrowed(pgn.description.as_ref()),
+        CamelCase::Lower => Cow::Borrowed(pgn.id.as_ref()),
+        CamelCase::Upper => Cow::Owned(upper_camel(pgn.id.as_ref())),
+    }
+}
+
+/// Convert a lowerCamelCase string to UpperCamelCase by uppercasing
+/// the first character. Other characters are left alone.
+fn upper_camel(s: &str) -> String {
+    let mut chars = s.chars();
+    match chars.next() {
+        Some(c) => c.to_uppercase().collect::<String>() + chars.as_str(),
+        None => String::new(),
+    }
+}
+
 /// Knobs for JSON output.
 #[derive(Debug, Default, Clone)]
 pub struct JsonOptions {
@@ -34,6 +68,30 @@ pub struct JsonOptions {
     /// object with per-field byte/bit-level diagnostics (matches
     /// canboat's `-debug`).
     pub debug: bool,
+    /// Emit field keys + PGN descriptions as camelCase or
+    /// UpperCamelCase identifiers instead of canboat's human-
+    /// readable form. Matches canboat C's `-camel` / `-upper-camel`
+    /// flags. See [`CamelCase`].
+    pub camel_case: CamelCase,
+}
+
+/// Identifier style selector for `-camel` / `-upper-camel`.
+///
+/// canboat C builds these by stripping spaces/punctuation from
+/// `"Unique Number"` → `"uniqueNumber"` (camelCase) or
+/// `"UniqueNumber"` (UpperCamelCase). The Rust port reads the
+/// pre-camelized `id` field straight from canboat.json — for
+/// [`CamelCase::Upper`] we just capitalise the first character.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub enum CamelCase {
+    /// Use human-readable names (`"Unique Number"`, `"ISO Address
+    /// Claim"`). Default; matches canboat C's default output.
+    #[default]
+    Off,
+    /// lowerCamelCase identifiers (`"uniqueNumber"`).
+    Lower,
+    /// UpperCamelCase identifiers (`"UniqueNumber"`).
+    Upper,
 }
 
 thread_local! {
@@ -60,7 +118,7 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
         pgn.prio, pgn.src, pgn.dst, pgn.pgn
     )?;
     w.write_str(",\"description\":")?;
-    write_json_string(w, &pgn.description)?;
+    write_json_string(w, pgn_display_description(pgn, opts.camel_case).as_ref())?;
 
     // Build the body of the `fields` object into a buffer so we can
     // skip the wrapping `,"fields":{ ... }` entirely when no field
@@ -159,7 +217,7 @@ fn write_json_inner<W: fmt::Write>(
                 current_iter = None;
             }
             fields_buf.write_str(top_sep)?;
-            write_json_string(fields_buf, &f.name)?;
+            write_json_string(fields_buf, field_display_name(f, opts.camel_case).as_ref())?;
             fields_buf.write_char(':')?;
             write_field_value(fields_buf, f, opts, &pgn.data)?;
             top_sep = ",";
@@ -179,18 +237,18 @@ fn write_json_inner<W: fmt::Write>(
                 current_set = f.repeat_set;
                 current_iter = Some(iter);
                 top_sep = ",";
-                write_json_string(fields_buf, &f.name)?;
+                write_json_string(fields_buf, field_display_name(f, opts.camel_case).as_ref())?;
                 fields_buf.write_char(':')?;
                 write_field_value(fields_buf, f, opts, &pgn.data)?;
             } else if Some(iter) != current_iter {
                 fields_buf.write_str("},{")?;
                 current_iter = Some(iter);
-                write_json_string(fields_buf, &f.name)?;
+                write_json_string(fields_buf, field_display_name(f, opts.camel_case).as_ref())?;
                 fields_buf.write_char(':')?;
                 write_field_value(fields_buf, f, opts, &pgn.data)?;
             } else {
                 fields_buf.write_char(',')?;
-                write_json_string(fields_buf, &f.name)?;
+                write_json_string(fields_buf, field_display_name(f, opts.camel_case).as_ref())?;
                 fields_buf.write_char(':')?;
                 write_field_value(fields_buf, f, opts, &pgn.data)?;
             }
@@ -698,7 +756,7 @@ fn write_field_value<W: fmt::Write>(
                         continue;
                     }
                     w.write_str(sep)?;
-                    write_json_string(w, &sf.name)?;
+                    write_json_string(w, field_display_name(sf, opts.camel_case).as_ref())?;
                     w.write_char(':')?;
                     write_field_value(w, sf, opts, payload)?;
                     sep = ",";

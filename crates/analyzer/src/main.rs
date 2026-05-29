@@ -20,7 +20,7 @@ use canboat_core::{
         detect, header_implies_coalesced, parse_format_header, parse_with, plain::ParseError,
         InputFormat,
     },
-    output::{write_json, write_text, GeoFormat, JsonOptions, TextOptions},
+    output::{write_json, write_text, CamelCase, GeoFormat, JsonOptions, TextOptions},
     FramePacketType, LoadOptions, PacketType, PgnDatabase, Reassembled, Reassembler,
 };
 use canboat_io::LineReader;
@@ -77,6 +77,17 @@ struct Cli {
     /// C→Ah, rad→deg. Matches canboat C's `-si`.
     #[arg(long)]
     si: bool,
+
+    /// Emit field keys + PGN descriptions as camelCase identifiers
+    /// (e.g. `"uniqueNumber"` instead of `"Unique Number"`). Matches
+    /// canboat C's `-camel`.
+    #[arg(long, conflicts_with = "upper_camel")]
+    camel: bool,
+
+    /// Same as `--camel` but UpperCamelCase (`"UniqueNumber"`).
+    /// Matches canboat C's `-upper-camel`.
+    #[arg(long = "upper-camel")]
+    upper_camel: bool,
 
     /// Use the given string in place of any analyzer-generated
     /// timestamps (matches canboat's `-fixtime`). Inputs that carry
@@ -147,10 +158,18 @@ fn run(cli: Cli) -> Result<()> {
     db.merge_pgns_from_json_with(SYNTHETIC_PGNS_JSON, load_opts)
         .context("merging synthetic PGN definitions")?;
 
+    let camel_case = if cli.upper_camel {
+        CamelCase::Upper
+    } else if cli.camel {
+        CamelCase::Lower
+    } else {
+        CamelCase::Off
+    };
     let json_opts = JsonOptions {
         include_empty: cli.empty,
         name_value: cli.nv,
         debug: cli.debug,
+        camel_case,
     };
     let geo = match cli.geo.as_str() {
         "dd" => GeoFormat::Dd,

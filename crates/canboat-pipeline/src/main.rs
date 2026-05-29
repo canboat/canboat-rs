@@ -40,6 +40,7 @@ use clap::Parser;
 use canboat_core::format::{
     detect, header_implies_coalesced, parse_format_header, parse_with, InputFormat,
 };
+use canboat_core::output::CamelCase;
 use canboat_core::{LoadOptions, PgnDatabase, RawFrame};
 use canboat_io::device::{self, Supervisor};
 use canboat_io::open_serial_rw;
@@ -172,6 +173,18 @@ struct Cli {
     #[arg(long)]
     si: bool,
 
+    /// Emit field keys + PGN descriptions as camelCase
+    /// identifiers (`"uniqueNumber"` instead of `"Unique Number"`)
+    /// on the analyzer JSON / snapshot TCP ports. Matches canboat
+    /// C's `-camel`.
+    #[arg(long, conflicts_with = "upper_camel")]
+    camel: bool,
+
+    /// Same as `--camel` but UpperCamelCase (`"UniqueNumber"`).
+    /// Matches canboat C's `-upper-camel`.
+    #[arg(long = "upper-camel")]
+    upper_camel: bool,
+
     /// Verbose logging.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -274,7 +287,21 @@ fn run(cli: Cli) -> Result<()> {
         tcp_joins.push(tcp::spawn_writeonly(cli.bind, cli.write_port, sender)?);
     }
 
-    pipeline::run(db, frames_rx, hubs, cli.nmea0183_stdout, pre_coalesced);
+    let camel_case = if cli.upper_camel {
+        CamelCase::Upper
+    } else if cli.camel {
+        CamelCase::Lower
+    } else {
+        CamelCase::Off
+    };
+    pipeline::run(
+        db,
+        frames_rx,
+        hubs,
+        cli.nmea0183_stdout,
+        pre_coalesced,
+        camel_case,
+    );
 
     // After the pipeline drains, signal the supervisor to stop
     // reconnecting. The TCP accept threads run forever — leak them;

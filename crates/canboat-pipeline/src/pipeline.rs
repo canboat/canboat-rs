@@ -26,7 +26,7 @@ use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
 use canboat_core::format::write_plain;
-use canboat_core::output::{write_json, JsonOptions};
+use canboat_core::output::{write_json, CamelCase, JsonOptions};
 use canboat_core::{FramePacketType, PgnDatabase, RawFrame, Reassembled, Reassembler};
 
 use crate::hub::Hub;
@@ -79,12 +79,16 @@ pub struct Hubs {
 ///   `RAWFORMAT_PLAIN_OR_FAST` → `FAST` lock-in). Once true it
 ///   stays true. The stdin pump also flips it when it sees a
 ///   `# format=<NAME>` header declaring a coalesced format.
+/// * `camel_case` selects field-key + PGN-description style for
+///   the analyzer JSON / snapshot output — `Off` / `Lower` (matches
+///   canboat C `-camel`) / `Upper` (matches `-upper-camel`).
 pub fn run(
     db: PgnDatabase,
     frames_rx: Receiver<RawFrame>,
     hubs: Hubs,
     emit_nmea_stdout: bool,
     pre_coalesced: Arc<AtomicBool>,
+    camel_case: CamelCase,
 ) {
     // LineWriter (rather than BufWriter) so each NMEA 0183 sentence
     // is flushed as soon as its trailing newline arrives. Long-
@@ -105,6 +109,7 @@ pub fn run(
         include_empty: false,
         name_value: true,
         debug: false,
+        camel_case,
     };
 
     while let Ok(frame) = frames_rx.recv() {

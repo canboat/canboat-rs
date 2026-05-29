@@ -12,7 +12,7 @@
 pub mod json;
 pub mod text;
 
-pub use json::{write_json, JsonOptions};
+pub use json::{write_json, CamelCase, JsonOptions};
 pub use text::{write_text, GeoFormat, TextOptions};
 
 /// Round-up decimal precision implied by `resolution`, matching

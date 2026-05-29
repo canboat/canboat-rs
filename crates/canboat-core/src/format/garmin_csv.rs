@@ -82,6 +82,7 @@ pub fn parse_line(line: &str, variant: Variant) -> Result<GarminCsvLine, ParseEr
     let _seq: u32 = seq_tok.parse().map_err(|_| ParseError::BadInteger {
         field: "seq",
         value: seq_tok.to_string(),
+        offset: None,
     })?;
 
     let tstamp_tok = parts.next().ok_or(ParseError::BadHeader {
@@ -95,6 +96,7 @@ pub fn parse_line(line: &str, variant: Variant) -> Result<GarminCsvLine, ParseEr
     let pgn: u32 = pgn_tok.parse().map_err(|_| ParseError::BadInteger {
         field: "pgn",
         value: pgn_tok.to_string(),
+        offset: None,
     })?;
 
     // Skip the variant-specific extra columns:
@@ -140,18 +142,22 @@ pub fn parse_line(line: &str, variant: Variant) -> Result<GarminCsvLine, ParseEr
     let src: u8 = src_tok.parse().map_err(|_| ParseError::BadInteger {
         field: "src",
         value: src_tok.to_string(),
+        offset: None,
     })?;
     let dst: u8 = dst_tok.parse().map_err(|_| ParseError::BadInteger {
         field: "dst",
         value: dst_tok.to_string(),
+        offset: None,
     })?;
     let prio: u8 = prio_tok.parse().map_err(|_| ParseError::BadInteger {
         field: "prio",
         value: prio_tok.to_string(),
+        offset: None,
     })?;
     let size: usize = size_tok.parse().map_err(|_| ParseError::BadInteger {
         field: "size",
         value: size_tok.to_string(),
+        offset: None,
     })?;
 
     let hex_str = packet_tok
@@ -162,6 +168,7 @@ pub fn parse_line(line: &str, variant: Variant) -> Result<GarminCsvLine, ParseEr
         return Err(ParseError::BadHexByte {
             index: hex_str.len() / 2,
             value: hex_str.chars().last().unwrap_or(' ').to_string(),
+            offset: None,
         });
     }
     let want = size.min(FASTPACKET_MAX_SIZE);
@@ -173,10 +180,12 @@ pub fn parse_line(line: &str, variant: Variant) -> Result<GarminCsvLine, ParseEr
         let s = std::str::from_utf8(chunk).map_err(|_| ParseError::BadHexByte {
             index: i,
             value: String::from_utf8_lossy(chunk).into_owned(),
+            offset: None,
         })?;
         let b = u8::from_str_radix(s, 16).map_err(|_| ParseError::BadHexByte {
             index: i,
             value: s.to_string(),
+            offset: None,
         })?;
         data.push(b);
     }
@@ -202,6 +211,7 @@ fn format_relative_timestamp(ms_str: &str) -> Result<String, ParseError> {
     let ms: u64 = ms_str.parse().map_err(|_| ParseError::BadInteger {
         field: "tstamp",
         value: ms_str.to_string(),
+        offset: None,
     })?;
     Ok(format_unix_ms(ms))
 }
@@ -213,6 +223,7 @@ fn format_absolute_timestamp(tok: &str) -> Result<String, ParseError> {
     let bad = || ParseError::BadInteger {
         field: "tstamp",
         value: tok.to_string(),
+        offset: None,
     };
     let mo: u32 = p.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;
     let d: u32 = p.next().ok_or_else(bad)?.parse().map_err(|_| bad())?;

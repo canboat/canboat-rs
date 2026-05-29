@@ -50,6 +50,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let canid = u32::from_str_radix(canid_tok, 16).map_err(|_| ParseError::BadInteger {
         field: "canid",
         value: canid_tok.to_string(),
+        offset: None,
     })?;
     let (prio, pgn, src, dst) = iso11783_decompose(canid);
 
@@ -66,6 +67,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
             let b = u8::from_str_radix(tok, 16).map_err(|_| ParseError::BadHexByte {
                 index: data.len(),
                 value: tok.to_string(),
+                offset: None,
             })?;
             data.push(b);
         }

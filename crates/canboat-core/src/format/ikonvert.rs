@@ -63,6 +63,7 @@ fn parse_n2k_line(rest: &str) -> Result<RawFrame, ParseError> {
     let data_vec = b64_decode(b64).ok_or(ParseError::BadHexByte {
         index: 0,
         value: b64.to_string(),
+        offset: None,
     })?;
     let data: SmallVec<[u8; 8]> = data_vec.into_iter().collect();
     Ok(RawFrame {
@@ -86,6 +87,7 @@ fn parse_int<T: std::str::FromStr>(
     s.trim().parse().map_err(|_| ParseError::BadInteger {
         field,
         value: s.to_string(),
+        offset: None,
     })
 }
 

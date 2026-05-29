@@ -60,6 +60,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let pgn = u32::from_str_radix(pgn_tok, 16).map_err(|_| ParseError::BadInteger {
         field: "pgn",
         value: pgn_tok.to_string(),
+        offset: None,
     })?;
     // Chetco's tstamp is hex milliseconds; canboat's `sscanf %x`
     // stops at any non-hex byte, so accept a trailing `!` (seen in
@@ -72,10 +73,12 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let tstamp_ms = u64::from_str_radix(&tstamp_hex, 16).map_err(|_| ParseError::BadInteger {
         field: "tstamp",
         value: tstamp_tok.to_string(),
+        offset: None,
     })?;
     let src = u8::from_str_radix(src_tok, 16).map_err(|_| ParseError::BadInteger {
         field: "src",
         value: src_tok.to_string(),
+        offset: None,
     })?;
 
     // Data: continuous hex pairs, terminated by `*XX` checksum.
@@ -84,6 +87,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
         return Err(ParseError::BadHexByte {
             index: data_str.len() / 2,
             value: data_str.chars().last().unwrap_or(' ').to_string(),
+            offset: None,
         });
     }
     let mut data: SmallVec<[u8; 8]> = SmallVec::new();
@@ -94,10 +98,12 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
         let s = std::str::from_utf8(chunk).map_err(|_| ParseError::BadHexByte {
             index: i,
             value: String::from_utf8_lossy(chunk).into_owned(),
+            offset: None,
         })?;
         let b = u8::from_str_radix(s, 16).map_err(|_| ParseError::BadHexByte {
             index: i,
             value: s.to_string(),
+            offset: None,
         })?;
         data.push(b);
     }

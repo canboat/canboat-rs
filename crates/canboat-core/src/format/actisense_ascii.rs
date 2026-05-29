@@ -32,6 +32,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
         return Err(ParseError::BadInteger {
             field: "timestamp",
             value: ts_tok.to_string(),
+            offset: None,
         });
     }
     let timestamp = format_actisense_timestamp(&ts_tok[1..])?;
@@ -44,6 +45,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let sdp = u32::from_str_radix(sdp_tok, 16).map_err(|_| ParseError::BadInteger {
         field: "sdp",
         value: sdp_tok.to_string(),
+        offset: None,
     })?;
     let prio = (sdp & 0xf) as u8;
     let dst = ((sdp >> 4) & 0xff) as u8;
@@ -57,6 +59,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let pgn = u32::from_str_radix(pgn_tok, 16).map_err(|_| ParseError::BadInteger {
         field: "pgn",
         value: pgn_tok.to_string(),
+        offset: None,
     })?;
 
     // Remaining tokens carry payload data. Actisense packs the bytes
@@ -70,16 +73,19 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
             return Err(ParseError::BadHexByte {
                 index: data.len(),
                 value: t.to_string(),
+                offset: None,
             });
         }
         for pair in bytes.chunks(2) {
             let s = std::str::from_utf8(pair).map_err(|_| ParseError::BadHexByte {
                 index: data.len(),
                 value: t.to_string(),
+                offset: None,
             })?;
             let b = u8::from_str_radix(s, 16).map_err(|_| ParseError::BadHexByte {
                 index: data.len(),
                 value: s.to_string(),
+                offset: None,
             })?;
             data.push(b);
         }
@@ -103,6 +109,7 @@ fn format_actisense_timestamp(rest: &str) -> Result<String, ParseError> {
             return Err(ParseError::BadInteger {
                 field: "timestamp",
                 value: rest.to_string(),
+                offset: None,
             });
         }
         (&time[..2], &time[2..4], &time[4..6], frac)
@@ -112,24 +119,29 @@ fn format_actisense_timestamp(rest: &str) -> Result<String, ParseError> {
         return Err(ParseError::BadInteger {
             field: "timestamp",
             value: rest.to_string(),
+            offset: None,
         });
     };
     let _h: u32 = h_str.parse().map_err(|_| ParseError::BadInteger {
         field: "timestamp",
         value: rest.to_string(),
+        offset: None,
     })?;
     let _m: u32 = mm_str.parse().map_err(|_| ParseError::BadInteger {
         field: "timestamp",
         value: rest.to_string(),
+        offset: None,
     })?;
     let _s: u32 = ss_str.parse().map_err(|_| ParseError::BadInteger {
         field: "timestamp",
         value: rest.to_string(),
+        offset: None,
     })?;
     // canboat formats with comma + 3-digit milliseconds.
     let ms: u32 = ms_str.parse().map_err(|_| ParseError::BadInteger {
         field: "timestamp",
         value: rest.to_string(),
+        offset: None,
     })?;
     Ok(format!("{h_str}:{mm_str}:{ss_str},{:03}", ms % 1000))
 }

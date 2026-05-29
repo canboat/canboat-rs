@@ -319,8 +319,29 @@ fn forward_plain_line(line: &str, sender: &FrameSender) -> bool {
         Ok(frame) => sender.send_frame(frame).is_ok(),
         Err(PlainError::Empty) => true,
         Err(e) => {
-            log::warn!("ignoring malformed PLAIN/FAST line: {e}");
+            log_bad_plain_line(trimmed, &e);
             true
+        }
+    }
+}
+
+/// Render the malformed-line warning with the offending line and a
+/// caret pointing at the byte offset where parsing failed. Helps
+/// the user see *what* came in over the wire that the parser
+/// didn't like.
+fn log_bad_plain_line(line: &str, err: &PlainError) {
+    match err.byte_offset() {
+        Some(offset) => {
+            // Cap the offset at the line length so we always render
+            // a sane pointer even if the source counted past EOL.
+            let pointer_col = offset.min(line.len());
+            let pointer = format!("{:width$}^", "", width = pointer_col);
+            log::warn!(
+                "ignoring malformed PLAIN/FAST line: {err}\n  line:    {line}\n  pointer: {pointer}"
+            );
+        }
+        None => {
+            log::warn!("ignoring malformed PLAIN/FAST line: {err}\n  line: {line}");
         }
     }
 }

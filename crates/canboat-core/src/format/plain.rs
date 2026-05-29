@@ -43,13 +43,39 @@ pub enum ParseError {
     #[error("expected {expected} comma-separated header fields, found {found}")]
     BadHeader { expected: usize, found: usize },
     #[error("malformed integer in field {field}: {value:?}")]
-    BadInteger { field: &'static str, value: String },
+    BadInteger {
+        field: &'static str,
+        value: String,
+        /// Byte offset within the original line where the field
+        /// started. `None` when the producing parser doesn't track
+        /// offsets (the non-PLAIN format parsers — airmar, chetco,
+        /// ydwg02, etc. — use `str::Split` and don't bother).
+        offset: Option<usize>,
+    },
     #[error("declared length {len} exceeds max {max}", max = FASTPACKET_MAX_SIZE)]
     LengthTooLarge { len: usize },
     #[error("expected {expected} hex bytes, found {found}")]
     BadPayloadCount { expected: usize, found: usize },
     #[error("malformed hex byte {value:?} at index {index}")]
-    BadHexByte { index: usize, value: String },
+    BadHexByte {
+        index: usize,
+        value: String,
+        offset: Option<usize>,
+    },
+}
+
+impl ParseError {
+    /// Byte offset within the line where the parse failed, when the
+    /// producing parser tracks it. Callers can use this to render a
+    /// caret-style pointer beneath the offending line.
+    pub fn byte_offset(&self) -> Option<usize> {
+        match self {
+            ParseError::BadInteger { offset, .. } | ParseError::BadHexByte { offset, .. } => {
+                *offset
+            }
+            _ => None,
+        }
+    }
 }
 
 /// Parse one PLAIN/FAST line.
@@ -70,17 +96,22 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
         Some(ts.to_string())
     };
 
+    // Byte offset of `rest` within the original `line` — used to
+    // translate `cursor` (which is relative to `rest`) into a
+    // line-relative offset on errors.
+    let rest_base = ts.len() + 1;
+
     // Header: prio, pgn, src, dst, len. Parse the five tokens by
     // walking byte-by-byte rather than using `str::Split` so we can
     // recover the byte offset of the payload start without paying
     // for an extra slice/iterator chain.
     let rest_bytes = rest.as_bytes();
     let mut cursor = 0usize;
-    let prio = take_uint_until_comma::<u8>(rest_bytes, &mut cursor, "prio")?;
-    let pgn = take_uint_until_comma::<u32>(rest_bytes, &mut cursor, "pgn")?;
-    let src = take_uint_until_comma::<u8>(rest_bytes, &mut cursor, "src")?;
-    let dst = take_uint_until_comma::<u8>(rest_bytes, &mut cursor, "dst")?;
-    let len = take_uint_until_comma::<usize>(rest_bytes, &mut cursor, "len")?;
+    let prio = take_uint_until_comma::<u8>(rest_bytes, &mut cursor, rest_base, "prio")?;
+    let pgn = take_uint_until_comma::<u32>(rest_bytes, &mut cursor, rest_base, "pgn")?;
+    let src = take_uint_until_comma::<u8>(rest_bytes, &mut cursor, rest_base, "src")?;
+    let dst = take_uint_until_comma::<u8>(rest_bytes, &mut cursor, rest_base, "dst")?;
+    let len = take_uint_until_comma::<usize>(rest_bytes, &mut cursor, rest_base, "len")?;
 
     if len > FASTPACKET_MAX_SIZE {
         return Err(ParseError::LengthTooLarge { len });
@@ -92,6 +123,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     // `from_str_radix(tok.trim(), 16)` per byte by roughly 3× —
     // canboat samples spend the largest chunk of their parse time
     // here.
+    let payload_start = cursor;
     let payload_bytes = &rest_bytes[cursor..];
     let mut data: SmallVec<[u8; 8]> = SmallVec::with_capacity(len);
     let mut i = 0usize;
@@ -106,6 +138,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
             return Err(ParseError::BadHexByte {
                 index: decoded,
                 value: String::from_utf8_lossy(&payload_bytes[i..]).into_owned(),
+                offset: Some(rest_base + payload_start + i),
             });
         }
         let hi = HEX_NIBBLE[payload_bytes[i] as usize];
@@ -114,6 +147,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
             return Err(ParseError::BadHexByte {
                 index: decoded,
                 value: String::from_utf8_lossy(&payload_bytes[i..i + 2]).into_owned(),
+                offset: Some(rest_base + payload_start + i),
             });
         }
         data.push((hi << 4) | lo);
@@ -149,9 +183,14 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
 /// Read a decimal unsigned integer up to the next comma in `bytes`,
 /// advancing `cursor` past the integer and the comma. Skips a
 /// leading space, matching the canboat sample style `01, 02`.
+///
+/// `base` is the offset of `bytes[0]` within the original line, so
+/// any returned `BadInteger` carries a *line-relative* byte offset
+/// for caret-style error rendering.
 fn take_uint_until_comma<T>(
     bytes: &[u8],
     cursor: &mut usize,
+    base: usize,
     field: &'static str,
 ) -> Result<T, ParseError>
 where
@@ -177,6 +216,7 @@ where
         return Err(ParseError::BadInteger {
             field,
             value: String::from_utf8_lossy(&bytes[start..*cursor]).into_owned(),
+            offset: Some(base + start),
         });
     }
     // Skip trailing whitespace then the comma.
@@ -189,6 +229,7 @@ where
     T::try_from(acc).map_err(|_| ParseError::BadInteger {
         field,
         value: acc.to_string(),
+        offset: Some(base + start),
     })
 }
 

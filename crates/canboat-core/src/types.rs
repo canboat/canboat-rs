@@ -150,6 +150,13 @@ pub struct FieldInfo {
     /// fix-up. `0` means "compute from resolution" (canboat default).
     #[serde(skip, default)]
     pub precision: u8,
+    /// `true` iff [`Self::name`] is exactly `"Length"`. The decoder
+    /// consults this for canboat's name-driven dynamic-length
+    /// dispatch (`fillGlobalsBasedOnFieldName`). Precomputed at load
+    /// so we avoid `&*f.name == "Length"` — a `memcmp` — on every
+    /// decoded field. Populated by `apply_non_si_unit_fixup`.
+    #[serde(skip, default)]
+    pub is_dynamic_length_marker: bool,
 }
 
 /// A PGN definition.

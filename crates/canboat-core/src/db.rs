@@ -29,6 +29,11 @@ const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 ///   - `Pa`   → `bar`     (resolution / 100000,   precision = 3)
 ///   - `C`    → `Ah`      (resolution / 3600)     [coulomb → amp-hour]
 fn apply_non_si_unit_fixup(f: &mut FieldInfo) {
+    // Precompute the canboat name-driven dynamic-length marker so
+    // the decoder doesn't have to `memcmp` against "Length" for
+    // every field at runtime.
+    f.is_dynamic_length_marker = &*f.name == "Length";
+
     // Canboat hard-codes 7-decimal display precision for lat/lon
     // (analyzer/print.c::fieldPrintLatLon → `%10.7f`). Mirror that
     // here so the precision_for() fallback doesn't print 16 digits

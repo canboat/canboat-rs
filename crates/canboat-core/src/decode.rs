@@ -706,7 +706,7 @@ fn decode_one_field_at(
     // DYNAMIC_FIELD_VALUE then consumes. Several PGNs use a regular
     // NUMBER field for this rather than the explicit
     // `DYNAMIC_FIELD_LENGTH` type (e.g. Simnet Parameter Set 130846).
-    if &*f.name == "Length" {
+    if f.is_dynamic_length_marker {
         let raw_len = match &value {
             FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
             FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),

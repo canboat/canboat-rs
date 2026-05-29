@@ -21,6 +21,7 @@
 
 use std::cell::RefCell;
 use std::io::{self, LineWriter, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
@@ -70,17 +71,20 @@ pub struct Hubs {
 ///   addition to the optional TCP NMEA-0183 broadcast). Off by
 ///   default — long-running deployments use the TCP port and don't
 ///   want their service log spammed.
-/// * `pre_coalesced` skips the fast-packet reassembler entirely.
-///   Set this for sources whose frames are already full PGN payloads
-///   (iKonvert, Maretron IPG). Without it, a coalesced fast-packet
-///   that happens to be 8 bytes or shorter gets misread as a
-///   reassembly fragment.
+/// * `pre_coalesced` is the shared "are frames already coalesced
+///   PGN payloads?" flag. Set up-front to `true` for sources known
+///   to coalesce on the wire (NGT-1, iKonvert, Maretron); the
+///   pipeline will additionally flip it to `true` the first time it
+///   sees a frame with `data.len() > 8` (matching canboat's
+///   `RAWFORMAT_PLAIN_OR_FAST` → `FAST` lock-in). Once true it
+///   stays true. The stdin pump also flips it when it sees a
+///   `# format=<NAME>` header declaring a coalesced format.
 pub fn run(
     db: PgnDatabase,
     frames_rx: Receiver<RawFrame>,
     hubs: Hubs,
     emit_nmea_stdout: bool,
-    pre_coalesced: bool,
+    pre_coalesced: Arc<AtomicBool>,
 ) {
     // LineWriter (rather than BufWriter) so each NMEA 0183 sentence
     // is flushed as soon as its trailing newline arrives. Long-
@@ -113,12 +117,26 @@ pub fn run(
             }
         }
 
-        // When the source already coalesces fast-packets (iKonvert,
-        // Maretron), the reassembler must be skipped entirely. A
-        // coalesced fast-packet whose payload is ≤8 bytes would
-        // otherwise have its first byte misread as a sequence /
-        // frame-index header.
-        let assembled = if pre_coalesced {
+        // When the source already coalesces fast-packets (NGT-1,
+        // iKonvert, Maretron, FAST-format stdin), the reassembler
+        // must be skipped entirely. A coalesced fast-packet whose
+        // payload is ≤8 bytes would otherwise have its first byte
+        // misread as a sequence / frame-index header.
+        //
+        // Sticky lock-in: once we see ANY frame with more than 8
+        // payload bytes, the upstream is definitely emitting
+        // coalesced PGNs, so flip the shared flag for all
+        // subsequent frames (and any other subscriber that reads
+        // it). Matches canboat's `RAWFORMAT_PLAIN_OR_FAST` → `FAST`
+        // promotion in analyzer.c.
+        if !pre_coalesced.load(Ordering::Relaxed) && frame.data.len() > 8 {
+            log::debug!(
+                "frame with {} payload bytes seen; locking pipeline into coalesced mode",
+                frame.data.len()
+            );
+            pre_coalesced.store(true, Ordering::Relaxed);
+        }
+        let assembled = if pre_coalesced.load(Ordering::Relaxed) {
             frame
         } else {
             let packet_type = db

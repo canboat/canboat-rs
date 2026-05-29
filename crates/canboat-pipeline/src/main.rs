@@ -29,6 +29,7 @@ mod tcp;
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
@@ -36,7 +37,9 @@ use std::thread;
 use anyhow::{bail, Context, Result};
 use clap::Parser;
 
-use canboat_core::format::{detect, parse_with, InputFormat};
+use canboat_core::format::{
+    detect, header_implies_coalesced, parse_format_header, parse_with, InputFormat,
+};
 use canboat_core::{PgnDatabase, RawFrame};
 use canboat_io::device::{self, Supervisor};
 use canboat_io::open_serial_rw;
@@ -284,7 +287,13 @@ fn run(cli: Cli) -> Result<()> {
 /// In device mode the supervisor's manager thread handles reconnect
 /// on disconnect/EOF with exponential backoff up to 30 s, so a flaky
 /// serial port or TCP gateway doesn't take the pipeline down.
-fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor>, bool)> {
+fn open_source(
+    cli: &Cli,
+) -> Result<(
+    mpsc::Receiver<RawFrame>,
+    Option<Supervisor>,
+    Arc<AtomicBool>,
+)> {
     if let Some(path) = cli.actisense.as_deref() {
         let baud = cli.baud.unwrap_or(115_200);
         let path = path.to_string();
@@ -294,9 +303,10 @@ fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor
         });
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);
-        // NGT-1 emits one PDGY-equivalent per CAN frame; the
-        // pipeline still needs the reassembler.
-        return Ok((rx, Some(sup), false));
+        // NGT-1's `N2K_MSG_RECEIVED` (0x93) frames carry full PGN
+        // payloads — fast-packet coalescing happens inside the
+        // device, not on the wire we receive. Skip the reassembler.
+        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
     }
     if let Some(path) = cli.ikonvert.as_deref() {
         let baud = cli.baud.unwrap_or(230_400);
@@ -318,7 +328,7 @@ fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor
         let (rx, sup) = split_supervisor(sup);
         // iKonvert coalesces fast-packets internally; skip the
         // reassembler entirely.
-        return Ok((rx, Some(sup), true));
+        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
     }
     if let Some(url) = cli.maretron.as_deref() {
         let url = url.to_string();
@@ -334,19 +344,22 @@ fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);
         // Maretron IPG ships full PGN payloads per 0xA5 frame.
-        return Ok((rx, Some(sup), true));
+        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
     }
-    // stdin fallback — no device, no reconnect logic needed. We can't
-    // know in advance whether the upstream uses PLAIN (per-CAN-frame,
-    // needs reassembly) or FAST (already coalesced), so leave the
-    // reassembler enabled. Its `data.len() > 8` shortcut handles
-    // FAST-format lines for typical real-world payload sizes.
+    // stdin fallback — no device, no reconnect logic needed. We
+    // can't know in advance whether the upstream uses PLAIN
+    // (per-CAN-frame, needs reassembly) or FAST (already coalesced).
+    // The stdin pump watches for `# format=<NAME>` headers and flips
+    // the flag when it sees one declaring a coalesced format; the
+    // pipeline itself also flips it on the first >8-byte payload.
+    let pre_coalesced = Arc::new(AtomicBool::new(false));
     let (tx, rx) = mpsc::channel::<RawFrame>();
+    let coalesced_for_pump = pre_coalesced.clone();
     thread::Builder::new()
         .name("stdin-pump".into())
-        .spawn(move || stdin_pump(tx))
+        .spawn(move || stdin_pump(tx, coalesced_for_pump))
         .expect("spawn stdin-pump");
-    Ok((rx, None, false))
+    Ok((rx, None, pre_coalesced))
 }
 
 /// Swap the `Supervisor::frames_rx` out so the pipeline can own it
@@ -409,7 +422,7 @@ fn open_maretron_pair(url: &str) -> io::Result<(Box<dyn Read + Send>, Box<dyn Wr
 /// Read PLAIN/FAST lines off stdin, parse to `RawFrame`, push onto
 /// `tx`. Auto-detects between PLAIN and FAST on the first non-empty
 /// line.
-fn stdin_pump(tx: mpsc::Sender<RawFrame>) {
+fn stdin_pump(tx: mpsc::Sender<RawFrame>, pre_coalesced: Arc<AtomicBool>) {
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::with_capacity(1024);
@@ -425,7 +438,26 @@ fn stdin_pump(tx: mpsc::Sender<RawFrame>) {
             }
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
-        if trimmed.is_empty() || trimmed.starts_with('#') {
+        if trimmed.is_empty() {
+            continue;
+        }
+        if trimmed.starts_with('#') {
+            // `# format=<NAME>` headers — emitted by the canboat C
+            // reader binaries — pin both the parser format and (for
+            // any coalesced format) the pipeline's reassembly bypass.
+            if let Some(fmt) = parse_format_header(trimmed) {
+                if active_format.is_none() {
+                    active_format = Some(fmt);
+                    log::info!("input format set by header: {:?}", fmt);
+                }
+                if header_implies_coalesced(trimmed) && !pre_coalesced.swap(true, Ordering::Relaxed)
+                {
+                    log::debug!(
+                        "stdin header declares coalesced format; \
+                         pipeline will skip reassembly"
+                    );
+                }
+            }
             continue;
         }
         if active_format.is_none() {

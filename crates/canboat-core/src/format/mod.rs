@@ -55,6 +55,57 @@ pub enum InputFormat {
     GarminCsv2,
 }
 
+/// Parse a `# format=<NAME>` header comment line. Returns the
+/// declared format when the line matches, else `None`.
+///
+/// Mirrors `canboat/analyzer/analyzer.c` and the
+/// `CANBOAT_FORMAT_FAST_HEADER` emitted by the canboat C reader
+/// binaries (`actisense-serial`, `ikonvert-serial`, `maretron-ipg`).
+/// Trailing whitespace / newline are tolerated; matching is
+/// case-insensitive on the format name.
+pub fn parse_format_header(line: &str) -> Option<InputFormat> {
+    let rest = line.strip_prefix("# format=")?;
+    // canboat names → InputFormat. The names mirror the C
+    // `RAW_FORMAT_STR` table; not every C enum has a Rust analogue
+    // (e.g. `RAWFORMAT_NAVLINK2`), so unknown names return `None`.
+    let name = rest.trim().to_ascii_uppercase();
+    match name.as_str() {
+        "PLAIN" | "PLAIN_OR_FAST" => Some(InputFormat::Plain),
+        "PLAIN_MIX_FAST" => Some(InputFormat::PlainMixFast),
+        // The C tools all emit `format=FAST` on stdout to signal
+        // "frames are already coalesced". We don't have a dedicated
+        // `Fast` variant — callers consult [`is_coalesced`] on
+        // either the returned `InputFormat` or, more usefully, on
+        // the raw header text via [`header_implies_coalesced`].
+        "FAST" => Some(InputFormat::Plain),
+        "ACTISENSE" | "ACTISENSE_ASCII" => Some(InputFormat::ActisenseAscii),
+        "YDWG02" => Some(InputFormat::Ydwg02),
+        "IKONVERT" => Some(InputFormat::Ikonvert),
+        "AIRMAR" => Some(InputFormat::Airmar),
+        "CHETCO" => Some(InputFormat::Chetco),
+        "GARMIN_CSV1" | "GARMIN" => Some(InputFormat::GarminCsv),
+        "GARMIN_CSV2" => Some(InputFormat::GarminCsv2),
+        _ => None,
+    }
+}
+
+/// True when a `# format=<NAME>` header declares a format whose
+/// frames are already coalesced PGN payloads (so the reassembler
+/// should be bypassed). Mirrors canboat C `analyzer.c:391` —
+/// PLAIN/PLAIN_OR_FAST/PLAIN_MIX_FAST/YDWG02 are *not* coalesced;
+/// everything else (FAST, ACTISENSE, IKONVERT, AIRMAR, CHETCO,
+/// GARMIN_CSV*) is.
+pub fn header_implies_coalesced(line: &str) -> bool {
+    let Some(rest) = line.strip_prefix("# format=") else {
+        return false;
+    };
+    let name = rest.trim().to_ascii_uppercase();
+    !matches!(
+        name.as_str(),
+        "PLAIN" | "PLAIN_OR_FAST" | "PLAIN_MIX_FAST" | "YDWG02"
+    )
+}
+
 /// Auto-detect the line format from a single representative line.
 /// Returns `None` if nothing matches; callers should fall back to
 /// [`InputFormat::Plain`] in that case (canboat's behavior).

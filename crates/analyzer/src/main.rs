@@ -16,7 +16,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use canboat_core::{
-    format::{detect, parse_with, plain::ParseError, InputFormat},
+    format::{
+        detect, header_implies_coalesced, parse_format_header, parse_with, plain::ParseError,
+        InputFormat,
+    },
     output::{write_json, write_text, GeoFormat, JsonOptions, TextOptions},
     FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
 };
@@ -230,7 +233,26 @@ fn run_loop<R: BufRead, W: Write>(
     // identically to the C analyzer.
     let mut coalesced_mode = false;
     while let Some(line) = reader.next_line().context("reading input line")? {
-        if line.is_empty() || line.starts_with('#') {
+        if line.is_empty() {
+            continue;
+        }
+        // Honor `# format=<NAME>` headers emitted by the canboat
+        // reader binaries (actisense-serial, ikonvert-serial,
+        // maretron-ipg). Matches analyzer.c:383 — the header pins
+        // the input format and, for any non-{PLAIN, PLAIN_OR_FAST,
+        // PLAIN_MIX_FAST, YDWG02} format, flips multiPackets into
+        // COALESCED mode (skip reassembly).
+        if line.starts_with('#') {
+            if let Some(fmt) = parse_format_header(line) {
+                if active_format.is_none() {
+                    active_format = Some(fmt);
+                    log::info!("input format set by header: {:?}", fmt);
+                }
+                if header_implies_coalesced(line) {
+                    coalesced_mode = true;
+                    log::debug!("header declares coalesced format; skipping reassembly");
+                }
+            }
             continue;
         }
         // Auto-detect on the first content line if the user didn't

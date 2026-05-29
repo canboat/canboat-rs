@@ -843,6 +843,7 @@ mod tests {
                 value: FieldValue::Number(0.0),
             }],
             has_repeating_set: [false, false],
+            index_by_order: [i8::MIN; 32],
         }
     }
 

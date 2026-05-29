@@ -217,6 +217,17 @@ pub struct DecodedPgn {
     /// `"list":[{` opener that analyzer/analyzer.c:1276 emits the
     /// moment it sees the start field.
     pub has_repeating_set: [bool; 2],
+    /// `index_by_order[order - 1]` = position in `self.fields` of
+    /// the top-level (non-repeating) field whose schema `order` is
+    /// `order`, or `i8::MIN` when the field wasn't decoded into
+    /// `self.fields` (e.g. truncated payload, filtered out, or part
+    /// of a repeating set). Populated by `decode_fields`. Used by
+    /// [`Self::field`] to deliver `O(1)` handle lookups.
+    ///
+    /// 32 slots is canboat's hard cap on per-PGN field count. The
+    /// array sits inline so the lookup is a single bounds-checked
+    /// load with no allocation.
+    pub index_by_order: [i8; 32],
 }
 
 impl DecodedPgn {
@@ -225,9 +236,7 @@ impl DecodedPgn {
     /// decoded in this payload (truncated, NotAvailable filtered by
     /// the decoder, etc.).
     ///
-    /// In phase 1 this is a linear scan of `self.fields`; phase 2
-    /// turns `self.fields` into a schema-ordered slot vector and
-    /// this method becomes a single array load.
+    /// `O(1)`: one array load + bounds check.
     #[inline]
     pub fn field(&self, h: &crate::FieldHandle) -> Option<&DecodedField> {
         // Debug-only: catch handles that were minted against a
@@ -239,15 +248,23 @@ impl DecodedPgn {
             h.pgn_id_hash,
             crate::db::djb2_hash_str(&self.id),
         );
-        self.fields.iter().find(|f| f.order == h.field_order)
+        self.field_unchecked(h)
     }
 
     /// Same as [`Self::field`] but skips the debug assert — useful
     /// for callers that intentionally use a single handle across
-    /// multiple PGN ids.
+    /// multiple PGN ids (rare).
     #[inline]
     pub fn field_unchecked(&self, h: &crate::FieldHandle) -> Option<&DecodedField> {
-        self.fields.iter().find(|f| f.order == h.field_order)
+        let idx_slot = (h.field_order as usize).checked_sub(1)?;
+        if idx_slot >= self.index_by_order.len() {
+            return None;
+        }
+        let idx = self.index_by_order[idx_slot];
+        if idx < 0 {
+            return None;
+        }
+        self.fields.get(idx as usize)
     }
 }
 
@@ -271,6 +288,7 @@ impl PgnDatabase {
             .ok_or(DecodeError::UnknownPgn { pgn: frame.pgn })?;
 
         let (fields, has_repeating_set) = decode_fields(info, &frame.data, self)?;
+        let index_by_order = build_index_by_order(&fields);
 
         Ok(DecodedPgn {
             timestamp: frame.timestamp.clone(),
@@ -283,6 +301,7 @@ impl PgnDatabase {
             data: frame.data.to_vec(),
             fields,
             has_repeating_set,
+            index_by_order,
         })
     }
 
@@ -513,6 +532,27 @@ fn decode_fields(
         i += 1;
     }
     Ok((out, entered))
+}
+
+/// Compute `DecodedPgn::index_by_order` from a freshly-decoded
+/// `fields` Vec. For every top-level field (`repeat_set == 0`),
+/// record its `Vec` position at slot `field.order - 1`. Slots with
+/// no decoded field — truncated payloads, NotAvailable filtered
+/// out, or schema positions belonging to a repeating set — keep
+/// the `i8::MIN` sentinel.
+fn build_index_by_order(fields: &[DecodedField]) -> [i8; 32] {
+    let mut idx = [i8::MIN; 32];
+    for (pos, f) in fields.iter().enumerate() {
+        if f.repeat_set != 0 {
+            continue;
+        }
+        if let Some(slot) = (f.order as usize).checked_sub(1) {
+            if slot < idx.len() && pos < i8::MAX as usize {
+                idx[slot] = pos as i8;
+            }
+        }
+    }
+    idx
 }
 
 #[allow(clippy::too_many_arguments)]

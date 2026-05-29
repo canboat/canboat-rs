@@ -88,4 +88,31 @@ mod smoke {
         // Unknown PGN id is None.
         assert!(db.field("noSuchPgn", "Unique Number").is_none());
     }
+
+    #[test]
+    fn field_handle_indexes_decoded_record() {
+        let db = PgnDatabase::load(db_path()).expect("load canboat.json");
+        // From canboat/analyzer/tests/pgn-test.in — Unique Number =
+        // 1088507, Manufacturer Code = 275 / Navico.
+        let mut data: smallvec::SmallVec<[u8; 8]> = smallvec::SmallVec::new();
+        for b in [0xfb, 0x9b, 0x70, 0x22, 0x00, 0x9b, 0x50, 0xc0] {
+            data.push(b);
+        }
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 6,
+            pgn: 60928,
+            src: 5,
+            dst: 255,
+            data,
+        };
+        let dec = db.decode(&frame).expect("decode");
+        // The same handle resolved at startup retrieves the
+        // top-level Unique Number field at `O(1)`.
+        let h = db
+            .field("isoAddressClaim", "Unique Number")
+            .expect("handle");
+        let f = dec.field(&h).expect("field present");
+        assert_eq!(f.value.as_i64(), Some(1_088_507));
+    }
 }

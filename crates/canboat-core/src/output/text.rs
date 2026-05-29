@@ -410,6 +410,7 @@ mod tests {
                 },
             ],
             has_repeating_set: [false, false],
+            index_by_order: [i8::MIN; 32],
         }
     }
 

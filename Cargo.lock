@@ -158,6 +158,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "canboat-pipeline"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "canboat-cli",
+ "canboat-core",
+ "canboat-io",
+ "clap",
+ "env_logger",
+ "log",
+ "n2kd",
+]
+
+[[package]]
 name = "canboat-tokio"
 version = "0.1.0"
 dependencies = [
@@ -567,20 +581,6 @@ dependencies = [
  "clap",
  "env_logger",
  "log",
-]
-
-[[package]]
-name = "n2kd-pipeline"
-version = "0.1.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "canboat-io",
- "clap",
- "env_logger",
- "log",
- "n2kd",
 ]
 
 [[package]]

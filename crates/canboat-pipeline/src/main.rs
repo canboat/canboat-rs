@@ -1,4 +1,4 @@
-//! `n2kd-pipeline` — single-process N2K → NMEA 0183 pipeline.
+//! `canboat-pipeline` — single-process N2K → NMEA 0183 pipeline.
 //!
 //! Combines the work that the C canboat stack normally splits across
 //! three processes (a device reader like `actisense-serial`, the
@@ -12,7 +12,7 @@
 //!
 //! * **stdin** (no `--actisense` / `--ikonvert` / `--maretron`): the
 //!   binary parses PLAIN/FAST lines off stdin. Compatible with
-//!   `analyzer < file.raw | n2kd-pipeline` style pipelines that used
+//!   `analyzer < file.raw | canboat-pipeline` style pipelines that used
 //!   to exist with `n2kd-inproc`.
 //! * **device**: a [`canboat_io::device`] reader stage opens the
 //!   chosen serial port / TCP socket and emits `RawFrame`s
@@ -47,7 +47,7 @@ const SYNTHETIC_PGNS_JSON: &str = include_str!("../../../data/synthetic-pgns.jso
 
 #[derive(Debug, Parser)]
 #[command(
-    name = "n2kd-pipeline",
+    name = "canboat-pipeline",
     about = "Single-process device-reader \u{2192} analyzer \u{2192} n2kd pipeline",
     version
 )]
@@ -120,7 +120,7 @@ struct Cli {
     /// Port for the bidirectional CSV (PLAIN/FAST) server. Clients
     /// receive every frame as a PLAIN/FAST line and can send
     /// PLAIN/FAST lines back to inject into the N2K bus. New in
-    /// `n2kd-pipeline`; no direct canboat C equivalent. Formatting
+    /// `canboat-pipeline`; no direct canboat C equivalent. Formatting
     /// is lazy (skipped when no client is subscribed). `0` disables.
     #[arg(long, default_value_t = 2603)]
     csv_port: u16,

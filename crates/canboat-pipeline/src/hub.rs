@@ -1,6 +1,6 @@
 //! Lazy broadcast hub for the read-only TCP outputs.
 //!
-//! `n2kd-pipeline` exposes three read streams a TCP client can
+//! `canboat-pipeline` exposes three read streams a TCP client can
 //! subscribe to: PLAIN/FAST CSV (also accepting writes — see
 //! [`crate::tcp`]), NMEA 0183 incl. AIVDM, and analyzer JSON. All
 //! three share this `Hub` structure: clients subscribe, the pipeline

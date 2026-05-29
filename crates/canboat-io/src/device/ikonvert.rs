@@ -28,6 +28,7 @@
 
 use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use canboat_core::format::ikonvert::{
     self, IkonvertLine, TX_LIMIT_OFF, TX_OFFLINE, TX_ONLINE_ALL, TX_ONLINE_NORMAL,
@@ -125,10 +126,33 @@ impl DeviceDecoder for Decoder {
                 continue;
             }
             match ikonvert::parse_line(trimmed) {
-                Ok(IkonvertLine::Frame(f)) => events.push(DeviceEvent::Frame(f)),
+                Ok(IkonvertLine::Frame(mut f)) => {
+                    // canboat C overrides the iKonvert's
+                    // seconds-since-boot timestamp with host time
+                    // (see `computeIKonvertTime`). The device clock
+                    // is known to drift, and downstream tools (the
+                    // analyzer, n2kd) expect a wall-clock timestamp.
+                    f.timestamp = Some(now_iso_ms());
+                    events.push(DeviceEvent::Frame(f));
+                }
                 Ok(IkonvertLine::Control(c)) => self.handle_control(&c, events),
                 Ok(IkonvertLine::Other) => {}
-                Err(e) => events.push(DeviceEvent::Error(format!("ikonvert: {e}"))),
+                Err(e) => {
+                    // When the iKonvert reboots mid-stream (e.g. on
+                    // a bus condition) it can splice its boot banner
+                    // straight onto the tail of an unterminated frame
+                    // line — no `\r\n` separator. The line then fails
+                    // to parse as a frame. Recover the TEXT signal
+                    // out of the rubble; it's the only signal we have
+                    // that the device just reset.
+                    if let Some(idx) = trimmed.find("$PDGY,TEXT,") {
+                        let banner = &trimmed[idx + "$PDGY,".len()..];
+                        log::warn!("ikonvert: corrupt line, but found TEXT banner");
+                        self.handle_control(banner, events);
+                    } else {
+                        events.push(DeviceEvent::Error(format!("ikonvert: {e}")));
+                    }
+                }
             }
         }
     }
@@ -170,19 +194,39 @@ impl Decoder {
         self.maybe_resend_offline(events);
     }
 
-    /// Transition out of `STATE_WAIT_OFFLINE_ACK` once the device's
-    /// `TEXT,…` banner arrives. No-op at any other state — TEXT
-    /// banners can show up later too (e.g. after a device reset).
+    /// Handle a `$PDGY,TEXT,…` banner.
+    ///
+    /// * While we're waiting for the OFFLINE response (state 13),
+    ///   advance into the rest of the handshake.
+    /// * After init is finished, TEXT means the device just rebooted
+    ///   itself (bus condition, watchdog, whatever) and is back in
+    ///   the pre-init OFFLINE state. Restart the handshake from
+    ///   `N2NET_INIT` — no need to re-send OFFLINE, the device is
+    ///   already there.
+    /// * Mid-handshake TEXT is unusual; treat it as a soft reset too.
     fn advance_after_text(&self, events: &mut Vec<DeviceEvent>) {
         let mut state = self.init_state.lock().expect("ikonvert state poisoned");
-        if *state != STATE_WAIT_OFFLINE_ACK {
-            return;
-        }
-        *state -= 1; // → STATE_MAYBE_RESET (12)
-        if let Some(cmd) = next_init_command(&mut state, &self.config) {
-            events.push(DeviceEvent::SendBytes(cmd.into_bytes()));
-        } else {
-            log::info!("ikonvert: initialization complete");
+        match *state {
+            STATE_WAIT_OFFLINE_ACK => {
+                *state = STATE_MAYBE_RESET;
+                if let Some(cmd) = next_init_command(&mut state, &self.config) {
+                    events.push(DeviceEvent::SendBytes(cmd.into_bytes()));
+                } else {
+                    log::info!("ikonvert: initialization complete");
+                }
+            }
+            STATE_DONE => {
+                log::warn!("ikonvert: device reset detected, re-initialising");
+                // Skip OFFLINE since the device is already offline
+                // post-reboot; jump straight to the post-RESET path.
+                *state = STATE_MAYBE_RESET;
+                if let Some(cmd) = next_init_command(&mut state, &self.config) {
+                    events.push(DeviceEvent::SendBytes(cmd.into_bytes()));
+                }
+            }
+            _ => {
+                log::debug!("ikonvert: TEXT during init at state {}", *state);
+            }
         }
     }
 
@@ -323,6 +367,38 @@ fn next_init_command(state: &mut u32, config: &Config) -> Option<String> {
     }
 }
 
+/// `YYYY-MM-DDTHH:MM:SS.mmm` from the host clock in UTC. Same shape
+/// the Maretron codec emits and what canboat C produces via
+/// `fmtTimestamp`.
+fn now_iso_ms() -> String {
+    let dur = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    let secs = dur.as_secs() as i64;
+    let ms = dur.subsec_millis();
+    let days = secs.div_euclid(86_400);
+    let day_secs = secs.rem_euclid(86_400) as u32;
+    let h = day_secs / 3600;
+    let m = (day_secs / 60) % 60;
+    let s = day_secs % 60;
+    let (y, mo, d) = days_to_ymd(days);
+    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{m:02}:{s:02}.{ms:03}")
+}
+
+fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -434,17 +510,56 @@ mod tests {
     }
 
     #[test]
-    fn text_only_advances_from_offline_wait() {
+    fn text_after_init_triggers_reinit() {
         let decoder = Decoder::new(Config::default());
-        // Send TEXT once → should advance and emit INIT,ALL.
         let mut events = Vec::new();
-        decoder.handle_control("TEXT,banner", &mut events);
-        assert_eq!(events.len(), 1);
-        // A second TEXT after init should NOT re-trigger anything.
+        decoder.handle_control("TEXT,banner", &mut events); // → INIT,ALL
         events.clear();
         decoder.handle_control("ACK,init", &mut events); // → done
         events.clear();
+        // Simulate the device rebooting and sending its banner again.
         decoder.handle_control("TEXT,banner2", &mut events);
-        assert!(events.is_empty(), "TEXT after init should be a no-op");
+        assert_eq!(events.len(), 1, "post-init TEXT should re-init");
+        match &events[0] {
+            DeviceEvent::SendBytes(b) => {
+                let s = String::from_utf8_lossy(b);
+                assert!(
+                    s.starts_with("$PDGY,N2NET_INIT"),
+                    "expected re-init to send INIT, got {s:?}"
+                );
+            }
+            _ => panic!("expected SendBytes"),
+        }
+    }
+
+    #[test]
+    fn corrupt_line_with_embedded_text_still_resets() {
+        // Mid-frame device reboot: the iKonvert splices its banner
+        // onto an unterminated `!PDGY,…` line. The decoder must
+        // recover the TEXT signal even though parse_line errors.
+        let mut decoder = Decoder::new(Config::default());
+        // Drive to STATE_DONE first.
+        let mut events = Vec::new();
+        decoder.handle_control("TEXT,init", &mut events); // → INIT
+        events.clear();
+        decoder.handle_control("ACK,init", &mut events); // → done
+        events.clear();
+
+        // Feed the actual garbage line observed on real hardware.
+        let bad = b"!PDGY,65350,2,27,\xff$PDGY,TEXT,Digital_Yacht_iKonvert_v2_49_x\r\n";
+        decoder.decode(bad, &mut events);
+
+        // Expect: no `Error` event (TEXT was recovered) and exactly
+        // one `SendBytes` carrying the re-init command.
+        let send_count = events
+            .iter()
+            .filter(|e| matches!(e, DeviceEvent::SendBytes(_)))
+            .count();
+        let err_count = events
+            .iter()
+            .filter(|e| matches!(e, DeviceEvent::Error(_)))
+            .count();
+        assert_eq!(err_count, 0, "TEXT salvage should suppress the parse error");
+        assert_eq!(send_count, 1, "device reset should re-init");
     }
 }

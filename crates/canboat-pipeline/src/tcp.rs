@@ -36,6 +36,14 @@ use anyhow::{Context, Result};
 use canboat_core::format::{parse_plain, PlainError};
 use canboat_io::device::FrameSender;
 
+/// One-shot header sent to every CSV (R/W) client on connect.
+/// Matches the line the canboat C reader binaries
+/// (`actisense-serial`, `ikonvert-serial`, `maretron-ipg`) emit on
+/// stdout to declare "frames are already coalesced FAST". A
+/// downstream canboat `analyzer` or canboatjs's `Liner +
+/// parseActisense` use this to skip per-CAN-frame reassembly.
+const CANBOAT_FORMAT_FAST_HEADER: &[u8] = b"# format=FAST\n";
+
 use crate::hub::Hub;
 use crate::snapshot::SnapshotStore;
 
@@ -282,6 +290,12 @@ fn run_csv_client(stream: TcpStream, hub: Arc<Hub>, sender: Option<FrameSender>)
     // Main thread — drain the subscription, write to the socket.
     let rx = hub.subscribe();
     let mut stream = write_stream;
+    // Send the canboat format header before the first frame so
+    // downstream parsers (canboat C analyzer, canboatjs) know the
+    // stream is already coalesced FAST and don't try reassembly.
+    if stream.write_all(CANBOAT_FORMAT_FAST_HEADER).is_err() {
+        return;
+    }
     while let Ok(line) = rx.recv() {
         if stream.write_all(line.as_bytes()).is_err() {
             break;

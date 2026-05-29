@@ -120,12 +120,16 @@ pub fn run(db: PgnDatabase, frames_rx: Receiver<RawFrame>, hubs: Hubs) {
         if want_json {
             json_line.clear();
             if write_json(&mut json_line, &decoded, &json_opts).is_ok() {
-                json_line.push('\n');
-                if hubs.analyzer.has_subscribers() {
-                    hubs.analyzer.broadcast(&json_line);
-                }
+                // Snapshot wants the bare JSON (it embeds the line as
+                // a value inside its own nested wrapper). The
+                // analyzer port wants one-record-per-line, so we tack
+                // the newline on for that path only.
                 if let Some(snap) = hubs.snapshot.as_ref() {
                     snap.store(&decoded, json_line.clone());
+                }
+                if hubs.analyzer.has_subscribers() {
+                    json_line.push('\n');
+                    hubs.analyzer.broadcast(&json_line);
                 }
             }
         }

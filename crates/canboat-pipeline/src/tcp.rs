@@ -75,16 +75,18 @@ fn snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
 }
 
 fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
-    // Snapshot under the cache lock, then write outside it so a slow
-    // client doesn't stall the pipeline's `store()` calls.
-    let lines = store.snapshot();
-    for line in lines {
-        if stream.write_all(line.as_bytes()).is_err() {
-            return;
-        }
-    }
-    // Closing happens implicitly when `stream` drops at the end of
-    // this function. canboat C n2kd does the same.
+    use std::net::Shutdown;
+    // Snapshot is a one-shot dump — build the JSON document under
+    // the cache lock, then drop the lock before sending so a slow
+    // client can't stall the pipeline's `store()` calls.
+    let doc = store.snapshot();
+    let _ = stream.write_all(doc.as_bytes());
+    let _ = stream.flush();
+    // Explicit shutdown to signal end-of-stream to the client — TCP
+    // close-after-flush is the canonical "one-shot snapshot done"
+    // signal. The implicit drop would do the same, but being
+    // explicit makes the intent obvious.
+    let _ = stream.shutdown(Shutdown::Both);
 }
 
 /// Bind a read-only TCP server. Each client subscribes to `hub` and

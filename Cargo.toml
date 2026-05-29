@@ -14,7 +14,7 @@ members = [
     "crates/pcap2candump",
     "crates/socketcan-writer",
     "crates/n2kd",
-    "crates/n2kd-inproc",
+    "crates/n2kd-pipeline",
 ]
 
 [workspace.package]

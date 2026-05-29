@@ -570,7 +570,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "n2kd-inproc"
+name = "n2kd-pipeline"
 version = "0.1.0"
 dependencies = [
  "anyhow",
@@ -578,6 +578,8 @@ dependencies = [
  "canboat-core",
  "canboat-io",
  "clap",
+ "env_logger",
+ "log",
  "n2kd",
 ]
 

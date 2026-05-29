@@ -8,7 +8,9 @@
 //! No tokio. No async. No threads. The sans-I/O decoder in
 //! `canboat-core` is driven directly from these synchronous reads.
 
-use std::io::{self, BufRead, Read};
+pub mod device;
+
+use std::io::{self, BufRead, Read, Write};
 use std::time::Duration;
 
 /// Read lines one at a time from a [`BufRead`] source.
@@ -109,6 +111,45 @@ pub fn open_serial(path: &str, baud: u32) -> io::Result<Box<dyn serialport::Seri
         .timeout(Duration::from_millis(250))
         .open()
         .map_err(|e| io::Error::other(e.to_string()))
+}
+
+/// Open a serial port and return an independent `(reader, writer)`
+/// pair as `Read`/`Write` trait objects. Mirrors what the
+/// `actisense-serial` / `ikonvert-serial` binaries do: open the port
+/// once, then `try_clone` the handle so the read and write threads
+/// each own an fd-sharing handle without a mutex. Hides
+/// `serialport::SerialPort` from callers that just want byte streams.
+pub fn open_serial_rw(
+    path: &str,
+    baud: u32,
+) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    let read_port = open_serial(path, baud)?;
+    let write_port = read_port
+        .try_clone()
+        .map_err(|e| io::Error::other(format!("cloning serial handle for {path}: {e}")))?;
+    Ok((
+        Box::new(SerialIo(read_port)),
+        Box::new(SerialIo(write_port)),
+    ))
+}
+
+/// Internal wrapper that adapts `Box<dyn SerialPort>` to a concrete
+/// type implementing both `Read` and `Write`.
+struct SerialIo(Box<dyn serialport::SerialPort>);
+
+impl Read for SerialIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        self.0.read(buf)
+    }
+}
+
+impl Write for SerialIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        self.0.write(buf)
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        self.0.flush()
+    }
 }
 
 #[cfg(test)]

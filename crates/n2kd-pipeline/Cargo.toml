@@ -1,15 +1,15 @@
 [package]
-name        = "n2kd-inproc"
+name        = "n2kd-pipeline"
 version     = { workspace = true }
 edition     = { workspace = true }
 license     = { workspace = true }
 authors     = { workspace = true }
 repository  = { workspace = true }
 rust-version = { workspace = true }
-description = "In-process analyzer → n2kd pipeline benchmark scaffolding."
+description = "Single-process device-reader → analyzer → n2kd pipeline."
 
 [[bin]]
-name = "n2kd-inproc"
+name = "n2kd-pipeline"
 path = "src/main.rs"
 
 [dependencies]
@@ -19,3 +19,5 @@ canboat-cli  = { workspace = true }
 n2kd         = { path = "../n2kd", version = "0.1.0" }
 anyhow       = { workspace = true }
 clap         = { workspace = true }
+log          = { workspace = true }
+env_logger   = { workspace = true }

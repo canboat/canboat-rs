@@ -1,0 +1,238 @@
+//! TCP listeners attached to the pipeline.
+//!
+//! Four endpoints:
+//!
+//! * **CSV server** (R/W) — clients receive the PLAIN/FAST text
+//!   rendering of every frame received from the device, *and* lines
+//!   they send back are parsed as PLAIN/FAST and queued for the
+//!   device writer. This is the canboat-style "one socket, both
+//!   directions" port.
+//!
+//! * **NMEA 0183 server** (RO) — clients receive every NMEA 0183
+//!   sentence the pipeline emits, including AIVDM.
+//!
+//! * **Analyzer server** (RO) — clients receive analyzer JSON, one
+//!   record per line.
+//!
+//! * **Write server** (WO) — accepts PLAIN/FAST lines and sends them
+//!   to the device writer. No data flows back. Cheaper for clients
+//!   that only need to inject N2K traffic.
+//!
+//! All read-side streams are lazy: the pipeline only formats data
+//! when at least one client is subscribed (see [`crate::hub::Hub`]).
+
+use std::io::{BufRead, BufReader, Write};
+use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::sync::Arc;
+use std::thread::{self, JoinHandle};
+
+use anyhow::{Context, Result};
+
+use canboat_core::format::{parse_plain, PlainError};
+use canboat_io::device::FrameSender;
+
+use crate::hub::Hub;
+
+/// Bind a read-only TCP server. Each client subscribes to `hub` and
+/// is forwarded broadcast lines until either side disconnects.
+pub fn spawn_readonly(
+    name: &'static str,
+    bind: Ipv4Addr,
+    port: u16,
+    hub: Arc<Hub>,
+) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding {name} TCP port {}:{}", bind, port))?;
+    log::info!("{name} server listening on {}:{}", bind, port);
+    Ok(thread::Builder::new()
+        .name(format!("{name}-accept"))
+        .spawn(move || readonly_accept(name, listener, hub))
+        .expect("spawn read-only accept"))
+}
+
+fn readonly_accept(name: &'static str, listener: TcpListener, hub: Arc<Hub>) {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("{name} accept failed: {e}");
+                return;
+            }
+        };
+        log::info!("{name} client connected: {peer}");
+        let h = hub.clone();
+        thread::Builder::new()
+            .name(format!("{name}-client"))
+            .spawn(move || run_readonly_client(stream, h))
+            .ok();
+    }
+}
+
+fn run_readonly_client(mut stream: TcpStream, hub: Arc<Hub>) {
+    let rx = hub.subscribe();
+    while let Ok(line) = rx.recv() {
+        if stream.write_all(line.as_bytes()).is_err() {
+            return;
+        }
+    }
+}
+
+/// Bind a write-only TCP server. Each client's lines are parsed as
+/// PLAIN/FAST and sent to the device writer. Useful for clients that
+/// just want to inject N2K traffic without reading anything back.
+pub fn spawn_writeonly(bind: Ipv4Addr, port: u16, sender: FrameSender) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding write-only TCP port {}:{}", bind, port))?;
+    log::info!("write-only server listening on {}:{}", bind, port);
+    Ok(thread::Builder::new()
+        .name("write-accept".into())
+        .spawn(move || writeonly_accept(listener, sender))
+        .expect("spawn write-only accept"))
+}
+
+fn writeonly_accept(listener: TcpListener, sender: FrameSender) {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("write-only accept failed: {e}");
+                return;
+            }
+        };
+        log::info!("write-only client connected: {peer}");
+        let s = sender.clone();
+        thread::Builder::new()
+            .name("write-client".into())
+            .spawn(move || run_writeonly_client(stream, s))
+            .ok();
+    }
+}
+
+fn run_writeonly_client(stream: TcpStream, sender: FrameSender) {
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(e) => {
+                log::debug!("write-only client read error: {e}");
+                return;
+            }
+        };
+        if !forward_plain_line(&line, &sender) {
+            return;
+        }
+    }
+}
+
+/// Bind the bidirectional CSV server. Each client thread spawns a
+/// reader sub-thread (parses incoming PLAIN/FAST lines and queues
+/// them for the device writer) and runs the read-out loop in the
+/// caller thread (drains the CsvHub subscription and writes to the
+/// socket).
+///
+/// `sender` is optional: when running in stdin mode there's no
+/// device to forward to, so incoming writes are silently dropped.
+pub fn spawn_csv_rw(
+    bind: Ipv4Addr,
+    port: u16,
+    hub: Arc<Hub>,
+    sender: Option<FrameSender>,
+) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding CSV TCP port {}:{}", bind, port))?;
+    log::info!("CSV R/W server listening on {}:{}", bind, port);
+    Ok(thread::Builder::new()
+        .name("csv-accept".into())
+        .spawn(move || csv_accept(listener, hub, sender))
+        .expect("spawn CSV accept"))
+}
+
+fn csv_accept(listener: TcpListener, hub: Arc<Hub>, sender: Option<FrameSender>) {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("csv accept failed: {e}");
+                return;
+            }
+        };
+        log::info!("csv client connected: {peer}");
+        let h = hub.clone();
+        let s = sender.clone();
+        thread::Builder::new()
+            .name("csv-client".into())
+            .spawn(move || run_csv_client(stream, h, s))
+            .ok();
+    }
+}
+
+fn run_csv_client(stream: TcpStream, hub: Arc<Hub>, sender: Option<FrameSender>) {
+    // Split the stream so the read side can run on its own thread.
+    // `TcpStream::try_clone` shares the underlying socket between
+    // the two handles; closing either side closes the connection.
+    let write_stream = stream;
+    let read_stream = match write_stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            log::warn!("csv: cannot clone client stream: {e}");
+            return;
+        }
+    };
+
+    // Reader subthread — parse incoming PLAIN/FAST lines and forward
+    // them to the device writer.
+    let read_handle = thread::Builder::new()
+        .name("csv-client-read".into())
+        .spawn(move || {
+            let reader = BufReader::new(read_stream);
+            for line in reader.lines() {
+                let line = match line {
+                    Ok(l) => l,
+                    Err(_) => return,
+                };
+                match sender.as_ref() {
+                    Some(sender) => {
+                        if !forward_plain_line(&line, sender) {
+                            return;
+                        }
+                    }
+                    None => {
+                        // Stdin mode: silently swallow lines.
+                        log::debug!("csv (no device): dropping client line");
+                    }
+                }
+            }
+        })
+        .expect("spawn csv reader subthread");
+
+    // Main thread — drain the subscription, write to the socket.
+    let rx = hub.subscribe();
+    let mut stream = write_stream;
+    while let Ok(line) = rx.recv() {
+        if stream.write_all(line.as_bytes()).is_err() {
+            break;
+        }
+    }
+    // Closing the write side via drop will also close the read side
+    // (shared socket fd), which lets the reader thread exit on its
+    // next read.
+    drop(stream);
+    let _ = read_handle.join();
+}
+
+/// Parse one PLAIN/FAST line and forward to the device writer.
+/// Returns `false` when the writer has gone away (caller should stop).
+fn forward_plain_line(line: &str, sender: &FrameSender) -> bool {
+    let trimmed = line.trim_end_matches(['\r', '\n']);
+    if trimmed.is_empty() || trimmed.starts_with('#') {
+        return true;
+    }
+    match parse_plain(trimmed) {
+        Ok(frame) => sender.send_frame(frame).is_ok(),
+        Err(PlainError::Empty) => true,
+        Err(e) => {
+            log::warn!("ignoring malformed PLAIN/FAST line: {e}");
+            true
+        }
+    }
+}

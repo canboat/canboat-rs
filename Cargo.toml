@@ -48,3 +48,11 @@ futures      = "0.3"
 lto         = "thin"
 codegen-units = 1
 strip       = true
+
+# Mirrors `release` but keeps debug info and disables strip, for use
+# with profilers like samply / `cargo flamegraph`. Build with
+#   cargo build --profile=profiling -p analyzer
+[profile.profiling]
+inherits = "release"
+debug    = "full"
+strip    = false

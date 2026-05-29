@@ -243,7 +243,7 @@ fn write_json_inner<W: fmt::Write>(
     }
     if !fields_buf.is_empty() {
         w.write_str(",\"fields\":{")?;
-        w.write_str(&fields_buf)?;
+        w.write_str(fields_buf)?;
         w.write_char('}')?;
     }
     w.write_char('}')?; // close top

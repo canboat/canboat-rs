@@ -76,7 +76,13 @@ pub(crate) fn write_fixed_float<W: std::fmt::Write>(
     // (2^53). That covers the AIS "Altitude unknown" sentinel
     // (~9.2e12) which canboat C formats via `%.*f` directly.
     if !v.is_finite() || v.abs() >= 1e12 {
-        return write!(w, "{:>width$.prec$}", v, width = min_width, prec = precision);
+        return write!(
+            w,
+            "{:>width$.prec$}",
+            v,
+            width = min_width,
+            prec = precision
+        );
     }
     // Preserve the sign of the original value — `-0.0001` with
     // precision 1 rounds to integer 0 but `core::fmt` (and canboat C)
@@ -110,8 +116,7 @@ pub(crate) fn write_fixed_float<W: std::fmt::Write>(
     let int_str = int_buf.format(int_part);
     let mut frac_buf = itoa::Buffer::new();
     let frac_str = frac_buf.format(frac_part);
-    let total_len =
-        (if neg { 1 } else { 0 }) + int_str.len() + 1 + precision;
+    let total_len = (if neg { 1 } else { 0 }) + int_str.len() + 1 + precision;
     for _ in 0..min_width.saturating_sub(total_len) {
         w.write_char(' ')?;
     }

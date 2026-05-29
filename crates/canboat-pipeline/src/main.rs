@@ -95,6 +95,21 @@ struct Cli {
     #[arg(long, default_value = "")]
     maretron_password: String,
 
+    /// iKonvert RX filter list (`<pgn>,<pgn>,...`). When set, init
+    /// brings the device online in `NORMAL` mode and runs the
+    /// `N2NET_RESET` + `RX_LIST` handshake steps.
+    #[arg(long, value_name = "PGN,PGN,...")]
+    ikonvert_rx: Option<String>,
+
+    /// iKonvert TX filter list (`<pgn>,<pgn>,...`). Triggers the
+    /// `N2NET_RESET` + `TX_LIST` handshake steps.
+    #[arg(long, value_name = "PGN,PGN,...")]
+    ikonvert_tx: Option<String>,
+
+    /// Disable the iKonvert TX rate limit. Use at your own risk.
+    #[arg(long)]
+    ikonvert_rate_limit_off: bool,
+
     /// Bind address for all TCP listeners.
     #[arg(long, default_value = "127.0.0.1")]
     bind: Ipv4Addr,
@@ -265,13 +280,18 @@ fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor
     if let Some(path) = cli.ikonvert.as_deref() {
         let baud = cli.baud.unwrap_or(230_400);
         let path = path.to_string();
+        let rx_list = cli.ikonvert_rx.clone();
+        let tx_list = cli.ikonvert_tx.clone();
+        let rate_limit_off = cli.ikonvert_rate_limit_off;
         let factory = NamedFactory::new("ikonvert", move || {
             let (reader, writer) = open_serial_rw(&path, baud)?;
-            Ok(device::ikonvert::run(
-                reader,
-                writer,
-                device::ikonvert::Config::default(),
-            ))
+            let config = device::ikonvert::Config {
+                rx_list: rx_list.clone(),
+                tx_list: tx_list.clone(),
+                rate_limit_off,
+                ..Default::default()
+            };
+            Ok(device::ikonvert::run(reader, writer, config))
         });
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);

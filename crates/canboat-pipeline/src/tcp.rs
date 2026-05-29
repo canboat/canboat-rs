@@ -1,6 +1,10 @@
 //! TCP listeners attached to the pipeline.
 //!
-//! Four endpoints:
+//! Five endpoints:
+//!
+//! * **Snapshot server** (RO, one-shot) — on connect, dumps every
+//!   live `(pgn, src, secondary)` cache entry as analyzer JSON, then
+//!   closes. Mirrors canboat C `n2kd`'s base port (2597 by default).
 //!
 //! * **CSV server** (R/W) — clients receive the PLAIN/FAST text
 //!   rendering of every frame received from the device, *and* lines
@@ -20,6 +24,7 @@
 //!
 //! All read-side streams are lazy: the pipeline only formats data
 //! when at least one client is subscribed (see [`crate::hub::Hub`]).
+//! The snapshot port pulls from a cache populated by the pipeline.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
@@ -32,6 +37,55 @@ use canboat_core::format::{parse_plain, PlainError};
 use canboat_io::device::FrameSender;
 
 use crate::hub::Hub;
+use crate::snapshot::SnapshotStore;
+
+/// Bind the snapshot server. Each accepted client gets one dump of
+/// every live `(pgn, src, secondary)` cache entry then the connection
+/// closes — same shape as canboat C `n2kd`'s base port.
+pub fn spawn_snapshot(
+    bind: Ipv4Addr,
+    port: u16,
+    store: Arc<SnapshotStore>,
+) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding snapshot TCP port {}:{}", bind, port))?;
+    log::info!("snapshot server listening on {}:{}", bind, port);
+    Ok(thread::Builder::new()
+        .name("snapshot-accept".into())
+        .spawn(move || snapshot_accept(listener, store))
+        .expect("spawn snapshot accept"))
+}
+
+fn snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("snapshot accept failed: {e}");
+                return;
+            }
+        };
+        log::info!("snapshot client connected: {peer}");
+        let s = store.clone();
+        thread::Builder::new()
+            .name("snapshot-client".into())
+            .spawn(move || run_snapshot_client(stream, s))
+            .ok();
+    }
+}
+
+fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
+    // Snapshot under the cache lock, then write outside it so a slow
+    // client doesn't stall the pipeline's `store()` calls.
+    let lines = store.snapshot();
+    for line in lines {
+        if stream.write_all(line.as_bytes()).is_err() {
+            return;
+        }
+    }
+    // Closing happens implicitly when `stream` drops at the end of
+    // this function. canboat C n2kd does the same.
+}
 
 /// Bind a read-only TCP server. Each client subscribes to `hub` and
 /// is forwarded broadcast lines until either side disconnects.

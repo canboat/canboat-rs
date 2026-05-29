@@ -10,10 +10,14 @@
 //! * `csv_hub` — every `RawFrame` rendered as a PLAIN/FAST line.
 //! * `nmea_hub` — every NMEA 0183 sentence (one or more per record).
 //! * `analyzer_hub` — every decoded record rendered as analyzer JSON.
+//! * `snapshot` — analyzer JSON stashed per `(pgn, src, secondary)`
+//!   for the n2kd-compatible full-state-on-connect port.
 //!
-//! Each side branch is gated by the corresponding hub's
-//! `has_subscribers()` so the no-clients steady state pays only an
-//! atomic load per frame.
+//! Each side branch is gated. The hub-broadcast paths skip the
+//! formatter when no one is subscribed (atomic load). The snapshot
+//! cache, when present, always wants its JSON line, so JSON
+//! serialization runs whenever either the analyzer hub has
+//! subscribers OR the snapshot store is configured.
 
 use std::cell::RefCell;
 use std::io::{self, BufWriter, Write};
@@ -25,6 +29,7 @@ use canboat_core::output::{write_json, JsonOptions};
 use canboat_core::{FramePacketType, PgnDatabase, RawFrame, Reassembled, Reassembler};
 
 use crate::hub::Hub;
+use crate::snapshot::SnapshotStore;
 
 thread_local! {
     static JSON_BUF: RefCell<String> = const { RefCell::new(String::new()) };
@@ -52,6 +57,10 @@ pub struct Hubs {
     pub csv: Arc<Hub>,
     pub nmea: Arc<Hub>,
     pub analyzer: Arc<Hub>,
+    /// Optional cache for the snapshot port. When `Some`, every
+    /// decoded record's analyzer JSON line lands in the cache; the
+    /// snapshot TCP listener dumps the live entries on each connect.
+    pub snapshot: Option<Arc<SnapshotStore>>,
 }
 
 /// Pipeline entry point. Returns when `frames_rx` is closed.
@@ -101,14 +110,23 @@ pub fn run(db: PgnDatabase, frames_rx: Receiver<RawFrame>, hubs: Hubs) {
             continue;
         };
 
-        // Lazy analyzer JSON broadcast — one JSON line per decoded
-        // record. The JSON serializer walks every decoded field, so
-        // skipping when no one is subscribed actually buys something.
-        if hubs.analyzer.has_subscribers() {
+        // Lazy analyzer JSON broadcast / snapshot stash — one JSON
+        // line per decoded record. Serialization runs when either
+        // the analyzer hub has subscribers OR the snapshot store is
+        // configured. The JSON serializer walks every decoded field,
+        // so skipping when no one needs the line actually buys
+        // something on a high-rate input stream.
+        let want_json = hubs.analyzer.has_subscribers() || hubs.snapshot.is_some();
+        if want_json {
             json_line.clear();
             if write_json(&mut json_line, &decoded, &json_opts).is_ok() {
                 json_line.push('\n');
-                hubs.analyzer.broadcast(&json_line);
+                if hubs.analyzer.has_subscribers() {
+                    hubs.analyzer.broadcast(&json_line);
+                }
+                if let Some(snap) = hubs.snapshot.as_ref() {
+                    snap.store(&decoded, json_line.clone());
+                }
             }
         }
 

@@ -23,6 +23,7 @@
 
 mod hub;
 mod pipeline;
+mod snapshot;
 mod tcp;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
@@ -42,6 +43,7 @@ use canboat_io::open_serial_rw;
 
 use crate::hub::Hub;
 use crate::pipeline::Hubs;
+use crate::snapshot::SnapshotStore;
 
 const SYNTHETIC_PGNS_JSON: &str = include_str!("../../../data/synthetic-pgns.json");
 
@@ -96,6 +98,14 @@ struct Cli {
     /// Bind address for all TCP listeners.
     #[arg(long, default_value = "127.0.0.1")]
     bind: Ipv4Addr,
+
+    /// Port for the snapshot server — on connect, dumps the latest
+    /// analyzer JSON line per `(pgn, src, secondary)` then closes.
+    /// Matches canboat C `n2kd`'s base port (`-p`). Enabling this
+    /// forces JSON serialization for every decoded record so the
+    /// cache stays current; disable with `0` if you don't need it.
+    #[arg(long, default_value_t = 2597)]
+    snapshot_port: u16,
 
     /// Port for the read-only analyzer JSON server — one decoded PGN
     /// per line. Matches canboat C `n2kd`'s `port+1` stream port.
@@ -167,10 +177,16 @@ fn run(cli: Cli) -> Result<()> {
     db.merge_pgns_from_json(SYNTHETIC_PGNS_JSON)
         .context("merging synthetic PGN definitions")?;
 
+    let snapshot = if cli.snapshot_port != 0 {
+        Some(Arc::new(SnapshotStore::new()))
+    } else {
+        None
+    };
     let hubs = Hubs {
         csv: Arc::new(Hub::new()),
         nmea: Arc::new(Hub::new()),
         analyzer: Arc::new(Hub::new()),
+        snapshot: snapshot.clone(),
     };
 
     // Pick the frame source and (if a device) its writer handle. In
@@ -180,6 +196,13 @@ fn run(cli: Cli) -> Result<()> {
     let device_sender = supervisor.as_ref().map(|s| s.frame_sender());
 
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();
+    if let Some(store) = snapshot.as_ref() {
+        tcp_joins.push(tcp::spawn_snapshot(
+            cli.bind,
+            cli.snapshot_port,
+            store.clone(),
+        )?);
+    }
     if cli.csv_port != 0 {
         tcp_joins.push(tcp::spawn_csv_rw(
             cli.bind,

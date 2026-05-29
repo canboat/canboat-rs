@@ -65,12 +65,23 @@ pub struct Hubs {
 
 /// Pipeline entry point. Returns when `frames_rx` is closed.
 ///
-/// `emit_nmea_stdout` mirrors canboat C `n2kd`'s `--nmea0183` flag:
-/// when `true`, NMEA 0183 sentences are also written to stdout (in
-/// addition to the optional TCP NMEA-0183 broadcast). Off by default
-/// — long-running deployments use the TCP port and don't want their
-/// service log spammed.
-pub fn run(db: PgnDatabase, frames_rx: Receiver<RawFrame>, hubs: Hubs, emit_nmea_stdout: bool) {
+/// * `emit_nmea_stdout` mirrors canboat C `n2kd`'s `--nmea0183` flag.
+///   When `true`, NMEA 0183 sentences are also written to stdout (in
+///   addition to the optional TCP NMEA-0183 broadcast). Off by
+///   default — long-running deployments use the TCP port and don't
+///   want their service log spammed.
+/// * `pre_coalesced` skips the fast-packet reassembler entirely.
+///   Set this for sources whose frames are already full PGN payloads
+///   (iKonvert, Maretron IPG). Without it, a coalesced fast-packet
+///   that happens to be 8 bytes or shorter gets misread as a
+///   reassembly fragment.
+pub fn run(
+    db: PgnDatabase,
+    frames_rx: Receiver<RawFrame>,
+    hubs: Hubs,
+    emit_nmea_stdout: bool,
+    pre_coalesced: bool,
+) {
     // LineWriter (rather than BufWriter) so each NMEA 0183 sentence
     // is flushed as soon as its trailing newline arrives. Long-
     // running deployments observe stdout for the latest state, not
@@ -102,19 +113,27 @@ pub fn run(db: PgnDatabase, frames_rx: Receiver<RawFrame>, hubs: Hubs, emit_nmea
             }
         }
 
-        let packet_type = db
-            .first_pgn(frame.pgn)
-            .or_else(|| db.fallback_pgn(frame.pgn))
-            .map(|p| match p.packet_type {
-                canboat_core::PacketType::Fast => FramePacketType::Fast,
-                canboat_core::PacketType::Single => FramePacketType::Single,
-                _ => FramePacketType::Other,
-            })
-            .unwrap_or(FramePacketType::Other);
-
-        let assembled = match reasm.push(frame, packet_type) {
-            Reassembled::PassThrough(f) | Reassembled::Complete(f) => f,
-            _ => continue,
+        // When the source already coalesces fast-packets (iKonvert,
+        // Maretron), the reassembler must be skipped entirely. A
+        // coalesced fast-packet whose payload is ≤8 bytes would
+        // otherwise have its first byte misread as a sequence /
+        // frame-index header.
+        let assembled = if pre_coalesced {
+            frame
+        } else {
+            let packet_type = db
+                .first_pgn(frame.pgn)
+                .or_else(|| db.fallback_pgn(frame.pgn))
+                .map(|p| match p.packet_type {
+                    canboat_core::PacketType::Fast => FramePacketType::Fast,
+                    canboat_core::PacketType::Single => FramePacketType::Single,
+                    _ => FramePacketType::Other,
+                })
+                .unwrap_or(FramePacketType::Other);
+            match reasm.push(frame, packet_type) {
+                Reassembled::PassThrough(f) | Reassembled::Complete(f) => f,
+                _ => continue,
+            }
         };
         let Ok(decoded) = db.decode(&assembled) else {
             continue;

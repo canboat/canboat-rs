@@ -214,7 +214,12 @@ fn run(cli: Cli) -> Result<()> {
     // Pick the frame source and (if a device) its writer handle. In
     // device mode the source is a Supervisor that survives serial /
     // TCP disconnects with exponential backoff.
-    let (frames_rx, supervisor) = open_source(&cli)?;
+    //
+    // `pre_coalesced` is true when each `RawFrame` from this source
+    // is already a complete PGN payload (iKonvert / Maretron). In
+    // that case the pipeline skips the fast-packet reassembler —
+    // those gateways have already done the coalescing on the wire.
+    let (frames_rx, supervisor, pre_coalesced) = open_source(&cli)?;
     let device_sender = supervisor.as_ref().map(|s| s.frame_sender());
 
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();
@@ -253,7 +258,7 @@ fn run(cli: Cli) -> Result<()> {
         tcp_joins.push(tcp::spawn_writeonly(cli.bind, cli.write_port, sender)?);
     }
 
-    pipeline::run(db, frames_rx, hubs, cli.nmea0183_stdout);
+    pipeline::run(db, frames_rx, hubs, cli.nmea0183_stdout, pre_coalesced);
 
     // After the pipeline drains, signal the supervisor to stop
     // reconnecting. The TCP accept threads run forever — leak them;
@@ -265,14 +270,21 @@ fn run(cli: Cli) -> Result<()> {
 }
 
 /// Open whichever input source the CLI selected. Returns
-/// `(frames_rx, optional_supervisor)`. In stdin mode the second
-/// element is `None`; the caller skips wiring the write-only TCP port
-/// since there's no device to forward to.
+/// `(frames_rx, optional_supervisor, pre_coalesced)`.
+///
+/// * `pre_coalesced` is `true` when each `RawFrame` produced by the
+///   source is already a complete PGN payload — the iKonvert and the
+///   Maretron IPG do their own fast-packet coalescing on the wire,
+///   so the pipeline must skip the reassembler for them. Sending
+///   small coalesced payloads through the reassembler causes their
+///   leading bytes to be misread as fast-packet headers.
+/// * `supervisor` is `None` only in stdin mode; the caller skips
+///   wiring the write-only TCP port and the supervisor shutdown.
 ///
 /// In device mode the supervisor's manager thread handles reconnect
-/// on disconnect/EOF, with exponential backoff up to 30 s, so a
-/// flaky serial port or TCP gateway doesn't take the pipeline down.
-fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor>)> {
+/// on disconnect/EOF with exponential backoff up to 30 s, so a flaky
+/// serial port or TCP gateway doesn't take the pipeline down.
+fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor>, bool)> {
     if let Some(path) = cli.actisense.as_deref() {
         let baud = cli.baud.unwrap_or(115_200);
         let path = path.to_string();
@@ -282,7 +294,9 @@ fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor
         });
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);
-        return Ok((rx, Some(sup)));
+        // NGT-1 emits one PDGY-equivalent per CAN frame; the
+        // pipeline still needs the reassembler.
+        return Ok((rx, Some(sup), false));
     }
     if let Some(path) = cli.ikonvert.as_deref() {
         let baud = cli.baud.unwrap_or(230_400);
@@ -302,7 +316,9 @@ fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor
         });
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);
-        return Ok((rx, Some(sup)));
+        // iKonvert coalesces fast-packets internally; skip the
+        // reassembler entirely.
+        return Ok((rx, Some(sup), true));
     }
     if let Some(url) = cli.maretron.as_deref() {
         let url = url.to_string();
@@ -317,15 +333,20 @@ fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor
         });
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);
-        return Ok((rx, Some(sup)));
+        // Maretron IPG ships full PGN payloads per 0xA5 frame.
+        return Ok((rx, Some(sup), true));
     }
-    // stdin fallback — no device, no reconnect logic needed.
+    // stdin fallback — no device, no reconnect logic needed. We can't
+    // know in advance whether the upstream uses PLAIN (per-CAN-frame,
+    // needs reassembly) or FAST (already coalesced), so leave the
+    // reassembler enabled. Its `data.len() > 8` shortcut handles
+    // FAST-format lines for typical real-world payload sizes.
     let (tx, rx) = mpsc::channel::<RawFrame>();
     thread::Builder::new()
         .name("stdin-pump".into())
         .spawn(move || stdin_pump(tx))
         .expect("spawn stdin-pump");
-    Ok((rx, None))
+    Ok((rx, None, false))
 }
 
 /// Swap the `Supervisor::frames_rx` out so the pipeline can own it

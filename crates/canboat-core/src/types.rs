@@ -185,6 +185,21 @@ pub struct LookupTable {
     pub max_value: Option<u64>,
     #[serde(rename = "EnumValues")]
     pub values: Vec<LookupValue>,
+    /// `value → index into self.values`. Built once after deserialise
+    /// so the per-field LOOKUP decode is O(1) instead of a linear
+    /// scan through every entry; populated by
+    /// [`PgnDatabase::finalize_lookups`].
+    #[serde(skip, default)]
+    pub(crate) by_value: std::collections::HashMap<u64, u32>,
+}
+
+impl LookupTable {
+    /// `Some(&LookupValue)` if `value` is in the enum, else `None`.
+    /// O(1) average-case lookup via the precomputed index.
+    pub fn get(&self, value: u64) -> Option<&LookupValue> {
+        let idx = *self.by_value.get(&value)?;
+        self.values.get(idx as usize)
+    }
 }
 
 /// A bit/name pair inside a BITLOOKUP enumeration.
@@ -207,6 +222,16 @@ pub struct BitLookupTable {
     pub max_value: Option<u64>,
     #[serde(rename = "EnumBitValues")]
     pub values: Vec<BitLookupValue>,
+    /// `bit → index into self.values`. See [`LookupTable::by_value`].
+    #[serde(skip, default)]
+    pub(crate) by_bit: std::collections::HashMap<u8, u32>,
+}
+
+impl BitLookupTable {
+    pub fn get(&self, bit: u8) -> Option<&BitLookupValue> {
+        let idx = *self.by_bit.get(&bit)?;
+        self.values.get(idx as usize)
+    }
 }
 
 /// One (Value1, Value2) → Name mapping inside an INDIRECT_LOOKUP table.
@@ -233,6 +258,17 @@ pub struct IndirectLookupTable {
     pub max_value: Option<u64>,
     #[serde(rename = "EnumValues")]
     pub values: Vec<IndirectLookupValue>,
+    /// `(value1, value2) → index into self.values`. See
+    /// [`LookupTable::by_value`].
+    #[serde(skip, default)]
+    pub(crate) by_pair: std::collections::HashMap<(u64, u64), u32>,
+}
+
+impl IndirectLookupTable {
+    pub fn get(&self, value1: u64, value2: u64) -> Option<&IndirectLookupValue> {
+        let idx = *self.by_pair.get(&(value1, value2))?;
+        self.values.get(idx as usize)
+    }
 }
 
 /// One key→field-type entry inside a [`LookupFieldTypeTable`]. The
@@ -292,4 +328,14 @@ pub struct LookupFieldTypeTable {
     pub max_value: Option<u64>,
     #[serde(rename = "EnumFieldTypeValues")]
     pub values: Vec<LookupFieldTypeValue>,
+    /// `value → index into self.values`. See [`LookupTable::by_value`].
+    #[serde(skip, default)]
+    pub(crate) by_value: std::collections::HashMap<u64, u32>,
+}
+
+impl LookupFieldTypeTable {
+    pub fn get(&self, value: u64) -> Option<&LookupFieldTypeValue> {
+        let idx = *self.by_value.get(&value)?;
+        self.values.get(idx as usize)
+    }
 }

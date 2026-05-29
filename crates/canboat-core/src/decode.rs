@@ -873,7 +873,7 @@ fn decode_lookup(
         .lookup_enumeration
         .as_deref()
         .and_then(|n| db.lookup(n))
-        .and_then(|t| t.values.iter().find(|v| v.value == raw))
+        .and_then(|t| t.get(raw))
         .map(|v| v.name.clone());
     // canboat: if no name is resolved AND value is in the reserved
     // sentinel range, drop the field (matches print.c:718). The
@@ -1400,7 +1400,7 @@ fn decode_dynamic_field_value(
                 let raw = ex.value as u64;
                 let nm = db
                     .lookup(name)
-                    .and_then(|t| t.values.iter().find(|v| v.value == raw))
+                    .and_then(|t| t.get(raw))
                     .map(|v| v.name.clone());
                 FieldValue::Lookup {
                     value: raw,

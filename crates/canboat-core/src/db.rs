@@ -267,20 +267,49 @@ impl PgnDatabase {
         for (idx, p) in raw.pgns.iter().enumerate() {
             pgn_index.entry(p.pgn).or_default().push(idx);
         }
-        let lookups = raw
+        // Build per-table value→index maps so the per-field decode
+        // path can do `O(1)` lookups instead of linear `iter().find()`
+        // through `values`. canboat.json has ~150 LOOKUP tables, many
+        // with 20+ entries — this turns up as a ~4 % CPU cost in
+        // the profiler before this index is built.
+        let lookups: HashMap<String, LookupTable> = raw
             .lookup_enumerations
             .into_iter()
-            .map(|t| (t.name.clone(), t))
+            .map(|mut t| {
+                t.by_value = t
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (v.value, i as u32))
+                    .collect();
+                (t.name.clone(), t)
+            })
             .collect();
-        let bit_lookups = raw
+        let bit_lookups: HashMap<String, BitLookupTable> = raw
             .lookup_bit_enumerations
             .into_iter()
-            .map(|t| (t.name.clone(), t))
+            .map(|mut t| {
+                t.by_bit = t
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (v.bit, i as u32))
+                    .collect();
+                (t.name.clone(), t)
+            })
             .collect();
-        let indirect_lookups = raw
+        let indirect_lookups: HashMap<String, IndirectLookupTable> = raw
             .lookup_indirect_enumerations
             .into_iter()
-            .map(|t| (t.name.clone(), t))
+            .map(|mut t| {
+                t.by_pair = t
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| ((v.value1, v.value2), i as u32))
+                    .collect();
+                (t.name.clone(), t)
+            })
             .collect();
         let mut ft_tables = raw.lookup_field_type_enumerations;
         for t in &mut ft_tables {
@@ -288,7 +317,18 @@ impl PgnDatabase {
                 apply_non_si_unit_fixup_lookup(v);
             }
         }
-        let field_type_lookups = ft_tables.into_iter().map(|t| (t.name.clone(), t)).collect();
+        let field_type_lookups: HashMap<String, LookupFieldTypeTable> = ft_tables
+            .into_iter()
+            .map(|mut t| {
+                t.by_value = t
+                    .values
+                    .iter()
+                    .enumerate()
+                    .map(|(i, v)| (v.value, i as u32))
+                    .collect();
+                (t.name.clone(), t)
+            })
+            .collect();
         Self {
             schema_version: raw.schema_version,
             version: raw.version,
@@ -364,9 +404,7 @@ impl PgnDatabase {
     pub fn indirect_lookup(&self, name: &str, value1: u64, value2: u64) -> Option<&str> {
         self.indirect_lookups
             .get(name)?
-            .values
-            .iter()
-            .find(|v| v.value1 == value1 && v.value2 == value2)
+            .get(value1, value2)
             .map(|v| v.name.as_str())
     }
 
@@ -375,10 +413,6 @@ impl PgnDatabase {
     /// `key`, carrying the field type / bits / resolution / unit that
     /// the subsequent DYNAMIC_FIELD_VALUE should be decoded as.
     pub fn field_type_lookup(&self, name: &str, key: u64) -> Option<&LookupFieldTypeValue> {
-        self.field_type_lookups
-            .get(name)?
-            .values
-            .iter()
-            .find(|v| v.value == key)
+        self.field_type_lookups.get(name)?.get(key)
     }
 }

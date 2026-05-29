@@ -36,6 +36,17 @@ pub struct JsonOptions {
     pub debug: bool,
 }
 
+thread_local! {
+    /// Per-thread scratch buffer for the inner `fields` JSON object.
+    /// Re-used across calls to amortise the allocation cost — the
+    /// profiler showed a fresh `String::new()` per record + a
+    /// `raw_vec::finish_grow` chain dominating the JSON writer's
+    /// self-time on hot workloads. `RefCell::take()` swaps an empty
+    /// String in for the duration of the call so reentrancy panics
+    /// rather than corrupts state.
+    static FIELDS_BUF: std::cell::RefCell<String> = const { std::cell::RefCell::new(String::new()) };
+}
+
 pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions) -> fmt::Result {
     w.write_char('{')?;
     if let Some(ts) = &pgn.timestamp {
@@ -56,8 +67,22 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     // ends up emitted (canboat's `printPgn` defers the open separator
     // until the first field — when every field is suppressed it just
     // closes the top-level object without ever opening fields).
-    let mut fields_buf = String::new();
-    let w_fields = &mut fields_buf;
+    //
+    // Re-use a thread-local buffer between calls — its capacity
+    // grows once and then stays put across millions of records.
+    let mut fields_buf = FIELDS_BUF.with(|c| c.take());
+    fields_buf.clear();
+    let result = write_json_inner(w, pgn, opts, &mut fields_buf);
+    FIELDS_BUF.with(|c| *c.borrow_mut() = fields_buf);
+    result
+}
+
+fn write_json_inner<W: fmt::Write>(
+    w: &mut W,
+    pgn: &DecodedPgn,
+    opts: &JsonOptions,
+    fields_buf: &mut String,
+) -> fmt::Result {
     let mut top_sep = "";
     // Active repeating-list state: which set (1 → "list", 2 → "list2")
     // and which iteration index we're inside.
@@ -129,50 +154,50 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
         // next; crossing iterations within the same set inserts "},{".
         if f.repeat_set == 0 {
             if current_set != 0 {
-                w_fields.write_str("}]")?;
+                fields_buf.write_str("}]")?;
                 current_set = 0;
                 current_iter = None;
             }
-            w_fields.write_str(top_sep)?;
-            write_json_string(w_fields, &f.name)?;
-            w_fields.write_char(':')?;
-            write_field_value(w_fields, f, opts, &pgn.data)?;
+            fields_buf.write_str(top_sep)?;
+            write_json_string(fields_buf, &f.name)?;
+            fields_buf.write_char(':')?;
+            write_field_value(fields_buf, f, opts, &pgn.data)?;
             top_sep = ",";
         } else {
             let iter = f.repeat_index.unwrap_or(0);
             if current_set != f.repeat_set {
                 if current_set != 0 {
-                    w_fields.write_str("}]")?;
+                    fields_buf.write_str("}]")?;
                 }
-                w_fields.write_str(top_sep)?;
+                fields_buf.write_str(top_sep)?;
                 let key = if f.repeat_set == 1 {
                     "\"list\":[{"
                 } else {
                     "\"list2\":[{"
                 };
-                w_fields.write_str(key)?;
+                fields_buf.write_str(key)?;
                 current_set = f.repeat_set;
                 current_iter = Some(iter);
                 top_sep = ",";
-                write_json_string(w_fields, &f.name)?;
-                w_fields.write_char(':')?;
-                write_field_value(w_fields, f, opts, &pgn.data)?;
+                write_json_string(fields_buf, &f.name)?;
+                fields_buf.write_char(':')?;
+                write_field_value(fields_buf, f, opts, &pgn.data)?;
             } else if Some(iter) != current_iter {
-                w_fields.write_str("},{")?;
+                fields_buf.write_str("},{")?;
                 current_iter = Some(iter);
-                write_json_string(w_fields, &f.name)?;
-                w_fields.write_char(':')?;
-                write_field_value(w_fields, f, opts, &pgn.data)?;
+                write_json_string(fields_buf, &f.name)?;
+                fields_buf.write_char(':')?;
+                write_field_value(fields_buf, f, opts, &pgn.data)?;
             } else {
-                w_fields.write_char(',')?;
-                write_json_string(w_fields, &f.name)?;
-                w_fields.write_char(':')?;
-                write_field_value(w_fields, f, opts, &pgn.data)?;
+                fields_buf.write_char(',')?;
+                write_json_string(fields_buf, &f.name)?;
+                fields_buf.write_char(':')?;
+                write_field_value(fields_buf, f, opts, &pgn.data)?;
             }
         }
     }
     if current_set != 0 {
-        w_fields.write_str("}]")?;
+        fields_buf.write_str("}]")?;
     }
     // Empty-list placeholder: canboat C unconditionally emits
     // `"list":[{` the moment it sees the repeating set's start field,

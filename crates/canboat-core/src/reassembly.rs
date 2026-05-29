@@ -98,6 +98,54 @@ impl Default for Slot {
     }
 }
 
+/// Render `bits` as a comma-separated list of set bit positions
+/// (e.g. `0b00101101` → `"0,2,3,5"`). Used to make the
+/// incomplete-fast-packet warning legible.
+fn describe_frames(bits: u32) -> String {
+    let mut out = String::new();
+    let mut first = true;
+    for i in 0..=FASTPACKET_MAX_INDEX {
+        if bits & (1u32 << i) != 0 {
+            if !first {
+                out.push(',');
+            }
+            out.push_str(&i.to_string());
+            first = false;
+        }
+    }
+    if out.is_empty() {
+        out.push_str("none");
+    }
+    out
+}
+
+/// Format the "what was expected but missing" half of the
+/// incomplete-fast-packet warning. `all_frames=0` means we never saw
+/// frame 0, so the total count is still unknown.
+fn describe_expectation(all_frames: u32, size: usize, frames: u32) -> String {
+    if all_frames == 0 {
+        return ", declared total size unknown (frame 0 not yet received)".to_string();
+    }
+    let missing = all_frames & !frames;
+    let total = all_frames.count_ones();
+    if missing == 0 {
+        format!(
+            ", expected {} frame{} (declared size {} bytes), all of them present",
+            total,
+            if total == 1 { "" } else { "s" },
+            size,
+        )
+    } else {
+        format!(
+            ", expected {} frame{} (declared size {} bytes), still missing {{{}}}",
+            total,
+            if total == 1 { "" } else { "s" },
+            size,
+            describe_frames(missing),
+        )
+    }
+}
+
 /// Fast-packet reassembler.
 pub struct Reassembler {
     slots: Vec<Slot>,
@@ -159,10 +207,22 @@ impl Reassembler {
         // `all_frames` from frame 0 so the in-flight non-zero indices
         // can still complete a payload. Matches analyzer.c:811-815.
         if self.slots[slot_idx].frames & (1u32 << frame_index) != 0 {
+            let slot = &self.slots[slot_idx];
             log::warn!(
-                "Received incomplete fast packet PGN {} from source {}",
+                "Incomplete fast packet pgn={} src={} seq=0x{:02x}: \
+                 frame index {} arrived again before the sequence completed. \
+                 Already received frame{} {{{}}}{}. Restarting assembly with this frame.",
                 frame.pgn,
                 frame.src,
+                seq,
+                frame_index,
+                if slot.frames.count_ones() == 1 {
+                    ""
+                } else {
+                    "s"
+                },
+                describe_frames(slot.frames),
+                describe_expectation(slot.all_frames, slot.size, slot.frames),
             );
             self.slots[slot_idx].frames = 0;
         }
@@ -280,6 +340,29 @@ impl Reassembler {
 mod tests {
     use super::*;
     use smallvec::smallvec;
+
+    #[test]
+    fn describe_frames_renders_set_bits_in_order() {
+        assert_eq!(describe_frames(0), "none");
+        assert_eq!(describe_frames(0b1), "0");
+        assert_eq!(describe_frames(0b101101), "0,2,3,5");
+        assert_eq!(describe_frames(0b111111), "0,1,2,3,4,5");
+    }
+
+    #[test]
+    fn describe_expectation_says_unknown_before_frame0() {
+        let s = describe_expectation(0, 0, 0);
+        assert!(s.contains("unknown"), "got: {s}");
+    }
+
+    #[test]
+    fn describe_expectation_lists_missing_indices() {
+        // all_frames = 0..5, seen = 0,1,2,3,5 → missing {4}, size 35
+        let s = describe_expectation(0b111111, 35, 0b101111);
+        assert!(s.contains("expected 6 frames"), "got: {s}");
+        assert!(s.contains("declared size 35"), "got: {s}");
+        assert!(s.contains("missing {4}"), "got: {s}");
+    }
 
     fn frame(pgn: u32, src: u8, data: Vec<u8>) -> RawFrame {
         RawFrame {

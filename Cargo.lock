@@ -140,6 +140,7 @@ dependencies = [
 name = "canboat-core"
 version = "0.1.0"
 dependencies = [
+ "itoa",
  "log",
  "serde",
  "serde_json",

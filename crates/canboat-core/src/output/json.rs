@@ -19,7 +19,7 @@ use std::fmt::{self, Write as _};
 
 use crate::decode::{DecodedField, DecodedPgn, FieldValue};
 
-use super::effective_precision;
+use super::{effective_precision, write_fixed_float};
 
 /// Knobs for JSON output.
 #[derive(Debug, Default, Clone)]
@@ -347,11 +347,12 @@ fn write_field_value_debug<W: fmt::Write>(
     match &f.value {
         FieldValue::Number(v) => {
             let p = effective_precision(f.precision, f.resolution);
-            if p == 7 && f.unit.as_deref() == Some("deg") {
-                write!(w, "{:>10.7}", v)?;
+            let min_w = if p == 7 && f.unit.as_deref() == Some("deg") {
+                10
             } else {
-                write!(w, "{:.*}", p, v)?;
-            }
+                0
+            };
+            write_fixed_float(w, *v, p, min_w)?;
         }
         FieldValue::Integer(v) => write!(w, "{}", v)?,
         FieldValue::Float(v) => write!(w, "{}", v)?,
@@ -509,11 +510,12 @@ fn write_field_value<W: fmt::Write>(
             // (`5.1815566` → ` 5.1815566`). We detect that field type
             // by the load-time precision=7 + unit=deg signal set in
             // db.rs.
-            if p == 7 && f.unit.as_deref() == Some("deg") {
-                write!(w, "{:>10.7}", v)
+            let min_w = if p == 7 && f.unit.as_deref() == Some("deg") {
+                10
             } else {
-                write!(w, "{:.*}", p, v)
-            }
+                0
+            };
+            write_fixed_float(w, *v, p, min_w)
         }
         FieldValue::Integer(v) => {
             // Under -nv, primary-key fields wear an annotation matching

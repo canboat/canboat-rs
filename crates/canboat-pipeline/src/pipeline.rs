@@ -20,7 +20,7 @@
 //! subscribers OR the snapshot store is configured.
 
 use std::cell::RefCell;
-use std::io::{self, BufWriter, Write};
+use std::io::{self, LineWriter, Write};
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 
@@ -64,9 +64,19 @@ pub struct Hubs {
 }
 
 /// Pipeline entry point. Returns when `frames_rx` is closed.
-pub fn run(db: PgnDatabase, frames_rx: Receiver<RawFrame>, hubs: Hubs) {
+///
+/// `emit_nmea_stdout` mirrors canboat C `n2kd`'s `--nmea0183` flag:
+/// when `true`, NMEA 0183 sentences are also written to stdout (in
+/// addition to the optional TCP NMEA-0183 broadcast). Off by default
+/// — long-running deployments use the TCP port and don't want their
+/// service log spammed.
+pub fn run(db: PgnDatabase, frames_rx: Receiver<RawFrame>, hubs: Hubs, emit_nmea_stdout: bool) {
+    // LineWriter (rather than BufWriter) so each NMEA 0183 sentence
+    // is flushed as soon as its trailing newline arrives. Long-
+    // running deployments observe stdout for the latest state, not
+    // a batched dump; canboat C n2kd flushes per line too.
     let stdout = io::stdout();
-    let mut out = BufWriter::with_capacity(1 << 16, stdout.lock());
+    let mut out = LineWriter::new(stdout.lock());
 
     let mut reasm = Reassembler::new();
     let mut nmea_buf = String::with_capacity(256);
@@ -149,7 +159,9 @@ pub fn run(db: PgnDatabase, frames_rx: Receiver<RawFrame>, hubs: Hubs) {
             })
         };
         if n_emitted > 0 {
-            let _ = out.write_all(nmea_buf.as_bytes());
+            if emit_nmea_stdout {
+                let _ = out.write_all(nmea_buf.as_bytes());
+            }
             if hubs.nmea.has_subscribers() {
                 hubs.nmea.broadcast(&nmea_buf);
             }

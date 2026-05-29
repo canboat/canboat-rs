@@ -150,6 +150,13 @@ struct Cli {
     #[arg(long, default_value_t = 2603)]
     csv_port: u16,
 
+    /// Also write NMEA 0183 sentences (including AIVDM) to stdout —
+    /// mirrors canboat C `n2kd`'s `--nmea0183` flag. Off by default,
+    /// matching n2kd's TCP-multiplex behaviour; subscribers should
+    /// connect to `--nmea0183-port` (2599) instead.
+    #[arg(long)]
+    nmea0183_stdout: bool,
+
     /// Verbose logging.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -246,7 +253,7 @@ fn run(cli: Cli) -> Result<()> {
         tcp_joins.push(tcp::spawn_writeonly(cli.bind, cli.write_port, sender)?);
     }
 
-    pipeline::run(db, frames_rx, hubs);
+    pipeline::run(db, frames_rx, hubs, cli.nmea0183_stdout);
 
     // After the pipeline drains, signal the supervisor to stop
     // reconnecting. The TCP accept threads run forever — leak them;

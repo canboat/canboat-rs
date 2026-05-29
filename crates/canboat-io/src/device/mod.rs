@@ -26,6 +26,9 @@
 pub mod ikonvert;
 pub mod maretron;
 pub mod ngt1;
+pub mod supervisor;
+
+pub use supervisor::{DeviceFactory, Supervisor};
 
 use std::io::{self, Read, Write};
 use std::sync::mpsc;
@@ -75,7 +78,7 @@ pub trait DeviceEncoder: Send + Sync + 'static {
 }
 
 /// Commands accepted by the writer thread.
-enum WriterCmd {
+pub(crate) enum WriterCmd {
     Bytes(Vec<u8>),
     Frame(RawFrame),
 }
@@ -140,6 +143,13 @@ impl FrameSender {
         self.cmd_tx
             .send(WriterCmd::Frame(frame))
             .map_err(|_| DeviceWriterGone)
+    }
+
+    /// Crate-internal constructor used by [`supervisor::Supervisor`]
+    /// so it can hand out a stable `FrameSender` backed by its own
+    /// outer cmd channel.
+    pub(crate) fn from_cmd_tx(cmd_tx: mpsc::Sender<WriterCmd>) -> Self {
+        Self { cmd_tx }
     }
 }
 

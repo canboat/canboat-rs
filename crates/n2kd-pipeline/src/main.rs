@@ -32,12 +32,12 @@ use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::{anyhow, bail, Context, Result};
+use anyhow::{bail, Context, Result};
 use clap::Parser;
 
 use canboat_core::format::{detect, parse_with, InputFormat};
 use canboat_core::{PgnDatabase, RawFrame};
-use canboat_io::device::{self, DeviceHandle};
+use canboat_io::device::{self, Supervisor};
 use canboat_io::open_serial_rw;
 
 use crate::hub::Hub;
@@ -97,31 +97,33 @@ struct Cli {
     #[arg(long, default_value = "127.0.0.1")]
     bind: Ipv4Addr,
 
-    /// Port for the bidirectional CSV (PLAIN/FAST) server. Clients
-    /// receive every frame as a PLAIN/FAST line and can send
-    /// PLAIN/FAST lines back to inject into the N2K bus. Formatting
-    /// is lazy (skipped when no client is subscribed). `0` disables.
+    /// Port for the read-only analyzer JSON server — one decoded PGN
+    /// per line. Matches canboat C `n2kd`'s `port+1` stream port.
+    /// Lazy: skipped when no client is subscribed. `0` disables.
     #[arg(long, default_value_t = 2598)]
-    csv_port: u16,
+    analyzer_port: u16,
 
     /// Port for the read-only NMEA 0183 server (includes AIVDM).
-    /// Formatting goes to stdout regardless; this server just
-    /// re-broadcasts. `0` disables.
+    /// Matches canboat C `n2kd`'s `port+2` NMEA 0183 port. `0`
+    /// disables.
     #[arg(long, default_value_t = 2599)]
     nmea0183_port: u16,
 
-    /// Port for the read-only analyzer JSON server — one decoded PGN
-    /// per line. Lazy: skipped when no client is subscribed. `0`
-    /// disables.
-    #[arg(long, default_value_t = 2600)]
-    analyzer_port: u16,
-
     /// Port for the write-only N2K injection server. PLAIN/FAST lines
-    /// from clients are encoded and pushed to the device. `0`
-    /// disables. Only active in device mode (otherwise there is no
-    /// device to send to).
-    #[arg(long, default_value_t = 2601)]
+    /// from clients are encoded and pushed to the device. Matches
+    /// canboat C `n2kd`'s `port+5` raw-input port. `0` disables.
+    /// Only active in device mode (otherwise there is no device to
+    /// send to).
+    #[arg(long, default_value_t = 2602)]
     write_port: u16,
+
+    /// Port for the bidirectional CSV (PLAIN/FAST) server. Clients
+    /// receive every frame as a PLAIN/FAST line and can send
+    /// PLAIN/FAST lines back to inject into the N2K bus. New in
+    /// `n2kd-pipeline`; no direct canboat C equivalent. Formatting
+    /// is lazy (skipped when no client is subscribed). `0` disables.
+    #[arg(long, default_value_t = 2603)]
+    csv_port: u16,
 
     /// Verbose logging.
     #[arg(short = 'v', long)]
@@ -171,9 +173,11 @@ fn run(cli: Cli) -> Result<()> {
         analyzer: Arc::new(Hub::new()),
     };
 
-    // Pick the frame source and (if a device) its writer handle.
-    let (frames_rx, device_handle) = open_source(&cli)?;
-    let device_sender = device_handle.as_ref().map(|h| h.frame_sender());
+    // Pick the frame source and (if a device) its writer handle. In
+    // device mode the source is a Supervisor that survives serial /
+    // TCP disconnects with exponential backoff.
+    let (frames_rx, supervisor) = open_source(&cli)?;
+    let device_sender = supervisor.as_ref().map(|s| s.frame_sender());
 
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();
     if cli.csv_port != 0 {
@@ -206,47 +210,66 @@ fn run(cli: Cli) -> Result<()> {
 
     pipeline::run(db, frames_rx, hubs);
 
-    // After the pipeline drains, tell the device threads to wind
-    // down. The TCP accept threads run forever — leak them; process
-    // exit will reap them.
-    if let Some(h) = device_handle {
-        h.join();
+    // After the pipeline drains, signal the supervisor to stop
+    // reconnecting. The TCP accept threads run forever — leak them;
+    // process exit will reap them.
+    if let Some(s) = supervisor {
+        s.shutdown();
     }
     Ok(())
 }
 
 /// Open whichever input source the CLI selected. Returns
-/// `(frames_rx, optional_device_handle)`. In stdin mode the second
-/// element is `None`; the caller skips wiring TCP servers.
-fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<DeviceHandle>)> {
+/// `(frames_rx, optional_supervisor)`. In stdin mode the second
+/// element is `None`; the caller skips wiring the write-only TCP port
+/// since there's no device to forward to.
+///
+/// In device mode the supervisor's manager thread handles reconnect
+/// on disconnect/EOF, with exponential backoff up to 30 s, so a
+/// flaky serial port or TCP gateway doesn't take the pipeline down.
+fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<Supervisor>)> {
     if let Some(path) = cli.actisense.as_deref() {
         let baud = cli.baud.unwrap_or(115_200);
-        let (reader, writer) = open_serial_pair(path, baud)?;
-        let handle = device::ngt1::run(reader, writer);
-        // We move handle.frames_rx out — but `DeviceHandle`'s field is
-        // public and the helpers go through `frame_sender()`, so we
-        // build the rest of the handle minus the receiver below.
-        let (rx, handle) = split_device_handle(handle);
-        return Ok((rx, Some(handle)));
+        let path = path.to_string();
+        let factory = NamedFactory::new("ngt1", move || {
+            let (reader, writer) = open_serial_rw(&path, baud)?;
+            Ok(device::ngt1::run(reader, writer))
+        });
+        let sup = Supervisor::new(factory);
+        let (rx, sup) = split_supervisor(sup);
+        return Ok((rx, Some(sup)));
     }
     if let Some(path) = cli.ikonvert.as_deref() {
         let baud = cli.baud.unwrap_or(230_400);
-        let (reader, writer) = open_serial_pair(path, baud)?;
-        let handle = device::ikonvert::run(reader, writer, device::ikonvert::Config::default());
-        let (rx, handle) = split_device_handle(handle);
-        return Ok((rx, Some(handle)));
+        let path = path.to_string();
+        let factory = NamedFactory::new("ikonvert", move || {
+            let (reader, writer) = open_serial_rw(&path, baud)?;
+            Ok(device::ikonvert::run(
+                reader,
+                writer,
+                device::ikonvert::Config::default(),
+            ))
+        });
+        let sup = Supervisor::new(factory);
+        let (rx, sup) = split_supervisor(sup);
+        return Ok((rx, Some(sup)));
     }
     if let Some(url) = cli.maretron.as_deref() {
-        let (reader, writer) = open_maretron_pair(url)?;
-        let cfg = device::maretron::Config {
-            password: cli.maretron_password.clone(),
-            fixtime: None,
-        };
-        let handle = device::maretron::run(reader, writer, cfg);
-        let (rx, handle) = split_device_handle(handle);
-        return Ok((rx, Some(handle)));
+        let url = url.to_string();
+        let password = cli.maretron_password.clone();
+        let factory = NamedFactory::new("maretron", move || {
+            let (reader, writer) = open_maretron_pair(&url)?;
+            let cfg = device::maretron::Config {
+                password: password.clone(),
+                fixtime: None,
+            };
+            Ok(device::maretron::run(reader, writer, cfg))
+        });
+        let sup = Supervisor::new(factory);
+        let (rx, sup) = split_supervisor(sup);
+        return Ok((rx, Some(sup)));
     }
-    // stdin fallback.
+    // stdin fallback — no device, no reconnect logic needed.
     let (tx, rx) = mpsc::channel::<RawFrame>();
     thread::Builder::new()
         .name("stdin-pump".into())
@@ -255,26 +278,45 @@ fn open_source(cli: &Cli) -> Result<(mpsc::Receiver<RawFrame>, Option<DeviceHand
     Ok((rx, None))
 }
 
-/// Split the device handle into the frame receiver + the rest of the
-/// handle (kept around so the writer/reader threads stay alive). The
-/// `DeviceHandle::frames_rx` field is public so we just move it out.
-fn split_device_handle(mut h: DeviceHandle) -> (mpsc::Receiver<RawFrame>, DeviceHandle) {
-    // Swap in a dummy receiver — its sender is dropped immediately so
-    // the channel is closed; the new handle never delivers frames
-    // (it's only held for shutdown / frame_sender() purposes).
+/// Swap the `Supervisor::frames_rx` out so the pipeline can own it
+/// while we keep the supervisor for shutdown / frame_sender access.
+fn split_supervisor(mut sup: Supervisor) -> (mpsc::Receiver<RawFrame>, Supervisor) {
     let (_dummy_tx, dummy_rx) = mpsc::channel::<RawFrame>();
-    let rx = std::mem::replace(&mut h.frames_rx, dummy_rx);
-    (rx, h)
+    let rx = std::mem::replace(&mut sup.frames_rx, dummy_rx);
+    (rx, sup)
 }
 
-fn open_serial_pair(
-    path: &str,
-    baud: u32,
-) -> Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
-    open_serial_rw(path, baud).with_context(|| format!("opening {} at {} bps", path, baud))
+/// A [`device::DeviceFactory`] that carries a static name and a
+/// closure. We can't `impl DeviceFactory for FnMut()` directly because
+/// the blanket name() default returns `"device"`; this wrapper plumbs
+/// the device-kind label through to the supervisor's log lines.
+struct NamedFactory<F> {
+    name: &'static str,
+    open: F,
 }
 
-fn open_maretron_pair(url: &str) -> Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+impl<F> NamedFactory<F>
+where
+    F: FnMut() -> io::Result<device::DeviceHandle> + Send + 'static,
+{
+    fn new(name: &'static str, open: F) -> Self {
+        Self { name, open }
+    }
+}
+
+impl<F> device::DeviceFactory for NamedFactory<F>
+where
+    F: FnMut() -> io::Result<device::DeviceHandle> + Send + 'static,
+{
+    fn open(&mut self) -> io::Result<device::DeviceHandle> {
+        (self.open)()
+    }
+    fn name(&self) -> &str {
+        self.name
+    }
+}
+
+fn open_maretron_pair(url: &str) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
     let raw = url.strip_prefix("tcp://").unwrap_or(url);
@@ -284,14 +326,12 @@ fn open_maretron_pair(url: &str) -> Result<(Box<dyn Read + Send>, Box<dyn Write 
         format!("{raw}:6543")
     };
     let resolved = with_port
-        .to_socket_addrs()
-        .with_context(|| format!("resolving {with_port}"))?
+        .to_socket_addrs()?
         .next()
-        .ok_or_else(|| anyhow!("no addresses for {with_port}"))?;
+        .ok_or_else(|| io::Error::other(format!("no addresses for {with_port}")))?;
     log::info!("maretron: connecting to {resolved}");
-    let stream = TcpStream::connect_timeout(&resolved, Duration::from_secs(10))
-        .with_context(|| format!("connecting to {with_port}"))?;
-    let read_clone = stream.try_clone().context("cloning TCP stream")?;
+    let stream = TcpStream::connect_timeout(&resolved, Duration::from_secs(10))?;
+    let read_clone = stream.try_clone()?;
     Ok((Box::new(read_clone), Box::new(stream)))
 }
 

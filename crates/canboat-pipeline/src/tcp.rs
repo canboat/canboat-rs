@@ -39,6 +39,18 @@ use canboat_io::device::FrameSender;
 use crate::hub::Hub;
 use crate::snapshot::SnapshotStore;
 
+/// Disable Nagle's algorithm on a freshly-accepted client socket.
+/// Without this, the kernel batches small writes for up to ~40 ms
+/// looking for more data to coalesce — fine for bulk transfers,
+/// terrible for the per-sentence streams this binary produces.
+/// Logged at debug level if setsockopt fails so the failure is
+/// noticed but doesn't take the client connection down.
+fn set_nodelay(stream: &TcpStream, name: &str) {
+    if let Err(e) = stream.set_nodelay(true) {
+        log::debug!("{name}: set_nodelay failed: {e}");
+    }
+}
+
 /// Bind the snapshot server. Each accepted client gets one dump of
 /// every live `(pgn, src, secondary)` cache entry then the connection
 /// closes — same shape as canboat C `n2kd`'s base port.
@@ -76,6 +88,7 @@ fn snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
 
 fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
     use std::net::Shutdown;
+    set_nodelay(&stream, "snapshot");
     // Snapshot is a one-shot dump — build the JSON document under
     // the cache lock, then drop the lock before sending so a slow
     // client can't stall the pipeline's `store()` calls.
@@ -125,6 +138,7 @@ fn readonly_accept(name: &'static str, listener: TcpListener, hub: Arc<Hub>) {
 }
 
 fn run_readonly_client(mut stream: TcpStream, hub: Arc<Hub>) {
+    set_nodelay(&stream, "readonly");
     let rx = hub.subscribe();
     while let Ok(line) = rx.recv() {
         if stream.write_all(line.as_bytes()).is_err() {
@@ -165,6 +179,7 @@ fn writeonly_accept(listener: TcpListener, sender: FrameSender) {
 }
 
 fn run_writeonly_client(stream: TcpStream, sender: FrameSender) {
+    set_nodelay(&stream, "write-only");
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = match line {
@@ -223,9 +238,12 @@ fn csv_accept(listener: TcpListener, hub: Arc<Hub>, sender: Option<FrameSender>)
 }
 
 fn run_csv_client(stream: TcpStream, hub: Arc<Hub>, sender: Option<FrameSender>) {
+    set_nodelay(&stream, "csv");
     // Split the stream so the read side can run on its own thread.
     // `TcpStream::try_clone` shares the underlying socket between
     // the two handles; closing either side closes the connection.
+    // (set_nodelay above is a socket-level option, so it applies
+    // to both halves.)
     let write_stream = stream;
     let read_stream = match write_stream.try_clone() {
         Ok(s) => s,

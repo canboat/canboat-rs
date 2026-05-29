@@ -315,6 +315,17 @@ fn forward_plain_line(line: &str, sender: &FrameSender) -> bool {
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return true;
     }
+    // Silently skip iKonvert-style control / data sentences that
+    // sometimes leak in from clients that were originally talking
+    // to a Digital Yacht iKonvert (`$PDGY,N2NET_OFFLINE`,
+    // `!PDGY,…`). They're not PLAIN/FAST. We could route them
+    // through to an iKonvert-typed device but that's a feature for
+    // another day; for now they're not "malformed", just not for
+    // us.
+    if trimmed.starts_with('$') || trimmed.starts_with('!') {
+        log::debug!("skipping non-PLAIN/FAST line: {trimmed}");
+        return true;
+    }
     match parse_plain(trimmed) {
         Ok(frame) => sender.send_frame(frame).is_ok(),
         Err(PlainError::Empty) => true,

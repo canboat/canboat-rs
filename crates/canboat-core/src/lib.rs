@@ -14,7 +14,7 @@ pub mod output;
 pub mod reassembly;
 pub mod types;
 
-pub use db::{FieldHandle, LoadError, PgnDatabase};
+pub use db::{FieldHandle, LoadError, LoadOptions, PgnDatabase};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use frame::{RawFrame, FASTPACKET_MAX_SIZE};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};

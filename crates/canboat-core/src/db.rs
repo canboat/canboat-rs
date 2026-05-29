@@ -250,43 +250,81 @@ pub struct PgnDatabase {
     field_type_lookups: HashMap<String, LookupFieldTypeTable>,
 }
 
+/// Knobs the loader honours. Defaults match canboat C `analyzer`:
+/// `si = false` — apply Pa→bar, K→°C, C→Ah, rad→deg fix-ups during
+/// load so output is in friendly units. Pass `LoadOptions { si: true }`
+/// (or use the `_si` constructors) to skip the fix-ups and keep
+/// fields in their canboat.json-declared SI base units. Matches the
+/// `-si` flag on canboat C's analyzer.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct LoadOptions {
+    pub si: bool,
+}
+
 impl PgnDatabase {
-    /// Load and parse a canboat database JSON file.
+    /// Load and parse a canboat database JSON file. Applies the
+    /// default non-SI fix-ups (Pa→bar, K→°C, C→Ah, rad→deg).
     pub fn load<P: AsRef<Path>>(path: P) -> Result<Self, LoadError> {
+        Self::load_with(path, LoadOptions::default())
+    }
+
+    /// Load with the supplied [`LoadOptions`]. Use `si: true` to
+    /// keep raw SI base units (no Pa→bar etc.); use the default to
+    /// match canboat C's default analyzer output.
+    pub fn load_with<P: AsRef<Path>>(path: P, opts: LoadOptions) -> Result<Self, LoadError> {
         let file = File::open(path)?;
         let reader = BufReader::new(file);
-        Self::from_reader(reader)
+        Self::from_reader_with(reader, opts)
     }
 
     /// Load from any `Read` source (file, bytes, embedded blob).
     pub fn from_reader<R: Read>(reader: R) -> Result<Self, LoadError> {
+        Self::from_reader_with(reader, LoadOptions::default())
+    }
+
+    pub fn from_reader_with<R: Read>(reader: R, opts: LoadOptions) -> Result<Self, LoadError> {
         let raw: CanboatJson = serde_json::from_reader(reader)?;
-        Ok(Self::from_raw(raw))
+        Ok(Self::from_raw(raw, opts))
     }
 
     /// Load from a JSON string in memory.
     pub fn from_json_str(json: &str) -> Result<Self, LoadError> {
+        Self::from_json_str_with(json, LoadOptions::default())
+    }
+
+    pub fn from_json_str_with(json: &str, opts: LoadOptions) -> Result<Self, LoadError> {
         let raw: CanboatJson = serde_json::from_str(json)?;
-        Ok(Self::from_raw(raw))
+        Ok(Self::from_raw(raw, opts))
     }
 
     /// Merge additional PGN entries from a canboat-shaped JSON blob
     /// into the loaded database. Used for the synthetic PGN range
     /// (CANBOAT_BEM / ACTISENSE_BEM / IKONVERT_BEM, starting at
     /// 0x40000) that canboat's C analyzer defines in `analyzer/pgn.h`
-    /// rather than `docs/canboat.json`. Each new PGN goes through the
-    /// same non-SI unit fix-up the loader applies on first load, then
-    /// is appended to the `pgns` list and indexed.
+    /// rather than `docs/canboat.json`. Applies the same non-SI
+    /// unit fix-up the loader applies on first load (the SI-mode
+    /// variant — `merge_pgns_from_json_with(json, opts)` — skips it
+    /// when `opts.si` is true).
     pub fn merge_pgns_from_json(&mut self, json: &str) -> Result<(), LoadError> {
+        self.merge_pgns_from_json_with(json, LoadOptions::default())
+    }
+
+    pub fn merge_pgns_from_json_with(
+        &mut self,
+        json: &str,
+        opts: LoadOptions,
+    ) -> Result<(), LoadError> {
         #[derive(Deserialize)]
         struct PgnList {
             #[serde(rename = "PGNs")]
             pgns: Vec<PgnInfo>,
         }
         let mut list: PgnList = serde_json::from_str(json)?;
-        for pgn in &mut list.pgns {
-            for f in &mut pgn.fields {
-                apply_non_si_unit_fixup(f);
+        if !opts.si {
+            for pgn in &mut list.pgns {
+                for f in &mut pgn.fields {
+                    apply_non_si_unit_fixup(f);
+                }
             }
         }
         let base = self.pgns.len();
@@ -297,15 +335,21 @@ impl PgnDatabase {
         Ok(())
     }
 
-    fn from_raw(mut raw: CanboatJson) -> Self {
+    fn from_raw(mut raw: CanboatJson, opts: LoadOptions) -> Self {
         // Apply canboat's non-SI unit conversions to every field once
         // at load time (mirrors `fieldtype.c::fixupTypes` in canboat).
         // After this pass, decoders and formatters can use the field
         // metadata verbatim: resolution / unit / precision / unit_offset
         // all reflect the displayed value, not the wire value.
-        for pgn in &mut raw.pgns {
-            for f in &mut pgn.fields {
-                apply_non_si_unit_fixup(f);
+        //
+        // SI mode (`-si` on canboat C) skips this pass — fields keep
+        // their canboat.json declared units / resolutions so output
+        // is in SI base units (Pa, K, C, rad, …).
+        if !opts.si {
+            for pgn in &mut raw.pgns {
+                for f in &mut pgn.fields {
+                    apply_non_si_unit_fixup(f);
+                }
             }
         }
         let mut pgn_index: HashMap<u32, Vec<usize>> = HashMap::new();
@@ -357,9 +401,11 @@ impl PgnDatabase {
             })
             .collect();
         let mut ft_tables = raw.lookup_field_type_enumerations;
-        for t in &mut ft_tables {
-            for v in &mut t.values {
-                apply_non_si_unit_fixup_lookup(v);
+        if !opts.si {
+            for t in &mut ft_tables {
+                for v in &mut t.values {
+                    apply_non_si_unit_fixup_lookup(v);
+                }
             }
         }
         let field_type_lookups: HashMap<String, LookupFieldTypeTable> = ft_tables

@@ -40,7 +40,7 @@ use clap::Parser;
 use canboat_core::format::{
     detect, header_implies_coalesced, parse_format_header, parse_with, InputFormat,
 };
-use canboat_core::{PgnDatabase, RawFrame};
+use canboat_core::{LoadOptions, PgnDatabase, RawFrame};
 use canboat_io::device::{self, Supervisor};
 use canboat_io::open_serial_rw;
 
@@ -163,6 +163,15 @@ struct Cli {
     #[arg(long)]
     nmea0183_stdout: bool,
 
+    /// Keep fields in their canboat-declared SI base units (rad,
+    /// Pa, K, C, …). Without this flag the pipeline applies
+    /// canboat's user-friendly fix-ups — Pa→bar, K→°C, C→Ah,
+    /// rad→deg — matching the canboat C analyzer's default. The
+    /// flag affects the analyzer JSON / snapshot ports and any
+    /// NMEA 0183 conversion that consumes raw field values.
+    #[arg(long)]
+    si: bool,
+
     /// Verbose logging.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -200,9 +209,10 @@ fn run(cli: Cli) -> Result<()> {
         .or_else(|| std::env::var_os("CANBOAT_JSON").map(PathBuf::from))
         .or_else(default_db_path)
         .context("no canboat.json path supplied (pass --db or set CANBOAT_JSON)")?;
-    let mut db = PgnDatabase::load(&db_path)
+    let load_opts = LoadOptions { si: cli.si };
+    let mut db = PgnDatabase::load_with(&db_path, load_opts)
         .with_context(|| format!("loading PGN database {}", db_path.display()))?;
-    db.merge_pgns_from_json(SYNTHETIC_PGNS_JSON)
+    db.merge_pgns_from_json_with(SYNTHETIC_PGNS_JSON, load_opts)
         .context("merging synthetic PGN definitions")?;
 
     let snapshot = if cli.snapshot_port != 0 {

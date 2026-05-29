@@ -21,7 +21,7 @@ use canboat_core::{
         InputFormat,
     },
     output::{write_json, write_text, GeoFormat, JsonOptions, TextOptions},
-    FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
+    FramePacketType, LoadOptions, PacketType, PgnDatabase, Reassembled, Reassembler,
 };
 use canboat_io::LineReader;
 
@@ -70,6 +70,13 @@ struct Cli {
     /// decimal seconds). Matches canboat's `-geo {dd|dm|dms}`.
     #[arg(long, value_name = "FMT", default_value = "dd")]
     geo: String,
+
+    /// Keep fields in their canboat-declared SI base units (rad,
+    /// Pa, K, C/coulomb, …). Without this flag the analyzer
+    /// applies canboat's user-friendly fix-ups — Pa→bar, K→°C,
+    /// C→Ah, rad→deg. Matches canboat C's `-si`.
+    #[arg(long)]
+    si: bool,
 
     /// Use the given string in place of any analyzer-generated
     /// timestamps (matches canboat's `-fixtime`). Inputs that carry
@@ -129,14 +136,15 @@ fn run(cli: Cli) -> Result<()> {
         .or_else(|| std::env::var_os("CANBOAT_JSON").map(PathBuf::from))
         .or_else(default_db_path)
         .context("no canboat.json path supplied (pass --db or set CANBOAT_JSON)")?;
-    let mut db = PgnDatabase::load(&db_path)
+    let load_opts = LoadOptions { si: cli.si };
+    let mut db = PgnDatabase::load_with(&db_path, load_opts)
         .with_context(|| format!("loading PGN database {}", db_path.display()))?;
     // Synthetic PGNs (CANBOAT_BEM / ACTISENSE_BEM / IKONVERT_BEM
     // range, 0x40000+) live in canboat's analyzer/pgn.h, not in
     // canboat.json. Merge the workspace-vendored mirror so output
     // for synthetic PGNs (e.g. PGN 262386 Actisense System status)
     // matches the canboat reference.
-    db.merge_pgns_from_json(SYNTHETIC_PGNS_JSON)
+    db.merge_pgns_from_json_with(SYNTHETIC_PGNS_JSON, load_opts)
         .context("merging synthetic PGN definitions")?;
 
     let json_opts = JsonOptions {

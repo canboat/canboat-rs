@@ -138,6 +138,19 @@ impl Decoder {
     fn handle_control(&self, body: &str, events: &mut Vec<DeviceEvent>) {
         // `body` is everything after the `$PDGY,` prefix. The C tool
         // dispatches on the head before the first comma — so do we.
+        //
+        // Quirk: the iKonvert does *not* acknowledge `N2NET_OFFLINE`
+        // with an `ACK,…` line. Instead it emits its device-info
+        // banner (`TEXT,Digital_Yacht_iKonvert_v2_…`). All later
+        // commands (RESET / RX_LIST / TX_LIST / INIT) are followed by
+        // a normal `ACK,…`. canboat C handles this by matching TEXT
+        // explicitly at state 13 and matching ACK at the other odd
+        // states.
+        if let Some(rest) = body.strip_prefix("TEXT,") {
+            log::info!("ikonvert: connected to {rest}");
+            self.advance_after_text(events);
+            return;
+        }
         if let Some(rest) = body.strip_prefix("ACK,") {
             log::debug!("ikonvert: ACK ({rest})");
             self.advance_after_ack(events);
@@ -149,13 +162,35 @@ impl Decoder {
             // a typical NAK is "already offline" which is harmless.
             return;
         }
+        // Any other `$PDGY,…` line that arrives while we're waiting
+        // for OFFLINE's TEXT reply means the device missed the
+        // command (or replied earlier than we started listening). C
+        // canboat resends; do the same.
         log::debug!("ikonvert control: {body}");
+        self.maybe_resend_offline(events);
+    }
+
+    /// Transition out of `STATE_WAIT_OFFLINE_ACK` once the device's
+    /// `TEXT,…` banner arrives. No-op at any other state — TEXT
+    /// banners can show up later too (e.g. after a device reset).
+    fn advance_after_text(&self, events: &mut Vec<DeviceEvent>) {
+        let mut state = self.init_state.lock().expect("ikonvert state poisoned");
+        if *state != STATE_WAIT_OFFLINE_ACK {
+            return;
+        }
+        *state -= 1; // → STATE_MAYBE_RESET (12)
+        if let Some(cmd) = next_init_command(&mut state, &self.config) {
+            events.push(DeviceEvent::SendBytes(cmd.into_bytes()));
+        } else {
+            log::info!("ikonvert: initialization complete");
+        }
     }
 
     fn advance_after_ack(&self, events: &mut Vec<DeviceEvent>) {
         let mut state = self.init_state.lock().expect("ikonvert state poisoned");
-        if *state == 0 || *state % 2 == 0 {
-            // Either init is complete or the ACK is unsolicited.
+        // ACK only advances at odd states *other* than the OFFLINE
+        // wait — that one needs TEXT.
+        if *state == STATE_DONE || *state == STATE_WAIT_OFFLINE_ACK || *state % 2 == 0 {
             return;
         }
         *state -= 1;
@@ -164,6 +199,20 @@ impl Decoder {
         } else {
             log::info!("ikonvert: initialization complete");
         }
+    }
+
+    /// If we're at `STATE_WAIT_OFFLINE_ACK` and a non-TEXT line just
+    /// arrived, the device may have missed our OFFLINE command. Push
+    /// it again so we don't sit waiting on the heartbeat stream
+    /// forever. Mirrors canboat C's `sendInitState == 13 → ++` logic.
+    fn maybe_resend_offline(&self, events: &mut Vec<DeviceEvent>) {
+        let state = self.init_state.lock().expect("ikonvert state poisoned");
+        if *state != STATE_WAIT_OFFLINE_ACK {
+            return;
+        }
+        drop(state);
+        log::debug!("ikonvert: resending N2NET_OFFLINE");
+        events.push(DeviceEvent::SendBytes(TX_OFFLINE.as_bytes().to_vec()));
     }
 }
 
@@ -279,17 +328,24 @@ mod tests {
     use super::*;
 
     /// Walk the state machine the way an iKonvert would: send the
-    /// first command via `init_bytes`, then feed each ACK back as the
-    /// "next event" and collect the resulting commands.
+    /// first command via `init_bytes`, then feed the first response
+    /// as TEXT (the OFFLINE-completion banner), and every subsequent
+    /// as ACK. Collects the bytes the codec wants written back.
     fn run_init(config: Config) -> Vec<String> {
         let encoder = Encoder { skip_init: false };
         let first = String::from_utf8(encoder.init_bytes()).unwrap();
         let mut commands = vec![first];
 
         let decoder = Decoder::new(config);
+        let mut first_response = true;
         loop {
             let mut events = Vec::new();
-            decoder.handle_control("ACK,test", &mut events);
+            if first_response {
+                decoder.handle_control("TEXT,iKonvert_simulated", &mut events);
+                first_response = false;
+            } else {
+                decoder.handle_control("ACK,test", &mut events);
+            }
             let mut emitted_one = false;
             for ev in events {
                 if let DeviceEvent::SendBytes(b) = ev {
@@ -352,11 +408,43 @@ mod tests {
     fn extra_ack_after_done_is_ignored() {
         let decoder = Decoder::new(Config::default());
         let mut events = Vec::new();
-        decoder.handle_control("ACK,offline", &mut events); // → INIT,ALL
+        decoder.handle_control("TEXT,welcome", &mut events); // → INIT,ALL
         events.clear();
         decoder.handle_control("ACK,init", &mut events); // → done
         events.clear();
         decoder.handle_control("ACK,stray", &mut events); // ignored
         assert!(events.is_empty(), "post-init ACKs must not emit commands");
+    }
+
+    #[test]
+    fn heartbeat_at_offline_wait_resends_offline() {
+        // While we're waiting for the TEXT banner, the iKonvert may
+        // emit any number of `$PDGY,000000,,,,,,` heartbeats. Each
+        // should trigger a retry of the OFFLINE command.
+        let decoder = Decoder::new(Config::default());
+        let mut events = Vec::new();
+        decoder.handle_control("000000,,,,,,", &mut events);
+        assert_eq!(events.len(), 1, "heartbeat should trigger one resend");
+        match &events[0] {
+            DeviceEvent::SendBytes(b) => {
+                assert_eq!(String::from_utf8_lossy(b), "$PDGY,N2NET_OFFLINE\r\n");
+            }
+            _ => panic!("expected SendBytes"),
+        }
+    }
+
+    #[test]
+    fn text_only_advances_from_offline_wait() {
+        let decoder = Decoder::new(Config::default());
+        // Send TEXT once → should advance and emit INIT,ALL.
+        let mut events = Vec::new();
+        decoder.handle_control("TEXT,banner", &mut events);
+        assert_eq!(events.len(), 1);
+        // A second TEXT after init should NOT re-trigger anything.
+        events.clear();
+        decoder.handle_control("ACK,init", &mut events); // → done
+        events.clear();
+        decoder.handle_control("TEXT,banner2", &mut events);
+        assert!(events.is_empty(), "TEXT after init should be a no-op");
     }
 }

@@ -21,9 +21,7 @@
 //! PGNs flow unchanged through the AIS port; the NMEA stream simply
 //! doesn't emit AIVDM sentences yet.
 
-mod ais;
-mod json;
-mod nmea0183;
+use n2kd::{ais, json, nmea0183};
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};

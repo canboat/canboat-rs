@@ -17,6 +17,44 @@ use crate::types::{
     LookupTable, PgnInfo,
 };
 
+/// Pre-resolved (PGN, field) pointer that hands out the corresponding
+/// [`crate::DecodedField`] in `O(1)`. Built once at startup via
+/// [`PgnDatabase::field`] and reused for the life of the process —
+/// typical use is to stash one per converter input in a `LazyLock` or
+/// `OnceLock` and look it up on every record.
+///
+/// The handle deliberately carries no borrow lifetime so it can sit in
+/// a `static`. The cost is that if the PGN database is reloaded with a
+/// different schema, stale handles still parse — `pgn_id_hash` lets
+/// `DecodedPgn::field` debug-assert that the handle was minted for
+/// the same PGN id the record was decoded under.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FieldHandle {
+    /// 1-based schema position of the resolved field. Matches
+    /// `FieldInfo::order`.
+    pub field_order: u8,
+    /// Cheap stable hash of the PGN id the handle was minted for —
+    /// see [`DecodedPgn::field`].
+    pub pgn_id_hash: u64,
+}
+
+/// Stable djb2-ish hash, mirrored from n2kd's secondary-key hash so
+/// debug-mode handle validation is one comparable u64.
+#[inline]
+fn djb2_hash(s: &str) -> u64 {
+    djb2_hash_str(s)
+}
+
+/// Same hash, crate-internal name so `DecodedPgn::field` can call it.
+#[inline]
+pub(crate) fn djb2_hash_str(s: &str) -> u64 {
+    let mut h: u64 = 5381;
+    for b in s.bytes() {
+        h = h.wrapping_shl(5).wrapping_add(h).wrapping_add(b as u64);
+    }
+    h
+}
+
 /// Multiplier to convert radians to degrees.
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
@@ -375,6 +413,36 @@ impl PgnDatabase {
             .get(&pgn)
             .and_then(|v| v.first())
             .map(|&i| &self.pgns[i])
+    }
+
+    /// First definition whose `Id` field matches `id` (e.g.
+    /// `"cogSogRapidUpdate"`). Walks all PGNs once on the first call;
+    /// subsequent calls re-walk — handlers that need many handles
+    /// should resolve them at startup via [`Self::field`] and cache
+    /// the result.
+    pub fn pgn_by_id(&self, id: &str) -> Option<&PgnInfo> {
+        self.pgns.iter().find(|p| &*p.id == id)
+    }
+
+    /// Resolve a (PGN id, field name) pair into a [`FieldHandle`] that
+    /// later indexes into [`crate::DecodedPgn`] at `O(1)`. Returns
+    /// `None` when the PGN or field name isn't found in the database.
+    ///
+    /// The handle is intended to be resolved once at startup (e.g.
+    /// inside a `LazyLock`) and reused across millions of decoded
+    /// records — the cost of `pgn_by_id` + `fields.iter().find` is
+    /// paid only at handle-construction time, never in the hot loop.
+    pub fn field(&self, pgn_id: &str, field_name: &str) -> Option<FieldHandle> {
+        let info = self.pgn_by_id(pgn_id)?;
+        let f = info.fields.iter().find(|f| &*f.name == field_name)?;
+        Some(FieldHandle {
+            field_order: f.order,
+            // `pgn_id` chars summed — same djb2-ish hash idea n2kd uses
+            // internally for its secondary-key fields. Cheap, stable,
+            // and good enough for the debug-only `assert_eq` in
+            // `DecodedPgn::field`.
+            pgn_id_hash: djb2_hash(pgn_id),
+        })
     }
 
     /// Find a catch-all "fallback" PGN definition for an unknown

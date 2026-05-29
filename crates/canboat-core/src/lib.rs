@@ -14,7 +14,7 @@ pub mod output;
 pub mod reassembly;
 pub mod types;
 
-pub use db::{LoadError, PgnDatabase};
+pub use db::{FieldHandle, LoadError, PgnDatabase};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use frame::{RawFrame, FASTPACKET_MAX_SIZE};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
@@ -73,5 +73,19 @@ mod smoke {
         let db = PgnDatabase::load(db_path()).expect("load canboat.json");
         let table = db.lookup("MANUFACTURER_CODE").expect("table present");
         assert!(table.values.iter().any(|v| v.name == "Navico"));
+    }
+
+    #[test]
+    fn field_handle_resolves_and_finds() {
+        let db = PgnDatabase::load(db_path()).expect("load canboat.json");
+        // PGN 60928 Unique Number is field order 1.
+        let h = db
+            .field("isoAddressClaim", "Unique Number")
+            .expect("unique number handle");
+        assert_eq!(h.field_order, 1);
+        // Unknown field name is None.
+        assert!(db.field("isoAddressClaim", "no such field").is_none());
+        // Unknown PGN id is None.
+        assert!(db.field("noSuchPgn", "Unique Number").is_none());
     }
 }

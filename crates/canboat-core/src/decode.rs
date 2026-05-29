@@ -126,6 +126,71 @@ pub enum FieldValue {
     Unsupported { field_type: &'static str },
 }
 
+impl FieldValue {
+    /// Extract a `f64` for numeric variants. `Integer` widens; `Time`
+    /// returns the post-resolution `seconds` value (matching what
+    /// formatters show). Non-numeric variants return `None`.
+    #[inline]
+    pub fn as_f64(&self) -> Option<f64> {
+        match self {
+            FieldValue::Number(v) | FieldValue::Float(v) => Some(*v),
+            FieldValue::Integer(v) => Some(*v as f64),
+            FieldValue::Time { seconds, .. } => Some(*seconds),
+            FieldValue::Date(d) => Some(*d as f64),
+            FieldValue::Mmsi(v) => Some(*v as f64),
+            _ => None,
+        }
+    }
+
+    /// Extract a `i64` from integer-shaped variants. `Lookup` returns
+    /// the raw enum integer; `Number` truncates; `Time` returns the
+    /// raw scaled-out integer the decoder kept around.
+    #[inline]
+    pub fn as_i64(&self) -> Option<i64> {
+        match self {
+            FieldValue::Integer(v) => Some(*v),
+            FieldValue::Number(v) => Some(*v as i64),
+            FieldValue::Lookup { value, .. } => Some(*value as i64),
+            FieldValue::BitField { value, .. } => Some(*value as i64),
+            FieldValue::Time { raw, .. } => Some(*raw),
+            FieldValue::Date(d) => Some(*d as i64),
+            FieldValue::Mmsi(v) => Some(*v as i64),
+            FieldValue::Pgn { value, .. } => Some(*value as i64),
+            _ => None,
+        }
+    }
+
+    /// Raw `u64` for `Lookup` / `BitField`. Use when you specifically
+    /// want the enum tag without worrying about sign.
+    #[inline]
+    pub fn lookup_value(&self) -> Option<u64> {
+        match self {
+            FieldValue::Lookup { value, .. } => Some(*value),
+            FieldValue::BitField { value, .. } => Some(*value),
+            _ => None,
+        }
+    }
+
+    /// `&str` for `String` / for the resolved `Lookup`/`BitField`
+    /// label when one was found. Non-text variants return `None`.
+    #[inline]
+    pub fn as_str(&self) -> Option<&str> {
+        match self {
+            FieldValue::String(s) => Some(s.as_str()),
+            FieldValue::Lookup { name: Some(n), .. } => Some(n.as_str()),
+            _ => None,
+        }
+    }
+
+    /// `true` when the field decoded to the canboat "not-available"
+    /// sentinel — useful for callers that want to fall back to a
+    /// default rather than emit nothing.
+    #[inline]
+    pub fn is_not_available(&self) -> bool {
+        matches!(self, FieldValue::NotAvailable)
+    }
+}
+
 /// A fully decoded PGN event.
 #[derive(Debug, Clone)]
 pub struct DecodedPgn {
@@ -152,6 +217,38 @@ pub struct DecodedPgn {
     /// `"list":[{` opener that analyzer/analyzer.c:1276 emits the
     /// moment it sees the start field.
     pub has_repeating_set: [bool; 2],
+}
+
+impl DecodedPgn {
+    /// Look up a non-repeating field by its pre-resolved
+    /// [`crate::FieldHandle`]. Returns `None` when the field wasn't
+    /// decoded in this payload (truncated, NotAvailable filtered by
+    /// the decoder, etc.).
+    ///
+    /// In phase 1 this is a linear scan of `self.fields`; phase 2
+    /// turns `self.fields` into a schema-ordered slot vector and
+    /// this method becomes a single array load.
+    #[inline]
+    pub fn field(&self, h: &crate::FieldHandle) -> Option<&DecodedField> {
+        // Debug-only: catch handles that were minted against a
+        // different PGN id than the record was decoded under. Free
+        // in release builds.
+        debug_assert!(
+            h.pgn_id_hash == crate::db::djb2_hash_str(&self.id),
+            "FieldHandle/PGN mismatch: handle was minted for a different PGN id ({} != {})",
+            h.pgn_id_hash,
+            crate::db::djb2_hash_str(&self.id),
+        );
+        self.fields.iter().find(|f| f.order == h.field_order)
+    }
+
+    /// Same as [`Self::field`] but skips the debug assert — useful
+    /// for callers that intentionally use a single handle across
+    /// multiple PGN ids.
+    #[inline]
+    pub fn field_unchecked(&self, h: &crate::FieldHandle) -> Option<&DecodedField> {
+        self.fields.iter().find(|f| f.order == h.field_order)
+    }
 }
 
 #[derive(Debug, thiserror::Error)]

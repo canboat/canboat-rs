@@ -13,8 +13,9 @@ name = "n2kd"
 path = "src/main.rs"
 
 [dependencies]
-canboat-cli = { workspace = true }
-anyhow      = { workspace = true }
-clap        = { workspace = true }
-env_logger  = { workspace = true }
-log         = { workspace = true }
+canboat-cli  = { workspace = true }
+canboat-core = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+env_logger   = { workspace = true }
+log          = { workspace = true }

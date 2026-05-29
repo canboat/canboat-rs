@@ -129,6 +129,42 @@ impl RateLimiter {
         *slot = Some(now);
         false
     }
+
+    /// `true` if rate-limiting is on. Used by the `decoded` module's
+    /// `should_drop_fast` shim so it can early-out when disabled
+    /// without rebuilding the limiter's clock state.
+    #[inline]
+    pub(crate) fn enabled(&self) -> bool {
+        self.enabled
+    }
+
+    /// Direct slot access for [`crate::decoded`]. `src` is bounds-
+    /// checked to `< 256` by its `u8` type; `rate` is indexed against
+    /// `RATE_COUNT` and the caller is expected to pass a valid one.
+    #[inline]
+    pub(crate) fn last_passed_slot(&mut self, src: usize, rate: usize) -> &mut Option<Instant> {
+        &mut self.last_passed[src][rate]
+    }
+
+    /// Refresh the single-slot SOG / COG cache that the `position`
+    /// handler (when it gets struct-path support in a later phase)
+    /// will consume for RMC emission.
+    #[inline]
+    pub(crate) fn record_sog_cog(&mut self, sog_ms: f64, cog_deg: f64) {
+        self.last_sog_cog = Some((sog_ms, cog_deg, Instant::now()));
+    }
+
+    /// `(sog_ms, cog_deg)` if [`Self::record_sog_cog`] was called
+    /// within the last second.
+    #[inline]
+    pub(crate) fn recent_sog_cog(&self) -> Option<(f64, f64)> {
+        let (sog, cog, ts) = self.last_sog_cog?;
+        if ts.elapsed() < Duration::from_secs(1) {
+            Some((sog, cog))
+        } else {
+            None
+        }
+    }
 }
 
 /// Convert one analyzer JSON line into zero or more NMEA 0183

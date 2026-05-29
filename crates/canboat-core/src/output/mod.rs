@@ -132,7 +132,7 @@ pub(crate) fn write_fixed_float<W: std::fmt::Write>(
 }
 
 /// Format days-since-1970-01-01 as `YYYY.MM.DD` (canboat text style).
-pub(crate) fn format_date(days: u16, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
+pub fn format_date(days: u16, w: &mut dyn std::fmt::Write) -> std::fmt::Result {
     let (y, m, d) = days_to_ymd(days as i64);
     write!(w, "{:04}.{:02}.{:02}", y, m, d)
 }
@@ -160,7 +160,7 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 /// the fractional part is zero, the `.fff` suffix is omitted — this
 /// matches canboat's text-mode `fieldPrintTime`, where the JSON path
 /// always shows the fraction and the text path skips it when zero.
-pub(crate) fn format_time(
+pub fn format_time(
     seconds: f64,
     precision: usize,
     trim_zero_fraction: bool,

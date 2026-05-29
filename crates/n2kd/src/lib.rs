@@ -7,5 +7,6 @@
 //! binary's `main.rs`.
 
 pub mod ais;
+pub mod decoded;
 pub mod json;
 pub mod nmea0183;

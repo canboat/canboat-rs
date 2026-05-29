@@ -83,6 +83,10 @@ fn run(cli: Cli) -> Result<()> {
     let mut nmea_buf = String::with_capacity(256);
     let mut rl = n2kd::nmea0183::RateLimiter::new(false);
     let mut ais_seq: u8 = 0;
+    // Pre-resolve every (PGN id, field name) pair the decoded path
+    // can consume into a `FieldHandle`. Built once here; reused per
+    // record.
+    let handles = n2kd::decoded::Handles::new(&db);
 
     // Match canboat's analyzer `-json -nv` defaults — `-nv` turns
     // every LOOKUP into `{value,name}` (which is what n2kd's
@@ -135,29 +139,39 @@ fn run(cli: Cli) -> Result<()> {
             continue;
         };
 
-        // Stage 2 — serialize to the thread-local JSON buffer that
-        // n2kd's conversion API consumes. This buffer is reused so
-        // the per-record alloc is amortised.
-        JSON_BUF.with(|c| {
-            let mut buf = c.borrow_mut();
-            buf.clear();
-            // write_json returns fmt::Result; we ignore it because a
-            // &mut String fmt sink can't actually fail.
-            let _ = write_json(&mut *buf, &decoded, &json_opts);
-
-            // Stage 3 — convert to NMEA 0183. n2kd takes `&str` JSON.
-            nmea_buf.clear();
-            let pgn = decoded.pgn;
-            let n_emitted = if AIS_PGNS.contains(&pgn) {
+        // Stage 2/3 — convert to NMEA 0183.
+        //
+        // Fast path: when the decoded module has a struct-based
+        // handler for this PGN, skip JSON serialization entirely
+        // and call into it directly.
+        //
+        // Slow path: serialize to a thread-local JSON buffer and
+        // hand off to the existing JSON-parsing converters in
+        // n2kd::nmea0183 / n2kd::ais. This is what every record
+        // used to do; only the few PGNs the decoded module hasn't
+        // grown a handler for still take it.
+        nmea_buf.clear();
+        let pgn = decoded.pgn;
+        let n_emitted = if n2kd::decoded::Handles::supports(pgn) {
+            n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles)
+        } else if AIS_PGNS.contains(&pgn) {
+            JSON_BUF.with(|c| {
+                let mut buf = c.borrow_mut();
+                buf.clear();
+                let _ = write_json(&mut *buf, &decoded, &json_opts);
                 n2kd::ais::convert(&mut nmea_buf, &buf, &mut ais_seq)
-            } else {
+            })
+        } else {
+            JSON_BUF.with(|c| {
+                let mut buf = c.borrow_mut();
+                buf.clear();
+                let _ = write_json(&mut *buf, &decoded, &json_opts);
                 n2kd::nmea0183::convert(&mut nmea_buf, &buf, &mut rl)
-            };
-            if n_emitted > 0 {
-                // Stage 4 — write to stdout.
-                let _ = out.write_all(nmea_buf.as_bytes());
-            }
-        });
+            })
+        };
+        if n_emitted > 0 {
+            let _ = out.write_all(nmea_buf.as_bytes());
+        }
     }
     out.flush().ok();
     Ok(())

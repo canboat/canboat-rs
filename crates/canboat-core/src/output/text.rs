@@ -196,7 +196,7 @@ fn is_latlon(f: &DecodedField) -> bool {
     if f.unit.as_deref() != Some("deg") {
         return false;
     }
-    let n = f.name.as_str();
+    let n: &str = &f.name;
     n.contains("atitude") || n.contains("ongitude") || n.contains("atit") || n.contains("ongit")
 }
 

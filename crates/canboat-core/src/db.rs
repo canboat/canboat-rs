@@ -10,6 +10,8 @@ use std::path::Path;
 
 use serde::Deserialize;
 
+use std::sync::Arc;
+
 use crate::types::{
     BitLookupTable, FieldInfo, IndirectLookupTable, LookupFieldTypeTable, LookupFieldTypeValue,
     LookupTable, PgnInfo,
@@ -51,7 +53,7 @@ fn apply_non_si_unit_fixup(f: &mut FieldInfo) {
             if let Some(v) = f.range_max.as_mut() {
                 *v = (*v * RAD_TO_DEG).max(360.0);
             }
-            f.unit = Some("deg".to_string());
+            f.unit = Some(Arc::from("deg"));
             f.precision = 1;
         }
         "rad/s" => {
@@ -64,7 +66,7 @@ fn apply_non_si_unit_fixup(f: &mut FieldInfo) {
             if let Some(v) = f.range_max.as_mut() {
                 *v *= RAD_TO_DEG;
             }
-            f.unit = Some("deg/s".to_string());
+            f.unit = Some(Arc::from("deg/s"));
         }
         "K" if !f.signed.unwrap_or(false) => {
             f.unit_offset = -273.15;
@@ -78,7 +80,7 @@ fn apply_non_si_unit_fixup(f: &mut FieldInfo) {
                 // anyway).
                 *v += -275.15;
             }
-            f.unit = Some("C".to_string());
+            f.unit = Some(Arc::from("C"));
         }
         "Pa" => {
             if let Some(r) = f.resolution.as_mut() {
@@ -90,7 +92,7 @@ fn apply_non_si_unit_fixup(f: &mut FieldInfo) {
             if let Some(v) = f.range_max.as_mut() {
                 *v /= 100_000.0;
             }
-            f.unit = Some("bar".to_string());
+            f.unit = Some(Arc::from("bar"));
             f.precision = 3;
         }
         "C" => {
@@ -103,7 +105,7 @@ fn apply_non_si_unit_fixup(f: &mut FieldInfo) {
             if let Some(v) = f.range_max.as_mut() {
                 *v /= 3600.0;
             }
-            f.unit = Some("Ah".to_string());
+            f.unit = Some(Arc::from("Ah"));
         }
         _ => {}
     }
@@ -130,27 +132,27 @@ fn apply_non_si_unit_fixup_lookup(v: &mut LookupFieldTypeValue) {
             if let Some(r) = v.resolution.as_mut() {
                 *r *= RAD_TO_DEG;
             }
-            v.unit = Some("deg".to_string());
+            v.unit = Some(Arc::from("deg"));
             v.precision = 1;
         }
         "rad/s" => {
             if let Some(r) = v.resolution.as_mut() {
                 *r *= RAD_TO_DEG;
             }
-            v.unit = Some("deg/s".to_string());
+            v.unit = Some(Arc::from("deg/s"));
         }
         "Pa" => {
             if let Some(r) = v.resolution.as_mut() {
                 *r /= 100_000.0;
             }
-            v.unit = Some("bar".to_string());
+            v.unit = Some(Arc::from("bar"));
             v.precision = 3;
         }
         "C" => {
             if let Some(r) = v.resolution.as_mut() {
                 *r /= 3600.0;
             }
-            v.unit = Some("Ah".to_string());
+            v.unit = Some(Arc::from("Ah"));
         }
         _ => {}
     }

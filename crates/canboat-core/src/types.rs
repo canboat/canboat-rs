@@ -4,6 +4,8 @@
 //! JSON (PascalCase) via serde rename. Everything optional in the JSON
 //! is `Option<_>` here.
 
+use std::sync::Arc;
+
 use serde::{Deserialize, Deserializer};
 
 /// Accept either a string or a numeric value as a string.
@@ -19,6 +21,20 @@ fn de_loose_string<'de, D: Deserializer<'de>>(d: D) -> Result<Option<String>, D:
         Some(Value::Bool(b)) => Some(b.to_string()),
         Some(other) => Some(other.to_string()),
     })
+}
+
+/// Deserialize a JSON string into `Arc<str>`. The interned text then
+/// clones with a single atomic increment instead of allocating a fresh
+/// `String`, which is the win we're after for hot per-field copies.
+fn de_arc_str<'de, D: Deserializer<'de>>(d: D) -> Result<Arc<str>, D::Error> {
+    let s = String::deserialize(d)?;
+    Ok(Arc::from(s.into_boxed_str()))
+}
+
+/// Optional variant of [`de_arc_str`].
+fn de_arc_str_opt<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Arc<str>>, D::Error> {
+    let s = Option::<String>::deserialize(d)?;
+    Ok(s.map(|s| Arc::from(s.into_boxed_str())))
 }
 
 /// How a PGN is transmitted on the wire.
@@ -89,8 +105,10 @@ pub enum FieldType {
 #[serde(rename_all = "PascalCase")]
 pub struct FieldInfo {
     pub order: u8,
-    pub id: String,
-    pub name: String,
+    #[serde(deserialize_with = "de_arc_str")]
+    pub id: Arc<str>,
+    #[serde(deserialize_with = "de_arc_str")]
+    pub name: Arc<str>,
     #[serde(default, deserialize_with = "de_loose_string")]
     pub description: Option<String>,
     pub bit_length: Option<u32>,
@@ -108,7 +126,8 @@ pub struct FieldInfo {
     pub offset: Option<i64>,
     pub range_min: Option<f64>,
     pub range_max: Option<f64>,
-    pub unit: Option<String>,
+    #[serde(default, deserialize_with = "de_arc_str_opt")]
+    pub unit: Option<Arc<str>>,
     pub physical_quantity: Option<String>,
     pub field_type: Option<FieldType>,
     pub lookup_enumeration: Option<String>,
@@ -139,8 +158,10 @@ pub struct FieldInfo {
 pub struct PgnInfo {
     #[serde(rename = "PGN")]
     pub pgn: u32,
-    pub id: String,
-    pub description: String,
+    #[serde(deserialize_with = "de_arc_str")]
+    pub id: Arc<str>,
+    #[serde(deserialize_with = "de_arc_str")]
+    pub description: Arc<str>,
     pub explanation: Option<String>,
     #[serde(rename = "URL")]
     pub url: Option<String>,
@@ -287,8 +308,8 @@ pub struct LookupFieldTypeValue {
     pub bits: Option<String>,
     #[serde(rename = "Resolution")]
     pub resolution: Option<f64>,
-    #[serde(rename = "Unit")]
-    pub unit: Option<String>,
+    #[serde(rename = "Unit", default, deserialize_with = "de_arc_str_opt")]
+    pub unit: Option<Arc<str>>,
     #[serde(rename = "LookupEnumeration")]
     pub lookup_enumeration: Option<String>,
     #[serde(rename = "LookupBitEnumeration")]

@@ -58,7 +58,7 @@ mod smoke {
     fn finds_iso_address_claim() {
         let db = PgnDatabase::load(db_path()).expect("load canboat.json");
         let pgn = db.first_pgn(60928).expect("PGN 60928 must exist");
-        assert_eq!(pgn.id, "isoAddressClaim");
+        assert_eq!(&*pgn.id, "isoAddressClaim");
         assert_eq!(pgn.packet_type, PacketType::Single);
         // 10 fields including Unique Number, Manufacturer Code, etc.
         assert_eq!(pgn.fields.len(), 10);

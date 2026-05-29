@@ -34,9 +34,9 @@ fn unavailable_with_range(f: &FieldInfo, ex: Extracted) -> bool {
 #[derive(Debug, Clone)]
 pub struct DecodedField {
     pub order: u8,
-    pub id: String,
-    pub name: String,
-    pub unit: Option<String>,
+    pub id: std::sync::Arc<str>,
+    pub name: std::sync::Arc<str>,
+    pub unit: Option<std::sync::Arc<str>>,
     /// Resolution as carried in canboat.json. The formatter uses this
     /// to pick a sensible number of decimal digits.
     pub resolution: Option<f64>,
@@ -97,7 +97,7 @@ pub enum FieldValue {
     /// human-readable name from the database, if known.
     Pgn {
         value: u32,
-        description: Option<String>,
+        description: Option<std::sync::Arc<str>>,
     },
     /// ISO_NAME — a 64-bit packed identifier that is also a valid
     /// PGN 60928 (ISO Address Claim) payload. We carry the raw value
@@ -134,9 +134,9 @@ pub struct DecodedPgn {
     pub pgn: u32,
     pub src: u8,
     pub dst: u8,
-    pub description: String,
+    pub description: std::sync::Arc<str>,
     /// canboat.json `Id` — stable camelCase identifier.
-    pub id: String,
+    pub id: std::sync::Arc<str>,
     /// The raw payload bytes the fields were decoded from. Kept on
     /// the DecodedPgn so the `-debug` JSON formatter can extract
     /// per-field `bytes` / `bits` annotations without holding the
@@ -706,7 +706,7 @@ fn decode_one_field_at(
     // DYNAMIC_FIELD_VALUE then consumes. Several PGNs use a regular
     // NUMBER field for this rather than the explicit
     // `DYNAMIC_FIELD_LENGTH` type (e.g. Simnet Parameter Set 130846).
-    if f.name == "Length" {
+    if &*f.name == "Length" {
         let raw_len = match &value {
             FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
             FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),
@@ -1525,7 +1525,7 @@ mod tests {
             data,
         };
         let dec = db().decode(&frame).expect("decode");
-        assert_eq!(dec.id, "isoAddressClaim");
+        assert_eq!(&*dec.id, "isoAddressClaim");
         assert_eq!(dec.fields.len(), 10);
 
         // Field 1: Unique Number (21-bit unsigned) = 1088507.
@@ -1585,7 +1585,7 @@ mod tests {
             data,
         };
         let picked = db().pick_variant(&frame).expect("variant");
-        assert_eq!(picked.id, "nmeaReadFieldsGroupFunction");
+        assert_eq!(&*picked.id, "nmeaReadFieldsGroupFunction");
     }
 
     #[test]

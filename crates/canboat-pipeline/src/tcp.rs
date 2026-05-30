@@ -27,7 +27,7 @@
 //! The snapshot port pulls from a cache populated by the pipeline.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 
@@ -42,7 +42,7 @@ use canboat_io::device::FrameSender;
 /// stdout to declare "frames are already coalesced FAST". A
 /// downstream canboat `analyzer` or canboatjs's `Liner +
 /// parseActisense` use this to skip per-CAN-frame reassembly.
-const CANBOAT_FORMAT_FAST_HEADER: &[u8] = b"# format=FAST\n";
+pub const CANBOAT_FORMAT_FAST_HEADER: &[u8] = b"# format=FAST\n";
 
 use crate::hub::Hub;
 use crate::snapshot::SnapshotStore;
@@ -95,8 +95,14 @@ fn snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
 }
 
 fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
-    use std::net::Shutdown;
     set_nodelay(&stream, "snapshot");
+    // Snapshot is a strictly read-only one-shot: FIN the read
+    // direction immediately so any client writes during the brief
+    // window before the dump completes get ECONNRESET / EPIPE
+    // instead of piling up in the kernel's receive buffer.
+    if let Err(e) = stream.shutdown(Shutdown::Read) {
+        log::debug!("snapshot: shutdown(read) failed: {e}");
+    }
     // Snapshot is a one-shot dump — build the JSON document under
     // the cache lock, then drop the lock before sending so a slow
     // client can't stall the pipeline's `store()` calls.
@@ -110,24 +116,49 @@ fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-/// Bind a read-only TCP server. Each client subscribes to `hub` and
-/// is forwarded broadcast lines until either side disconnects.
-pub fn spawn_readonly(
+/// Bind a TCP server that streams `hub` broadcast lines out to every
+/// connected client and (optionally) accepts PLAIN/FAST lines back
+/// from those clients, forwarding the parsed `RawFrame`s to the
+/// device writer through `sender`.
+///
+/// * `hub` — the broadcast source the client reads from.
+/// * `sender` — when `Some`, the client connection is bidirectional:
+///   a reader subthread parses inbound PLAIN/FAST lines and queues
+///   `RawFrame`s for the device writer. When `None`, the connection
+///   is read-only (no inbound thread is spawned at all).
+/// * `header` — optional bytes written to the client immediately on
+///   connect, before the first broadcast line. Used by the CSV port
+///   to emit canboat's `# format=FAST\n` header so downstream
+///   PLAIN/FAST parsers know the stream is pre-coalesced.
+pub fn spawn_stream_server(
     name: &'static str,
     bind: Ipv4Addr,
     port: u16,
     hub: Arc<Hub>,
+    sender: Option<FrameSender>,
+    header: Option<&'static [u8]>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding {name} TCP port {}:{}", bind, port))?;
-    log::info!("{name} server listening on {}:{}", bind, port);
+    let mode = match (sender.is_some(), header.is_some()) {
+        (true, true) => "R/W + header",
+        (true, false) => "R/W",
+        (false, _) => "RO",
+    };
+    log::info!("{name} server listening on {}:{} ({mode})", bind, port);
     Ok(thread::Builder::new()
         .name(format!("{name}-accept"))
-        .spawn(move || readonly_accept(name, listener, hub))
-        .expect("spawn read-only accept"))
+        .spawn(move || stream_accept(name, listener, hub, sender, header))
+        .expect("spawn stream accept"))
 }
 
-fn readonly_accept(name: &'static str, listener: TcpListener, hub: Arc<Hub>) {
+fn stream_accept(
+    name: &'static str,
+    listener: TcpListener,
+    hub: Arc<Hub>,
+    sender: Option<FrameSender>,
+    header: Option<&'static [u8]>,
+) {
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(s) => s,
@@ -138,18 +169,82 @@ fn readonly_accept(name: &'static str, listener: TcpListener, hub: Arc<Hub>) {
         };
         log::info!("{name} client connected: {peer}");
         let h = hub.clone();
+        let s = sender.clone();
         thread::Builder::new()
             .name(format!("{name}-client"))
-            .spawn(move || run_readonly_client(stream, h))
+            .spawn(move || run_stream_client(name, stream, h, s, header))
             .ok();
     }
 }
 
-fn run_readonly_client(mut stream: TcpStream, hub: Arc<Hub>) {
-    set_nodelay(&stream, "readonly");
+fn run_stream_client(
+    name: &'static str,
+    stream: TcpStream,
+    hub: Arc<Hub>,
+    sender: Option<FrameSender>,
+    header: Option<&'static [u8]>,
+) {
+    set_nodelay(&stream, name);
+
+    // Spawn the inbound reader subthread when the caller wired up a
+    // writer. The reader owns its own clone of the socket so the
+    // write loop below can keep running independently. Closing
+    // either side closes the underlying fd, which lets the other
+    // exit on its next read/write.
+    //
+    // When no sender is configured, the port is strictly read-only:
+    // FIN the read direction so any client write attempts get
+    // ECONNRESET / EPIPE instead of silently piling up in the
+    // kernel's receive buffer.
+    let read_handle = if let Some(sender) = sender.clone() {
+        match stream.try_clone() {
+            Ok(read_stream) => Some(
+                thread::Builder::new()
+                    .name(format!("{name}-client-read"))
+                    .spawn(move || run_inbound_reader(read_stream, sender))
+                    .expect("spawn inbound reader"),
+            ),
+            Err(e) => {
+                log::warn!("{name}: cannot clone client stream: {e}");
+                None
+            }
+        }
+    } else {
+        if let Err(e) = stream.shutdown(Shutdown::Read) {
+            log::debug!("{name}: shutdown(read) failed: {e}");
+        }
+        None
+    };
+
+    // Main: drain the subscription and write to the socket.
     let rx = hub.subscribe();
+    let mut stream = stream;
+    if let Some(bytes) = header {
+        if stream.write_all(bytes).is_err() {
+            return;
+        }
+    }
     while let Ok(line) = rx.recv() {
         if stream.write_all(line.as_bytes()).is_err() {
+            break;
+        }
+    }
+    // Closing the write side drops the fd; the inbound reader (if
+    // any) exits on its next read.
+    drop(stream);
+    if let Some(j) = read_handle {
+        let _ = j.join();
+    }
+}
+
+fn run_inbound_reader(stream: TcpStream, sender: FrameSender) {
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        if !forward_plain_line(&line, &sender) {
             return;
         }
     }
@@ -201,111 +296,6 @@ fn run_writeonly_client(stream: TcpStream, sender: FrameSender) {
             return;
         }
     }
-}
-
-/// Bind the bidirectional CSV server. Each client thread spawns a
-/// reader sub-thread (parses incoming PLAIN/FAST lines and queues
-/// them for the device writer) and runs the read-out loop in the
-/// caller thread (drains the CsvHub subscription and writes to the
-/// socket).
-///
-/// `sender` is optional: when running in stdin mode there's no
-/// device to forward to, so incoming writes are silently dropped.
-pub fn spawn_csv_rw(
-    bind: Ipv4Addr,
-    port: u16,
-    hub: Arc<Hub>,
-    sender: Option<FrameSender>,
-) -> Result<JoinHandle<()>> {
-    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
-        .with_context(|| format!("binding CSV TCP port {}:{}", bind, port))?;
-    log::info!("CSV R/W server listening on {}:{}", bind, port);
-    Ok(thread::Builder::new()
-        .name("csv-accept".into())
-        .spawn(move || csv_accept(listener, hub, sender))
-        .expect("spawn CSV accept"))
-}
-
-fn csv_accept(listener: TcpListener, hub: Arc<Hub>, sender: Option<FrameSender>) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("csv accept failed: {e}");
-                return;
-            }
-        };
-        log::info!("csv client connected: {peer}");
-        let h = hub.clone();
-        let s = sender.clone();
-        thread::Builder::new()
-            .name("csv-client".into())
-            .spawn(move || run_csv_client(stream, h, s))
-            .ok();
-    }
-}
-
-fn run_csv_client(stream: TcpStream, hub: Arc<Hub>, sender: Option<FrameSender>) {
-    set_nodelay(&stream, "csv");
-    // Split the stream so the read side can run on its own thread.
-    // `TcpStream::try_clone` shares the underlying socket between
-    // the two handles; closing either side closes the connection.
-    // (set_nodelay above is a socket-level option, so it applies
-    // to both halves.)
-    let write_stream = stream;
-    let read_stream = match write_stream.try_clone() {
-        Ok(s) => s,
-        Err(e) => {
-            log::warn!("csv: cannot clone client stream: {e}");
-            return;
-        }
-    };
-
-    // Reader subthread — parse incoming PLAIN/FAST lines and forward
-    // them to the device writer.
-    let read_handle = thread::Builder::new()
-        .name("csv-client-read".into())
-        .spawn(move || {
-            let reader = BufReader::new(read_stream);
-            for line in reader.lines() {
-                let line = match line {
-                    Ok(l) => l,
-                    Err(_) => return,
-                };
-                match sender.as_ref() {
-                    Some(sender) => {
-                        if !forward_plain_line(&line, sender) {
-                            return;
-                        }
-                    }
-                    None => {
-                        // Stdin mode: silently swallow lines.
-                        log::debug!("csv (no device): dropping client line");
-                    }
-                }
-            }
-        })
-        .expect("spawn csv reader subthread");
-
-    // Main thread — drain the subscription, write to the socket.
-    let rx = hub.subscribe();
-    let mut stream = write_stream;
-    // Send the canboat format header before the first frame so
-    // downstream parsers (canboat C analyzer, canboatjs) know the
-    // stream is already coalesced FAST and don't try reassembly.
-    if stream.write_all(CANBOAT_FORMAT_FAST_HEADER).is_err() {
-        return;
-    }
-    while let Ok(line) = rx.recv() {
-        if stream.write_all(line.as_bytes()).is_err() {
-            break;
-        }
-    }
-    // Closing the write side via drop will also close the read side
-    // (shared socket fd), which lets the reader thread exit on its
-    // next read.
-    drop(stream);
-    let _ = read_handle.join();
 }
 
 /// Parse one PLAIN/FAST line and forward to the device writer.

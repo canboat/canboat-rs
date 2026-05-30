@@ -259,28 +259,42 @@ fn run(cli: Cli) -> Result<()> {
             store.clone(),
         )?);
     }
+    // Every readable port accepts PLAIN/FAST writes back from
+    // connected clients when a device sender is wired up — clients
+    // can inject N2K traffic on any port they're already subscribed
+    // to. The CSV port additionally emits the canboat `# format=FAST`
+    // header on connect so downstream PLAIN/FAST parsers (canboat C
+    // analyzer, canboatjs) know the stream is pre-coalesced.
     if cli.csv_port != 0 {
-        tcp_joins.push(tcp::spawn_csv_rw(
+        tcp_joins.push(tcp::spawn_stream_server(
+            "csv",
             cli.bind,
             cli.csv_port,
             hubs.csv.clone(),
             device_sender.clone(),
+            Some(tcp::CANBOAT_FORMAT_FAST_HEADER),
         )?);
     }
     if cli.nmea0183_port != 0 {
-        tcp_joins.push(tcp::spawn_readonly(
+        // NMEA 0183 is strictly read-only — clients trying to write
+        // get an immediate FIN on the read direction.
+        tcp_joins.push(tcp::spawn_stream_server(
             "nmea0183",
             cli.bind,
             cli.nmea0183_port,
             hubs.nmea.clone(),
+            None,
+            None,
         )?);
     }
     if cli.analyzer_port != 0 {
-        tcp_joins.push(tcp::spawn_readonly(
+        tcp_joins.push(tcp::spawn_stream_server(
             "analyzer",
             cli.bind,
             cli.analyzer_port,
             hubs.analyzer.clone(),
+            device_sender.clone(),
+            None,
         )?);
     }
     if let (Some(sender), true) = (device_sender, cli.write_port != 0) {

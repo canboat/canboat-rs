@@ -116,39 +116,46 @@ fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
     let _ = stream.shutdown(Shutdown::Both);
 }
 
+/// Direction policy for [`spawn_stream_server`]. Mode `ReadOnly`
+/// shuts down the TCP read direction on every accept; `ReadWrite`
+/// spawns an inbound reader subthread that parses PLAIN/FAST lines
+/// and forwards `RawFrame`s through `sender` if one is configured
+/// (silently drops them when `None`, e.g. stdin-mode pipeline with
+/// no device behind it).
+pub enum Direction {
+    ReadOnly,
+    ReadWrite { sender: Option<FrameSender> },
+}
+
 /// Bind a TCP server that streams `hub` broadcast lines out to every
-/// connected client and (optionally) accepts PLAIN/FAST lines back
-/// from those clients, forwarding the parsed `RawFrame`s to the
-/// device writer through `sender`.
+/// connected client and — depending on [`Direction`] — optionally
+/// accepts PLAIN/FAST lines back from those clients.
 ///
-/// * `hub` — the broadcast source the client reads from.
-/// * `sender` — when `Some`, the client connection is bidirectional:
-///   a reader subthread parses inbound PLAIN/FAST lines and queues
-///   `RawFrame`s for the device writer. When `None`, the connection
-///   is read-only (no inbound thread is spawned at all).
-/// * `header` — optional bytes written to the client immediately on
-///   connect, before the first broadcast line. Used by the CSV port
-///   to emit canboat's `# format=FAST\n` header so downstream
-///   PLAIN/FAST parsers know the stream is pre-coalesced.
+/// `header` is optional bytes written to the client immediately on
+/// connect, before the first broadcast line. Used by the CSV port
+/// to emit canboat's `# format=FAST\n` so downstream PLAIN/FAST
+/// parsers know the stream is pre-coalesced.
 pub fn spawn_stream_server(
     name: &'static str,
     bind: Ipv4Addr,
     port: u16,
     hub: Arc<Hub>,
-    sender: Option<FrameSender>,
+    direction: Direction,
     header: Option<&'static [u8]>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding {name} TCP port {}:{}", bind, port))?;
-    let mode = match (sender.is_some(), header.is_some()) {
-        (true, true) => "R/W + header",
-        (true, false) => "R/W",
-        (false, _) => "RO",
+    let mode = match (&direction, header.is_some()) {
+        (Direction::ReadWrite { sender: Some(_) }, true) => "R/W + header",
+        (Direction::ReadWrite { sender: Some(_) }, false) => "R/W",
+        (Direction::ReadWrite { sender: None }, true) => "R/W (writes dropped) + header",
+        (Direction::ReadWrite { sender: None }, false) => "R/W (writes dropped)",
+        (Direction::ReadOnly, _) => "RO",
     };
     log::info!("{name} server listening on {}:{} ({mode})", bind, port);
     Ok(thread::Builder::new()
         .name(format!("{name}-accept"))
-        .spawn(move || stream_accept(name, listener, hub, sender, header))
+        .spawn(move || stream_accept(name, listener, hub, direction, header))
         .expect("spawn stream accept"))
 }
 
@@ -156,7 +163,7 @@ fn stream_accept(
     name: &'static str,
     listener: TcpListener,
     hub: Arc<Hub>,
-    sender: Option<FrameSender>,
+    direction: Direction,
     header: Option<&'static [u8]>,
 ) {
     loop {
@@ -169,10 +176,15 @@ fn stream_accept(
         };
         log::info!("{name} client connected: {peer}");
         let h = hub.clone();
-        let s = sender.clone();
+        let d = match &direction {
+            Direction::ReadOnly => Direction::ReadOnly,
+            Direction::ReadWrite { sender } => Direction::ReadWrite {
+                sender: sender.clone(),
+            },
+        };
         thread::Builder::new()
             .name(format!("{name}-client"))
-            .spawn(move || run_stream_client(name, stream, h, s, header))
+            .spawn(move || run_stream_client(name, stream, h, d, header))
             .ok();
     }
 }
@@ -181,39 +193,37 @@ fn run_stream_client(
     name: &'static str,
     stream: TcpStream,
     hub: Arc<Hub>,
-    sender: Option<FrameSender>,
+    direction: Direction,
     header: Option<&'static [u8]>,
 ) {
     set_nodelay(&stream, name);
 
-    // Spawn the inbound reader subthread when the caller wired up a
-    // writer. The reader owns its own clone of the socket so the
-    // write loop below can keep running independently. Closing
-    // either side closes the underlying fd, which lets the other
-    // exit on its next read/write.
-    //
-    // When no sender is configured, the port is strictly read-only:
-    // FIN the read direction so any client write attempts get
-    // ECONNRESET / EPIPE instead of silently piling up in the
-    // kernel's receive buffer.
-    let read_handle = if let Some(sender) = sender.clone() {
-        match stream.try_clone() {
+    let read_handle = match direction {
+        // Strictly read-only: FIN the read direction so any client
+        // write attempts get ECONNRESET / EPIPE instead of silently
+        // piling up in the kernel's receive buffer.
+        Direction::ReadOnly => {
+            if let Err(e) = stream.shutdown(Shutdown::Read) {
+                log::debug!("{name}: shutdown(read) failed: {e}");
+            }
+            None
+        }
+        // R/W: spawn a reader subthread on its own socket clone.
+        // When no device sender is configured (stdin mode) the
+        // reader silently drops inbound lines — we still accept the
+        // writes (no FIN), we just have nowhere to forward them.
+        Direction::ReadWrite { sender } => match stream.try_clone() {
             Ok(read_stream) => Some(
                 thread::Builder::new()
                     .name(format!("{name}-client-read"))
-                    .spawn(move || run_inbound_reader(read_stream, sender))
+                    .spawn(move || run_inbound_reader(name, read_stream, sender))
                     .expect("spawn inbound reader"),
             ),
             Err(e) => {
                 log::warn!("{name}: cannot clone client stream: {e}");
                 None
             }
-        }
-    } else {
-        if let Err(e) = stream.shutdown(Shutdown::Read) {
-            log::debug!("{name}: shutdown(read) failed: {e}");
-        }
-        None
+        },
     };
 
     // Main: drain the subscription and write to the socket.
@@ -237,15 +247,31 @@ fn run_stream_client(
     }
 }
 
-fn run_inbound_reader(stream: TcpStream, sender: FrameSender) {
+fn run_inbound_reader(name: &'static str, stream: TcpStream, sender: Option<FrameSender>) {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(_) => return,
         };
-        if !forward_plain_line(&line, &sender) {
-            return;
+        match &sender {
+            // Device wired up: forward the line. Stop when the writer
+            // has gone away.
+            Some(s) => {
+                if !forward_plain_line(&line, s) {
+                    return;
+                }
+            }
+            // Stdin-mode pipeline: no device to forward to. Drain the
+            // line so the client keeps making progress, but log at
+            // debug so a stray write doesn't disappear without a
+            // trace.
+            None => {
+                let trimmed = line.trim_end_matches(['\r', '\n']);
+                if !trimmed.is_empty() {
+                    log::debug!("{name}: no device wired up, dropping client line: {trimmed}");
+                }
+            }
         }
     }
 }

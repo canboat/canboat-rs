@@ -68,7 +68,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "DEVICE",
-        conflicts_with_all = ["ikonvert", "maretron"]
+        conflicts_with_all = ["ikonvert", "maretron", "canboat_csv"]
     )]
     actisense: Option<String>,
 
@@ -77,7 +77,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "DEVICE",
-        conflicts_with_all = ["actisense", "maretron"]
+        conflicts_with_all = ["actisense", "maretron", "canboat_csv"]
     )]
     ikonvert: Option<String>,
 
@@ -86,9 +86,21 @@ struct Cli {
     #[arg(
         long,
         value_name = "URL",
-        conflicts_with_all = ["actisense", "ikonvert"]
+        conflicts_with_all = ["actisense", "ikonvert", "canboat_csv"]
     )]
     maretron: Option<String>,
+
+    /// Chain into another `canboat-pipeline` instance over its
+    /// bidirectional Raw CSV port (default 2603). Accepts
+    /// `host:port` or `tcp://host[:port]`. Wire format is
+    /// canboat PLAIN/FAST CSV in both directions, so all frames
+    /// and any client writes flow end-to-end.
+    #[arg(
+        long,
+        value_name = "URL",
+        conflicts_with_all = ["actisense", "ikonvert", "maretron"]
+    )]
+    canboat_csv: Option<String>,
 
     /// Baud rate for serial devices. Defaults: 115200 for NGT-1,
     /// 230400 for iKonvert. Ignored for Maretron.
@@ -271,7 +283,9 @@ fn run(cli: Cli) -> Result<()> {
             cli.bind,
             cli.csv_port,
             hubs.csv.clone(),
-            device_sender.clone(),
+            tcp::Direction::ReadWrite {
+                sender: device_sender.clone(),
+            },
             Some(tcp::CANBOAT_FORMAT_FAST_HEADER),
         )?);
     }
@@ -283,7 +297,7 @@ fn run(cli: Cli) -> Result<()> {
             cli.bind,
             cli.nmea0183_port,
             hubs.nmea.clone(),
-            None,
+            tcp::Direction::ReadOnly,
             None,
         )?);
     }
@@ -293,7 +307,9 @@ fn run(cli: Cli) -> Result<()> {
             cli.bind,
             cli.analyzer_port,
             hubs.analyzer.clone(),
-            device_sender.clone(),
+            tcp::Direction::ReadWrite {
+                sender: device_sender.clone(),
+            },
             None,
         )?);
     }
@@ -400,6 +416,18 @@ fn open_source(
         // Maretron IPG ships full PGN payloads per 0xA5 frame.
         return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
     }
+    if let Some(url) = cli.canboat_csv.as_deref() {
+        let url = url.to_string();
+        let factory = NamedFactory::new("canboat-csv", move || {
+            let (reader, writer) = open_canboat_csv_pair(&url)?;
+            Ok(device::canboat_csv::run(reader, writer))
+        });
+        let sup = Supervisor::new(factory);
+        let (rx, sup) = split_supervisor(sup);
+        // Wire format is canboat PLAIN/FAST — each line is already
+        // a complete PGN payload, so skip the reassembler.
+        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
+    }
     // stdin fallback — no device, no reconnect logic needed. We
     // can't know in advance whether the upstream uses PLAIN
     // (per-CAN-frame, needs reassembly) or FAST (already coalesced).
@@ -455,19 +483,38 @@ where
 }
 
 fn open_maretron_pair(url: &str) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    open_tcp_pair(url, 6543, "maretron")
+}
+
+fn open_canboat_csv_pair(
+    url: &str,
+) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    open_tcp_pair(url, 2603, "canboat-csv")
+}
+
+/// Open a TCP socket and return cloned read/write halves. Mirrors
+/// what the device codecs need: a separate `Box<dyn Read>` and
+/// `Box<dyn Write>` over the same underlying connection. Tolerates
+/// `tcp://` URL prefix, fills in `default_port` when the user
+/// didn't include one.
+fn open_tcp_pair(
+    url: &str,
+    default_port: u16,
+    log_label: &'static str,
+) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     use std::net::{TcpStream, ToSocketAddrs};
     use std::time::Duration;
     let raw = url.strip_prefix("tcp://").unwrap_or(url);
     let with_port = if raw.contains(':') {
         raw.to_string()
     } else {
-        format!("{raw}:6543")
+        format!("{raw}:{default_port}")
     };
     let resolved = with_port
         .to_socket_addrs()?
         .next()
         .ok_or_else(|| io::Error::other(format!("no addresses for {with_port}")))?;
-    log::info!("maretron: connecting to {resolved}");
+    log::info!("{log_label}: connecting to {resolved}");
     let stream = TcpStream::connect_timeout(&resolved, Duration::from_secs(10))?;
     let read_clone = stream.try_clone()?;
     Ok((Box::new(read_clone), Box::new(stream)))

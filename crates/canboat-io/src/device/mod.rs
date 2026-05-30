@@ -23,6 +23,7 @@
 //! }
 //! ```
 
+pub mod canboat_csv;
 pub mod ikonvert;
 pub mod maretron;
 pub mod ngt1;
@@ -38,6 +39,7 @@ use std::time::{Duration, Instant};
 use canboat_core::RawFrame;
 
 /// Events emitted by a [`DeviceDecoder`] as bytes are pumped in.
+#[derive(Debug)]
 pub enum DeviceEvent {
     /// A complete N2K frame received from the bus.
     Frame(RawFrame),

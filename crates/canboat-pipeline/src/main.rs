@@ -95,12 +95,29 @@ struct Cli {
     /// `host:port` or `tcp://host[:port]`. Wire format is
     /// canboat PLAIN/FAST CSV in both directions, so all frames
     /// and any client writes flow end-to-end.
+    ///
+    /// When `--canboat-csv-write` is also given, this URL is used
+    /// only as a read source (e.g. an iptee'd raw stream), and
+    /// outbound writes are diverted to the write URL instead.
     #[arg(
         long,
         value_name = "URL",
         conflicts_with_all = ["actisense", "ikonvert", "maretron"]
     )]
     canboat_csv: Option<String>,
+
+    /// Optional separate sink for outbound PLAIN/FAST frames when
+    /// chaining via `--canboat-csv`. Use this when the read source
+    /// is a one-way feed (e.g. iptee on actisense-serial output)
+    /// and writes need to go to a different endpoint (e.g. n2kd's
+    /// input-stream port). Without this flag, reads and writes
+    /// share the single `--canboat-csv` socket.
+    #[arg(
+        long,
+        value_name = "URL",
+        requires = "canboat_csv"
+    )]
+    canboat_csv_write: Option<String>,
 
     /// Baud rate for serial devices. Defaults: 115200 for NGT-1,
     /// 230400 for iKonvert. Ignored for Maretron.
@@ -416,10 +433,14 @@ fn open_source(
         // Maretron IPG ships full PGN payloads per 0xA5 frame.
         return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
     }
-    if let Some(url) = cli.canboat_csv.as_deref() {
-        let url = url.to_string();
+    if let Some(read_url) = cli.canboat_csv.as_deref() {
+        let read_url = read_url.to_string();
+        let write_url = cli.canboat_csv_write.clone();
         let factory = NamedFactory::new("canboat-csv", move || {
-            let (reader, writer) = open_canboat_csv_pair(&url)?;
+            let (reader, writer) = match &write_url {
+                Some(w) => open_canboat_csv_split(&read_url, w)?,
+                None => open_canboat_csv_pair(&read_url)?,
+            };
             Ok(device::canboat_csv::run(reader, writer))
         });
         let sup = Supervisor::new(factory);
@@ -490,6 +511,25 @@ fn open_canboat_csv_pair(
     url: &str,
 ) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     open_tcp_pair(url, 2603, "canboat-csv")
+}
+
+/// Split-mode: read frames from `read_url`, send frames out to
+/// `write_url`. Two independent TCP connections; the unused
+/// directions of each are dropped (their kernel-side socket
+/// references remain alive via the other half, but we never
+/// touch them).
+///
+/// Use case: chaining into a pipeline whose read source is a
+/// one-way feed (e.g. `iptee` mirroring the raw output of
+/// `actisense-serial`) while the write sink is a separate
+/// endpoint (e.g. `n2kd`'s input-stream port on `port + 3`).
+fn open_canboat_csv_split(
+    read_url: &str,
+    write_url: &str,
+) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+    let (read_half, _unused_write) = open_tcp_pair(read_url, 2603, "canboat-csv read")?;
+    let (_unused_read, write_half) = open_tcp_pair(write_url, 2603, "canboat-csv write")?;
+    Ok((read_half, write_half))
 }
 
 /// Open a TCP socket and return cloned read/write halves. Mirrors

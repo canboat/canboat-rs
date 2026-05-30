@@ -451,8 +451,10 @@ mod tests {
 
     #[test]
     fn rx_list_triggers_reset_rxlist_normal() {
-        let mut cfg = Config::default();
-        cfg.rx_list = Some("129025,129026".to_string());
+        let cfg = Config {
+            rx_list: Some("129025,129026".to_string()),
+            ..Config::default()
+        };
         let cmds = run_init(cfg);
         assert_eq!(
             cmds,
@@ -467,8 +469,10 @@ mod tests {
 
     #[test]
     fn rate_limit_off_sends_after_init_with_no_ack() {
-        let mut cfg = Config::default();
-        cfg.rate_limit_off = true;
+        let cfg = Config {
+            rate_limit_off: true,
+            ..Config::default()
+        };
         let cmds = run_init(cfg);
         assert_eq!(
             cmds,

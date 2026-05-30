@@ -59,11 +59,17 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
+/// `(pgn, src, secondary_text)` — the secondary text is the
+/// readable value of the discriminating field (Instance / Reference
+/// / User ID / …), `None` when none of the discriminator fields is
+/// present.
+type CacheKey = (u32, u8, Option<String>);
+
 pub struct SnapshotStore {
-    /// Keyed on `(pgn, src, secondary_text)` so the same PGN /
-    /// source pair with different sub-targets (multiple AIS ships,
-    /// multiple sensor instances, ...) coexist.
-    cache: Mutex<HashMap<(u32, u8, Option<String>), CacheEntry>>,
+    /// Keyed on [`CacheKey`] so the same PGN / source pair with
+    /// different sub-targets (multiple AIS ships, multiple sensor
+    /// instances, ...) coexist.
+    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
 }
 
 impl SnapshotStore {
@@ -101,7 +107,8 @@ impl SnapshotStore {
 
         // Group live entries by PGN, preserving per-PGN order by src
         // for readability.
-        let mut by_pgn: HashMap<u32, Vec<((u8, &Option<String>), &CacheEntry)>> = HashMap::new();
+        type GroupKey<'a> = (u8, &'a Option<String>);
+        let mut by_pgn: HashMap<u32, Vec<(GroupKey<'_>, &CacheEntry)>> = HashMap::new();
         for ((pgn, src, sec), entry) in guard.iter() {
             by_pgn.entry(*pgn).or_default().push(((*src, sec), entry));
         }

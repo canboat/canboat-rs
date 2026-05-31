@@ -112,11 +112,7 @@ struct Cli {
     /// and writes need to go to a different endpoint (e.g. n2kd's
     /// input-stream port). Without this flag, reads and writes
     /// share the single `--canboat-csv` socket.
-    #[arg(
-        long,
-        value_name = "URL",
-        requires = "canboat_csv"
-    )]
+    #[arg(long, value_name = "URL", requires = "canboat_csv")]
     canboat_csv_write: Option<String>,
 
     /// Baud rate for serial devices. Defaults: 115200 for NGT-1,
@@ -525,9 +521,7 @@ fn open_maretron_pair(url: &str) -> io::Result<(Box<dyn Read + Send>, Box<dyn Wr
     open_tcp_pair(url, 6543, "maretron")
 }
 
-fn open_canboat_csv_pair(
-    url: &str,
-) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
+fn open_canboat_csv_pair(url: &str) -> io::Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
     open_tcp_pair(url, 2603, "canboat-csv")
 }
 

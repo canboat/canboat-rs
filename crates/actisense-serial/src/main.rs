@@ -163,8 +163,7 @@ fn run(cli: Cli) -> Result<()> {
     // In -w mode against a serial device we still poll & discard the
     // device's bytes (kernel buffer hygiene); for non-serial sources
     // -w just skips the read entirely.
-    let do_read_device =
-        !cli.write_only || matches!(read_source, InputSource::Serial(_));
+    let do_read_device = !cli.write_only || matches!(read_source, InputSource::Serial(_));
 
     // --- Open the input source. For a serial device that we'll also
     // be writing to, we clone the handle so the writer thread has its

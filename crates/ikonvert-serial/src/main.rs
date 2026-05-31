@@ -8,15 +8,19 @@
 //! delegated to `canboat-io::device`, so this binary is mostly CLI
 //! plumbing.
 //!
-//! Modes (combinable, mirror canboat's C tool):
+//! Modes mirror canboat v6.2.0:
 //!
 //! ```text
 //!     (none)  bidirectional
-//!     -r      read-only — never read stdin, never write device
-//!     -w      write-only — never read device
-//!     -p      passthru — read stdin but discard it
-//!     -o      output-commands — echo each stdin line to stdout
+//!     -r      read-only — skip stdin entirely (init handshake still runs)
+//!     -w      write-only — drain device frames but don't emit them
+//!     -p      passthru — send stdin to device AND echo it to stdout
 //! ```
+//!
+//! The iKonvert boots into `N2NET_OFFLINE` and emits nothing until the
+//! host sends `N2NET_INIT`, so the init handshake runs in `-r` too;
+//! `-r` is implemented at the parse layer (no stdin pump), not by
+//! disabling writes.
 
 use std::fs::File;
 use std::io::{self, BufRead, BufWriter, Read, Write};
@@ -57,21 +61,19 @@ struct Cli {
     #[arg(short = 'b', long = "baud", alias = "speed", short_alias = 's', default_value_t = DEFAULT_BAUD)]
     baud: u32,
 
-    /// Read-only mode.
+    /// Read-only mode — never read stdin; device init handshake still runs.
     #[arg(short = 'r', long = "read-only")]
     read_only: bool,
 
-    /// Write-only mode.
+    /// Write-only mode — read stdin and write to device; drain device
+    /// frames but don't emit them on stdout.
     #[arg(short = 'w', long = "write-only")]
     write_only: bool,
 
-    /// Passthru mode — read stdin but don't forward to device.
+    /// Passthru mode — send stdin to the device AND echo each line to
+    /// stdout. To suppress device writes use `-r`.
     #[arg(short = 'p', long)]
     passthru: bool,
-
-    /// Echo each stdin line back to stdout.
-    #[arg(short = 'o', long = "output-commands")]
-    output_commands: bool,
 
     /// Optional comma-separated RX filter list. If set, brings the
     /// device online in NORMAL mode rather than ALL.
@@ -152,7 +154,9 @@ fn run(cli: Cli) -> Result<()> {
 
     // Replay / read-from-stdin mode skips the init handshake; with no
     // real device behind the writer side there's nothing to ACK.
-    let config = if do_init && !cli.read_only {
+    // Note: -r still runs init against a real device — the iKonvert
+    // boots OFFLINE and emits nothing until N2NET_INIT lands.
+    let config = if do_init {
         ikonvert::Config {
             rx_list: cli.rx.clone(),
             tx_list: cli.tx.clone(),
@@ -164,18 +168,18 @@ fn run(cli: Cli) -> Result<()> {
     };
 
     let handle = ikonvert::run(reader, writer, config);
-    let sender = handle.frame_sender();
 
-    // Stdin pump — only when we'll actually forward. The codec
-    // handles outbound frames; we just parse PLAIN/FAST lines and
-    // hand them off.
-    let do_read_stdin = !cli.read_only && !cli.write_only;
+    // Stdin pump — only when we'll actually forward to a real device.
+    // In -w we still read stdin (and write to device), we just
+    // suppress the stdout emit downstream; only -r skips stdin
+    // entirely. For replay / read-from-stdin sources there's no
+    // writable device behind us, so don't block on stdin. Only
+    // materialize the FrameSender if we're using it — otherwise the
+    // extra cmd_tx clone keeps the writer thread alive forever and
+    // handle.join() hangs after the reader hits EOF.
+    let do_read_stdin = !cli.read_only && do_init;
     let stdin_join = if do_read_stdin {
-        Some(spawn_stdin_pump(
-            sender.clone(),
-            cli.passthru,
-            cli.output_commands,
-        ))
+        Some(spawn_stdin_pump(handle.frame_sender(), cli.passthru))
     } else {
         None
     };
@@ -214,18 +218,14 @@ fn drain_frames_to_stdout<W: Write>(
     Ok(())
 }
 
-fn spawn_stdin_pump(
-    sender: FrameSender,
-    passthru: bool,
-    output_commands: bool,
-) -> thread::JoinHandle<()> {
+fn spawn_stdin_pump(sender: FrameSender, passthru: bool) -> thread::JoinHandle<()> {
     thread::Builder::new()
         .name("stdin-pump".into())
-        .spawn(move || stdin_pump_thread(sender, passthru, output_commands))
+        .spawn(move || stdin_pump_thread(sender, passthru))
         .expect("spawn stdin pump")
 }
 
-fn stdin_pump_thread(sender: FrameSender, passthru: bool, output_commands: bool) {
+fn stdin_pump_thread(sender: FrameSender, passthru: bool) {
     let stdin = io::stdin();
     let mut lock = stdin.lock();
     let mut line = String::with_capacity(512);
@@ -240,15 +240,12 @@ fn stdin_pump_thread(sender: FrameSender, passthru: bool, output_commands: bool)
                 return;
             }
         }
-        if output_commands {
+        if passthru {
             let _ = stdout.write_all(line.as_bytes());
             let _ = stdout.flush();
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if passthru {
             continue;
         }
         let frame = match parse_plain(trimmed) {

@@ -7,14 +7,13 @@
 //!   `N2K_MSG_SEND` (0x94) frames, and writes them to the serial port
 //!   so they appear on the NMEA 2000 bus.
 //!
-//! Mode flags mirror the C `actisense-serial`. They can be combined:
+//! Mode flags mirror the C `actisense-serial` (canboat v6.2.0):
 //!
 //! ```text
 //!     (none)  bidirectional
-//!     -r      read-only — never read stdin, open device read-only
-//!     -w      write-only — never read device
-//!     -p      passthru — read stdin but discard it (don't write to device)
-//!     -o      output-commands — also echo each stdin line to stdout
+//!     -r      read-only — skip stdin entirely
+//!     -w      write-only — drain device output but don't emit it
+//!     -p      passthru — send stdin to device AND echo it to stdout
 //! ```
 //!
 //! The architecture is three sync threads:
@@ -89,20 +88,15 @@ struct Cli {
     #[arg(short = 'r', long = "read-only")]
     read_only: bool,
 
-    /// Write-only mode — never read the device. Useful for blind
-    /// transmission tests.
+    /// Write-only mode — read stdin and write to device; drain device
+    /// output but don't emit it on stdout.
     #[arg(short = 'w', long = "write-only")]
     write_only: bool,
 
-    /// Passthru mode — read stdin but discard it (do NOT forward to
-    /// device). Combined with `-o`, lets you tee canboat traffic.
+    /// Passthru mode — send stdin to the device AND echo each line to
+    /// stdout. To suppress device writes use `-r`.
     #[arg(short = 'p', long)]
     passthru: bool,
-
-    /// Echo each stdin line back to stdout. Pairs with `-p` to make
-    /// stdin → stdout a no-op of the canboat stream.
-    #[arg(short = 'o', long = "output-commands")]
-    output_commands: bool,
 
     /// Exit if no frame has been read in this many seconds (0 disables).
     #[arg(short = 't', long, default_value_t = 0u64)]
@@ -166,7 +160,11 @@ fn run(cli: Cli) -> Result<()> {
     // and prevent clean shutdown when the device read loop ends (e.g.
     // when replaying from `--file`).
     let do_read_stdin = do_write;
-    let do_read_device = !cli.write_only;
+    // In -w mode against a serial device we still poll & discard the
+    // device's bytes (kernel buffer hygiene); for non-serial sources
+    // -w just skips the read entirely.
+    let do_read_device =
+        !cli.write_only || matches!(read_source, InputSource::Serial(_));
 
     // --- Open the input source. For a serial device that we'll also
     // be writing to, we clone the handle so the writer thread has its
@@ -214,20 +212,21 @@ fn run(cli: Cli) -> Result<()> {
     // --- Spawn the stdin pump if we're going to consume stdin.
     let stdin_join = if do_read_stdin {
         let tx_for_writer = write_tx.clone();
-        let echo = cli.output_commands;
         let pass = cli.passthru;
         let join = thread::Builder::new()
             .name("stdin-pump".into())
-            .spawn(move || stdin_pump_thread(tx_for_writer, pass, echo))
+            .spawn(move || stdin_pump_thread(tx_for_writer, pass))
             .expect("spawn stdin pump");
         Some(join)
     } else {
         None
     };
 
-    // --- Main thread: read device bytes and emit PLAIN/FAST.
+    // --- Main thread: read device bytes and emit PLAIN/FAST. In -w
+    // mode against a serial device we still read but suppress the
+    // emit, so the kernel RX buffer doesn't back up.
     if do_read_device {
-        run_read_loop(&mut read_handle, &mut out, cli.timeout)?;
+        run_read_loop(&mut read_handle, &mut out, cli.timeout, cli.write_only)?;
     }
 
     // Drop the writer's sender first so the writer thread sees EOF on
@@ -289,7 +288,12 @@ impl Write for SerialWriter {
     }
 }
 
-fn run_read_loop<R: Read>(reader: &mut R, out: &mut impl Write, timeout_secs: u64) -> Result<()> {
+fn run_read_loop<R: Read>(
+    reader: &mut R,
+    out: &mut impl Write,
+    timeout_secs: u64,
+    suppress_output: bool,
+) -> Result<()> {
     let mut pump = BytePump::new(reader);
     let mut decoder = Ngt1Decoder::new();
     let mut line = String::with_capacity(256);
@@ -302,6 +306,9 @@ fn run_read_loop<R: Read>(reader: &mut R, out: &mut impl Write, timeout_secs: u6
             Ok(None) => break,
             Ok(Some(chunk)) => {
                 last_rx = std::time::Instant::now();
+                if suppress_output {
+                    continue;
+                }
                 for ev in decoder.push_bytes(chunk) {
                     if let NgtEvent::Message(msg) = ev {
                         if let Some(frame) = msg.to_raw_frame() {
@@ -373,11 +380,7 @@ fn writer_thread<W: Write>(mut device: W, rx: mpsc::Receiver<RawFrame>) {
     }
 }
 
-fn stdin_pump_thread(
-    write_tx: Option<mpsc::Sender<RawFrame>>,
-    passthru: bool,
-    output_commands: bool,
-) {
+fn stdin_pump_thread(write_tx: Option<mpsc::Sender<RawFrame>>, passthru: bool) {
     let stdin = io::stdin();
     let mut lock = stdin.lock();
     let mut line = String::with_capacity(512);
@@ -392,16 +395,14 @@ fn stdin_pump_thread(
                 return;
             }
         }
-        if output_commands {
-            // Echo verbatim (line already has trailing newline).
+        if passthru {
+            // Echo verbatim (line already has trailing newline) in
+            // addition to forwarding the parsed frame to the device.
             let _ = stdout.write_all(line.as_bytes());
             let _ = stdout.flush();
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if passthru {
             continue;
         }
         let Some(tx) = write_tx.as_ref() else {

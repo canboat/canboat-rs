@@ -4,7 +4,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 const DLE: u8 = 0x10;
 const STX: u8 = 0x02;
@@ -64,6 +64,7 @@ fn replays_synthetic_ngt1_into_plain_line() {
     let out = Command::new(&exe)
         .arg("--file")
         .arg(&cap_path)
+        .stdin(Stdio::null())
         .output()
         .expect("run actisense-serial");
     let _ = std::fs::remove_file(&cap_path);

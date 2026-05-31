@@ -3,7 +3,7 @@
 
 use std::io::Write;
 use std::path::PathBuf;
-use std::process::Command;
+use std::process::{Command, Stdio};
 
 #[test]
 fn replays_synthetic_ikonvert_into_plain_line() {
@@ -24,6 +24,7 @@ fn replays_synthetic_ikonvert_into_plain_line() {
     let out = Command::new(test_binary_path())
         .arg("--file")
         .arg(&cap_path)
+        .stdin(Stdio::null())
         .output()
         .expect("run ikonvert-serial");
     let _ = std::fs::remove_file(&cap_path);
@@ -35,13 +36,15 @@ fn replays_synthetic_ikonvert_into_plain_line() {
     );
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
     // First line is the canboat format header tag; second is the
-    // decoded frame.
+    // decoded frame. The codec deliberately overrides the iKonvert's
+    // seconds-since-boot timestamp with host wall-clock (matches
+    // canboat C's computeIKonvertTime), so only the post-timestamp
+    // tail is stable across runs.
     let mut lines = stdout.lines();
     assert_eq!(lines.next(), Some("# format=FAST"));
-    assert_eq!(
-        lines.next(),
-        Some("12.345,6,60928,5,255,8,fb,9b,70,22,00,9b,50,c0")
-    );
+    let frame = lines.next().expect("frame line");
+    let (_ts, tail) = frame.split_once(',').expect("comma after timestamp");
+    assert_eq!(tail, "6,60928,5,255,8,fb,9b,70,22,00,9b,50,c0");
 }
 
 fn test_binary_path() -> PathBuf {

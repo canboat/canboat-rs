@@ -14,15 +14,13 @@
 //!   6. On stdin lines that look like PLAIN/FAST, encode them as
 //!      Maretron 0xA5 frames and push them back to the IPG.
 //!
-//! Mode flags mirror the C tool:
+//! Mode flags mirror canboat v6.2.0:
 //!
 //! ```text
 //!   (none)  bidirectional
-//!   -r      read-only — never read stdin, never send to IPG
-//!   -w      write-only — never read from IPG
-//!   -p      passthru — read stdin but discard it (only echo to
-//!           stdout when paired with `-o`)
-//!   -o      echo each stdin line to stdout
+//!   -r      read-only — skip stdin entirely
+//!   -w      write-only — drain IPG frames but don't emit them
+//!   -p      passthru — send stdin to IPG AND echo it to stdout
 //! ```
 
 use std::io::{self, BufRead, BufWriter, Read, Write};
@@ -70,18 +68,15 @@ struct Cli {
     #[arg(short = 'r', long = "read-only")]
     read_only: bool,
 
-    /// Write-only mode — never forward incoming frames to stdout.
+    /// Write-only mode — read stdin and send to IPG; drain IPG frames
+    /// but don't emit them on stdout.
     #[arg(short = 'w', long = "write-only")]
     write_only: bool,
 
-    /// Passthru mode — read stdin but discard (only echo if combined
-    /// with `-o`).
+    /// Passthru mode — send stdin to the IPG AND echo each line to
+    /// stdout. To suppress device writes use `-r`.
     #[arg(short = 'p', long)]
     passthru: bool,
-
-    /// Echo each stdin line back to stdout.
-    #[arg(short = 'o', long = "output-commands")]
-    output_commands: bool,
 
     /// Exit if no IPG frame has been received in N seconds. `0`
     /// disables the timeout.
@@ -182,11 +177,10 @@ fn run(cli: Cli) -> Result<()> {
     // is fine because we only flip after CONNECTED arrives.
     let stdin_join = if !cli.read_only {
         let stdin_tx = tx.clone();
-        let echo = cli.output_commands;
         let pass = cli.passthru;
         let join = thread::Builder::new()
             .name("maretron-stdin".into())
-            .spawn(move || stdin_pump_thread(stdin_tx, pass, echo))
+            .spawn(move || stdin_pump_thread(stdin_tx, pass))
             .expect("spawn stdin");
         Some(join)
     } else {
@@ -245,7 +239,7 @@ fn writer_thread<W: Write>(mut device: W, rx: mpsc::Receiver<TxItem>) {
     }
 }
 
-fn stdin_pump_thread(tx: mpsc::Sender<TxItem>, passthru: bool, output_commands: bool) {
+fn stdin_pump_thread(tx: mpsc::Sender<TxItem>, passthru: bool) {
     let stdin = io::stdin();
     let mut lock = stdin.lock();
     let mut line = String::with_capacity(512);
@@ -260,15 +254,12 @@ fn stdin_pump_thread(tx: mpsc::Sender<TxItem>, passthru: bool, output_commands: 
                 return;
             }
         }
-        if output_commands {
+        if passthru {
             let _ = stdout.write_all(line.as_bytes());
             let _ = stdout.flush();
         }
         let trimmed = line.trim_end_matches(['\r', '\n']);
         if trimmed.is_empty() || trimmed.starts_with('#') {
-            continue;
-        }
-        if passthru {
             continue;
         }
         let frame = match parse_plain(trimmed) {

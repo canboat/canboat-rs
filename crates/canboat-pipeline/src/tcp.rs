@@ -28,13 +28,25 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
 
 use canboat_core::format::{parse_plain, PlainError};
+use canboat_core::RawFrame;
 use canboat_io::device::FrameSender;
+
+/// Where a client-written frame goes. In device mode, we forward to
+/// the device *and* loop it back into the pipeline source so it
+/// appears in NMEA 0183 / snapshot / read-side TCP output, mirroring
+/// the stdin-pump behaviour. In stdin mode there's no device and no
+/// loopback channel, so writes are dropped on the floor.
+#[derive(Clone)]
+pub struct InjectPoint {
+    pub device: FrameSender,
+    pub loopback: mpsc::Sender<RawFrame>,
+}
 
 /// One-shot header sent to every CSV (R/W) client on connect.
 /// Matches the line the canboat C reader binaries
@@ -119,12 +131,12 @@ fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
 /// Direction policy for [`spawn_stream_server`]. Mode `ReadOnly`
 /// shuts down the TCP read direction on every accept; `ReadWrite`
 /// spawns an inbound reader subthread that parses PLAIN/FAST lines
-/// and forwards `RawFrame`s through `sender` if one is configured
+/// and forwards `RawFrame`s through `inject` if one is configured
 /// (silently drops them when `None`, e.g. stdin-mode pipeline with
 /// no device behind it).
 pub enum Direction {
     ReadOnly,
-    ReadWrite { sender: Option<FrameSender> },
+    ReadWrite { inject: Option<InjectPoint> },
 }
 
 /// Bind a TCP server that streams `hub` broadcast lines out to every
@@ -146,10 +158,10 @@ pub fn spawn_stream_server(
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding {name} TCP port {}:{}", bind, port))?;
     let mode = match (&direction, header.is_some()) {
-        (Direction::ReadWrite { sender: Some(_) }, true) => "R/W + header",
-        (Direction::ReadWrite { sender: Some(_) }, false) => "R/W",
-        (Direction::ReadWrite { sender: None }, true) => "R/W (writes dropped) + header",
-        (Direction::ReadWrite { sender: None }, false) => "R/W (writes dropped)",
+        (Direction::ReadWrite { inject: Some(_) }, true) => "R/W + header",
+        (Direction::ReadWrite { inject: Some(_) }, false) => "R/W",
+        (Direction::ReadWrite { inject: None }, true) => "R/W (writes dropped) + header",
+        (Direction::ReadWrite { inject: None }, false) => "R/W (writes dropped)",
         (Direction::ReadOnly, _) => "RO",
     };
     log::info!("{name} server listening on {}:{} ({mode})", bind, port);
@@ -178,8 +190,8 @@ fn stream_accept(
         let h = hub.clone();
         let d = match &direction {
             Direction::ReadOnly => Direction::ReadOnly,
-            Direction::ReadWrite { sender } => Direction::ReadWrite {
-                sender: sender.clone(),
+            Direction::ReadWrite { inject } => Direction::ReadWrite {
+                inject: inject.clone(),
             },
         };
         thread::Builder::new()
@@ -209,14 +221,14 @@ fn run_stream_client(
             None
         }
         // R/W: spawn a reader subthread on its own socket clone.
-        // When no device sender is configured (stdin mode) the
-        // reader silently drops inbound lines — we still accept the
-        // writes (no FIN), we just have nowhere to forward them.
-        Direction::ReadWrite { sender } => match stream.try_clone() {
+        // When no inject point is configured (stdin mode) the reader
+        // silently drops inbound lines — we still accept the writes
+        // (no FIN), we just have nowhere to forward them.
+        Direction::ReadWrite { inject } => match stream.try_clone() {
             Ok(read_stream) => Some(
                 thread::Builder::new()
                     .name(format!("{name}-client-read"))
-                    .spawn(move || run_inbound_reader(name, read_stream, sender))
+                    .spawn(move || run_inbound_reader(name, read_stream, inject))
                     .expect("spawn inbound reader"),
             ),
             Err(e) => {
@@ -247,18 +259,18 @@ fn run_stream_client(
     }
 }
 
-fn run_inbound_reader(name: &'static str, stream: TcpStream, sender: Option<FrameSender>) {
+fn run_inbound_reader(name: &'static str, stream: TcpStream, inject: Option<InjectPoint>) {
     let reader = BufReader::new(stream);
     for line in reader.lines() {
         let line = match line {
             Ok(l) => l,
             Err(_) => return,
         };
-        match &sender {
+        match &inject {
             // Device wired up: forward the line. Stop when the writer
-            // has gone away.
-            Some(s) => {
-                if !forward_plain_line(&line, s) {
+            // (or pipeline) has gone away.
+            Some(i) => {
+                if !forward_plain_line(&line, i) {
                     return;
                 }
             }
@@ -279,17 +291,17 @@ fn run_inbound_reader(name: &'static str, stream: TcpStream, sender: Option<Fram
 /// Bind a write-only TCP server. Each client's lines are parsed as
 /// PLAIN/FAST and sent to the device writer. Useful for clients that
 /// just want to inject N2K traffic without reading anything back.
-pub fn spawn_writeonly(bind: Ipv4Addr, port: u16, sender: FrameSender) -> Result<JoinHandle<()>> {
+pub fn spawn_writeonly(bind: Ipv4Addr, port: u16, inject: InjectPoint) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding write-only TCP port {}:{}", bind, port))?;
     log::info!("write-only server listening on {}:{}", bind, port);
     Ok(thread::Builder::new()
         .name("write-accept".into())
-        .spawn(move || writeonly_accept(listener, sender))
+        .spawn(move || writeonly_accept(listener, inject))
         .expect("spawn write-only accept"))
 }
 
-fn writeonly_accept(listener: TcpListener, sender: FrameSender) {
+fn writeonly_accept(listener: TcpListener, inject: InjectPoint) {
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(s) => s,
@@ -299,15 +311,15 @@ fn writeonly_accept(listener: TcpListener, sender: FrameSender) {
             }
         };
         log::info!("write-only client connected: {peer}");
-        let s = sender.clone();
+        let i = inject.clone();
         thread::Builder::new()
             .name("write-client".into())
-            .spawn(move || run_writeonly_client(stream, s))
+            .spawn(move || run_writeonly_client(stream, i))
             .ok();
     }
 }
 
-fn run_writeonly_client(stream: TcpStream, sender: FrameSender) {
+fn run_writeonly_client(stream: TcpStream, inject: InjectPoint) {
     set_nodelay(&stream, "write-only");
     let reader = BufReader::new(stream);
     for line in reader.lines() {
@@ -318,15 +330,17 @@ fn run_writeonly_client(stream: TcpStream, sender: FrameSender) {
                 return;
             }
         };
-        if !forward_plain_line(&line, &sender) {
+        if !forward_plain_line(&line, &inject) {
             return;
         }
     }
 }
 
-/// Parse one PLAIN/FAST line and forward to the device writer.
-/// Returns `false` when the writer has gone away (caller should stop).
-fn forward_plain_line(line: &str, sender: &FrameSender) -> bool {
+/// Parse one PLAIN/FAST line, send to the device, AND loop it back
+/// into the pipeline source so it appears in the pipeline's output
+/// streams. Returns `false` when either the device writer or the
+/// pipeline has gone away (caller should stop).
+fn forward_plain_line(line: &str, inject: &InjectPoint) -> bool {
     let trimmed = line.trim_end_matches(['\r', '\n']);
     if trimmed.is_empty() || trimmed.starts_with('#') {
         return true;
@@ -343,7 +357,12 @@ fn forward_plain_line(line: &str, sender: &FrameSender) -> bool {
         return true;
     }
     match parse_plain(trimmed) {
-        Ok(frame) => sender.send_frame(frame).is_ok(),
+        Ok(frame) => {
+            if inject.device.send_frame(frame.clone()).is_err() {
+                return false;
+            }
+            inject.loopback.send(frame).is_ok()
+        }
         Err(PlainError::Empty) => true,
         Err(e) => {
             log_bad_plain_line(trimmed, &e);

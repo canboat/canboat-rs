@@ -42,7 +42,7 @@ use canboat_core::format::{
 };
 use canboat_core::output::CamelCase;
 use canboat_core::{LoadOptions, PgnDatabase, RawFrame};
-use canboat_io::device::{self, Supervisor};
+use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
 
 use crate::hub::Hub;
@@ -280,6 +280,24 @@ fn run(cli: Cli) -> Result<()> {
     let (frames_rx, supervisor, pre_coalesced) = open_source(&cli)?;
     let device_sender = supervisor.as_ref().map(|s| s.frame_sender());
 
+    // In device mode treat stdin like `actisense-serial -p`: parse
+    // PLAIN/FAST lines, write the resulting frames to the device,
+    // AND loop them back into the pipeline source so they show up in
+    // NMEA 0183 / TCP outputs alongside device-originated frames.
+    // TCP read/write ports get the same loopback channel so client
+    // writes behave the same way.
+    let (frames_rx, inject) = match device_sender.clone() {
+        Some(sender) => {
+            let (rx, loopback) = install_stdin_loopback(frames_rx, sender, pre_coalesced.clone());
+            let inject = tcp::InjectPoint {
+                device: device_sender.clone().expect("device_sender Some"),
+                loopback,
+            };
+            (rx, Some(inject))
+        }
+        None => (frames_rx, None),
+    };
+
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();
     if let Some(store) = snapshot.as_ref() {
         tcp_joins.push(tcp::spawn_snapshot(
@@ -301,7 +319,7 @@ fn run(cli: Cli) -> Result<()> {
             cli.csv_port,
             hubs.csv.clone(),
             tcp::Direction::ReadWrite {
-                sender: device_sender.clone(),
+                inject: inject.clone(),
             },
             Some(tcp::CANBOAT_FORMAT_FAST_HEADER),
         )?);
@@ -325,13 +343,13 @@ fn run(cli: Cli) -> Result<()> {
             cli.analyzer_port,
             hubs.analyzer.clone(),
             tcp::Direction::ReadWrite {
-                sender: device_sender.clone(),
+                inject: inject.clone(),
             },
             None,
         )?);
     }
-    if let (Some(sender), true) = (device_sender, cli.write_port != 0) {
-        tcp_joins.push(tcp::spawn_writeonly(cli.bind, cli.write_port, sender)?);
+    if let (Some(i), true) = (inject, cli.write_port != 0) {
+        tcp_joins.push(tcp::spawn_writeonly(cli.bind, cli.write_port, i)?);
     }
 
     let camel_case = if cli.upper_camel {
@@ -460,7 +478,7 @@ fn open_source(
     let coalesced_for_pump = pre_coalesced.clone();
     thread::Builder::new()
         .name("stdin-pump".into())
-        .spawn(move || stdin_pump(tx, coalesced_for_pump))
+        .spawn(move || stdin_pump(tx, coalesced_for_pump, None))
         .expect("spawn stdin-pump");
     Ok((rx, None, pre_coalesced))
 }
@@ -562,8 +580,15 @@ fn open_tcp_pair(
 
 /// Read PLAIN/FAST lines off stdin, parse to `RawFrame`, push onto
 /// `tx`. Auto-detects between PLAIN and FAST on the first non-empty
-/// line.
-fn stdin_pump(tx: mpsc::Sender<RawFrame>, pre_coalesced: Arc<AtomicBool>) {
+/// line. When `device_sender` is `Some`, each parsed frame is also
+/// forwarded to the device — mirroring `actisense-serial -p`'s
+/// "send to device AND echo to stdout" behaviour, where the echo
+/// half is implemented here as a loopback into the pipeline source.
+fn stdin_pump(
+    tx: mpsc::Sender<RawFrame>,
+    pre_coalesced: Arc<AtomicBool>,
+    device_sender: Option<FrameSender>,
+) {
     let stdin = io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut line = String::with_capacity(1024);
@@ -607,10 +632,48 @@ fn stdin_pump(tx: mpsc::Sender<RawFrame>, pre_coalesced: Arc<AtomicBool>) {
         let Ok(Some(frame)) = parse_with(active_format.unwrap(), trimmed) else {
             continue;
         };
+        if let Some(sender) = &device_sender {
+            // Drop on the floor if the device is currently
+            // disconnected; the supervisor will reconnect, but stdin
+            // injection is best-effort.
+            let _ = sender.send_frame(frame.clone());
+        }
         if tx.send(frame).is_err() {
             return;
         }
     }
+}
+
+/// Spawn a forwarder thread that pulls from `device_frames_rx` into a
+/// fresh merge channel, plus a stdin pump that parses PLAIN/FAST
+/// lines from stdin and pushes them onto the same merge channel
+/// *and* writes them to the device via `sender`. Returns
+/// `(merge_rx, loopback_tx)` — the receiver becomes the pipeline's
+/// source and the sender is handed to TCP servers so client writes
+/// can join the same loopback.
+fn install_stdin_loopback(
+    device_frames_rx: mpsc::Receiver<RawFrame>,
+    sender: FrameSender,
+    pre_coalesced: Arc<AtomicBool>,
+) -> (mpsc::Receiver<RawFrame>, mpsc::Sender<RawFrame>) {
+    let (merge_tx, merge_rx) = mpsc::channel::<RawFrame>();
+    let merge_tx_device = merge_tx.clone();
+    let merge_tx_stdin = merge_tx.clone();
+    thread::Builder::new()
+        .name("device-forward".into())
+        .spawn(move || {
+            while let Ok(f) = device_frames_rx.recv() {
+                if merge_tx_device.send(f).is_err() {
+                    return;
+                }
+            }
+        })
+        .expect("spawn device-forward");
+    thread::Builder::new()
+        .name("stdin-pump".into())
+        .spawn(move || stdin_pump(merge_tx_stdin, pre_coalesced, Some(sender)))
+        .expect("spawn stdin-pump");
+    (merge_rx, merge_tx)
 }
 
 // Suppress an unused-import warning when no device flag is built (we

@@ -31,7 +31,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use canboat_core::format::ikonvert::{
-    self, IkonvertLine, TX_LIMIT_OFF, TX_OFFLINE, TX_ONLINE_ALL, TX_ONLINE_NORMAL,
+    self, synthesize_network_status, IkonvertLine, TX_LIMIT_OFF, TX_OFFLINE, TX_ONLINE_ALL,
+    TX_ONLINE_NORMAL,
 };
 use canboat_core::RawFrame;
 
@@ -184,6 +185,27 @@ impl Decoder {
             log::warn!("ikonvert: NAK ({rest})");
             // Stay at the current state — canboat C does the same;
             // a typical NAK is "already offline" which is harmless.
+            return;
+        }
+        // `$PDGY,000000,…` — network-status heartbeat. The populated
+        // form is surfaced as a synthesized IKONVERT_BEM frame (PGN
+        // 262400); the empty keep-alive form (`,,,,,,`) is logged
+        // only. Either way the heartbeat still drives the during-init
+        // resend, mirroring C's unconditional `sendNextInitCommand`
+        // call after each handled ASCII line.
+        if body.starts_with("000000,") {
+            match synthesize_network_status(body, now_iso_ms()) {
+                Some(frame) => {
+                    log::debug!(
+                        "ikonvert: synthesized network status (load={} count={})",
+                        frame.data[0],
+                        frame.data[5],
+                    );
+                    events.push(DeviceEvent::Frame(frame));
+                }
+                None => log::debug!("ikonvert: keep-alive heartbeat"),
+            }
+            self.maybe_resend_offline(events);
             return;
         }
         // Any other `$PDGY,…` line that arrives while we're waiting
@@ -510,6 +532,35 @@ mod tests {
                 assert_eq!(String::from_utf8_lossy(b), "$PDGY,N2NET_OFFLINE\r\n");
             }
             _ => panic!("expected SendBytes"),
+        }
+    }
+
+    #[test]
+    fn populated_heartbeat_emits_synthetic_frame() {
+        // Drive past the init handshake so the resend path is inert
+        // and the only event we should see is the synthesized frame.
+        let decoder = Decoder::new(Config::default());
+        let mut events = Vec::new();
+        decoder.handle_control("TEXT,welcome", &mut events); // → INIT,ALL
+        events.clear();
+        decoder.handle_control("ACK,init", &mut events); // → done
+        events.clear();
+
+        decoder.handle_control("000000,38,1,38,753,2,0", &mut events);
+        assert_eq!(events.len(), 1, "data heartbeat should emit one frame");
+        match &events[0] {
+            DeviceEvent::Frame(f) => {
+                assert_eq!(f.pgn, 0x40100); // IKONVERT_BEM
+                assert_eq!(f.prio, 7);
+                assert_eq!(f.src, 0);
+                assert_eq!(f.dst, 255);
+                assert_eq!(f.data.len(), 15);
+                // Spot-check a couple of bytes; full coverage lives
+                // in the canboat-core unit test.
+                assert_eq!(f.data[0], 38, "CAN load");
+                assert_eq!(&f.data[6..10], &[0xf1, 0x02, 0, 0], "uptime LE = 753");
+            }
+            other => panic!("expected Frame, got {other:?}"),
         }
     }
 

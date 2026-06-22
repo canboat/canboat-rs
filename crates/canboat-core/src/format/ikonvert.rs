@@ -143,6 +143,83 @@ pub fn encode_tx_frame(frame: &crate::frame::RawFrame) -> String {
     out
 }
 
+/// `IKONVERT_BEM` — start of the iKonvert synthetic-PGN range. The
+/// network-status heartbeat the device emits unsolicitedly (`$PDGY,
+/// 000000,<load>,<errors>,<count>,<uptime>,<addr>,<rejected>`) is
+/// surfaced as a synthetic frame at this PGN, matching
+/// `IKONVERT_BEM` in `canboat/common/common.h`. The matching field
+/// definition lives in `data/synthetic-pgns.json` as
+/// `ikonvertNetworkStatus`.
+pub const IKONVERT_BEM: u32 = 0x40100;
+
+/// Synthesize an `iKonvert: Network status` (PGN [`IKONVERT_BEM`])
+/// frame from a `$PDGY,000000,…` body.
+///
+/// `body` is the text after the `$PDGY,` prefix. Returns `None` for
+/// the keep-alive form (all six fields empty) and for any body that
+/// does not start with `000000,`. Mirrors the heartbeat branch of
+/// `parseIKonvertAsciiMessage` in `canboat/ikonvert-serial/ikonvert-serial.c`:
+/// 15 bytes prefilled with `0xff`, then load/errors overlaid
+/// unconditionally and count/uptime/addr/rejected overlaid only when
+/// non-zero (so the N2K "no data" sentinel survives).
+pub fn synthesize_network_status(body: &str, timestamp: String) -> Option<RawFrame> {
+    let rest = body.strip_prefix("000000,")?;
+    if rest == ",,,,," {
+        return None;
+    }
+    let mut fields = rest.split(',');
+    let load = parse_status_field(fields.next()).unwrap_or(0xff);
+    let errors = parse_status_field(fields.next()).unwrap_or(-1);
+    let count = parse_status_field(fields.next()).unwrap_or(0);
+    let uptime = parse_status_field(fields.next()).unwrap_or(0);
+    let addr = parse_status_field(fields.next()).unwrap_or(0);
+    let rejected = parse_status_field(fields.next()).unwrap_or(0);
+
+    let mut data = [0xffu8; 15];
+    data[0] = load as u8;
+    let errors_u = errors as u32;
+    data[1] = errors_u as u8;
+    data[2] = (errors_u >> 8) as u8;
+    data[3] = (errors_u >> 16) as u8;
+    data[4] = (errors_u >> 24) as u8;
+    if count != 0 {
+        data[5] = count as u8;
+    }
+    if uptime != 0 {
+        let uptime_u = uptime as u32;
+        data[6] = uptime_u as u8;
+        data[7] = (uptime_u >> 8) as u8;
+        data[8] = (uptime_u >> 16) as u8;
+        data[9] = (uptime_u >> 24) as u8;
+    }
+    if addr != 0 {
+        data[10] = addr as u8;
+    }
+    if rejected != 0 {
+        let rejected_u = rejected as u32;
+        data[11] = rejected_u as u8;
+        data[12] = (rejected_u >> 8) as u8;
+        data[13] = (rejected_u >> 16) as u8;
+        data[14] = (rejected_u >> 24) as u8;
+    }
+    Some(RawFrame {
+        timestamp: Some(timestamp),
+        prio: 7,
+        pgn: IKONVERT_BEM,
+        src: 0,
+        dst: 255,
+        data: data.into_iter().collect(),
+    })
+}
+
+fn parse_status_field(s: Option<&str>) -> Option<i32> {
+    let s = s?;
+    if s.is_empty() {
+        return None;
+    }
+    s.parse().ok()
+}
+
 /// `$PDGY,N2NET_INIT,ALL\r\n` — bring the device online with all PGNs.
 pub const TX_ONLINE_ALL: &str = "$PDGY,N2NET_INIT,ALL\r\n";
 
@@ -262,6 +339,41 @@ mod tests {
         // then base64 then CRLF. prio and src are NOT included on TX.
         let line = encode_tx_frame(&frame);
         assert_eq!(line, "!PDGY,60928,255,AQID\r\n");
+    }
+
+    #[test]
+    fn synthesizes_network_status_from_populated_heartbeat() {
+        // `$PDGY,000000,38,1,38,753,2,0` — the form the iKonvert emits
+        // once it has bus data. Values from a real capture.
+        let f = synthesize_network_status("000000,38,1,38,753,2,0", "ts".into()).unwrap();
+        assert_eq!(f.pgn, IKONVERT_BEM);
+        assert_eq!(f.prio, 7);
+        assert_eq!(f.src, 0);
+        assert_eq!(f.dst, 255);
+        assert_eq!(f.data.len(), 15);
+        assert_eq!(
+            f.data.as_slice(),
+            &[
+                38, // CAN load
+                0x01, 0x00, 0x00, 0x00, // errors LE
+                38,   // device count
+                0xf1, 0x02, 0x00, 0x00, // uptime LE (753)
+                2,    // gateway address
+                0xff, 0xff, 0xff, 0xff, // rejected = 0 → keep 0xff
+            ]
+        );
+    }
+
+    #[test]
+    fn keep_alive_heartbeat_does_not_synthesize() {
+        // The iKonvert keep-alive form: `$PDGY,000000,,,,,,`.
+        assert!(synthesize_network_status("000000,,,,,,", "ts".into()).is_none());
+    }
+
+    #[test]
+    fn non_heartbeat_body_does_not_synthesize() {
+        assert!(synthesize_network_status("ACK,whatever", "ts".into()).is_none());
+        assert!(synthesize_network_status("TEXT,banner", "ts".into()).is_none());
     }
 
     #[test]

@@ -87,7 +87,7 @@ fn replays_ikonvert_data_heartbeat_into_synthesized_pgn() {
     let (_ts, tail) = frame.split_once(',').expect("comma after timestamp");
     assert_eq!(
         tail,
-        "7,262400,0,255,15,26,01,00,00,00,26,f1,02,00,00,02,ff,ff,ff,ff"
+        "7,262400,2,255,15,26,01,00,00,00,26,f1,02,00,00,02,ff,ff,ff,ff"
     );
 }
 

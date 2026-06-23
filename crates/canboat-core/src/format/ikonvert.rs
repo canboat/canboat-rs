@@ -206,7 +206,11 @@ pub fn synthesize_network_status(body: &str, timestamp: String) -> Option<RawFra
         timestamp: Some(timestamp),
         prio: 7,
         pgn: IKONVERT_BEM,
-        src: 0,
+        // Source = the gateway's claimed CAN address (5th heartbeat
+        // field). Lets downstream tools attribute the network-status
+        // PGN to the iKonvert itself instead of bucketing every
+        // gateway's status into src=0.
+        src: addr as u8,
         dst: 255,
         data: data.into_iter().collect(),
     })
@@ -348,7 +352,7 @@ mod tests {
         let f = synthesize_network_status("000000,38,1,38,753,2,0", "ts".into()).unwrap();
         assert_eq!(f.pgn, IKONVERT_BEM);
         assert_eq!(f.prio, 7);
-        assert_eq!(f.src, 0);
+        assert_eq!(f.src, 2, "src tracks the gateway address field");
         assert_eq!(f.dst, 255);
         assert_eq!(f.data.len(), 15);
         assert_eq!(

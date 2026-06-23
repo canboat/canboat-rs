@@ -15,8 +15,10 @@
 //!
 //! Step-by-step (per canboat C `sendNextInitCommand`):
 //!
-//!   1. `$PDGY,N2NET_OFFLINE`         → wait ACK
-//!   2. `$PDGY,N2NET_RESET`           → wait ACK   (only if rx/tx list set)
+//!   1. `$PDGY,N2NET_OFFLINE`         → wait ACK (returned as TEXT banner)
+//!   2. `$PDGY,N2NET_RESET`           → wait ACK   (unconditional — wipes
+//!                                                  any RX/TX filter stored
+//!                                                  in the device's NVRAM)
 //!   3. `$PDGY,RX_LIST,<pgns>`        → wait ACK   (only if rx list set)
 //!   4. `$PDGY,TX_LIST,<pgns>`        → wait ACK   (only if tx list set)
 //!   5. `$PDGY,N2NET_INIT,{ALL|NORMAL}` → wait ACK
@@ -48,11 +50,12 @@ pub const IKONVERT_SYNTHETIC_PGN: u32 = 0x40000;
 #[derive(Debug, Clone, Default)]
 pub struct Config {
     /// Comma-separated PGN filter for receive. If set, init enters
-    /// `NORMAL` mode instead of `ALL` and the `N2NET_RESET` /
-    /// `RX_LIST` steps run.
+    /// `NORMAL` mode instead of `ALL` and runs the `RX_LIST` step.
+    /// `N2NET_RESET` is always sent during init regardless of this
+    /// field — see the module-level handshake docs.
     pub rx_list: Option<String>,
     /// Comma-separated PGN filter for transmit. Triggers the
-    /// `N2NET_RESET` / `TX_LIST` steps.
+    /// `TX_LIST` step (the `N2NET_RESET` step always runs).
     pub tx_list: Option<String>,
     /// Disable the iKonvert TX rate limit. Off by default.
     pub rate_limit_off: bool,
@@ -63,10 +66,6 @@ pub struct Config {
 }
 
 impl Config {
-    fn has_lists(&self) -> bool {
-        self.rx_list.is_some() || self.tx_list.is_some()
-    }
-
     /// Replay-friendly variant: no init, no keepalive. The codec
     /// just decodes whatever bytes arrive on the read side.
     pub fn skip_init() -> Self {
@@ -223,14 +222,14 @@ impl Decoder {
     /// * After init is finished, TEXT means the device just rebooted
     ///   itself (bus condition, watchdog, whatever) and is back in
     ///   the pre-init OFFLINE state. Restart the handshake from
-    ///   `N2NET_INIT` — no need to re-send OFFLINE, the device is
+    ///   `N2NET_RESET` — no need to re-send OFFLINE, the device is
     ///   already there.
     /// * Mid-handshake TEXT is unusual; treat it as a soft reset too.
     fn advance_after_text(&self, events: &mut Vec<DeviceEvent>) {
         let mut state = self.init_state.lock().expect("ikonvert state poisoned");
         match *state {
             STATE_WAIT_OFFLINE_ACK => {
-                *state = STATE_MAYBE_RESET;
+                *state = STATE_SEND_RESET;
                 if let Some(cmd) = next_init_command(&mut state, &self.config) {
                     events.push(DeviceEvent::SendBytes(cmd.into_bytes()));
                 } else {
@@ -240,8 +239,8 @@ impl Decoder {
             STATE_DONE => {
                 log::warn!("ikonvert: device reset detected, re-initialising");
                 // Skip OFFLINE since the device is already offline
-                // post-reboot; jump straight to the post-RESET path.
-                *state = STATE_MAYBE_RESET;
+                // post-reboot; resume with the unconditional RESET.
+                *state = STATE_SEND_RESET;
                 if let Some(cmd) = next_init_command(&mut state, &self.config) {
                     events.push(DeviceEvent::SendBytes(cmd.into_bytes()));
                 }
@@ -319,7 +318,7 @@ const STATE_MAYBE_TX_LIST: u32 = 8;
 const STATE_WAIT_TX_LIST_ACK: u32 = 7;
 const STATE_MAYBE_RX_LIST: u32 = 10;
 const STATE_WAIT_RX_LIST_ACK: u32 = 9;
-const STATE_MAYBE_RESET: u32 = 12;
+const STATE_SEND_RESET: u32 = 12;
 const STATE_WAIT_RESET_ACK: u32 = 11;
 const STATE_WAIT_OFFLINE_ACK: u32 = 13;
 
@@ -329,15 +328,13 @@ const STATE_WAIT_OFFLINE_ACK: u32 = 13;
 fn next_init_command(state: &mut u32, config: &Config) -> Option<String> {
     loop {
         match *state {
-            STATE_MAYBE_RESET => {
-                // Step 2 — only when the user has supplied filter lists.
-                if config.has_lists() {
-                    *state = STATE_WAIT_RESET_ACK;
-                    log::info!("ikonvert: send N2NET_RESET");
-                    return Some("$PDGY,N2NET_RESET\r\n".to_string());
-                }
-                *state = STATE_MAYBE_RX_LIST;
-                // fall through
+            STATE_SEND_RESET => {
+                // Always issue N2NET_RESET so any RX/TX filter the
+                // device may have stored in NVRAM from a previous
+                // session is wiped before we (optionally) set our own.
+                *state = STATE_WAIT_RESET_ACK;
+                log::info!("ikonvert: send N2NET_RESET");
+                return Some("$PDGY,N2NET_RESET\r\n".to_string());
             }
             STATE_MAYBE_RX_LIST => {
                 if let Some(list) = &config.rx_list {
@@ -459,15 +456,16 @@ mod tests {
     }
 
     #[test]
-    fn default_init_sends_offline_then_init_all() {
+    fn default_init_sends_offline_reset_init_all() {
         let cmds = run_init(Config::default());
         assert_eq!(
             cmds,
             vec![
                 "$PDGY,N2NET_OFFLINE\r\n".to_string(),
+                "$PDGY,N2NET_RESET\r\n".to_string(),
                 "$PDGY,N2NET_INIT,ALL\r\n".to_string(),
             ],
-            "default init should be OFFLINE → INIT,ALL (no RESET, no lists)"
+            "default init should be OFFLINE → RESET → INIT,ALL"
         );
     }
 
@@ -500,6 +498,7 @@ mod tests {
             cmds,
             vec![
                 "$PDGY,N2NET_OFFLINE\r\n".to_string(),
+                "$PDGY,N2NET_RESET\r\n".to_string(),
                 "$PDGY,N2NET_INIT,ALL\r\n".to_string(),
                 "$PDGY,TX_LIMIT,OFF\r\n".to_string(),
             ]
@@ -510,7 +509,9 @@ mod tests {
     fn extra_ack_after_done_is_ignored() {
         let decoder = Decoder::new(Config::default());
         let mut events = Vec::new();
-        decoder.handle_control("TEXT,welcome", &mut events); // → INIT,ALL
+        decoder.handle_control("TEXT,welcome", &mut events); // → RESET
+        events.clear();
+        decoder.handle_control("ACK,reset", &mut events); // → INIT,ALL
         events.clear();
         decoder.handle_control("ACK,init", &mut events); // → done
         events.clear();
@@ -541,7 +542,9 @@ mod tests {
         // and the only event we should see is the synthesized frame.
         let decoder = Decoder::new(Config::default());
         let mut events = Vec::new();
-        decoder.handle_control("TEXT,welcome", &mut events); // → INIT,ALL
+        decoder.handle_control("TEXT,welcome", &mut events); // → RESET
+        events.clear();
+        decoder.handle_control("ACK,reset", &mut events); // → INIT,ALL
         events.clear();
         decoder.handle_control("ACK,init", &mut events); // → done
         events.clear();
@@ -552,7 +555,7 @@ mod tests {
             DeviceEvent::Frame(f) => {
                 assert_eq!(f.pgn, 0x40100); // IKONVERT_BEM
                 assert_eq!(f.prio, 7);
-                assert_eq!(f.src, 0);
+                assert_eq!(f.src, 2, "src = gateway address from heartbeat");
                 assert_eq!(f.dst, 255);
                 assert_eq!(f.data.len(), 15);
                 // Spot-check a couple of bytes; full coverage lives
@@ -568,7 +571,9 @@ mod tests {
     fn text_after_init_triggers_reinit() {
         let decoder = Decoder::new(Config::default());
         let mut events = Vec::new();
-        decoder.handle_control("TEXT,banner", &mut events); // → INIT,ALL
+        decoder.handle_control("TEXT,banner", &mut events); // → RESET
+        events.clear();
+        decoder.handle_control("ACK,reset", &mut events); // → INIT,ALL
         events.clear();
         decoder.handle_control("ACK,init", &mut events); // → done
         events.clear();
@@ -579,8 +584,8 @@ mod tests {
             DeviceEvent::SendBytes(b) => {
                 let s = String::from_utf8_lossy(b);
                 assert!(
-                    s.starts_with("$PDGY,N2NET_INIT"),
-                    "expected re-init to send INIT, got {s:?}"
+                    s.starts_with("$PDGY,N2NET_RESET"),
+                    "expected re-init to start with RESET, got {s:?}"
                 );
             }
             _ => panic!("expected SendBytes"),
@@ -595,7 +600,9 @@ mod tests {
         let mut decoder = Decoder::new(Config::default());
         // Drive to STATE_DONE first.
         let mut events = Vec::new();
-        decoder.handle_control("TEXT,init", &mut events); // → INIT
+        decoder.handle_control("TEXT,init", &mut events); // → RESET
+        events.clear();
+        decoder.handle_control("ACK,reset", &mut events); // → INIT,ALL
         events.clear();
         decoder.handle_control("ACK,init", &mut events); // → done
         events.clear();

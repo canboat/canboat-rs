@@ -27,6 +27,7 @@ pub mod canboat_csv;
 pub mod ikonvert;
 pub mod maretron;
 pub mod ngt1;
+pub mod socketcan;
 pub mod supervisor;
 
 pub use supervisor::{DeviceFactory, Supervisor};
@@ -152,6 +153,22 @@ impl FrameSender {
     /// outer cmd channel.
     pub(crate) fn from_cmd_tx(cmd_tx: mpsc::Sender<WriterCmd>) -> Self {
         Self { cmd_tx }
+    }
+}
+
+/// Build a [`DeviceHandle`] from already-wired channels and thread
+/// handles. Used by codecs whose I/O model isn't byte-stream-shaped
+/// (e.g. `socketcan`) and can't use the generic [`run`] runner below.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn from_parts(
+    frames_rx: mpsc::Receiver<RawFrame>,
+    cmd_tx: mpsc::Sender<WriterCmd>,
+    joins: Vec<JoinHandle<()>>,
+) -> DeviceHandle {
+    DeviceHandle {
+        frames_rx,
+        cmd_tx,
+        joins,
     }
 }
 

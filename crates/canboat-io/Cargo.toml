@@ -12,3 +12,7 @@ description = "Sync std::io adapters for canboat-core (stdin, serial, TCP)."
 canboat-core = { workspace = true }
 log          = { workspace = true }
 serialport   = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = "3"
+libc      = "0.2"

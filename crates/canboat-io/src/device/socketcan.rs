@@ -1078,7 +1078,11 @@ mod imp {
                                 &mut group_fn_reasm,
                                 rx.id & CAN_EFF_MASK,
                                 &rx.data[..rx.dlc],
-                                if rx.when_ms != 0 { rx.when_ms } else { now_ms() },
+                                if rx.when_ms != 0 {
+                                    rx.when_ms
+                                } else {
+                                    now_ms()
+                                },
                             );
                         }
                         Ok(None) => break,

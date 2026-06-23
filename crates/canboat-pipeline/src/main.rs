@@ -23,6 +23,7 @@
 
 mod hub;
 mod pipeline;
+mod quirks;
 mod snapshot;
 mod tcp;
 
@@ -158,6 +159,19 @@ struct Cli {
     #[arg(long)]
     no_request_claims: bool,
 
+    /// Apply a device-specific firmware-quirk workaround on the bus.
+    /// Currently only `scx20` is recognised: when something on the bus
+    /// asks for PGN 126996 Product Information, fabricate the response
+    /// on behalf of a known SCX-20 (it sometimes "forgets" how to
+    /// answer). The single-value form accepted today is expected to
+    /// grow into a repeatable flag once more quirks land.
+    ///
+    /// Only works with `--socketcan` — every other device backend
+    /// rewrites the source address on outbound, which would defeat the
+    /// impersonation.
+    #[arg(long, value_enum, value_name = "NAME")]
+    quirk: Option<quirks::QuirkKind>,
+
     /// Bind address for all TCP listeners. Defaults to `0.0.0.0` so
     /// clients on the LAN (chartplotters, OpenCPN, etc.) can
     /// connect. Pass `127.0.0.1` to restrict access to the local
@@ -251,6 +265,17 @@ fn main() -> Result<()> {
 }
 
 fn run(cli: Cli) -> Result<()> {
+    // Refuse --quirk without --socketcan up front: every other device
+    // backend rewrites the source address on outbound, which makes the
+    // quirk's impersonation a no-op on the wire.
+    if cli.quirk.is_some() && cli.socketcan.is_none() {
+        anyhow::bail!(
+            "--quirk only works with --socketcan; other device backends \
+             rewrite src on outbound writes so an impersonated frame \
+             cannot reach the bus with the original source address"
+        );
+    }
+
     let level = if cli.quiet {
         "error"
     } else if cli.verbose {
@@ -278,13 +303,6 @@ fn run(cli: Cli) -> Result<()> {
         None
     };
     let engine = Arc::new(RequestEngine::new());
-    let hubs = Hubs {
-        csv: Arc::new(Hub::new()),
-        nmea: Arc::new(Hub::new()),
-        analyzer: Arc::new(Hub::new()),
-        snapshot: snapshot.clone(),
-        engine: Arc::clone(&engine),
-    };
 
     // Pick the frame source and (if a device) its writer handle. In
     // device mode the source is a Supervisor that survives serial /
@@ -296,6 +314,20 @@ fn run(cli: Cli) -> Result<()> {
     // those gateways have already done the coalescing on the wire.
     let (frames_rx, supervisor, pre_coalesced) = open_source(&cli)?;
     let device_sender = supervisor.as_ref().map(|s| s.frame_sender());
+
+    // Quirks (e.g. SCX-20 PGN 126996 fabrication) need to write the
+    // synthetic onto the wire — they grab their own clone of the
+    // device sender and live inside `Hubs`.
+    let quirks_kinds = cli.quirk.into_iter().collect();
+    let hubs = Hubs {
+        csv: Arc::new(Hub::new()),
+        nmea: Arc::new(Hub::new()),
+        analyzer: Arc::new(Hub::new()),
+        snapshot: snapshot.clone(),
+        engine: Arc::clone(&engine),
+        quirks: quirks::Quirks::new(quirks_kinds),
+        device_sender: device_sender.clone(),
+    };
 
     // In device mode treat stdin like `actisense-serial -p`: parse
     // PLAIN/FAST lines, write the resulting frames to the device,

@@ -20,6 +20,7 @@
 //! subscribers OR the snapshot store is configured.
 
 use std::cell::RefCell;
+use std::collections::VecDeque;
 use std::io::{self, LineWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
@@ -28,9 +29,11 @@ use std::sync::Arc;
 use canboat_core::format::write_plain;
 use canboat_core::output::{write_json, CamelCase, JsonOptions};
 use canboat_core::{FramePacketType, PgnDatabase, RawFrame, Reassembled, Reassembler};
+use canboat_io::device::FrameSender;
 use n2kd::request_engine::RequestEngine;
 
 use crate::hub::Hub;
+use crate::quirks::Quirks;
 use crate::snapshot::SnapshotStore;
 
 thread_local! {
@@ -69,6 +72,16 @@ pub struct Hubs {
     /// when there's a device writer to send the resulting PGN 59904
     /// requests to.
     pub engine: Arc<RequestEngine>,
+    /// Device-quirk workarounds. Inspects every inbound frame and
+    /// optionally emits synthetic responses (e.g. PGN 126996 on
+    /// behalf of an SCX-20 that's "forgotten" how to answer). Empty
+    /// kinds = no-op; the per-frame call short-circuits.
+    pub quirks: Quirks,
+    /// Outbound frame sender into the device writer. Used by quirk
+    /// synthesisers to land their impersonation on the wire so
+    /// external consumers (e.g. an NGT-1 on the same bus) see it.
+    /// `None` in stdin-only mode where there's no device writer.
+    pub device_sender: Option<FrameSender>,
 }
 
 /// Pipeline entry point. Returns when `frames_rx` is closed.
@@ -92,7 +105,7 @@ pub struct Hubs {
 pub fn run(
     db: PgnDatabase,
     frames_rx: Receiver<RawFrame>,
-    hubs: Hubs,
+    mut hubs: Hubs,
     emit_nmea_stdout: bool,
     pre_coalesced: Arc<AtomicBool>,
     camel_case: CamelCase,
@@ -119,7 +132,37 @@ pub fn run(
         camel_case,
     };
 
-    while let Ok(frame) = frames_rx.recv() {
+    // Quirk synthesisers can produce extra `RawFrame`s in response to
+    // an inbound bus frame. We re-feed them through this same loop so
+    // they pass through reassembly, decode and broadcast just like a
+    // real bus frame would. A synthetic frame can't re-trigger a
+    // quirk (its PGN is always a *response*, never the trigger PGN),
+    // so there's no risk of an infinite synthesis loop.
+    let mut pending_synth: VecDeque<RawFrame> = VecDeque::new();
+
+    loop {
+        let frame = if let Some(synth) = pending_synth.pop_front() {
+            synth
+        } else {
+            match frames_rx.recv() {
+                Ok(f) => f,
+                Err(_) => break,
+            }
+        };
+
+        // Quirk shim: inspect the inbound bus frame, maybe synthesise.
+        // Each synthetic is written to the bus (so external consumers
+        // see it with the impersonated src) and queued back into this
+        // loop (so the local pipeline indexes / broadcasts it too).
+        if hubs.quirks.is_enabled() {
+            for synth in hubs.quirks.process_inbound(&frame) {
+                if let Some(sender) = hubs.device_sender.as_ref() {
+                    let _ = sender.send_frame(synth.clone());
+                }
+                pending_synth.push_back(synth);
+            }
+        }
+
         // Lazy CSV broadcast — one PLAIN/FAST line per RawFrame.
         if hubs.csv.has_subscribers() {
             csv_line.clear();

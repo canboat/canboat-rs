@@ -189,6 +189,18 @@ impl Quirks {
                 continue;
             }
             *last = now;
+            // Loud so it never becomes an invisible default: we are
+            // impersonating another node on the bus, which is unusual
+            // enough that an operator scanning the log should always
+            // see it happening. `frame.src`/`dst` identify the
+            // requester so the user can correlate with their tool of
+            // choice.
+            log::warn!(
+                "quirk(scx20): fabricating PGN 126996 from src={src} \
+                 in response to PGN 59904 request {}->{}",
+                frame.src,
+                frame.dst,
+            );
             out.push(build_scx20_product_info(src));
         }
         out

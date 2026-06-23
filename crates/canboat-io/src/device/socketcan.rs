@@ -77,7 +77,7 @@ pub fn run(_iface: &str, _config: Config) -> std::io::Result<super::DeviceHandle
 
 #[cfg(target_os = "linux")]
 mod imp {
-    use std::collections::VecDeque;
+    use std::collections::{HashMap, VecDeque};
     use std::os::fd::AsRawFd;
     use std::sync::mpsc;
     use std::thread;
@@ -89,6 +89,7 @@ mod imp {
 
     use super::config::Config;
     use crate::device::{from_parts, DeviceHandle, WriterCmd};
+    use crate::fastpacket;
 
     const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
     const CAN_ERR_FLAG: u32 = 0x2000_0000;
@@ -250,6 +251,14 @@ mod imp {
     struct TxBuffer {
         queue: VecDeque<socketcan::CanFrame>,
         overflowed: usize,
+        /// Per-(pgn, src) fast-packet sequence counter, mod 8. The
+        /// upper 3 bits of every fast-packet `frame[0]` carry this
+        /// value; a strict receiver uses it to distinguish back-to-
+        /// back instances of the same PGN from continuations of an
+        /// in-flight reassembly. We previously left it at 0, so a
+        /// receiver could fold two consecutive Product-Info responses
+        /// into one corrupted reassembly.
+        fast_seq: HashMap<(u32, u8), u8>,
     }
 
     impl TxBuffer {
@@ -257,7 +266,17 @@ mod imp {
             Self {
                 queue: VecDeque::with_capacity(64),
                 overflowed: 0,
+                fast_seq: HashMap::new(),
             }
+        }
+
+        /// Returns the next fast-packet sequence number for
+        /// `(pgn, src)` and advances the counter.
+        fn next_fast_seq(&mut self, pgn: u32, src: u8) -> u8 {
+            let slot = self.fast_seq.entry((pgn, src)).or_insert(0);
+            let s = *slot;
+            *slot = (s + 1) & 0x07;
+            s
         }
 
         fn push(&mut self, can_id: u32, data: &[u8]) {
@@ -303,22 +322,37 @@ mod imp {
         /// and reassembles them identically to bus traffic.
         fn send_pgn(&mut self, prio: u8, pgn: u32, src: u8, dst: u8, data: &[u8], emit: bool) {
             let can_id = iso_compose(prio, pgn, src, dst);
-            // Single-frame PGNs go out as one frame; fast-packet PGNs
-            // are always fast-framed even when short, since receivers
-            // key on the PGN type.
-            let single = data.len() <= 8 && !is_fast_packet(pgn);
-            if single {
+            // Single vs fast-packet is decided strictly from the PGN
+            // type table generated at build time from canboat.json.
+            // **Never** infer from `data.len()` alone: a single-frame
+            // PGN whose payload happens to be 8 bytes (PGN 127508
+            // Battery Status is the canonical example) must NOT be
+            // wrapped in a fast-packet shell — the receiver's schema
+            // would decode the seq/len header bytes as the first two
+            // payload fields and produce wildly wrong values.
+            // Conversely, a fast-packet PGN with ≤8 bytes of payload
+            // (PGN 126208 Group Function ACK, 6 bytes) still has to go
+            // out with the fast-packet wrapper because strict
+            // receivers key on the PGN type, not the byte count.
+            let is_fast = fastpacket::packet_type(pgn) == FramePacketType::Fast;
+            if !is_fast {
                 self.tx_buf.push(can_id, data);
                 if emit {
                     self.emit_chunk(prio, pgn, src, dst, data);
                 }
             } else {
+                // Per ISO 11783-3: every fast-packet CAN frame is
+                // exactly 8 bytes; the last chunk is padded with 0xff.
+                // The first byte is `(seq << 5) | index`, with `seq`
+                // incrementing per-(pgn, src) instance so consecutive
+                // first frames are distinguishable from continuations.
+                let seq = self.tx_buf.next_fast_seq(pgn, src);
                 let mut index: u8 = 0;
                 let mut remaining = data.len();
                 let mut offset = 0;
                 while remaining > 0 {
-                    let mut frame = [0u8; 8];
-                    frame[0] = index;
+                    let mut frame = [0xffu8; 8];
+                    frame[0] = (seq << 5) | (index & 0x1f);
                     let chunk;
                     let payload_start;
                     if index == 0 {
@@ -331,10 +365,9 @@ mod imp {
                     }
                     frame[payload_start..payload_start + chunk]
                         .copy_from_slice(&data[offset..offset + chunk]);
-                    let len = payload_start + chunk;
-                    self.tx_buf.push(can_id, &frame[..len]);
+                    self.tx_buf.push(can_id, &frame[..]);
                     if emit {
-                        self.emit_chunk(prio, pgn, src, dst, &frame[..len]);
+                        self.emit_chunk(prio, pgn, src, dst, &frame[..]);
                     }
                     offset += chunk;
                     remaining -= chunk;
@@ -357,13 +390,6 @@ mod imp {
             );
             let _ = self.frames_tx.send(f);
         }
-    }
-
-    /// Decide fast-packet by range only — the worker reassembles
-    /// incoming frames with [`packet_type`] which falls back to the
-    /// canboat-core database for the mixed range.
-    fn is_fast_packet(pgn: u32) -> bool {
-        (0x10000..0x20000).contains(&pgn) || pgn >= CANBOAT_PGN_START
     }
 
     #[derive(PartialEq)]

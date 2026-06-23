@@ -146,6 +146,7 @@ dependencies = [
  "canboat-core",
  "libc",
  "log",
+ "serde_json",
  "serialport",
  "socketcan",
 ]
@@ -832,7 +833,6 @@ dependencies = [
  "env_logger",
  "libc",
  "log",
- "serde_json",
  "socketcan",
 ]
 

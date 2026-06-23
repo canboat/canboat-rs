@@ -20,9 +20,6 @@ clap         = { workspace = true }
 env_logger   = { workspace = true }
 log          = { workspace = true }
 
-[build-dependencies]
-serde_json   = { workspace = true }
-
 [target.'cfg(target_os = "linux")'.dependencies]
 canboat-io = { workspace = true }
 socketcan  = "3"

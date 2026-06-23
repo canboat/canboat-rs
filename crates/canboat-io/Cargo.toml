@@ -13,6 +13,9 @@ canboat-core = { workspace = true }
 log          = { workspace = true }
 serialport   = { workspace = true }
 
+[build-dependencies]
+serde_json = { workspace = true }
+
 [target.'cfg(target_os = "linux")'.dependencies]
 socketcan = "3"
 libc      = "0.2"

@@ -1,9 +1,16 @@
 //! Generate the fast-packet lookup table for the "mixed" PGN range
 //! (0x1F000..0x1FFFF) at build time from the canboat PGN database, so
 //! the single/fast decision always tracks the spec. PGNs outside that
-//! range are decided by range alone (see `packet_type` in main.rs).
+//! range are decided by range alone (see `fastpacket::packet_type`).
 //!
-//! This mirrors `canboat/socketcan-serial/gen-fastpacket-table.py`.
+//! The table is consumed by `canboat_io::fastpacket::packet_type`:
+//! - the SocketCAN encoder uses it so it never wraps an 8-byte
+//!   single-frame PGN (e.g. PGN 127508 Battery Status) in a
+//!   fast-packet shell;
+//! - the `socketcan-serial` binary's stdout reassembler uses it to
+//!   correctly identify single vs fast arriving from the bus.
+//!
+//! Mirrors `canboat/socketcan-serial/gen-fastpacket-table.py`.
 
 use std::env;
 use std::fs;

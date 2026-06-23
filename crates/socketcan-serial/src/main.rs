@@ -30,13 +30,6 @@ use std::process::ExitCode;
 
 use clap::Parser;
 
-#[cfg(target_os = "linux")]
-include!(concat!(env!("OUT_DIR"), "/fastpacket_table.rs"));
-
-/// Synthetic-PGN range — never on the wire, never sent to the bus.
-#[cfg(target_os = "linux")]
-const CANBOAT_PGN_START: u32 = 0x40000;
-
 #[derive(Debug, Parser)]
 #[command(
     name = "socketcan-serial",
@@ -153,31 +146,11 @@ mod linux {
     use anyhow::{Context, Result};
     use canboat_core::format::plain::{parse_line, write_line};
     use canboat_core::frame::RawFrame;
-    use canboat_core::{FramePacketType, Reassembled, Reassembler};
+    use canboat_core::{Reassembled, Reassembler};
     use canboat_io::device::socketcan::{self, Config};
+    use canboat_io::fastpacket;
 
     use super::*;
-
-    /// Classify a PGN as fast-packet or single-frame, for the binary's
-    /// stdout reassembler. Range decides it everywhere except the mixed
-    /// 0x1F000..0x1FFFF window, which uses the build-time-generated table
-    /// (`build.rs`).
-    fn packet_type(pgn: u32) -> FramePacketType {
-        if (FASTPACKET_MIXED_START..FASTPACKET_MIXED_END).contains(&pgn) {
-            return if FASTPACKET_MIXED[(pgn - FASTPACKET_MIXED_START) as usize] {
-                FramePacketType::Fast
-            } else {
-                FramePacketType::Single
-            };
-        }
-        if (0x10000..FASTPACKET_MIXED_START).contains(&pgn) {
-            return FramePacketType::Fast; // fast-packet-only range
-        }
-        if pgn >= CANBOAT_PGN_START {
-            return FramePacketType::Fast; // synthetic CANboat fast PGNs (not on the wire)
-        }
-        FramePacketType::Single
-    }
 
     pub fn run(cli: Cli) -> Result<()> {
         // --- Open the SocketCAN bus participant in canboat-io.
@@ -232,7 +205,7 @@ mod linux {
         let mut reasm = Reassembler::new();
         let writeonly = cli.writeonly;
         while let Ok(frame) = handle.frames_rx.recv() {
-            let pt = packet_type(frame.pgn);
+            let pt = fastpacket::packet_type(frame.pgn);
             let coalesced = match reasm.push(frame, pt) {
                 Reassembled::PassThrough(f) | Reassembled::Complete(f) => f,
                 Reassembled::Partial => continue,

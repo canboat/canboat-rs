@@ -9,6 +9,7 @@
 //! `canboat-core` is driven directly from these synchronous reads.
 
 pub mod device;
+pub mod fastpacket;
 
 use std::io::{self, BufRead, Read, Write};
 use std::time::Duration;

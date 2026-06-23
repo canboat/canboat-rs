@@ -21,7 +21,8 @@ fn main() {
 
     let text = fs::read_to_string(&json_path)
         .unwrap_or_else(|e| panic!("cannot read {}: {e}", json_path.display()));
-    let db: serde_json::Value = serde_json::from_str(&text).expect("canboat.json is not valid JSON");
+    let db: serde_json::Value =
+        serde_json::from_str(&text).expect("canboat.json is not valid JSON");
 
     let size = (MIXED_END - MIXED_START) as usize;
     // Default: the manufacturer-proprietary tail is fast-packet, the
@@ -55,7 +56,9 @@ fn main() {
         MIXED_START,
         MIXED_END - 1
     ));
-    out.push_str(&format!("pub static FASTPACKET_MIXED: [bool; 0x{size:X}] = ["));
+    out.push_str(&format!(
+        "pub static FASTPACKET_MIXED: [bool; 0x{size:X}] = ["
+    ));
     for (i, v) in fast.iter().enumerate() {
         if i % 32 == 0 {
             out.push_str("\n    ");

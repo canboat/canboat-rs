@@ -86,7 +86,12 @@ mod tests {
 
     #[test]
     fn encodes_version_and_strings() {
-        let f = startup_record_at("6.2.0", "socketcan-serial", "nmea2000", "2026-01-01T00:00:00.000Z".into());
+        let f = startup_record_at(
+            "6.2.0",
+            "socketcan-serial",
+            "nmea2000",
+            "2026-01-01T00:00:00.000Z".into(),
+        );
         assert_eq!(f.pgn, CANBOAT_BEM);
         assert_eq!(f.prio, 7);
         assert_eq!(f.dst, 255);

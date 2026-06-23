@@ -154,6 +154,12 @@ fn run(cli: Cli) -> Result<()> {
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
     out.write_all(CANBOAT_FORMAT_FAST_HEADER.as_bytes())?;
+    // Synthetic startup record, like canboat's emitCanboatStartupRecord.
+    let rec = canboat_core::startup_record(env!("CARGO_PKG_VERSION"), "maretron-ipg", device);
+    let mut prologue = String::with_capacity(160);
+    canboat_core::format::plain::write_line(&mut prologue, &rec).ok();
+    out.write_all(prologue.as_bytes())?;
+    out.write_all(b"\n")?;
     out.flush()?;
 
     let read_stream = stream.try_clone().context("cloning TCP stream")?;

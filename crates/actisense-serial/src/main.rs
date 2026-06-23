@@ -139,8 +139,19 @@ fn run(cli: Cli) -> Result<()> {
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
-    // Emit the prologue that downstream tools key on.
+    // Emit the prologue that downstream tools key on: the FAST header
+    // and the synthetic startup record (like canboat's
+    // emitCanboatStartupRecord).
     out.write_all(CANBOAT_FORMAT_FAST_HEADER.as_bytes())?;
+    let rec = canboat_core::startup_record(
+        env!("CARGO_PKG_VERSION"),
+        "actisense-serial",
+        cli.device.as_deref().unwrap_or("-"),
+    );
+    let mut prologue = String::with_capacity(160);
+    canboat_core::format::plain::write_line(&mut prologue, &rec).ok();
+    out.write_all(prologue.as_bytes())?;
+    out.write_all(b"\n")?;
     out.flush()?;
 
     // Decide what kind of input we're reading. A `--file` always

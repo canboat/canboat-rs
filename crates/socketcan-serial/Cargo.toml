@@ -1,0 +1,28 @@
+[package]
+name        = "socketcan-serial"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "Bridge a Linux SocketCAN interface to/from canboat FAST format, with ISO address claiming."
+
+[[bin]]
+name = "socketcan-serial"
+path = "src/main.rs"
+
+[dependencies]
+canboat-core = { workspace = true }
+canboat-cli  = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+env_logger   = { workspace = true }
+log          = { workspace = true }
+
+[build-dependencies]
+serde_json   = { workspace = true }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+socketcan = "3"
+libc      = "0.2"

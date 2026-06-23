@@ -767,9 +767,19 @@ mod imp {
         }
     }
 
+    /// One inbound CAN frame plus its kernel SO_TIMESTAMP: extended
+    /// id, payload length, payload bytes, and the timestamp in ms
+    /// since the epoch (0 if the cmsg wasn't present).
+    struct RecvFrame {
+        id: u32,
+        dlc: usize,
+        data: [u8; 8],
+        when_ms: u64,
+    }
+
     /// Read one CAN frame plus its kernel SO_TIMESTAMP. `Ok(None)` means
     /// the socket has no more frames ready right now.
-    fn recv_frame(fd: i32) -> std::io::Result<Option<(u32, usize, [u8; 8], u64)>> {
+    fn recv_frame(fd: i32) -> std::io::Result<Option<RecvFrame>> {
         let mut raw = [0u8; 16]; // struct can_frame
         let mut ctrl = [0u8; 64];
         // SAFETY: pointers refer to live local buffers for the duration
@@ -818,7 +828,12 @@ mod imp {
             let dlc = raw[4] as usize;
             let mut data = [0u8; 8];
             data.copy_from_slice(&raw[8..16]);
-            Ok(Some((id, dlc.min(8), data, when)))
+            Ok(Some(RecvFrame {
+                id,
+                dlc: dlc.min(8),
+                data,
+                when_ms: when,
+            }))
         }
     }
 
@@ -905,8 +920,7 @@ mod imp {
     /// worker thread. Returns a standard [`DeviceHandle`] for the
     /// caller to drain RX from and push TX into.
     pub fn run(iface: &str, config: Config) -> std::io::Result<DeviceHandle> {
-        let sock = CanSocket::open(iface)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))?;
+        let sock = CanSocket::open(iface).map_err(std::io::Error::other)?;
         sock.set_nonblocking(true)?;
         let fd = sock.as_raw_fd();
 
@@ -1050,8 +1064,8 @@ mod imp {
                 while budget > 0 {
                     budget -= 1;
                     match recv_frame(fd) {
-                        Ok(Some((id, dlc, data, when))) => {
-                            if id & CAN_ERR_FLAG != 0 {
+                        Ok(Some(rx)) => {
+                            if rx.id & CAN_ERR_FLAG != 0 {
                                 continue;
                             }
                             let mut bus = Bus {
@@ -1062,9 +1076,9 @@ mod imp {
                                 &mut bus,
                                 &mut claimer,
                                 &mut group_fn_reasm,
-                                id & CAN_EFF_MASK,
-                                &data[..dlc],
-                                if when != 0 { when } else { now_ms() },
+                                rx.id & CAN_EFF_MASK,
+                                &rx.data[..rx.dlc],
+                                if rx.when_ms != 0 { rx.when_ms } else { now_ms() },
                             );
                         }
                         Ok(None) => break,

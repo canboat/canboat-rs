@@ -69,7 +69,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "DEVICE",
-        conflicts_with_all = ["ikonvert", "maretron", "canboat_csv"]
+        conflicts_with_all = ["ikonvert", "maretron", "canboat_csv", "socketcan"]
     )]
     actisense: Option<String>,
 
@@ -78,7 +78,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "DEVICE",
-        conflicts_with_all = ["actisense", "maretron", "canboat_csv"]
+        conflicts_with_all = ["actisense", "maretron", "canboat_csv", "socketcan"]
     )]
     ikonvert: Option<String>,
 
@@ -87,9 +87,20 @@ struct Cli {
     #[arg(
         long,
         value_name = "URL",
-        conflicts_with_all = ["actisense", "ikonvert", "canboat_csv"]
+        conflicts_with_all = ["actisense", "ikonvert", "canboat_csv", "socketcan"]
     )]
     maretron: Option<String>,
+
+    /// Read frames from a Linux SocketCAN interface (e.g. `can0`,
+    /// `nmea2000`). The pipeline becomes a full NMEA 2000 bus
+    /// participant: it claims an ISO address, answers ISO Requests and
+    /// Group Functions, and sends Heartbeats. Linux-only.
+    #[arg(
+        long,
+        value_name = "IFACE",
+        conflicts_with_all = ["actisense", "ikonvert", "maretron", "canboat_csv"]
+    )]
+    socketcan: Option<String>,
 
     /// Chain into another `canboat-pipeline` instance over its
     /// bidirectional Raw CSV port (default 2603). Accepts
@@ -103,7 +114,7 @@ struct Cli {
     #[arg(
         long,
         value_name = "URL",
-        conflicts_with_all = ["actisense", "ikonvert", "maretron"]
+        conflicts_with_all = ["actisense", "ikonvert", "maretron", "socketcan"]
     )]
     canboat_csv: Option<String>,
 
@@ -485,6 +496,19 @@ fn open_source(
         // Wire format is canboat PLAIN/FAST — each line is already
         // a complete PGN payload, so skip the reassembler.
         return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
+    }
+    if let Some(iface) = cli.socketcan.as_deref() {
+        let iface = iface.to_string();
+        let config = device::socketcan::Config::default();
+        let factory = NamedFactory::new("socketcan", move || {
+            device::socketcan::run(&iface, config.clone())
+        });
+        let sup = Supervisor::new(factory);
+        let (rx, sup) = split_supervisor(sup);
+        // The SocketCAN adapter emits single-frame chunks (8 bytes max)
+        // to the pipeline; reassembly happens here via the canboat-core
+        // PGN database, which has accurate mixed-range classification.
+        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(false))));
     }
     // stdin fallback — no device, no reconnect logic needed. We
     // can't know in advance whether the upstream uses PLAIN

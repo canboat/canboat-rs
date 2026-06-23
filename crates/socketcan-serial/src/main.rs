@@ -26,6 +26,7 @@ use clap::Parser;
 include!(concat!(env!("OUT_DIR"), "/fastpacket_table.rs"));
 
 /// Synthetic-PGN range — never on the wire, never sent to the bus.
+#[cfg(target_os = "linux")]
 const CANBOAT_PGN_START: u32 = 0x40000;
 
 #[derive(Debug, Parser)]
@@ -67,7 +68,12 @@ struct Cli {
     timeout: u64,
 
     /// Preferred source address to claim.
-    #[arg(short = 'a', long = "address", value_name = "ADDR", default_value_t = 0)]
+    #[arg(
+        short = 'a',
+        long = "address",
+        value_name = "ADDR",
+        default_value_t = 0
+    )]
     address: u8,
 
     /// Unique number for the ISO NAME (default derived from the pid).
@@ -75,11 +81,21 @@ struct Cli {
     unique: u32,
 
     /// Manufacturer code for the ISO NAME (999 = Signal K).
-    #[arg(short = 'm', long = "manufacturer", value_name = "N", default_value_t = 999)]
+    #[arg(
+        short = 'm',
+        long = "manufacturer",
+        value_name = "N",
+        default_value_t = 999
+    )]
     manufacturer: u16,
 
     /// Heartbeat (PGN 126993) interval in ms; 0 disables.
-    #[arg(long = "heartbeat", alias = "hb", value_name = "MS", default_value_t = 60000)]
+    #[arg(
+        long = "heartbeat",
+        alias = "hb",
+        value_name = "MS",
+        default_value_t = 60000
+    )]
     heartbeat: u64,
 }
 
@@ -102,6 +118,7 @@ fn main() -> ExitCode {
 /// Classify a PGN as fast-packet or single-frame. Range decides it
 /// everywhere except the mixed 0x1F000..0x1FFFF window, which uses the
 /// generated table. Mirrors `isFastPacket()` in the C tool.
+#[cfg(target_os = "linux")]
 fn packet_type(pgn: u32) -> canboat_core::FramePacketType {
     use canboat_core::FramePacketType::{Fast, Single};
     if (FASTPACKET_MIXED_START..FASTPACKET_MIXED_END).contains(&pgn) {
@@ -122,6 +139,7 @@ fn packet_type(pgn: u32) -> canboat_core::FramePacketType {
 
 /// Decompose a 29-bit ISO 11783 CAN id into (prio, pgn, src, dst).
 /// Matches `getISO11783BitsFromCanId` in canboat/common/common.c.
+#[cfg(target_os = "linux")]
 fn iso_decompose(id: u32) -> (u8, u32, u8, u8) {
     let prio = ((id >> 26) & 0x7) as u8;
     let rdp = (id >> 24) & 0x3;
@@ -136,9 +154,11 @@ fn iso_decompose(id: u32) -> (u8, u32, u8, u8) {
 }
 
 /// Tiny helper to keep `iso_decompose` readable.
+#[cfg(target_os = "linux")]
 trait IntoPgnDst {
     fn into_pgn_dst(self, prio: u8, src: u8) -> (u8, u32, u8, u8);
 }
+#[cfg(target_os = "linux")]
 impl IntoPgnDst for (u32, u8) {
     fn into_pgn_dst(self, prio: u8, src: u8) -> (u8, u32, u8, u8) {
         (prio, self.0, src, self.1)
@@ -147,6 +167,7 @@ impl IntoPgnDst for (u32, u8) {
 
 /// Build the 29-bit ISO 11783 CAN id (without the EFF flag) from N2K
 /// fields. Mirrors `getCanIdFromISO11783Bits`.
+#[cfg(target_os = "linux")]
 fn iso_compose(prio: u8, pgn: u32, src: u8, dst: u8) -> u32 {
     let mut id = src as u32;
     let pf = (pgn >> 8) & 0xff;
@@ -163,6 +184,7 @@ fn iso_compose(prio: u8, pgn: u32, src: u8, dst: u8) -> u32 {
 /// Format epoch milliseconds as `YYYY-MM-DDTHH:MM:SS.mmmZ` (UTC),
 /// matching canboat's `fmtTimestamp`. No chrono — civil date via the
 /// Howard-Hinnant algorithm, as elsewhere in canboat-core.
+#[cfg(target_os = "linux")]
 fn format_iso(ms: u64) -> String {
     let secs = (ms / 1000) as i64;
     let millis = ms % 1000;
@@ -173,6 +195,7 @@ fn format_iso(ms: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
 }
 
+#[cfg(target_os = "linux")]
 fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -236,8 +259,13 @@ mod linux {
 
     // PGNs we originate / consume, reported via PGN 126464 on request.
     const TX_PGN_LIST: [u32; 7] = [
-        PGN_ISO_ACK, PGN_ISO_REQUEST, PGN_ISO_ADDRESS_CLAIM, PGN_GROUP_FUNCTION, PGN_PGN_LIST,
-        PGN_HEARTBEAT, PGN_PRODUCT_INFO,
+        PGN_ISO_ACK,
+        PGN_ISO_REQUEST,
+        PGN_ISO_ADDRESS_CLAIM,
+        PGN_GROUP_FUNCTION,
+        PGN_PGN_LIST,
+        PGN_HEARTBEAT,
+        PGN_PRODUCT_INFO,
     ];
     const RX_PGN_LIST: [u32; 3] = [PGN_ISO_REQUEST, PGN_ISO_ADDRESS_CLAIM, PGN_GROUP_FUNCTION];
 
@@ -273,8 +301,8 @@ mod linux {
         writeonly: bool,         // -w: don't echo to stdout
         heartbeat_interval: u64, // ms, 0 disables
         heartbeat_seq: u8,
-        next_heartbeat: u64,     // ms
-        last_product_info: u64,  // ms; rate-limit broadcast bursts
+        next_heartbeat: u64,    // ms
+        last_product_info: u64, // ms; rate-limit broadcast bursts
         used: [bool; 256],
     }
 
@@ -290,14 +318,20 @@ mod linux {
             // learn which addresses are taken before we pick one. Sent
             // from the null address since we have not claimed yet.
             self.send_request(sock, ADDR_NULL, ADDR_GLOBAL, PGN_ISO_ADDRESS_CLAIM);
-            log::debug!("Scanning bus {SCAN_TIMEOUT_MS} ms before claiming (NAME {:#018x})", self.name);
+            log::debug!(
+                "Scanning bus {SCAN_TIMEOUT_MS} ms before claiming (NAME {:#018x})",
+                self.name
+            );
         }
 
         fn begin_claim(&mut self, sock: &CanSocket) {
             if self.used[self.preferred as usize] {
                 match self.pick_free() {
                     Some(next) => {
-                        log::debug!("Preferred address {} is taken, using {next}", self.preferred);
+                        log::debug!(
+                            "Preferred address {} is taken, using {next}",
+                            self.preferred
+                        );
                         self.address = next;
                     }
                     None => {
@@ -314,12 +348,24 @@ mod linux {
             self.state = ClaimState::Pending;
             self.deadline = now_ms() + CLAIM_TIMEOUT_MS;
             self.send_claim(sock, ADDR_GLOBAL);
-            log::debug!("Claiming address {} with NAME {:#018x}", self.address, self.name);
+            log::debug!(
+                "Claiming address {} with NAME {:#018x}",
+                self.address,
+                self.name
+            );
         }
 
         fn send_claim(&self, sock: &CanSocket, dst: u8) {
             let data = self.name_to_bytes();
-            send_pgn(sock, 6, PGN_ISO_ADDRESS_CLAIM, self.address, dst, &data, !self.writeonly);
+            send_pgn(
+                sock,
+                6,
+                PGN_ISO_ADDRESS_CLAIM,
+                self.address,
+                dst,
+                &data,
+                !self.writeonly,
+            );
         }
 
         fn send_request(&self, sock: &CanSocket, src: u8, dst: u8, pgn: u32) {
@@ -347,7 +393,10 @@ mod linux {
             }
             // Someone is claiming our address. Lowest NAME wins.
             if self.name < their_name {
-                log::debug!("Won address {} conflict (our NAME lower), re-claiming", self.address);
+                log::debug!(
+                    "Won address {} conflict (our NAME lower), re-claiming",
+                    self.address
+                );
                 self.state = ClaimState::Pending;
                 self.deadline = now_ms() + CLAIM_TIMEOUT_MS;
                 self.send_claim(sock, ADDR_GLOBAL);
@@ -364,7 +413,10 @@ mod linux {
                     self.send_claim(sock, ADDR_GLOBAL);
                     return;
                 }
-                log::error!("Lost address {} and no free address left; cannot claim", self.address);
+                log::error!(
+                    "Lost address {} and no free address left; cannot claim",
+                    self.address
+                );
             } else {
                 log::error!(
                     "Lost address {} conflict and not arbitrary-address-capable; cannot claim",
@@ -430,7 +482,15 @@ mod linux {
             put_string_fix(&mut data[100..132], &(self.name & 0x1fffff).to_string());
             data[132] = CERTIFICATION_LEVEL;
             data[133] = LOAD_EQUIVALENCY;
-            send_pgn(sock, 6, PGN_PRODUCT_INFO, self.address, ADDR_GLOBAL, &data, !self.writeonly);
+            send_pgn(
+                sock,
+                6,
+                PGN_PRODUCT_INFO,
+                self.address,
+                ADDR_GLOBAL,
+                &data,
+                !self.writeonly,
+            );
         }
 
         // PGN List (Transmit and Receive), PGN 126464: one message per list.
@@ -441,7 +501,15 @@ mod linux {
                 for pgn in list {
                     data.extend_from_slice(&pgn.to_le_bytes()[..3]);
                 }
-                send_pgn(sock, 6, PGN_PGN_LIST, self.address, dst, &data, !self.writeonly);
+                send_pgn(
+                    sock,
+                    6,
+                    PGN_PGN_LIST,
+                    self.address,
+                    dst,
+                    &data,
+                    !self.writeonly,
+                );
             }
         }
 
@@ -449,11 +517,26 @@ mod linux {
         fn send_iso_ack(&self, sock: &CanSocket, dst: u8, control: u8, pgn: u32) {
             let p = pgn.to_le_bytes();
             let data = [control, 0xff, 0xff, 0xff, 0xff, p[0], p[1], p[2]];
-            send_pgn(sock, 6, PGN_ISO_ACK, self.address, dst, &data, !self.writeonly);
+            send_pgn(
+                sock,
+                6,
+                PGN_ISO_ACK,
+                self.address,
+                dst,
+                &data,
+                !self.writeonly,
+            );
         }
 
         // Acknowledge Group Function, PGN 126208 function 2.
-        fn send_ack_group_function(&self, sock: &CanSocket, dst: u8, pgn: u32, pgn_err: u8, param_err: u8) {
+        fn send_ack_group_function(
+            &self,
+            sock: &CanSocket,
+            dst: u8,
+            pgn: u32,
+            pgn_err: u8,
+            param_err: u8,
+        ) {
             let p = pgn.to_le_bytes();
             let data = [
                 GROUP_FUNCTION_ACK,
@@ -463,14 +546,25 @@ mod linux {
                 (pgn_err & 0x0f) | ((param_err & 0x0f) << 4),
                 0, // number of parameters
             ];
-            send_pgn(sock, 6, PGN_GROUP_FUNCTION, self.address, dst, &data, !self.writeonly);
+            send_pgn(
+                sock,
+                6,
+                PGN_GROUP_FUNCTION,
+                self.address,
+                dst,
+                &data,
+                !self.writeonly,
+            );
         }
 
         // NMEA Request Group Function (PGN 126208, function 0). We act only on
         // a request targeting our Heartbeat (PGN 126993): it sets the transmit
         // interval (or disables it), then we reply with an Acknowledge.
         fn handle_group_function(&mut self, sock: &CanSocket, src: u8, data: &[u8]) {
-            if data.len() < 8 || data[0] != GROUP_FUNCTION_REQUEST || self.state != ClaimState::Claimed {
+            if data.len() < 8
+                || data[0] != GROUP_FUNCTION_REQUEST
+                || self.state != ClaimState::Claimed
+            {
                 return;
             }
             let target = data[1] as u32 | (data[2] as u32) << 8 | (data[3] as u32) << 16;
@@ -530,8 +624,8 @@ mod linux {
         // once we own an address so other nodes know we are alive.
         fn send_heartbeat(&mut self, sock: &CanSocket) {
             let offset = (self.heartbeat_interval / 10) as u16; // field resolution 0.01 s
-            // Controller 1 State = Error Active (0), Controller 2 State = not
-            // available (3), Equipment Status = Operational (0), reserved = 1.
+                                                                // Controller 1 State = Error Active (0), Controller 2 State = not
+                                                                // available (3), Equipment Status = Operational (0), reserved = 1.
             let data = [
                 offset as u8,
                 (offset >> 8) as u8,
@@ -542,8 +636,20 @@ mod linux {
                 0xff,
                 0xff,
             ];
-            send_pgn(sock, 7, PGN_HEARTBEAT, self.address, ADDR_GLOBAL, &data, !self.writeonly);
-            self.heartbeat_seq = if self.heartbeat_seq >= 252 { 0 } else { self.heartbeat_seq + 1 };
+            send_pgn(
+                sock,
+                7,
+                PGN_HEARTBEAT,
+                self.address,
+                ADDR_GLOBAL,
+                &data,
+                !self.writeonly,
+            );
+            self.heartbeat_seq = if self.heartbeat_seq >= 252 {
+                0
+            } else {
+                self.heartbeat_seq + 1
+            };
         }
     }
 
@@ -590,7 +696,14 @@ mod linux {
         // sees a complete picture of the bus including this node. The stdin
         // bridge passes emit=false; its -p passthru handles echoing instead.
         if emit {
-            let f = RawFrame::new(Some(format_iso(now_ms())), prio, pgn, src, dst, data.iter().copied());
+            let f = RawFrame::new(
+                Some(format_iso(now_ms())),
+                prio,
+                pgn,
+                src,
+                dst,
+                data.iter().copied(),
+            );
             let mut line = String::with_capacity(96);
             write_line(&mut line, &f).ok();
             let mut so = std::io::stdout().lock();
@@ -726,7 +839,11 @@ mod linux {
             name: build_name(&cli),
             address: cli.address,
             preferred: cli.address,
-            state: if cli.no_claim { ClaimState::Disabled } else { ClaimState::Pending },
+            state: if cli.no_claim {
+                ClaimState::Disabled
+            } else {
+                ClaimState::Pending
+            },
             deadline: 0,
             arbitrary: true,
             writeonly: cli.writeonly,
@@ -740,7 +857,11 @@ mod linux {
         let mut out = std::io::BufWriter::new(std::io::stdout());
         writeln!(out, "# format=FAST")?;
         // Synthetic startup record, like canboat's emitCanboatStartupRecord.
-        let rec = canboat_core::startup_record(env!("CARGO_PKG_VERSION"), "socketcan-serial", &cli.device);
+        let rec = canboat_core::startup_record(
+            env!("CARGO_PKG_VERSION"),
+            "socketcan-serial",
+            &cli.device,
+        );
         let mut line = String::with_capacity(160);
         write_line(&mut line, &rec).ok();
         out.write_all(line.as_bytes())?;
@@ -774,8 +895,16 @@ mod linux {
             let timeout_ms = wait.min(i32::MAX as u64) as i32;
 
             let mut fds = [
-                libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
-                libc::pollfd { fd: libc::STDIN_FILENO, events: libc::POLLIN, revents: 0 },
+                libc::pollfd {
+                    fd,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
+                libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                },
             ];
             let nfds = if stdin_eof { 1 } else { 2 };
             // SAFETY: poll over a valid pollfd array.
@@ -883,7 +1012,15 @@ mod linux {
             }
             match canboat_core::format::plain::parse_line(trimmed) {
                 Ok(frame) if frame.pgn < CANBOAT_PGN_START => {
-                    send_pgn(sock, frame.prio, frame.pgn, claimer.address, frame.dst, &frame.data, false);
+                    send_pgn(
+                        sock,
+                        frame.prio,
+                        frame.pgn,
+                        claimer.address,
+                        frame.dst,
+                        &frame.data,
+                        false,
+                    );
                 }
                 Ok(_) => {} // synthetic status PGN, not for the bus
                 Err(e) => log::warn!("skipping malformed line: {e}"),
@@ -920,7 +1057,14 @@ mod linux {
 
         // Reassemble even in writeonly mode so group functions are honoured;
         // only the stdout emit is suppressed.
-        let frame = RawFrame::new(Some(format_iso(when)), prio, pgn, src, dst, data.iter().copied());
+        let frame = RawFrame::new(
+            Some(format_iso(when)),
+            prio,
+            pgn,
+            src,
+            dst,
+            data.iter().copied(),
+        );
         match reasm.push(frame, packet_type(pgn)) {
             Reassembled::PassThrough(f) | Reassembled::Complete(f) => {
                 if !writeonly {

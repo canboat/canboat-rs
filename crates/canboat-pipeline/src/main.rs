@@ -103,6 +103,17 @@ struct Cli {
     )]
     socketcan: Option<String>,
 
+    /// Preferred ISO source address to claim on the SocketCAN bus.
+    /// Defaults to 0; the claim machine will pick a free address if
+    /// this one is taken. Ignored without `--socketcan`.
+    #[arg(
+        long = "socketcan-address",
+        value_name = "ADDR",
+        default_value_t = 0,
+        requires = "socketcan"
+    )]
+    socketcan_address: u8,
+
     /// Chain into another `canboat-pipeline` instance over its
     /// bidirectional Raw CSV port (default 2603). Accepts
     /// `host:port` or `tcp://host[:port]`. Wire format is
@@ -531,7 +542,10 @@ fn open_source(
     }
     if let Some(iface) = cli.socketcan.as_deref() {
         let iface = iface.to_string();
-        let config = device::socketcan::Config::default();
+        let config = device::socketcan::Config {
+            address: cli.socketcan_address,
+            ..device::socketcan::Config::default()
+        };
         let factory = NamedFactory::new("socketcan", move || {
             device::socketcan::run(&iface, config.clone())
         });

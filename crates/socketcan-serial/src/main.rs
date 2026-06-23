@@ -97,6 +97,18 @@ struct Cli {
         default_value_t = 60000
     )]
     heartbeat: u64,
+
+    /// ISO NAME System Instance, 0..15. Real sensors leave this at 0,
+    /// so the default of 15 (max) pushes our NAME up in the lower-NAME-
+    /// wins arbitration order — we yield to any well-behaved device on
+    /// the bus rather than steal addresses from real hardware.
+    #[arg(
+        long = "system-instance",
+        alias = "si",
+        value_name = "N",
+        default_value_t = 15
+    )]
+    system_instance: u8,
 }
 
 fn main() -> ExitCode {
@@ -1095,7 +1107,7 @@ mod linux {
         let device_instance: u64 = 0;
         let device_function: u64 = 130; // PC Gateway
         let device_class: u64 = 25; // Inter/Intranetwork Device
-        let system_instance: u64 = 0;
+        let system_instance: u64 = cli.system_instance as u64 & 0x0f;
         let industry_group: u64 = 4; // Marine
         let arbitrary: u64 = 1;
         (unique as u64)

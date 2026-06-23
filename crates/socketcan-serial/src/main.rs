@@ -213,9 +213,34 @@ mod linux {
     const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
     const CAN_ERR_FLAG: u32 = 0x2000_0000;
 
-    const PGN_ISO_ADDRESS_CLAIM: u32 = 60928;
+    const PGN_ISO_ACK: u32 = 59392;
     const PGN_ISO_REQUEST: u32 = 59904;
+    const PGN_ISO_ADDRESS_CLAIM: u32 = 60928;
+    const PGN_GROUP_FUNCTION: u32 = 126208;
+    const PGN_PGN_LIST: u32 = 126464;
     const PGN_HEARTBEAT: u32 = 126993;
+    const PGN_PRODUCT_INFO: u32 = 126996;
+
+    // Product Information (PGN 126996) content.
+    const N2K_DB_VERSION: u16 = 2100; // 2.100 at 0.001 resolution
+    const PRODUCT_CODE: u16 = 1;
+    const CERTIFICATION_LEVEL: u8 = 0; // Level A
+    const LOAD_EQUIVALENCY: u8 = 1; // 1 LEN = 50 mA
+    const MODEL_ID: &str = "socketcan-serial";
+
+    // Group Function (PGN 126208) function codes and DURATION sentinels.
+    const GROUP_FUNCTION_REQUEST: u8 = 0;
+    const GROUP_FUNCTION_ACK: u8 = 2;
+    const TX_INTERVAL_NO_CHANGE: u32 = 0xffff_ffff;
+    const TX_INTERVAL_RESTORE_DEFAULT: u32 = 0xffff_fffe;
+
+    // PGNs we originate / consume, reported via PGN 126464 on request.
+    const TX_PGN_LIST: [u32; 7] = [
+        PGN_ISO_ACK, PGN_ISO_REQUEST, PGN_ISO_ADDRESS_CLAIM, PGN_GROUP_FUNCTION, PGN_PGN_LIST,
+        PGN_HEARTBEAT, PGN_PRODUCT_INFO,
+    ];
+    const RX_PGN_LIST: [u32; 3] = [PGN_ISO_REQUEST, PGN_ISO_ADDRESS_CLAIM, PGN_GROUP_FUNCTION];
+
     const ADDR_GLOBAL: u8 = 255;
     const ADDR_NULL: u8 = 254;
     const ADDR_MAX: u8 = 253;
@@ -247,7 +272,8 @@ mod linux {
         arbitrary: bool,
         heartbeat_interval: u64, // ms, 0 disables
         heartbeat_seq: u8,
-        next_heartbeat: u64, // ms
+        next_heartbeat: u64,     // ms
+        last_product_info: u64,  // ms; rate-limit broadcast bursts
         used: [bool; 256],
     }
 
@@ -349,17 +375,132 @@ mod linux {
             self.send_claim(sock, ADDR_GLOBAL);
         }
 
-        fn on_request(&self, sock: &CanSocket, dst: u8, data: &[u8]) {
+        fn on_request(&mut self, sock: &CanSocket, src: u8, dst: u8, data: &[u8]) {
             if data.len() < 3 {
                 return;
             }
             let requested = data[0] as u32 | (data[1] as u32) << 8 | (data[2] as u32) << 16;
-            if requested == PGN_ISO_ADDRESS_CLAIM
-                && (dst == self.address || dst == ADDR_GLOBAL)
-                && matches!(self.state, ClaimState::Claimed | ClaimState::Pending)
-            {
-                self.send_claim(sock, ADDR_GLOBAL);
+            let addressed = dst == self.address;
+            if !addressed && dst != ADDR_GLOBAL {
+                return; // request is for some other node
             }
+
+            // The address claim must be answerable even before fully claimed.
+            if requested == PGN_ISO_ADDRESS_CLAIM {
+                if matches!(self.state, ClaimState::Claimed | ClaimState::Pending) {
+                    self.send_claim(sock, ADDR_GLOBAL);
+                }
+                return;
+            }
+
+            if self.state != ClaimState::Claimed {
+                return; // need a claimed address to answer from
+            }
+
+            match requested {
+                PGN_PRODUCT_INFO => self.send_product_info(sock),
+                PGN_PGN_LIST => self.send_pgn_list(sock, src),
+                PGN_HEARTBEAT => self.send_heartbeat(sock),
+                _ => {
+                    // ISO 11783-3: NAK an addressed request for a PGN we do
+                    // not send; silently ignore an unsupported global request.
+                    if addressed {
+                        self.send_iso_ack(sock, src, 1 /* NAK */, requested);
+                    }
+                }
+            }
+        }
+
+        // Product Information, PGN 126996. Broadcast (PDU2), so one reply
+        // answers every requester; rate-limited to collapse discovery bursts.
+        fn send_product_info(&mut self, sock: &CanSocket) {
+            let now = now_ms();
+            if now - self.last_product_info < 1000 {
+                return;
+            }
+            self.last_product_info = now;
+
+            let mut data = [0u8; 134];
+            data[0..2].copy_from_slice(&N2K_DB_VERSION.to_le_bytes());
+            data[2..4].copy_from_slice(&PRODUCT_CODE.to_le_bytes());
+            put_string_fix(&mut data[4..36], MODEL_ID);
+            put_string_fix(&mut data[36..68], env!("CARGO_PKG_VERSION"));
+            put_string_fix(&mut data[68..100], ""); // model version
+            put_string_fix(&mut data[100..132], &(self.name & 0x1fffff).to_string());
+            data[132] = CERTIFICATION_LEVEL;
+            data[133] = LOAD_EQUIVALENCY;
+            send_pgn(sock, 6, PGN_PRODUCT_INFO, self.address, ADDR_GLOBAL, &data);
+        }
+
+        // PGN List (Transmit and Receive), PGN 126464: one message per list.
+        fn send_pgn_list(&self, sock: &CanSocket, dst: u8) {
+            for (func, list) in [(0u8, &TX_PGN_LIST[..]), (1u8, &RX_PGN_LIST[..])] {
+                let mut data = Vec::with_capacity(1 + 3 * list.len());
+                data.push(func);
+                for pgn in list {
+                    data.extend_from_slice(&pgn.to_le_bytes()[..3]);
+                }
+                send_pgn(sock, 6, PGN_PGN_LIST, self.address, dst, &data);
+            }
+        }
+
+        // ISO Acknowledgement, PGN 59392.
+        fn send_iso_ack(&self, sock: &CanSocket, dst: u8, control: u8, pgn: u32) {
+            let p = pgn.to_le_bytes();
+            let data = [control, 0xff, 0xff, 0xff, 0xff, p[0], p[1], p[2]];
+            send_pgn(sock, 6, PGN_ISO_ACK, self.address, dst, &data);
+        }
+
+        // Acknowledge Group Function, PGN 126208 function 2.
+        fn send_ack_group_function(&self, sock: &CanSocket, dst: u8, pgn: u32, pgn_err: u8, param_err: u8) {
+            let p = pgn.to_le_bytes();
+            let data = [
+                GROUP_FUNCTION_ACK,
+                p[0],
+                p[1],
+                p[2],
+                (pgn_err & 0x0f) | ((param_err & 0x0f) << 4),
+                0, // number of parameters
+            ];
+            send_pgn(sock, 6, PGN_GROUP_FUNCTION, self.address, dst, &data);
+        }
+
+        // NMEA Request Group Function (PGN 126208, function 0). We act only on
+        // a request targeting our Heartbeat (PGN 126993): it sets the transmit
+        // interval (or disables it), then we reply with an Acknowledge.
+        fn handle_group_function(&mut self, sock: &CanSocket, src: u8, data: &[u8]) {
+            if data.len() < 8 || data[0] != GROUP_FUNCTION_REQUEST || self.state != ClaimState::Claimed {
+                return;
+            }
+            let target = data[1] as u32 | (data[2] as u32) << 8 | (data[3] as u32) << 16;
+            if target != PGN_HEARTBEAT {
+                return;
+            }
+            // Transmission interval: 32-bit, 0.001s resolution => ms.
+            let interval = u32::from_le_bytes([data[4], data[5], data[6], data[7]]);
+            let mut param_err = 0u8;
+            match interval {
+                TX_INTERVAL_NO_CHANGE => {}
+                TX_INTERVAL_RESTORE_DEFAULT => {
+                    self.heartbeat_interval = 60000;
+                    self.next_heartbeat = now_ms() + self.heartbeat_interval;
+                    log::info!("Heartbeat interval restored to default 60000 ms");
+                }
+                0 => {
+                    self.heartbeat_interval = 0;
+                    log::info!("Heartbeat disabled by group function");
+                }
+                1000..=60000 => {
+                    self.heartbeat_interval = interval as u64;
+                    self.next_heartbeat = now_ms() + self.heartbeat_interval;
+                    log::info!("Heartbeat interval set to {interval} ms by group function");
+                }
+                _ => {
+                    param_err = 2; // transmission interval out of range
+                    log::error!("Requested heartbeat interval {interval} ms out of range");
+                }
+            }
+            self.send_ack_group_function(sock, src, PGN_HEARTBEAT, 0, param_err);
         }
 
         fn tick(&mut self, sock: &CanSocket, now: u64) {
@@ -370,6 +511,7 @@ mod linux {
             if self.state == ClaimState::Pending && now >= self.deadline {
                 self.state = ClaimState::Claimed;
                 log::info!("Address {} claimed", self.address);
+                self.send_product_info(sock); // announce ourselves once
                 if self.heartbeat_interval > 0 {
                     self.next_heartbeat = now + self.heartbeat_interval;
                 }
@@ -404,12 +546,20 @@ mod linux {
         }
     }
 
+    /// Copy a string into a fixed-width NUL-padded STRING_FIX field.
+    fn put_string_fix(dst: &mut [u8], s: &str) {
+        let n = s.len().min(dst.len());
+        dst[..n].copy_from_slice(&s.as_bytes()[..n]);
+    }
+
     /// Send an NMEA 2000 message, splitting into a fast packet if the
     /// payload is longer than 8 bytes. Same wire layout as
     /// socketcan-writer.
     fn send_pgn(sock: &CanSocket, prio: u8, pgn: u32, src: u8, dst: u8, data: &[u8]) {
         let can_id = iso_compose(prio, pgn, src, dst);
-        if data.len() <= 8 {
+        // Single-frame PGNs go out as one frame; fast-packet PGNs are always
+        // fast-framed even when short, since receivers key on the PGN type.
+        if data.len() <= 8 && packet_type(pgn) != canboat_core::FramePacketType::Fast {
             send_raw(sock, can_id, data);
             return;
         }
@@ -440,14 +590,31 @@ mod linux {
         let Some(id) = ExtendedId::new(can_id & CAN_EFF_MASK) else {
             return;
         };
-        match socketcan::CanFrame::new(socketcan::Id::Extended(id), data) {
-            Some(frame) => {
-                if let Err(e) = sock.write_frame(&frame) {
+        let Some(frame) = socketcan::CanFrame::new(socketcan::Id::Extended(id), data) else {
+            log::error!("could not build CAN frame for id {can_id:#x}");
+            return;
+        };
+        // The interface tx queue can be shorter than a fast packet (qlen 10
+        // vs 20 frames for Product Information). On a transient full queue the
+        // kernel returns ENOBUFS / WouldBlock; back off and retry so the
+        // multi-frame message is not truncated on the wire.
+        for _ in 0..50 {
+            match sock.write_frame(&frame) {
+                Ok(()) => return,
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.raw_os_error() == Some(libc::ENOBUFS) =>
+                {
+                    // SAFETY: usleep is always safe.
+                    unsafe { libc::usleep(2000) };
+                }
+                Err(e) => {
                     log::error!("write to CAN: {e}");
+                    return;
                 }
             }
-            None => log::error!("could not build CAN frame for id {can_id:#x}"),
         }
+        log::error!("write to CAN: tx queue full after retries");
     }
 
     /// Read one frame plus its kernel SO_TIMESTAMP via recvmsg.
@@ -551,6 +718,7 @@ mod linux {
             heartbeat_interval: cli.heartbeat,
             heartbeat_seq: 0,
             next_heartbeat: 0,
+            last_product_info: 0,
             used: [false; 256],
         };
 
@@ -726,26 +894,30 @@ mod linux {
     ) -> Result<()> {
         let (prio, pgn, src, dst) = iso_decompose(can_id);
 
+        // Single-frame messages that drive the address-claim protocol.
         if claimer.state != ClaimState::Disabled {
             if pgn == PGN_ISO_ADDRESS_CLAIM {
                 claimer.on_claim(sock, src, data);
             } else if pgn == PGN_ISO_REQUEST {
-                claimer.on_request(sock, dst, data);
+                claimer.on_request(sock, src, dst, data);
             }
         }
 
-        if writeonly {
-            return Ok(());
-        }
-
+        // Reassemble even in writeonly mode so group functions are honoured;
+        // only the stdout emit is suppressed.
         let frame = RawFrame::new(Some(format_iso(when)), prio, pgn, src, dst, data.iter().copied());
         match reasm.push(frame, packet_type(pgn)) {
             Reassembled::PassThrough(f) | Reassembled::Complete(f) => {
-                let mut line = String::with_capacity(96);
-                write_line(&mut line, &f).ok();
-                out.write_all(line.as_bytes())?;
-                out.write_all(b"\n")?;
-                out.flush()?;
+                if !writeonly {
+                    let mut line = String::with_capacity(96);
+                    write_line(&mut line, &f).ok();
+                    out.write_all(line.as_bytes())?;
+                    out.write_all(b"\n")?;
+                    out.flush()?;
+                }
+                if claimer.state != ClaimState::Disabled && f.pgn == PGN_GROUP_FUNCTION {
+                    claimer.handle_group_function(sock, src, &f.data);
+                }
             }
             Reassembled::Partial => {}
             Reassembled::Error(e) => log::debug!("reassembly: {e}"),

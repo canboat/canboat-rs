@@ -24,5 +24,6 @@ log          = { workspace = true }
 serde_json   = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-socketcan = "3"
-libc      = "0.2"
+canboat-io = { workspace = true }
+socketcan  = "3"
+libc       = "0.2"

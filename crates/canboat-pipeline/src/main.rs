@@ -44,6 +44,7 @@ use canboat_core::output::CamelCase;
 use canboat_core::{LoadOptions, PgnDatabase, RawFrame};
 use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
+use n2kd::request_engine::{self, RequestEngine};
 
 use crate::hub::Hub;
 use crate::pipeline::Hubs;
@@ -258,11 +259,13 @@ fn run(cli: Cli) -> Result<()> {
     } else {
         None
     };
+    let engine = Arc::new(RequestEngine::new());
     let hubs = Hubs {
         csv: Arc::new(Hub::new()),
         nmea: Arc::new(Hub::new()),
         analyzer: Arc::new(Hub::new()),
         snapshot: snapshot.clone(),
+        engine: Arc::clone(&engine),
     };
 
     // Pick the frame source and (if a device) its writer handle. In
@@ -293,6 +296,16 @@ fn run(cli: Cli) -> Result<()> {
         }
         None => (frames_rx, None),
     };
+
+    // Mirror canboat C `n2kd`'s periodic ISO claim / product-info
+    // auto-request. Only meaningful when there's a device writer to
+    // put the requests on the bus; in stdin-only mode there is no
+    // sink, so we skip the engine entirely.
+    if let Some(sender) = device_sender.clone() {
+        request_engine::spawn(Arc::clone(&engine), move |dst, pgn| {
+            let _ = sender.send_frame(request_engine::iso_request_frame(0, dst, pgn));
+        });
+    }
 
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();
     if let Some(store) = snapshot.as_ref() {

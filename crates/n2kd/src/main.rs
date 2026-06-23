@@ -21,6 +21,7 @@
 //! PGNs flow unchanged through the AIS port; the NMEA stream simply
 //! doesn't emit AIVDM sentences yet.
 
+use n2kd::request_engine::{self, RequestEngine};
 use n2kd::{ais, json, nmea0183};
 
 use std::collections::HashMap;
@@ -45,20 +46,6 @@ const SENSOR_TIMEOUT: Duration = Duration::from_secs(120);
 const AIS_TIMEOUT: Duration = Duration::from_secs(3600);
 /// How often the status port emits a snapshot.
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
-/// Spacing between individual claim-request emissions — matches
-/// `DEVICE_REQUEST_SPACING` in main.c.
-const DEVICE_REQUEST_SPACING: Duration = Duration::from_secs(1);
-/// Minimum time between repeating a claim or product-info request for
-/// the same device — matches `DEVICE_REQUEST_INTERVAL`.
-const DEVICE_REQUEST_INTERVAL: Duration = Duration::from_secs(300);
-
-/// PGN 60928 — ISO Address Claim.
-const PGN_CLAIM: u32 = 60928;
-/// PGN 126996 — Product Information.
-const PGN_PROD_INFO: u32 = 126996;
-/// PGN 126998 — Configuration Information (also auto-requested by
-/// canboat).
-const PGN_CONFIG_INFO: u32 = 126998;
 
 /// AIS PGN list — these flow through the AIS port verbatim. Matches
 /// the `PGN_AIS_*` defines in nmea0183.c.
@@ -188,7 +175,8 @@ fn run(cli: Cli) -> Result<()> {
         log::debug!("--fixtime accepted but not applied to logging: {ts}");
     }
 
-    let mut hub = Hub::new(src_filter, cli.rate_limit, udp);
+    let engine = Arc::new(RequestEngine::new());
+    let mut hub = Hub::new(src_filter, cli.rate_limit, udp, Arc::clone(&engine));
     hub.nmea_to_stdout = cli.nmea0183 && !cli.restrict;
     let hub = Arc::new(hub);
 
@@ -229,7 +217,7 @@ fn run(cli: Cli) -> Result<()> {
     // `--no-request-claims` opt-out both turn it off. Skip in
     // `--nmea0183` debug mode too — stdout is already busy.
     if !cli.restrict && !cli.no_request_claims && !cli.nmea0183 {
-        spawn_claim_request_engine(Arc::clone(&hub));
+        spawn_claim_request_engine(Arc::clone(&engine));
     }
 
     run_stdin_pump(&hub)
@@ -406,56 +394,16 @@ fn spawn_status_emitter(hub: Arc<Hub>) {
         .ok();
 }
 
-/// Periodic claim-request engine. Walks devices we've seen, emits a
-/// PLAIN-format ISO request on stdout for each one that needs a
-/// claim or product-info refresh. Honours the same intervals as
-/// canboat: at most one request per `DEVICE_REQUEST_SPACING`,
-/// repeating the same device no more often than
-/// `DEVICE_REQUEST_INTERVAL`.
-fn spawn_claim_request_engine(hub: Arc<Hub>) {
-    thread::Builder::new()
-        .name("n2kd-claim-engine".into())
-        .spawn(move || {
-            let mut next_claim = 0u8;
-            let mut next_prod = 0u8;
-            let mut last_claim_emit = Instant::now() - DEVICE_REQUEST_SPACING;
-            let mut last_prod_emit = Instant::now() - DEVICE_REQUEST_SPACING;
-            loop {
-                thread::sleep(Duration::from_millis(500));
-                let now = Instant::now();
-                if now.duration_since(last_claim_emit) >= DEVICE_REQUEST_SPACING {
-                    if let Some(dst) =
-                        hub.find_next_device_needing_request(&mut next_claim, PgnRequestKind::Claim)
-                    {
-                        emit_iso_request(dst, PGN_CLAIM);
-                        last_claim_emit = now;
-                    }
-                }
-                if now.duration_since(last_prod_emit) >= DEVICE_REQUEST_SPACING {
-                    if let Some(dst) = hub.find_next_device_needing_request(
-                        &mut next_prod,
-                        PgnRequestKind::ProductInfo,
-                    ) {
-                        // canboat asks for both 126996 (Product Info)
-                        // and 126998 (Configuration Info) under the
-                        // same scheduling slot.
-                        emit_iso_request(dst, PGN_PROD_INFO);
-                        emit_iso_request(dst, PGN_CONFIG_INFO);
-                        last_prod_emit = now;
-                    }
-                }
-            }
-        })
-        .ok();
-}
-
-/// PGN 59904 "ISO Request" — `<ts>,6,59904,0,<dst>,3,<pgn LE bytes>`.
-fn emit_iso_request(dst: u8, pgn: u32) {
-    let now = now_iso();
-    let b0 = pgn & 0xff;
-    let b1 = (pgn >> 8) & 0xff;
-    let b2 = (pgn >> 16) & 0xff;
-    println!("{now},6,59904,0,{dst},3,{b0:02x},{b1:02x},{b2:02x}");
+/// Spawn the library `request_engine` with an emit closure that
+/// writes canboat PLAIN-format ISO requests to stdout — a downstream
+/// writer (e.g. `actisense-serial`) puts them on the bus.
+fn spawn_claim_request_engine(engine: Arc<RequestEngine>) {
+    request_engine::spawn(engine, |dst, pgn| {
+        println!(
+            "{}",
+            request_engine::format_iso_request_plain(&now_iso(), dst, pgn)
+        );
+    });
 }
 
 fn now_iso() -> String {
@@ -484,12 +432,6 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
     let y = if m <= 2 { y + 1 } else { y };
     (y, m, d)
-}
-
-#[derive(Copy, Clone)]
-enum PgnRequestKind {
-    Claim,
-    ProductInfo,
 }
 
 /// Per-stream-client handler.
@@ -643,7 +585,7 @@ const SECONDARY_KEYS: &[(&str, bool)] = &[
 
 struct Hub {
     cache: Mutex<HashMap<(u32, u8, u64), CacheEntry>>,
-    devices: Mutex<HashMap<u8, DeviceState>>,
+    engine: Arc<RequestEngine>,
     subscribers: Mutex<HashMap<u8, Vec<Sender<String>>>>,
     src_filter: Option<SrcFilter>,
     rate_limiter: Mutex<RateLimiter>,
@@ -658,20 +600,16 @@ struct CacheEntry {
     expires_at: Instant,
 }
 
-#[derive(Default, Debug, Clone, Copy)]
-struct DeviceState {
-    seen: bool,
-    last_claim_received: Option<Instant>,
-    last_claim_requested: Option<Instant>,
-    last_prod_info_received: Option<Instant>,
-    last_prod_info_requested: Option<Instant>,
-}
-
 impl Hub {
-    fn new(src_filter: Option<SrcFilter>, rate_limit: bool, udp: Option<UdpBroadcast>) -> Self {
+    fn new(
+        src_filter: Option<SrcFilter>,
+        rate_limit: bool,
+        udp: Option<UdpBroadcast>,
+        engine: Arc<RequestEngine>,
+    ) -> Self {
         Self {
             cache: Mutex::new(HashMap::new()),
-            devices: Mutex::new(HashMap::new()),
+            engine,
             subscribers: Mutex::new(HashMap::new()),
             src_filter,
             rate_limiter: Mutex::new(RateLimiter::new(rate_limit)),
@@ -688,54 +626,7 @@ impl Hub {
     }
 
     fn note_device_seen(&self, pgn: u32, src: u8) {
-        let now = Instant::now();
-        let mut devs = self.devices.lock().unwrap();
-        let entry = devs.entry(src).or_default();
-        entry.seen = true;
-        if pgn == PGN_CLAIM {
-            entry.last_claim_received = Some(now);
-        } else if pgn == PGN_PROD_INFO {
-            entry.last_prod_info_received = Some(now);
-        }
-    }
-
-    fn find_next_device_needing_request(&self, next: &mut u8, kind: PgnRequestKind) -> Option<u8> {
-        let now = Instant::now();
-        let devs = self.devices.lock().ok()?;
-        for offset in 0..=u8::MAX as u16 {
-            let idx = next.wrapping_add(offset as u8);
-            let Some(state) = devs.get(&idx) else {
-                continue;
-            };
-            if !state.seen {
-                continue;
-            }
-            let (last_received, last_requested) = match kind {
-                PgnRequestKind::Claim => (state.last_claim_received, state.last_claim_requested),
-                PgnRequestKind::ProductInfo => (
-                    state.last_prod_info_received,
-                    state.last_prod_info_requested,
-                ),
-            };
-            if last_received.is_some_and(|t| now.duration_since(t) < DEVICE_REQUEST_INTERVAL) {
-                continue;
-            }
-            if last_requested.is_some_and(|t| now.duration_since(t) < DEVICE_REQUEST_INTERVAL) {
-                continue;
-            }
-            // Stamp it requested. Re-take the lock as mutable.
-            drop(devs);
-            let mut devs = self.devices.lock().unwrap();
-            if let Some(state) = devs.get_mut(&idx) {
-                match kind {
-                    PgnRequestKind::Claim => state.last_claim_requested = Some(now),
-                    PgnRequestKind::ProductInfo => state.last_prod_info_requested = Some(now),
-                }
-            }
-            *next = idx.wrapping_add(1);
-            return Some(idx);
-        }
-        None
+        self.engine.note_device_seen(pgn, src);
     }
 
     fn store(&self, meta: Meta, line: String) {
@@ -763,7 +654,7 @@ impl Hub {
 
     fn status_snapshot(&self) -> String {
         let cache_len = self.cache.lock().unwrap().len();
-        let devs_seen = self.devices.lock().unwrap().len();
+        let devs_seen = self.engine.device_count();
         let total_subs: usize = self
             .subscribers
             .lock()

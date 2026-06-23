@@ -28,6 +28,7 @@ use std::sync::Arc;
 use canboat_core::format::write_plain;
 use canboat_core::output::{write_json, CamelCase, JsonOptions};
 use canboat_core::{FramePacketType, PgnDatabase, RawFrame, Reassembled, Reassembler};
+use n2kd::request_engine::RequestEngine;
 
 use crate::hub::Hub;
 use crate::snapshot::SnapshotStore;
@@ -62,6 +63,12 @@ pub struct Hubs {
     /// decoded record's analyzer JSON line lands in the cache; the
     /// snapshot TCP listener dumps the live entries on each connect.
     pub snapshot: Option<Arc<SnapshotStore>>,
+    /// Per-device tracker for the periodic ISO claim / product-info
+    /// auto-request engine. The pipeline updates it from every
+    /// decoded frame; `main.rs` separately spawns the request loop
+    /// when there's a device writer to send the resulting PGN 59904
+    /// requests to.
+    pub engine: Arc<RequestEngine>,
 }
 
 /// Pipeline entry point. Returns when `frames_rx` is closed.
@@ -161,6 +168,10 @@ pub fn run(
         let Ok(decoded) = db.decode(&assembled) else {
             continue;
         };
+
+        // Feed the periodic claim/product-info request engine.
+        // Updates "last received" stamps for PGN 60928 and 126996.
+        hubs.engine.note_device_seen(decoded.pgn, decoded.src);
 
         // Lazy analyzer JSON broadcast / snapshot stash — one JSON
         // line per decoded record. Serialization runs when either

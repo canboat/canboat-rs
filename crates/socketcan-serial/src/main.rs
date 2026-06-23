@@ -77,6 +77,10 @@ struct Cli {
     /// Manufacturer code for the ISO NAME (999 = Signal K).
     #[arg(short = 'm', long = "manufacturer", value_name = "N", default_value_t = 999)]
     manufacturer: u16,
+
+    /// Heartbeat (PGN 126993) interval in ms; 0 disables.
+    #[arg(long = "heartbeat", alias = "hb", value_name = "MS", default_value_t = 60000)]
+    heartbeat: u64,
 }
 
 fn main() -> ExitCode {
@@ -211,6 +215,7 @@ mod linux {
 
     const PGN_ISO_ADDRESS_CLAIM: u32 = 60928;
     const PGN_ISO_REQUEST: u32 = 59904;
+    const PGN_HEARTBEAT: u32 = 126993;
     const ADDR_GLOBAL: u8 = 255;
     const ADDR_NULL: u8 = 254;
     const ADDR_MAX: u8 = 253;
@@ -240,6 +245,9 @@ mod linux {
         state: ClaimState,
         deadline: u64,
         arbitrary: bool,
+        heartbeat_interval: u64, // ms, 0 disables
+        heartbeat_seq: u8,
+        next_heartbeat: u64, // ms
         used: [bool; 256],
     }
 
@@ -362,7 +370,37 @@ mod linux {
             if self.state == ClaimState::Pending && now >= self.deadline {
                 self.state = ClaimState::Claimed;
                 log::info!("Address {} claimed", self.address);
+                if self.heartbeat_interval > 0 {
+                    self.next_heartbeat = now + self.heartbeat_interval;
+                }
             }
+            if self.state == ClaimState::Claimed
+                && self.heartbeat_interval > 0
+                && now >= self.next_heartbeat
+            {
+                self.send_heartbeat(sock);
+                self.next_heartbeat = now + self.heartbeat_interval;
+            }
+        }
+
+        // NMEA 2000 Heartbeat, PGN 126993. Sent every heartbeat_interval ms
+        // once we own an address so other nodes know we are alive.
+        fn send_heartbeat(&mut self, sock: &CanSocket) {
+            let offset = (self.heartbeat_interval / 10) as u16; // field resolution 0.01 s
+            // Controller 1 State = Error Active (0), Controller 2 State = not
+            // available (3), Equipment Status = Operational (0), reserved = 1.
+            let data = [
+                offset as u8,
+                (offset >> 8) as u8,
+                self.heartbeat_seq,
+                0xCC,
+                0xff,
+                0xff,
+                0xff,
+                0xff,
+            ];
+            send_pgn(sock, 7, PGN_HEARTBEAT, self.address, ADDR_GLOBAL, &data);
+            self.heartbeat_seq = if self.heartbeat_seq >= 252 { 0 } else { self.heartbeat_seq + 1 };
         }
     }
 
@@ -510,6 +548,9 @@ mod linux {
             state: if cli.no_claim { ClaimState::Disabled } else { ClaimState::Pending },
             deadline: 0,
             arbitrary: true,
+            heartbeat_interval: cli.heartbeat,
+            heartbeat_seq: 0,
+            next_heartbeat: 0,
             used: [false; 256],
         };
 
@@ -533,18 +574,21 @@ mod linux {
         if !stdin_eof {
             set_nonblocking(libc::STDIN_FILENO).ok();
         }
+        let mut last_frame = now_ms();
 
         loop {
             let now = now_ms();
-            let timeout_ms: i32 = if matches!(claimer.state, ClaimState::Pending | ClaimState::Scanning)
+            // Wake at the soonest of: claim deadline, next heartbeat, or 1s.
+            let wait: u64 = if matches!(claimer.state, ClaimState::Pending | ClaimState::Scanning)
                 && claimer.deadline > now
             {
-                (claimer.deadline - now) as i32
-            } else if cli.timeout > 0 {
-                (cli.timeout * 1000) as i32
+                claimer.deadline - now
+            } else if claimer.state == ClaimState::Claimed && claimer.heartbeat_interval > 0 {
+                claimer.next_heartbeat.saturating_sub(now)
             } else {
                 1000
             };
+            let timeout_ms = wait.min(i32::MAX as u64) as i32;
 
             let mut fds = [
                 libc::pollfd { fd, events: libc::POLLIN, revents: 0 },
@@ -560,14 +604,12 @@ mod linux {
                 }
                 return Err(e).context("poll");
             }
-            if r == 0
-                && cli.timeout > 0
-                && !matches!(claimer.state, ClaimState::Pending | ClaimState::Scanning)
-            {
+            if cli.timeout > 0 && now_ms().saturating_sub(last_frame) >= cli.timeout * 1000 {
                 anyhow::bail!("Timeout {} seconds; no data received", cli.timeout);
             }
 
             if fds[0].revents & libc::POLLIN != 0 {
+                last_frame = now_ms();
                 // Drain at most a batch per wake-up, then yield so the
                 // address-claim timers keep advancing on a busy bus.
                 let mut budget = 256;

@@ -30,7 +30,7 @@ exists:
 | `ikonvert-serial`  | Digital Yacht iKonvert ↔ canboat PLAIN/FAST. ACK-driven init handshake, mid-stream device-reset recovery. | yes (live device)    |
 | `n2kd`             | Analyzer-JSON → NMEA 0183 / AIVDM multiplexer, drop-in for canboat C `n2kd`.   | yes (replay)         |
 | `canboat-pipeline` | Single-process device-reader → analyzer → n2kd. Snapshot / NMEA 0183 / analyzer-JSON / CSV-R/W / write-only TCP servers, supervisor-based device reconnect, lazy formatting. | yes (live iKonvert)  |
-| `socketcan-serial` | Linux SocketCAN ↔ canboat FAST. Software fast-packet reassembly, ISO address claim (scan-then-claim, conflict back-off, ISO Request replies), `SO_TIMESTAMP`. Drop-in for canboat C's socketcan-serial. | yes (live, mcp2515) |
+| `socketcan-serial` | Linux SocketCAN ↔ canboat FAST. Software fast-packet reassembly, ISO address claim (scan-then-claim, conflict back-off, ISO Request replies), Heartbeat (PGN 126993, default 60 s), `SO_TIMESTAMP`. Drop-in for canboat C's socketcan-serial. | yes (live, mcp2515) |
 
 Other binaries (`actisense-serial`, `maretron-ipg`, `replay`,
 `candump2analyzer`, `pcap2candump`, `socketcan-writer`) build and

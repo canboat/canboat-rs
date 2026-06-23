@@ -233,8 +233,10 @@ fn run(cli: Cli) -> anyhow::Result<()> {
 
 #[cfg(target_os = "linux")]
 mod linux {
+    use std::collections::VecDeque;
     use std::io::Write;
     use std::os::fd::AsRawFd;
+    use std::sync::Mutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use anyhow::{Context, Result};
@@ -725,7 +727,19 @@ mod linux {
         }
     }
 
-    fn send_raw(sock: &CanSocket, can_id: u32, data: &[u8]) {
+    /// Hold outbound frames until the kernel CAN qdisc has room. The
+    /// poll loop drains one frame per POLLOUT wakeup so a fast-packet
+    /// burst never stalls RX or the claim timers. ~1 s of bus time at
+    /// 250 kbit/s with the default txqueuelen.
+    const TX_BUFFER_CAPACITY: usize = 1024;
+
+    static TX_QUEUE: Mutex<VecDeque<socketcan::CanFrame>> = Mutex::new(VecDeque::new());
+    static TX_OVERFLOWED: Mutex<usize> = Mutex::new(0);
+
+    /// Enqueue a CAN frame for asynchronous TX. The actual `write_frame`
+    /// happens later, in [`tx_drain_one`], when [`run`]'s poll loop sees
+    /// the socket become writable.
+    fn send_raw(_sock: &CanSocket, can_id: u32, data: &[u8]) {
         let Some(id) = ExtendedId::new(can_id & CAN_EFF_MASK) else {
             return;
         };
@@ -733,27 +747,59 @@ mod linux {
             log::error!("could not build CAN frame for id {can_id:#x}");
             return;
         };
-        // The interface tx queue can be shorter than a fast packet (qlen 10
-        // vs 20 frames for Product Information). On a transient full queue the
-        // kernel returns ENOBUFS / WouldBlock; back off and retry so the
-        // multi-frame message is not truncated on the wire.
-        for _ in 0..50 {
-            match sock.write_frame(&frame) {
-                Ok(()) => return,
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.raw_os_error() == Some(libc::ENOBUFS) =>
-                {
-                    // SAFETY: usleep is always safe.
-                    unsafe { libc::usleep(2000) };
+        let mut q = TX_QUEUE.lock().unwrap();
+        if q.len() >= TX_BUFFER_CAPACITY {
+            let mut overflowed = TX_OVERFLOWED.lock().unwrap();
+            if *overflowed == 0 {
+                log::error!(
+                    "CAN TX buffer full ({TX_BUFFER_CAPACITY} frames), dropping outbound frame"
+                );
+            }
+            *overflowed += 1;
+            return;
+        }
+        q.push_back(frame);
+    }
+
+    /// Returns true iff the TX buffer currently holds at least one frame
+    /// (so the poll loop should add POLLOUT to the CAN socket's events).
+    fn tx_has_pending() -> bool {
+        !TX_QUEUE.lock().unwrap().is_empty()
+    }
+
+    /// Try to write the oldest queued frame. Returns true if a frame was
+    /// actually delivered; false on empty queue or kernel backpressure
+    /// (the frame stays queued, retried on the next wakeup).
+    fn tx_drain_one(sock: &CanSocket) -> bool {
+        let mut q = TX_QUEUE.lock().unwrap();
+        let Some(frame) = q.front().cloned() else {
+            return false;
+        };
+        match sock.write_frame(&frame) {
+            Ok(()) => {
+                q.pop_front();
+                let mut overflowed = TX_OVERFLOWED.lock().unwrap();
+                if *overflowed > 0 && q.len() < TX_BUFFER_CAPACITY / 2 {
+                    log::info!(
+                        "CAN TX buffer recovered ({} frames had been dropped)",
+                        *overflowed
+                    );
+                    *overflowed = 0;
                 }
-                Err(e) => {
-                    log::error!("write to CAN: {e}");
-                    return;
-                }
+                true
+            }
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.raw_os_error() == Some(libc::ENOBUFS) =>
+            {
+                false
+            }
+            Err(e) => {
+                log::error!("write to CAN: {e} (dropping frame)");
+                q.pop_front();
+                false
             }
         }
-        log::error!("write to CAN: tx queue full after retries");
     }
 
     /// Read one frame plus its kernel SO_TIMESTAMP via recvmsg.
@@ -894,22 +940,35 @@ mod linux {
 
         loop {
             let now = now_ms();
+            let tx_pending = tx_has_pending();
             // Wake at the soonest of: claim deadline, next heartbeat, or 1s.
-            let wait: u64 = if matches!(claimer.state, ClaimState::Pending | ClaimState::Scanning)
-                && claimer.deadline > now
-            {
-                claimer.deadline - now
-            } else if claimer.state == ClaimState::Claimed && claimer.heartbeat_interval > 0 {
-                claimer.next_heartbeat.saturating_sub(now)
-            } else {
-                1000
-            };
+            // When TX is backlogged also clamp to a short timeout as a
+            // safety net in case POLLOUT lags qdisc availability on
+            // some kernels.
+            let mut wait: u64 =
+                if matches!(claimer.state, ClaimState::Pending | ClaimState::Scanning)
+                    && claimer.deadline > now
+                {
+                    claimer.deadline - now
+                } else if claimer.state == ClaimState::Claimed && claimer.heartbeat_interval > 0 {
+                    claimer.next_heartbeat.saturating_sub(now)
+                } else {
+                    1000
+                };
+            if tx_pending && wait > 5 {
+                wait = 5;
+            }
             let timeout_ms = wait.min(i32::MAX as u64) as i32;
 
+            let can_events = if tx_pending {
+                libc::POLLIN | libc::POLLOUT
+            } else {
+                libc::POLLIN
+            };
             let mut fds = [
                 libc::pollfd {
                     fd,
-                    events: libc::POLLIN,
+                    events: can_events,
                     revents: 0,
                 },
                 libc::pollfd {
@@ -930,6 +989,14 @@ mod linux {
             }
             if cli.timeout > 0 && now_ms().saturating_sub(last_frame) >= cli.timeout * 1000 {
                 anyhow::bail!("Timeout {} seconds; no data received", cli.timeout);
+            }
+
+            // Drain one frame per writability wakeup (or per safety-net
+            // timeout) so a single producer can't monopolise the loop;
+            // RX, stdin and the claim timers stay responsive across long
+            // fast-packet bursts.
+            if tx_has_pending() {
+                tx_drain_one(&sock);
             }
 
             if fds[0].revents & libc::POLLIN != 0 {

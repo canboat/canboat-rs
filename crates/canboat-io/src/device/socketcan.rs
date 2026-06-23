@@ -315,11 +315,9 @@ mod imp {
 
     impl<'a> Bus<'a> {
         /// Enqueue a self-generated outbound PGN. Splits >8-byte
-        /// payloads into fast-packet chunks and pushes each chunk to
-        /// the kernel queue. When `emit` is true the *same* chunks are
-        /// also forwarded to `frames_tx` as single-frame `RawFrame`s so
-        /// the consumer sees the on-wire footprint of our own emissions
-        /// and reassembles them identically to bus traffic.
+        /// payloads into fast-packet chunks for the wire; when `emit`
+        /// is true the consumer also sees one coalesced `RawFrame` on
+        /// `frames_tx` (same contract as inbound — never split).
         fn send_pgn(&mut self, prio: u8, pgn: u32, src: u8, dst: u8, data: &[u8], emit: bool) {
             let can_id = iso_compose(prio, pgn, src, dst);
             // Single vs fast-packet is decided strictly from the PGN
@@ -337,9 +335,6 @@ mod imp {
             let is_fast = fastpacket::packet_type(pgn) == FramePacketType::Fast;
             if !is_fast {
                 self.tx_buf.push(can_id, data);
-                if emit {
-                    self.emit_chunk(prio, pgn, src, dst, data);
-                }
             } else {
                 // Per ISO 11783-3: every fast-packet CAN frame is
                 // exactly 8 bytes; the last chunk is padded with 0xff.
@@ -366,29 +361,22 @@ mod imp {
                     frame[payload_start..payload_start + chunk]
                         .copy_from_slice(&data[offset..offset + chunk]);
                     self.tx_buf.push(can_id, &frame[..]);
-                    if emit {
-                        self.emit_chunk(prio, pgn, src, dst, &frame[..]);
-                    }
                     offset += chunk;
                     remaining -= chunk;
                     index = index.wrapping_add(1);
                 }
             }
-        }
-
-        /// Forward one CAN-frame-sized chunk to the consumer as a
-        /// single-frame `RawFrame`. Consumer is responsible for fast-
-        /// packet reassembly.
-        fn emit_chunk(&self, prio: u8, pgn: u32, src: u8, dst: u8, chunk: &[u8]) {
-            let f = RawFrame::new(
-                Some(format_iso(now_ms())),
-                prio,
-                pgn,
-                src,
-                dst,
-                chunk.iter().copied(),
-            );
-            let _ = self.frames_tx.send(f);
+            if emit {
+                let f = RawFrame::new(
+                    Some(format_iso(now_ms())),
+                    prio,
+                    pgn,
+                    src,
+                    dst,
+                    data.iter().copied(),
+                );
+                let _ = self.frames_tx.send(f);
+            }
         }
     }
 
@@ -838,16 +826,17 @@ mod imp {
     }
 
     /// Translate an incoming single-frame CAN message. Drives the
-    /// claim state machine, the Group Function responder (PGN 126208 —
-    /// the one multi-frame PGN the library acts on directly, so we
-    /// keep a small internal reassembler just for it), and forwards
-    /// every bus single-frame to `frames_tx` as-is. Consumer reassembly
-    /// uses the canboat-core PGN database (in canboat-pipeline /
-    /// socketcan-serial).
+    /// claim state machine immediately on the raw single frame (its
+    /// PGNs — 60928, 59904 — are all single-frame anyway), then
+    /// pushes through the reassembler. On a coalesced output we (a)
+    /// invoke the Group Function handler if it's PGN 126208 and (b)
+    /// forward the *coalesced* `RawFrame` to `frames_tx` so the
+    /// consumer (canboat-pipeline, socketcan-serial stdout, …) sees a
+    /// complete PGN, matching the NGT-1 / iKonvert adapter contract.
     fn handle_frame(
         bus: &mut Bus<'_>,
         claimer: &mut Claimer,
-        group_fn_reasm: &mut Reassembler,
+        reasm: &mut Reassembler,
         can_id: u32,
         data: &[u8],
         when: u64,
@@ -867,26 +856,24 @@ mod imp {
                 claimer.on_claim(bus, src, data);
             } else if pgn == PGN_ISO_REQUEST {
                 claimer.on_request(bus, src, dst, data);
-            } else if pgn == PGN_GROUP_FUNCTION {
-                // Reassemble locally so we can act on
-                // Heartbeat-interval Request Group Functions even when
-                // the consumer doesn't need a coalesced view.
-                match group_fn_reasm.push(single_frame.clone(), FramePacketType::Fast) {
-                    Reassembled::Complete(coalesced) => {
-                        claimer.handle_group_function(bus, src, &coalesced.data);
-                    }
-                    Reassembled::PassThrough(coalesced) => {
-                        claimer.handle_group_function(bus, src, &coalesced.data);
-                    }
-                    Reassembled::Partial => {}
-                    Reassembled::Error(e) => log::debug!("group-function reassembly: {e}"),
-                }
             }
         }
 
-        // Forward the bus single-frame to the consumer untouched;
-        // they reassemble using the canboat-core db.
-        let _ = bus.frames_tx.send(single_frame);
+        // Classify with the build-time fastpacket table, push through
+        // the reassembler, and forward the coalesced result. A real
+        // single-frame PGN takes the `PassThrough` branch unchanged;
+        // a fast-packet PGN accumulates until `Complete`.
+        let pt = fastpacket::packet_type(pgn);
+        match reasm.push(single_frame, pt) {
+            Reassembled::PassThrough(f) | Reassembled::Complete(f) => {
+                if claimer.state != ClaimState::Disabled && f.pgn == PGN_GROUP_FUNCTION {
+                    claimer.handle_group_function(bus, src, &f.data);
+                }
+                let _ = bus.frames_tx.send(f);
+            }
+            Reassembled::Partial => {}
+            Reassembled::Error(e) => log::debug!("reassembly: {e}"),
+        }
     }
 
     /// Apply an outbound `WriterCmd` from the public `DeviceHandle` API.
@@ -967,10 +954,13 @@ mod imp {
     ) {
         let mut claimer = Claimer::new(&config);
         let mut tx_buf = TxBuffer::new();
-        // Reassembler used *only* for PGN 126208 (Group Function), so
-        // the library can act on Heartbeat-interval requests. Consumer
-        // reassembly is the pipeline's / binary's responsibility.
-        let mut group_fn_reasm = Reassembler::new();
+        // Fast-packet reassembler driven by the build-time
+        // `fastpacket` table. The library hands fully coalesced
+        // `RawFrame`s to `frames_tx`, matching the NGT-1 / iKonvert
+        // adapter contract; both the standalone binary and
+        // canboat-pipeline can then run with `pre_coalesced = true`
+        // and skip a second reassembly pass.
+        let mut reasm = Reassembler::new();
         let mut last_frame = now_ms();
         let timeout_ms = config.timeout_secs.saturating_mul(1000);
 
@@ -1075,7 +1065,7 @@ mod imp {
                             handle_frame(
                                 &mut bus,
                                 &mut claimer,
-                                &mut group_fn_reasm,
+                                &mut reasm,
                                 rx.id & CAN_EFF_MASK,
                                 &rx.data[..rx.dlc],
                                 if rx.when_ms != 0 {

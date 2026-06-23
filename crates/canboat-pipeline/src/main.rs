@@ -551,10 +551,11 @@ fn open_source(
         });
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);
-        // The SocketCAN adapter emits single-frame chunks (8 bytes max)
-        // to the pipeline; reassembly happens here via the canboat-core
-        // PGN database, which has accurate mixed-range classification.
-        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(false))));
+        // The SocketCAN adapter reassembles internally (driven by the
+        // `canboat-io::fastpacket` table) and hands us coalesced
+        // `RawFrame`s, matching the NGT-1 / iKonvert contract — skip
+        // the pipeline's own reassembler.
+        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
     }
     // stdin fallback — no device, no reconnect logic needed. We
     // can't know in advance whether the upstream uses PLAIN

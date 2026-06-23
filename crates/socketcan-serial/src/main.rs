@@ -146,9 +146,7 @@ mod linux {
     use anyhow::{Context, Result};
     use canboat_core::format::plain::{parse_line, write_line};
     use canboat_core::frame::RawFrame;
-    use canboat_core::{Reassembled, Reassembler};
     use canboat_io::device::socketcan::{self, Config};
-    use canboat_io::fastpacket;
 
     use super::*;
 
@@ -199,26 +197,17 @@ mod linux {
             None
         };
 
-        // --- Drain RX frames from the library, reassemble fast-packet
-        // PGNs, and emit one PLAIN/FAST line per coalesced PGN to stdout
-        // (unless writeonly).
-        let mut reasm = Reassembler::new();
+        // --- Drain RX frames from the library and emit one PLAIN/FAST
+        // line per PGN to stdout (unless writeonly). The library
+        // reassembles internally and hands us coalesced `RawFrame`s,
+        // so we just format and write.
         let writeonly = cli.writeonly;
         while let Ok(frame) = handle.frames_rx.recv() {
-            let pt = fastpacket::packet_type(frame.pgn);
-            let coalesced = match reasm.push(frame, pt) {
-                Reassembled::PassThrough(f) | Reassembled::Complete(f) => f,
-                Reassembled::Partial => continue,
-                Reassembled::Error(e) => {
-                    log::debug!("reassembly: {e}");
-                    continue;
-                }
-            };
             if writeonly {
                 continue;
             }
             line.clear();
-            if write_line(&mut line, &coalesced).is_err() {
+            if write_line(&mut line, &frame).is_err() {
                 continue;
             }
             out.write_all(line.as_bytes())?;

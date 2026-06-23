@@ -38,13 +38,16 @@ fn replays_synthetic_ikonvert_into_plain_line() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
-    // First line is the canboat format header tag; second is the
-    // decoded frame. The codec deliberately overrides the iKonvert's
-    // seconds-since-boot timestamp with host wall-clock (matches
-    // canboat C's computeIKonvertTime), so only the post-timestamp
-    // tail is stable across runs.
+    // Output shape: "# format=FAST" header, then the synthetic
+    // "CANboat: Startup" record (PGN 262656) that every device-reader
+    // binary emits as its first frame, then the actual decoded frame.
+    // The codec deliberately overrides the iKonvert's seconds-since-
+    // boot timestamp with host wall-clock (matches canboat C's
+    // computeIKonvertTime), so only the post-timestamp tail is stable
+    // across runs.
     let mut lines = stdout.lines();
     assert_eq!(lines.next(), Some("# format=FAST"));
+    skip_startup_record(lines.next().expect("startup line"));
     let frame = lines.next().expect("frame line");
     let (_ts, tail) = frame.split_once(',').expect("comma after timestamp");
     assert_eq!(tail, "6,60928,5,255,8,fb,9b,70,22,00,9b,50,c0");
@@ -82,6 +85,7 @@ fn replays_ikonvert_data_heartbeat_into_synthesized_pgn() {
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
     let mut lines = stdout.lines();
     assert_eq!(lines.next(), Some("# format=FAST"));
+    skip_startup_record(lines.next().expect("startup line"));
     let frame = lines.next().expect("frame line");
     // Timestamp is host wall-clock; check the rest of the line.
     let (_ts, tail) = frame.split_once(',').expect("comma after timestamp");
@@ -93,4 +97,15 @@ fn replays_ikonvert_data_heartbeat_into_synthesized_pgn() {
 
 fn test_binary_path() -> PathBuf {
     PathBuf::from(env!("CARGO_BIN_EXE_ikonvert-serial"))
+}
+
+/// Sanity-check the synthetic startup record (PGN 262656) every
+/// device-reader binary emits as its first frame. Asserts the line
+/// is the right PGN/header shape; doesn't pin the version or device
+/// fields since those vary with the binary's `CARGO_PKG_VERSION`.
+fn skip_startup_record(line: &str) {
+    assert!(
+        line.contains(",7,262656,0,255,66,"),
+        "expected CANboat: Startup record, got: {line:?}"
+    );
 }

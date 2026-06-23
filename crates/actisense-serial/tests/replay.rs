@@ -75,9 +75,16 @@ fn replays_synthetic_ngt1_into_plain_line() {
         String::from_utf8_lossy(&out.stderr)
     );
     let stdout = String::from_utf8(out.stdout).expect("utf-8 stdout");
-    // The binary emits "# format=FAST" header line first, then frames.
+    // Output shape: "# format=FAST" header, then the synthetic
+    // "CANboat: Startup" record (PGN 262656) that every device-reader
+    // binary emits as its first frame, then the actual decoded frame.
     let mut lines = stdout.lines();
     assert_eq!(lines.next(), Some("# format=FAST"));
+    let startup = lines.next().expect("startup line");
+    assert!(
+        startup.contains(",7,262656,0,255,66,"),
+        "expected CANboat: Startup record, got: {startup:?}"
+    );
     assert_eq!(
         lines.next(),
         Some("12345,6,60928,5,255,8,fb,9b,70,22,00,9b,50,c0"),

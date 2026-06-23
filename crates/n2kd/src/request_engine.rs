@@ -166,6 +166,45 @@ pub fn iso_request_frame(src: u8, dst: u8, pgn: u32) -> RawFrame {
     RawFrame::new(None, 6, PGN_ISO_REQUEST, src, dst, iso_request_payload(pgn))
 }
 
+/// Spawn the request loop on a background thread. On every tick the
+/// engine checks both schedules; due requests are passed to `emit` as
+/// `(dst, pgn)` tuples. The Product Info slot fires two emits in a
+/// row (126996 and 126998), matching canboat C.
+///
+/// The thread runs forever; both callers (n2kd binary, canboat-
+/// pipeline) leak it on process exit.
+pub fn spawn(engine: Arc<RequestEngine>, emit: impl Fn(u8, u32) + Send + 'static) {
+    thread::Builder::new()
+        .name("n2kd-claim-engine".into())
+        .spawn(move || {
+            let mut next_claim = 0u8;
+            let mut next_prod = 0u8;
+            let mut last_claim_emit = Instant::now() - DEVICE_REQUEST_SPACING;
+            let mut last_prod_emit = Instant::now() - DEVICE_REQUEST_SPACING;
+            loop {
+                thread::sleep(Duration::from_millis(500));
+                let now = Instant::now();
+                if now.duration_since(last_claim_emit) >= DEVICE_REQUEST_SPACING {
+                    if let Some(dst) = engine.next_due(&mut next_claim, RequestKind::Claim) {
+                        emit(dst, PGN_CLAIM);
+                        last_claim_emit = now;
+                    }
+                }
+                if now.duration_since(last_prod_emit) >= DEVICE_REQUEST_SPACING {
+                    if let Some(dst) = engine.next_due(&mut next_prod, RequestKind::ProductInfo) {
+                        // canboat asks for both 126996 (Product Info)
+                        // and 126998 (Configuration Info) under the
+                        // same scheduling slot.
+                        emit(dst, PGN_PROD_INFO);
+                        emit(dst, PGN_CONFIG_INFO);
+                        last_prod_emit = now;
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -293,43 +332,4 @@ mod tests {
         // nothing left to do.
         assert_eq!(e.next_due(&mut cursor, RequestKind::Claim), None);
     }
-}
-
-/// Spawn the request loop on a background thread. On every tick the
-/// engine checks both schedules; due requests are passed to `emit` as
-/// `(dst, pgn)` tuples. The Product Info slot fires two emits in a
-/// row (126996 and 126998), matching canboat C.
-///
-/// The thread runs forever; both callers (n2kd binary, canboat-
-/// pipeline) leak it on process exit.
-pub fn spawn(engine: Arc<RequestEngine>, emit: impl Fn(u8, u32) + Send + 'static) {
-    thread::Builder::new()
-        .name("n2kd-claim-engine".into())
-        .spawn(move || {
-            let mut next_claim = 0u8;
-            let mut next_prod = 0u8;
-            let mut last_claim_emit = Instant::now() - DEVICE_REQUEST_SPACING;
-            let mut last_prod_emit = Instant::now() - DEVICE_REQUEST_SPACING;
-            loop {
-                thread::sleep(Duration::from_millis(500));
-                let now = Instant::now();
-                if now.duration_since(last_claim_emit) >= DEVICE_REQUEST_SPACING {
-                    if let Some(dst) = engine.next_due(&mut next_claim, RequestKind::Claim) {
-                        emit(dst, PGN_CLAIM);
-                        last_claim_emit = now;
-                    }
-                }
-                if now.duration_since(last_prod_emit) >= DEVICE_REQUEST_SPACING {
-                    if let Some(dst) = engine.next_due(&mut next_prod, RequestKind::ProductInfo) {
-                        // canboat asks for both 126996 (Product Info)
-                        // and 126998 (Configuration Info) under the
-                        // same scheduling slot.
-                        emit(dst, PGN_PROD_INFO);
-                        emit(dst, PGN_CONFIG_INFO);
-                        last_prod_emit = now;
-                    }
-                }
-            }
-        })
-        .ok();
 }

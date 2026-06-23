@@ -17,8 +17,7 @@
 //!
 //!   1. `$PDGY,N2NET_OFFLINE`         → wait ACK (returned as TEXT banner)
 //!   2. `$PDGY,N2NET_RESET`           → wait ACK   (unconditional — wipes
-//!                                                  any RX/TX filter stored
-//!                                                  in the device's NVRAM)
+//!      any RX/TX filter stored in the device's NVRAM)
 //!   3. `$PDGY,RX_LIST,<pgns>`        → wait ACK   (only if rx list set)
 //!   4. `$PDGY,TX_LIST,<pgns>`        → wait ACK   (only if tx list set)
 //!   5. `$PDGY,N2NET_INIT,{ALL|NORMAL}` → wait ACK

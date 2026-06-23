@@ -12,12 +12,14 @@ pub mod format;
 pub mod frame;
 pub mod output;
 pub mod reassembly;
+pub mod startup;
 pub mod types;
 
 pub use db::{FieldHandle, LoadError, LoadOptions, PgnDatabase};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use frame::{RawFrame, FASTPACKET_MAX_SIZE};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
+pub use startup::{startup_record, CANBOAT_BEM};
 pub use types::{
     BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable, IndirectLookupValue,
     LookupTable, LookupValue, PacketType, PgnInfo,

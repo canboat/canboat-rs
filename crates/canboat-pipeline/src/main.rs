@@ -140,6 +140,13 @@ struct Cli {
     #[arg(long)]
     ikonvert_rate_limit_off: bool,
 
+    /// Suppress the periodic ISO Address Claim / Product Info request
+    /// engine. By default it runs whenever a device writer is wired up
+    /// (matching canboat C `n2kd`'s default). Stdin-only mode always
+    /// skips the engine — there's nowhere to send the requests.
+    #[arg(long)]
+    no_request_claims: bool,
+
     /// Bind address for all TCP listeners. Defaults to `0.0.0.0` so
     /// clients on the LAN (chartplotters, OpenCPN, etc.) can
     /// connect. Pass `127.0.0.1` to restrict access to the local
@@ -300,11 +307,14 @@ fn run(cli: Cli) -> Result<()> {
     // Mirror canboat C `n2kd`'s periodic ISO claim / product-info
     // auto-request. Only meaningful when there's a device writer to
     // put the requests on the bus; in stdin-only mode there is no
-    // sink, so we skip the engine entirely.
-    if let Some(sender) = device_sender.clone() {
-        request_engine::spawn(Arc::clone(&engine), move |dst, pgn| {
-            let _ = sender.send_frame(request_engine::iso_request_frame(0, dst, pgn));
-        });
+    // sink, so we skip the engine entirely. `--no-request-claims`
+    // disables it explicitly (matches n2kd's flag).
+    if !cli.no_request_claims {
+        if let Some(sender) = device_sender.clone() {
+            request_engine::spawn(Arc::clone(&engine), move |dst, pgn| {
+                let _ = sender.send_frame(request_engine::iso_request_frame(0, dst, pgn));
+            });
+        }
     }
 
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();

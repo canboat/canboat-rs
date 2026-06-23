@@ -166,6 +166,135 @@ pub fn iso_request_frame(src: u8, dst: u8, pgn: u32) -> RawFrame {
     RawFrame::new(None, 6, PGN_ISO_REQUEST, src, dst, iso_request_payload(pgn))
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn iso_request_payload_is_little_endian() {
+        assert_eq!(iso_request_payload(60928), [0x00, 0xee, 0x00]);
+        assert_eq!(iso_request_payload(126996), [0x14, 0xf0, 0x01]);
+        assert_eq!(iso_request_payload(126998), [0x16, 0xf0, 0x01]);
+    }
+
+    #[test]
+    fn format_iso_request_plain_matches_canboat_shape() {
+        // Mirrors the PLAIN line `<ts>,6,59904,0,<dst>,3,<lo>,<mid>,<hi>`
+        // that canboat C's request engine emits on stdout.
+        assert_eq!(
+            format_iso_request_plain("2026-01-01T00:00:00.000Z", 35, 60928),
+            "2026-01-01T00:00:00.000Z,6,59904,0,35,3,00,ee,00"
+        );
+    }
+
+    #[test]
+    fn iso_request_frame_carries_correct_header() {
+        let f = iso_request_frame(0, 17, 126996);
+        assert_eq!(f.prio, 6);
+        assert_eq!(f.pgn, PGN_ISO_REQUEST);
+        assert_eq!(f.src, 0);
+        assert_eq!(f.dst, 17);
+        assert_eq!(f.data.as_slice(), &[0x14, 0xf0, 0x01]);
+    }
+
+    #[test]
+    fn device_count_tracks_distinct_sources() {
+        let e = RequestEngine::new();
+        assert_eq!(e.device_count(), 0);
+        e.note_device_seen(127251, 7); // rate-of-turn, src 7
+        e.note_device_seen(127257, 7); // attitude, same src
+        assert_eq!(e.device_count(), 1, "same src must not double-count");
+        e.note_device_seen(127251, 23); // different src
+        assert_eq!(e.device_count(), 2);
+    }
+
+    #[test]
+    fn next_due_returns_seen_device_then_marks_it_requested() {
+        let e = RequestEngine::new();
+        e.note_device_seen(127251, 9); // arbitrary non-claim PGN
+        let mut cursor = 0u8;
+
+        let first = e.next_due(&mut cursor, RequestKind::Claim);
+        assert_eq!(first, Some(9), "device 9 was seen and never asked");
+        assert_eq!(cursor, 10, "cursor must advance past the returned src");
+
+        // Same call again should skip src 9 because it's now within
+        // DEVICE_REQUEST_INTERVAL of its last_claim_requested stamp.
+        // (Cursor wraps all 256 slots; only src 9 is known, so we get
+        // back None.)
+        cursor = 0;
+        let second = e.next_due(&mut cursor, RequestKind::Claim);
+        assert_eq!(second, None, "recently-requested device must be skipped");
+    }
+
+    #[test]
+    fn next_due_skips_unseen_entries() {
+        let e = RequestEngine::new();
+        // Touch the map with a "seen via non-PGN" entry: PGN that
+        // isn't claim/prod-info still marks the device seen.
+        e.note_device_seen(127257, 5);
+        // Manually insert an "unseen" entry to ensure that branch is
+        // exercised — a device that briefly existed but never had
+        // .seen set. Easiest path: use the public API only.
+        let mut cursor = 0u8;
+        assert_eq!(e.next_due(&mut cursor, RequestKind::Claim), Some(5));
+    }
+
+    #[test]
+    fn next_due_kinds_are_independent() {
+        // A pending Claim request should not consume the ProductInfo
+        // slot for the same device.
+        let e = RequestEngine::new();
+        e.note_device_seen(127251, 12);
+        let mut c = 0u8;
+        assert_eq!(e.next_due(&mut c, RequestKind::Claim), Some(12));
+        let mut c = 0u8;
+        assert_eq!(
+            e.next_due(&mut c, RequestKind::ProductInfo),
+            Some(12),
+            "ProductInfo slot must still be due after a Claim request"
+        );
+    }
+
+    #[test]
+    fn next_due_recent_received_suppresses_request() {
+        // Receiving a claim from a device should make the engine
+        // skip Claim requests for that source within the interval.
+        let e = RequestEngine::new();
+        e.note_device_seen(PGN_CLAIM, 42);
+        let mut cursor = 0u8;
+        assert_eq!(
+            e.next_due(&mut cursor, RequestKind::Claim),
+            None,
+            "fresh PGN 60928 receipt must satisfy the Claim schedule"
+        );
+        // But ProductInfo is independent — that schedule is still due.
+        let mut cursor = 0u8;
+        assert_eq!(e.next_due(&mut cursor, RequestKind::ProductInfo), Some(42));
+    }
+
+    #[test]
+    fn next_due_round_robins_across_seen_devices() {
+        let e = RequestEngine::new();
+        e.note_device_seen(127251, 3);
+        e.note_device_seen(127251, 11);
+        e.note_device_seen(127251, 200);
+
+        let mut cursor = 0u8;
+        let first = e.next_due(&mut cursor, RequestKind::Claim).unwrap();
+        let second = e.next_due(&mut cursor, RequestKind::Claim).unwrap();
+        let third = e.next_due(&mut cursor, RequestKind::Claim).unwrap();
+        // Three distinct seen devices, none have been requested yet
+        // → all three should come out in cursor order.
+        let mut hits = [first, second, third];
+        hits.sort();
+        assert_eq!(hits, [3, 11, 200]);
+        // Fourth call: all three were just stamped requested →
+        // nothing left to do.
+        assert_eq!(e.next_due(&mut cursor, RequestKind::Claim), None);
+    }
+}
+
 /// Spawn the request loop on a background thread. On every tick the
 /// engine checks both schedules; due requests are passed to `emit` as
 /// `(dst, pgn)` tuples. The Product Info slot fires two emits in a

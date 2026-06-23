@@ -270,6 +270,7 @@ mod linux {
         state: ClaimState,
         deadline: u64,
         arbitrary: bool,
+        writeonly: bool,         // -w: don't echo to stdout
         heartbeat_interval: u64, // ms, 0 disables
         heartbeat_seq: u8,
         next_heartbeat: u64,     // ms
@@ -318,12 +319,12 @@ mod linux {
 
         fn send_claim(&self, sock: &CanSocket, dst: u8) {
             let data = self.name_to_bytes();
-            send_pgn(sock, 6, PGN_ISO_ADDRESS_CLAIM, self.address, dst, &data);
+            send_pgn(sock, 6, PGN_ISO_ADDRESS_CLAIM, self.address, dst, &data, !self.writeonly);
         }
 
         fn send_request(&self, sock: &CanSocket, src: u8, dst: u8, pgn: u32) {
             let data = [pgn as u8, (pgn >> 8) as u8, (pgn >> 16) as u8];
-            send_pgn(sock, 6, PGN_ISO_REQUEST, src, dst, &data);
+            send_pgn(sock, 6, PGN_ISO_REQUEST, src, dst, &data, !self.writeonly);
         }
 
         fn pick_free(&self) -> Option<u8> {
@@ -429,7 +430,7 @@ mod linux {
             put_string_fix(&mut data[100..132], &(self.name & 0x1fffff).to_string());
             data[132] = CERTIFICATION_LEVEL;
             data[133] = LOAD_EQUIVALENCY;
-            send_pgn(sock, 6, PGN_PRODUCT_INFO, self.address, ADDR_GLOBAL, &data);
+            send_pgn(sock, 6, PGN_PRODUCT_INFO, self.address, ADDR_GLOBAL, &data, !self.writeonly);
         }
 
         // PGN List (Transmit and Receive), PGN 126464: one message per list.
@@ -440,7 +441,7 @@ mod linux {
                 for pgn in list {
                     data.extend_from_slice(&pgn.to_le_bytes()[..3]);
                 }
-                send_pgn(sock, 6, PGN_PGN_LIST, self.address, dst, &data);
+                send_pgn(sock, 6, PGN_PGN_LIST, self.address, dst, &data, !self.writeonly);
             }
         }
 
@@ -448,7 +449,7 @@ mod linux {
         fn send_iso_ack(&self, sock: &CanSocket, dst: u8, control: u8, pgn: u32) {
             let p = pgn.to_le_bytes();
             let data = [control, 0xff, 0xff, 0xff, 0xff, p[0], p[1], p[2]];
-            send_pgn(sock, 6, PGN_ISO_ACK, self.address, dst, &data);
+            send_pgn(sock, 6, PGN_ISO_ACK, self.address, dst, &data, !self.writeonly);
         }
 
         // Acknowledge Group Function, PGN 126208 function 2.
@@ -462,7 +463,7 @@ mod linux {
                 (pgn_err & 0x0f) | ((param_err & 0x0f) << 4),
                 0, // number of parameters
             ];
-            send_pgn(sock, 6, PGN_GROUP_FUNCTION, self.address, dst, &data);
+            send_pgn(sock, 6, PGN_GROUP_FUNCTION, self.address, dst, &data, !self.writeonly);
         }
 
         // NMEA Request Group Function (PGN 126208, function 0). We act only on
@@ -541,7 +542,7 @@ mod linux {
                 0xff,
                 0xff,
             ];
-            send_pgn(sock, 7, PGN_HEARTBEAT, self.address, ADDR_GLOBAL, &data);
+            send_pgn(sock, 7, PGN_HEARTBEAT, self.address, ADDR_GLOBAL, &data, !self.writeonly);
             self.heartbeat_seq = if self.heartbeat_seq >= 252 { 0 } else { self.heartbeat_seq + 1 };
         }
     }
@@ -555,34 +556,47 @@ mod linux {
     /// Send an NMEA 2000 message, splitting into a fast packet if the
     /// payload is longer than 8 bytes. Same wire layout as
     /// socketcan-writer.
-    fn send_pgn(sock: &CanSocket, prio: u8, pgn: u32, src: u8, dst: u8, data: &[u8]) {
+    fn send_pgn(sock: &CanSocket, prio: u8, pgn: u32, src: u8, dst: u8, data: &[u8], emit: bool) {
         let can_id = iso_compose(prio, pgn, src, dst);
         // Single-frame PGNs go out as one frame; fast-packet PGNs are always
         // fast-framed even when short, since receivers key on the PGN type.
         if data.len() <= 8 && packet_type(pgn) != canboat_core::FramePacketType::Fast {
             send_raw(sock, can_id, data);
-            return;
+        } else {
+            let total = data.len();
+            let mut index: u8 = 0;
+            let mut taken = 0usize;
+            while taken < total {
+                let mut frame = [0u8; 8];
+                frame[0] = index;
+                let len = if index == 0 {
+                    frame[1] = total as u8;
+                    let chunk = (total - taken).min(6);
+                    frame[2..2 + chunk].copy_from_slice(&data[taken..taken + chunk]);
+                    taken += chunk;
+                    2 + chunk
+                } else {
+                    let chunk = (total - taken).min(7);
+                    frame[1..1 + chunk].copy_from_slice(&data[taken..taken + chunk]);
+                    taken += chunk;
+                    1 + chunk
+                };
+                send_raw(sock, can_id, &frame[..len]);
+                index = index.wrapping_add(1);
+            }
         }
-        let total = data.len();
-        let mut index: u8 = 0;
-        let mut taken = 0usize;
-        while taken < total {
-            let mut frame = [0u8; 8];
-            frame[0] = index;
-            let len = if index == 0 {
-                frame[1] = total as u8;
-                let chunk = (total - taken).min(6);
-                frame[2..2 + chunk].copy_from_slice(&data[taken..taken + chunk]);
-                taken += chunk;
-                2 + chunk
-            } else {
-                let chunk = (total - taken).min(7);
-                frame[1..1 + chunk].copy_from_slice(&data[taken..taken + chunk]);
-                taken += chunk;
-                1 + chunk
-            };
-            send_raw(sock, can_id, &frame[..len]);
-            index = index.wrapping_add(1);
+
+        // Echo our own generated PGNs to stdout too, so a downstream consumer
+        // sees a complete picture of the bus including this node. The stdin
+        // bridge passes emit=false; its -p passthru handles echoing instead.
+        if emit {
+            let f = RawFrame::new(Some(format_iso(now_ms())), prio, pgn, src, dst, data.iter().copied());
+            let mut line = String::with_capacity(96);
+            write_line(&mut line, &f).ok();
+            let mut so = std::io::stdout().lock();
+            let _ = so.write_all(line.as_bytes());
+            let _ = so.write_all(b"\n");
+            let _ = so.flush();
         }
     }
 
@@ -715,6 +729,7 @@ mod linux {
             state: if cli.no_claim { ClaimState::Disabled } else { ClaimState::Pending },
             deadline: 0,
             arbitrary: true,
+            writeonly: cli.writeonly,
             heartbeat_interval: cli.heartbeat,
             heartbeat_seq: 0,
             next_heartbeat: 0,
@@ -868,7 +883,7 @@ mod linux {
             }
             match canboat_core::format::plain::parse_line(trimmed) {
                 Ok(frame) if frame.pgn < CANBOAT_PGN_START => {
-                    send_pgn(sock, frame.prio, frame.pgn, claimer.address, frame.dst, &frame.data);
+                    send_pgn(sock, frame.prio, frame.pgn, claimer.address, frame.dst, &frame.data, false);
                 }
                 Ok(_) => {} // synthetic status PGN, not for the bus
                 Err(e) => log::warn!("skipping malformed line: {e}"),

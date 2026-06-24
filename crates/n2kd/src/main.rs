@@ -547,15 +547,21 @@ struct Meta {
 fn extract_meta(line: &str) -> Option<Meta> {
     let pgn = json::int(line, "pgn")? as u32;
     let src = json::int(line, "src")? as u8;
-    let secondary = SECONDARY_KEYS
-        .iter()
-        .find_map(|(k, _)| {
-            let idx = line.find(k)?;
+    // Combine *every* matching secondary-key field into a rolling hash
+    // rather than only the first hit. PGNs that need a tuple of fields
+    // to disambiguate variants (e.g. Furuno PGN 130845 "Multi Sats In
+    // View Extended" — same src, but distinct entries per
+    // (Antenna, Page) — or BEP Marine PGN 130817 — per Page) get a
+    // unique cache slot per tuple instead of overwriting each other.
+    let mut secondary: u64 = 0;
+    for (k, _) in SECONDARY_KEYS {
+        if let Some(idx) = line.find(k) {
             let after = &line[idx + k.len()..];
             let end = after.find([',', '}']).unwrap_or(after.len());
-            Some(djb2_hash(after[..end].trim_matches(['"', ' ', ':'])))
-        })
-        .unwrap_or(0);
+            let v = after[..end].trim_matches(['"', ' ', ':']);
+            secondary = secondary.wrapping_mul(33).wrapping_add(djb2_hash(v));
+        }
+    }
     let is_ais_like = SECONDARY_KEYS
         .iter()
         .any(|(k, ais)| *ais && line.contains(k));
@@ -581,6 +587,12 @@ const SECONDARY_KEYS: &[(&str, bool)] = &[
     ("\"User ID\":", true),
     ("\"Message ID\":", true),
     ("\"Proprietary ID\":", false),
+    // Furuno PGN 130845 = per-(Antenna, Page); BEP Marine PGN 130817 =
+    // per-Page. Both are the only PGNs in canboat.json that name a
+    // field exactly `Antenna` / `Page`, and the trailing colon in the
+    // substring rules out the sibling `"Page type":` field.
+    ("\"Antenna\":", false),
+    ("\"Page\":", false),
 ];
 
 struct Hub {
@@ -709,6 +721,50 @@ mod tests {
         let line = r#"{"timestamp":"…","src":23,"pgn":129039,"fields":{"Message ID":18,"User ID":"244180106"}}"#;
         let meta = extract_meta(line).unwrap();
         assert!(meta.is_ais_like);
+        // Regression guard: the AIS path's secondary must remain
+        // non-zero so different vessels (different User IDs) don't
+        // collide in the cache.
+        assert_ne!(meta.secondary, 0);
+    }
+
+    /// Furuno PGN 130845 "Multi Sats In View Extended" arrives 4×2
+    /// times per cycle (4 antennas × 2 pages); without per-tuple
+    /// secondary the cache only retains the last variant. Confirm the
+    /// (Antenna, Page) tuple produces distinct secondary hashes.
+    #[test]
+    fn extract_meta_distinguishes_furuno_130845_by_antenna_and_page() {
+        let mk = |antenna: u8, page: u8| {
+            format!(
+                r#"{{"timestamp":"x","src":52,"pgn":130845,"fields":{{"Manufacturer Code":{{"value":1855,"name":"Furuno"}},"Antenna":{antenna},"Page type":2,"Page":{page},"Sats in View":21}}}}"#
+            )
+        };
+        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
+        for antenna in 0..4u8 {
+            for page in 1..=2u8 {
+                let m = extract_meta(&mk(antenna, page)).unwrap();
+                assert!(
+                    seen.insert(m.secondary),
+                    "antenna={antenna} page={page} hashed to {:#x}, already seen",
+                    m.secondary
+                );
+            }
+        }
+        assert_eq!(seen.len(), 8);
+    }
+
+    /// "Page type" must not match the "Page" substring (the trailing
+    /// `:` rules it out). Distinguish lines that differ only in
+    /// "Page type" without mismatching the Page-only logic.
+    #[test]
+    fn extract_meta_does_not_match_page_type_as_page() {
+        // Identical Page=1 but differing Page type values — secondary
+        // should be the same because Page type isn't in the key list.
+        let a = r#"{"src":52,"pgn":130845,"fields":{"Antenna":1,"Page type":2,"Page":1}}"#;
+        let b = r#"{"src":52,"pgn":130845,"fields":{"Antenna":1,"Page type":3,"Page":1}}"#;
+        assert_eq!(
+            extract_meta(a).unwrap().secondary,
+            extract_meta(b).unwrap().secondary,
+        );
     }
 
     #[test]

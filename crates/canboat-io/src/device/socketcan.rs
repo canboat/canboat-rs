@@ -877,16 +877,22 @@ mod imp {
     }
 
     /// Apply an outbound `WriterCmd` from the public `DeviceHandle` API.
-    /// `src == 0` is interpreted as "use my claim address"; any other
-    /// value is forwarded unchanged so quirk synthesisers can
-    /// impersonate other nodes on the wire.
+    /// `src == 0` (PC-gateway / unset default) and `src == 255`
+    /// (broadcast — never a valid source on the bus) are both
+    /// interpreted as "use my claim address"; any other value is
+    /// forwarded unchanged so quirk synthesisers can impersonate other
+    /// nodes on the wire (e.g. the SCX-20 quirk uses `src = 52`).
     fn dispatch_cmd(bus: &mut Bus<'_>, claimer: &Claimer, cmd: WriterCmd) {
         match cmd {
             WriterCmd::Frame(f) => {
                 if f.pgn >= CANBOAT_PGN_START {
                     return; // synthetic, never goes on the bus
                 }
-                let src = if f.src == 0 { claimer.address } else { f.src };
+                let src = if f.src == 0 || f.src == ADDR_GLOBAL {
+                    claimer.address
+                } else {
+                    f.src
+                };
                 // emit=false: this is a user-initiated send; the caller
                 // already has visibility into what they sent. (For the
                 // SCX-20 quirk we want the synthetic 126996 to be

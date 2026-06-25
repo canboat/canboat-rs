@@ -21,7 +21,7 @@ use canboat_core::{
         InputFormat,
     },
     output::{write_json, write_text, CamelCase, GeoFormat, JsonOptions, TextOptions},
-    FramePacketType, LoadOptions, PacketType, PgnDatabase, Reassembled, Reassembler,
+    FramePacketType, LoadOptions, PacketType, PgnDatabase, Reassembled, Reassembler, CANBOAT_BEM,
 };
 use canboat_io::LineReader;
 
@@ -259,6 +259,13 @@ fn run_loop<R: BufRead, W: Write>(
     // pgn-test.in's mix of 8-byte and 43-byte payloads) decode
     // identically to the C analyzer.
     let mut coalesced_mode = false;
+    // Under -fixtime, suppress the incoming CANboat startup record
+    // (CANBOAT_BEM) that producer tools emit at the head of every
+    // stream. Its payload embeds the producer's build version, which
+    // otherwise leaks into -fixtime output and breaks version-agnostic
+    // golden tests. Mirrors the banner suppression above; same "n2kd"
+    // carve-out so n2kd's own pipeline is unchanged.
+    let suppress_startup_record = cli.fixtime.as_deref().is_some_and(|s| !s.contains("n2kd"));
     while let Some(line) = reader.next_line().context("reading input line")? {
         if line.is_empty() {
             continue;
@@ -298,6 +305,10 @@ fn run_loop<R: BufRead, W: Write>(
                 continue;
             }
         };
+
+        if suppress_startup_record && frame.pgn == CANBOAT_BEM {
+            continue;
+        }
 
         if let Some(want) = cli.pgn {
             if frame.pgn != want {

@@ -161,7 +161,11 @@ mod linux {
             no_claim: cli.no_claim,
             timeout_secs: cli.timeout,
         };
-        let handle = socketcan::run(&cli.device, config)
+        // Binary doesn't surface the claim address externally — pass
+        // a fresh atom and discard the handle to it.
+        let claim_addr =
+            std::sync::Arc::new(std::sync::atomic::AtomicU8::new(socketcan::CLAIM_UNCLAIMED));
+        let handle = socketcan::run(&cli.device, config, claim_addr)
             .with_context(|| format!("opening SocketCAN {}", cli.device))?;
 
         // --- Emit the canboat prologue: FAST format header + synthetic

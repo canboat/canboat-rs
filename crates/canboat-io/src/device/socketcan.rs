@@ -27,6 +27,12 @@ pub use imp::run;
 
 pub use config::Config;
 
+/// Sentinel value stored in the claim-address atom when the gateway
+/// hasn't successfully claimed an address yet. Callers (e.g.
+/// `canboat-pipeline`'s CSV-port injector) treat this as "no rewrite
+/// available, leave the caller's `src` alone".
+pub const CLAIM_UNCLAIMED: u8 = 254;
+
 mod config {
     /// Bus-participant configuration. All fields have sensible defaults
     /// via [`Config::default`]; tweak only what differs from canboat C
@@ -68,7 +74,11 @@ mod config {
 }
 
 #[cfg(not(target_os = "linux"))]
-pub fn run(_iface: &str, _config: Config) -> std::io::Result<super::DeviceHandle> {
+pub fn run(
+    _iface: &str,
+    _config: Config,
+    _claim_addr: std::sync::Arc<std::sync::atomic::AtomicU8>,
+) -> std::io::Result<super::DeviceHandle> {
     Err(std::io::Error::new(
         std::io::ErrorKind::Unsupported,
         "SocketCAN is only available on Linux",
@@ -79,7 +89,8 @@ pub fn run(_iface: &str, _config: Config) -> std::io::Result<super::DeviceHandle
 mod imp {
     use std::collections::{HashMap, VecDeque};
     use std::os::fd::AsRawFd;
-    use std::sync::mpsc;
+    use std::sync::atomic::{AtomicU8, Ordering};
+    use std::sync::{mpsc, Arc};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -912,7 +923,20 @@ mod imp {
     /// Open the SocketCAN interface and spawn the bus-participant
     /// worker thread. Returns a standard [`DeviceHandle`] for the
     /// caller to drain RX from and push TX into.
-    pub fn run(iface: &str, config: Config) -> std::io::Result<DeviceHandle> {
+    ///
+    /// `claim_addr` is shared with the worker: it starts at
+    /// [`super::CLAIM_UNCLAIMED`] (254) and is updated to our
+    /// currently-claimed source address every time the worker decides
+    /// it. Callers that need to rewrite an outbound `src` to match the
+    /// gateway's live address (e.g. canboat-pipeline's CSV-port
+    /// injector, so the in-process loopback shows the same `src` the
+    /// rewritten frame will reach the bus with) read it from this
+    /// atom. The supervisor reuses the same atom across reconnects.
+    pub fn run(
+        iface: &str,
+        config: Config,
+        claim_addr: Arc<AtomicU8>,
+    ) -> std::io::Result<DeviceHandle> {
         let sock = CanSocket::open(iface).map_err(std::io::Error::other)?;
         sock.set_nonblocking(true)?;
         let fd = sock.as_raw_fd();
@@ -942,7 +966,7 @@ mod imp {
 
         let join = thread::Builder::new()
             .name("socketcan-worker".into())
-            .spawn(move || worker(sock, fd, config, frames_tx, cmd_rx))?;
+            .spawn(move || worker(sock, fd, config, frames_tx, cmd_rx, claim_addr))?;
 
         Ok(from_parts(frames_rx, cmd_tx, vec![join]))
     }
@@ -957,9 +981,14 @@ mod imp {
         config: Config,
         frames_tx: mpsc::Sender<RawFrame>,
         cmd_rx: mpsc::Receiver<WriterCmd>,
+        claim_addr: Arc<AtomicU8>,
     ) {
         let mut claimer = Claimer::new(&config);
+        // Reset the claim atom to "unclaimed" so a reconnect resumes
+        // with no stale value visible to consumers.
+        claim_addr.store(super::CLAIM_UNCLAIMED, Ordering::Relaxed);
         let mut tx_buf = TxBuffer::new();
+        let mut last_published_addr: u8 = super::CLAIM_UNCLAIMED;
         // Fast-packet reassembler driven by the build-time
         // `fastpacket` table. The library hands fully coalesced
         // `RawFrame`s to `frames_tx`, matching the NGT-1 / iKonvert
@@ -1096,6 +1125,24 @@ mod imp {
                 frames_tx: &frames_tx,
             };
             claimer.tick(&mut bus, now_ms());
+
+            // 8. Publish the live claim to the shared atom so external
+            //    consumers (e.g. the canboat-pipeline CSV injector,
+            //    which needs to rewrite an incoming src=0/255 to our
+            //    address before mirroring the frame onto the in-process
+            //    pipeline) always see what's on the wire. Only update
+            //    when actually claimed; while scanning/pending/failed
+            //    leave it at CLAIM_UNCLAIMED so the caller knows not
+            //    to rewrite yet.
+            let live = if claimer.state == ClaimState::Claimed {
+                claimer.address
+            } else {
+                super::CLAIM_UNCLAIMED
+            };
+            if live != last_published_addr {
+                claim_addr.store(live, Ordering::Relaxed);
+                last_published_addr = live;
+            }
         }
     }
 }

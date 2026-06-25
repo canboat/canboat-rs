@@ -28,6 +28,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::sync::{mpsc, Arc};
 use std::thread::{self, JoinHandle};
 
@@ -46,6 +47,14 @@ use canboat_io::device::FrameSender;
 pub struct InjectPoint {
     pub device: FrameSender,
     pub loopback: mpsc::Sender<RawFrame>,
+    /// Live claim address from the underlying device adapter, when
+    /// known (today only `--socketcan` exposes it). Used to rewrite a
+    /// client-supplied `src == 0` (PC-gateway default) or `src == 255`
+    /// (broadcast — never a valid source) to the gateway's address on
+    /// the loopback side, so the in-process pipeline sees the same
+    /// `src` the rewritten frame will reach the bus with. `None`
+    /// disables the rewrite (other device backends; stdin mode).
+    pub claim_addr: Option<Arc<AtomicU8>>,
 }
 
 /// One-shot header sent to every CSV (R/W) client on connect.
@@ -357,7 +366,24 @@ fn forward_plain_line(line: &str, inject: &InjectPoint) -> bool {
         return true;
     }
     match parse_plain(trimmed) {
-        Ok(frame) => {
+        Ok(mut frame) => {
+            // Rewrite a default / broadcast `src` to our gateway's
+            // live claim address on BOTH paths. The device adapter
+            // does the same rewrite internally for the bus side, but
+            // the loopback bypasses that — so without this, the
+            // in-process pipeline (n2kd snapshot / analyzer-port JSON
+            // / NMEA 0183) shows the original `src=0` or `src=255`
+            // even though the on-wire frame has the gateway's src.
+            // `CLAIM_UNCLAIMED` (254) means we haven't claimed yet —
+            // leave src as-is rather than guess.
+            if matches!(frame.src, 0 | 255) {
+                if let Some(claim) = inject.claim_addr.as_deref() {
+                    let live = claim.load(Ordering::Relaxed);
+                    if live != canboat_io::device::socketcan::CLAIM_UNCLAIMED {
+                        frame.src = live;
+                    }
+                }
+            }
             if inject.device.send_frame(frame.clone()).is_err() {
                 return false;
             }

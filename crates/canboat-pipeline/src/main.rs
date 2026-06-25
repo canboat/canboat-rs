@@ -323,7 +323,12 @@ fn run(cli: Cli) -> Result<()> {
     // is already a complete PGN payload (iKonvert / Maretron). In
     // that case the pipeline skips the fast-packet reassembler —
     // those gateways have already done the coalescing on the wire.
-    let (frames_rx, supervisor, pre_coalesced) = open_source(&cli)?;
+    let OpenedSource {
+        frames_rx,
+        supervisor,
+        pre_coalesced,
+        claim_addr: device_claim_addr,
+    } = open_source(&cli)?;
     let device_sender = supervisor.as_ref().map(|s| s.frame_sender());
 
     // Quirks (e.g. SCX-20 PGN 126996 fabrication) need to write the
@@ -352,6 +357,7 @@ fn run(cli: Cli) -> Result<()> {
             let inject = tcp::InjectPoint {
                 device: device_sender.clone().expect("device_sender Some"),
                 loopback,
+                claim_addr: device_claim_addr.clone(),
             };
             (rx, Some(inject))
         }
@@ -465,13 +471,20 @@ fn run(cli: Cli) -> Result<()> {
 /// In device mode the supervisor's manager thread handles reconnect
 /// on disconnect/EOF with exponential backoff up to 30 s, so a flaky
 /// serial port or TCP gateway doesn't take the pipeline down.
-fn open_source(
-    cli: &Cli,
-) -> Result<(
-    mpsc::Receiver<RawFrame>,
-    Option<Supervisor>,
-    Arc<AtomicBool>,
-)> {
+/// What `open_source` hands back to `run`. Separate struct (rather
+/// than a return tuple) because the field count grew past what
+/// clippy's `type_complexity` lint will tolerate.
+struct OpenedSource {
+    frames_rx: mpsc::Receiver<RawFrame>,
+    supervisor: Option<Supervisor>,
+    pre_coalesced: Arc<AtomicBool>,
+    /// Live claim address of the device backend, when known (today
+    /// only `--socketcan` exposes one). Read by the CSV-port
+    /// injector to rewrite client-supplied default-`src` frames.
+    claim_addr: Option<Arc<std::sync::atomic::AtomicU8>>,
+}
+
+fn open_source(cli: &Cli) -> Result<OpenedSource> {
     if let Some(path) = cli.actisense.as_deref() {
         let baud = cli.baud.unwrap_or(115_200);
         let path = path.to_string();
@@ -484,7 +497,12 @@ fn open_source(
         // NGT-1's `N2K_MSG_RECEIVED` (0x93) frames carry full PGN
         // payloads — fast-packet coalescing happens inside the
         // device, not on the wire we receive. Skip the reassembler.
-        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
+        return Ok(OpenedSource {
+            frames_rx: rx,
+            supervisor: Some(sup),
+            pre_coalesced: Arc::new(AtomicBool::new(true)),
+            claim_addr: None,
+        });
     }
     if let Some(path) = cli.ikonvert.as_deref() {
         let baud = cli.baud.unwrap_or(230_400);
@@ -506,7 +524,12 @@ fn open_source(
         let (rx, sup) = split_supervisor(sup);
         // iKonvert coalesces fast-packets internally; skip the
         // reassembler entirely.
-        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
+        return Ok(OpenedSource {
+            frames_rx: rx,
+            supervisor: Some(sup),
+            pre_coalesced: Arc::new(AtomicBool::new(true)),
+            claim_addr: None,
+        });
     }
     if let Some(url) = cli.maretron.as_deref() {
         let url = url.to_string();
@@ -522,7 +545,12 @@ fn open_source(
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);
         // Maretron IPG ships full PGN payloads per 0xA5 frame.
-        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
+        return Ok(OpenedSource {
+            frames_rx: rx,
+            supervisor: Some(sup),
+            pre_coalesced: Arc::new(AtomicBool::new(true)),
+            claim_addr: None,
+        });
     }
     if let Some(read_url) = cli.canboat_csv.as_deref() {
         let read_url = read_url.to_string();
@@ -538,7 +566,12 @@ fn open_source(
         let (rx, sup) = split_supervisor(sup);
         // Wire format is canboat PLAIN/FAST — each line is already
         // a complete PGN payload, so skip the reassembler.
-        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
+        return Ok(OpenedSource {
+            frames_rx: rx,
+            supervisor: Some(sup),
+            pre_coalesced: Arc::new(AtomicBool::new(true)),
+            claim_addr: None,
+        });
     }
     if let Some(iface) = cli.socketcan.as_deref() {
         let iface = iface.to_string();
@@ -546,8 +579,14 @@ fn open_source(
             address: cli.socketcan_address,
             ..device::socketcan::Config::default()
         };
+        // Shared across factory reconnects so the live claim address
+        // survives supervisor-driven device-session restarts.
+        let claim_addr = Arc::new(std::sync::atomic::AtomicU8::new(
+            device::socketcan::CLAIM_UNCLAIMED,
+        ));
+        let claim_for_factory = Arc::clone(&claim_addr);
         let factory = NamedFactory::new("socketcan", move || {
-            device::socketcan::run(&iface, config.clone())
+            device::socketcan::run(&iface, config.clone(), Arc::clone(&claim_for_factory))
         });
         let sup = Supervisor::new(factory);
         let (rx, sup) = split_supervisor(sup);
@@ -555,7 +594,12 @@ fn open_source(
         // `canboat-io::fastpacket` table) and hands us coalesced
         // `RawFrame`s, matching the NGT-1 / iKonvert contract — skip
         // the pipeline's own reassembler.
-        return Ok((rx, Some(sup), Arc::new(AtomicBool::new(true))));
+        return Ok(OpenedSource {
+            frames_rx: rx,
+            supervisor: Some(sup),
+            pre_coalesced: Arc::new(AtomicBool::new(true)),
+            claim_addr: Some(claim_addr),
+        });
     }
     // stdin fallback — no device, no reconnect logic needed. We
     // can't know in advance whether the upstream uses PLAIN
@@ -570,7 +614,12 @@ fn open_source(
         .name("stdin-pump".into())
         .spawn(move || stdin_pump(tx, coalesced_for_pump, None))
         .expect("spawn stdin-pump");
-    Ok((rx, None, pre_coalesced))
+    Ok(OpenedSource {
+        frames_rx: rx,
+        supervisor: None,
+        pre_coalesced,
+        claim_addr: None,
+    })
 }
 
 /// Swap the `Supervisor::frames_rx` out so the pipeline can own it

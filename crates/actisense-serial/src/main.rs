@@ -44,7 +44,7 @@ use clap::Parser;
 
 use canboat_core::format::{
     encode_n2k_send_frame, encode_startup_ping, ngt1::NgtEvent, parse_plain, plain::ParseError,
-    write_plain, Ngt1Decoder,
+    write_plain, Ngt1Decoder, NgtMessage, N2K_MSG_RECEIVED,
 };
 use canboat_core::RawFrame;
 use canboat_io::{open_serial, BytePump};
@@ -178,34 +178,58 @@ fn run(cli: Cli) -> Result<()> {
 
     // --- Open the input source. For a serial device that we'll also
     // be writing to, we clone the handle so the writer thread has its
-    // own fd.
-    let (mut read_handle, write_handle_opt): (Box<dyn Read + Send>, Option<Box<dyn Write + Send>>) =
-        match &read_source {
-            InputSource::Serial(path) => {
-                let read_port = open_serial(path, cli.baud)
-                    .with_context(|| format!("opening {} at {} bps", path, cli.baud))?;
-                let write_handle: Option<Box<dyn Write + Send>> = if do_write {
-                    let wp = read_port
-                        .try_clone()
-                        .with_context(|| format!("cloning {}", path))?;
-                    Some(Box::new(SerialWriter::new(wp)))
-                } else {
-                    None
-                };
-                (Box::new(SerialReader::new(read_port)), write_handle)
-            }
-            InputSource::File(path) => (
-                Box::new(
-                    File::open(path).with_context(|| format!("opening file {}", path.display()))?,
-                ),
-                None,
-            ),
-            InputSource::Stdin => {
-                let stdin = io::stdin();
-                let reader: Box<dyn Read + Send> = Box::new(StdinReader(stdin));
-                (reader, None)
-            }
-        };
+    // own fd. For a regular file we also sniff the first byte to spot
+    // a W2K-1 / OpenCPN JSON capture so we can switch to the line-
+    // oriented reader.
+    let (mut read_handle, write_handle_opt, read_kind): (
+        Box<dyn Read + Send>,
+        Option<Box<dyn Write + Send>>,
+        ReadKind,
+    ) = match &read_source {
+        InputSource::Serial(path) => {
+            let read_port = open_serial(path, cli.baud)
+                .with_context(|| format!("opening {} at {} bps", path, cli.baud))?;
+            let write_handle: Option<Box<dyn Write + Send>> = if do_write {
+                let wp = read_port
+                    .try_clone()
+                    .with_context(|| format!("cloning {}", path))?;
+                Some(Box::new(SerialWriter::new(wp)))
+            } else {
+                None
+            };
+            (
+                Box::new(SerialReader::new(read_port)),
+                write_handle,
+                ReadKind::Ngt1,
+            )
+        }
+        InputSource::File(path) => {
+            let mut file =
+                File::open(path).with_context(|| format!("opening file {}", path.display()))?;
+            // Peek the first byte to decide between raw NGT-1 bytes and
+            // a W2K-1 / OpenCPN JSON capture (`{"pgn":..,"payload":[..]}`
+            // per line). The peeked byte is prepended back via
+            // `Read::chain` so the read loop still sees it.
+            let mut first = [0u8; 1];
+            let n = file
+                .read(&mut first)
+                .with_context(|| format!("sniffing {}", path.display()))?;
+            let kind = if n == 1 && first[0] == b'{' {
+                log::debug!("W2K JSON mode selected for {}", path.display());
+                ReadKind::W2KJson
+            } else {
+                ReadKind::Ngt1
+            };
+            let prefix = io::Cursor::new(first[..n].to_vec());
+            let handle: Box<dyn Read + Send> = Box::new(prefix.chain(file));
+            (handle, None, kind)
+        }
+        InputSource::Stdin => {
+            let stdin = io::stdin();
+            let reader: Box<dyn Read + Send> = Box::new(StdinReader(stdin));
+            (reader, None, ReadKind::Ngt1)
+        }
+    };
 
     // --- Spawn the writer thread if we're going to transmit.
     let (write_tx, writer_join) = if let Some(handle) = write_handle_opt {
@@ -236,7 +260,12 @@ fn run(cli: Cli) -> Result<()> {
     // mode against a serial device we still read but suppress the
     // emit, so the kernel RX buffer doesn't back up.
     if do_read_device {
-        run_read_loop(&mut read_handle, &mut out, cli.timeout, cli.write_only)?;
+        match read_kind {
+            ReadKind::Ngt1 => {
+                run_read_loop(&mut read_handle, &mut out, cli.timeout, cli.write_only)?
+            }
+            ReadKind::W2KJson => run_w2k_read_loop(&mut read_handle, &mut out, cli.write_only)?,
+        }
     }
 
     // Drop the writer's sender first so the writer thread sees EOF on
@@ -256,6 +285,14 @@ enum InputSource {
     File(PathBuf),
     /// `-` on the command line — read NGT-1 bytes from stdin.
     Stdin,
+}
+
+/// Which device-side wire format we'll decode. NGT-1 byte stream is the
+/// default for serial / stdin / raw files; W2K-1 / OpenCPN JSON capture
+/// is auto-detected from a leading `{` and parsed line-at-a-time.
+enum ReadKind {
+    Ngt1,
+    W2KJson,
 }
 
 /// `io::Stdin` exposes `Read` but the call holds a lock per `read`;
@@ -350,6 +387,96 @@ fn run_read_loop<R: Read>(
     Ok(())
 }
 
+/// Read a W2K-1 / OpenCPN JSON capture: one `{"pgn":..,"payload":[..]}`
+/// object per line, where the payload array is a de-framed Actisense
+/// N2K message — `command(1) length(1) prio(1) pgn(3 LE) dst(1) src(1)
+/// ts(4 LE) dlen(1) data(dlen)`. The DLE framing and checksum a serial
+/// NGT-1 would add are absent, so we hand the body straight to
+/// `NgtMessage::to_raw_frame` after stripping the command + stale
+/// length bytes. Mirrors `w2kMessageReceived` in canboat's
+/// `actisense-serial.c`.
+fn run_w2k_read_loop<R: Read>(
+    reader: &mut R,
+    out: &mut impl Write,
+    suppress_output: bool,
+) -> Result<()> {
+    let mut reader = io::BufReader::new(reader);
+    let mut line = String::with_capacity(2048);
+    let mut payload = Vec::with_capacity(256);
+    let mut text = String::with_capacity(256);
+    let mut frames_emitted: u64 = 0;
+    loop {
+        line.clear();
+        match reader.read_line(&mut line) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(e) => return Err(e).context("reading W2K JSON line"),
+        }
+        if suppress_output {
+            continue;
+        }
+        if !parse_w2k_payload(&line, &mut payload) {
+            continue;
+        }
+        if payload.len() < 13 || payload[0] != N2K_MSG_RECEIVED {
+            log::warn!(
+                "ignoring W2K payload ({} bytes, command {:02x})",
+                payload.len(),
+                payload.first().copied().unwrap_or(0)
+            );
+            continue;
+        }
+        // Skip command byte + stale BST length byte; the rest is what
+        // NgtMessage::to_raw_frame expects (prio + pgn + dst + src +
+        // ts + dlen + data).
+        let msg = NgtMessage {
+            command: N2K_MSG_RECEIVED,
+            payload: payload[2..].to_vec(),
+        };
+        if let Some(frame) = msg.to_raw_frame() {
+            text.clear();
+            write_plain(&mut text, &frame).expect("write to String");
+            out.write_all(text.as_bytes())?;
+            out.write_all(b"\n")?;
+            out.flush()?;
+            frames_emitted += 1;
+        }
+    }
+    log::info!("emitted {frames_emitted} N2K frames (W2K JSON)");
+    Ok(())
+}
+
+/// Pull the integer bytes out of a W2K-1 line's `"payload":[..]` array.
+/// Returns `false` and leaves `out` empty if the line doesn't carry a
+/// well-formed payload array. Doesn't try to be a real JSON parser —
+/// the C tool does the same lightweight scan.
+fn parse_w2k_payload(line: &str, out: &mut Vec<u8>) -> bool {
+    out.clear();
+    let Some(start) = line.find("\"payload\"") else {
+        return false;
+    };
+    let after_key = &line[start..];
+    let Some(bracket) = after_key.find('[') else {
+        return false;
+    };
+    let rest = &after_key[bracket + 1..];
+    let end = rest.find(']').unwrap_or(rest.len());
+    for tok in rest[..end].split(',') {
+        let t = tok.trim();
+        if t.is_empty() {
+            continue;
+        }
+        match t.parse::<u16>() {
+            Ok(v) if v <= 255 => out.push(v as u8),
+            _ => {
+                out.clear();
+                return false;
+            }
+        }
+    }
+    true
+}
+
 fn writer_thread<W: Write>(mut device: W, rx: mpsc::Receiver<RawFrame>) {
     // Send the NGT-1 startup sequence on entry so the device unlocks
     // its TX queue.
@@ -430,5 +557,65 @@ fn stdin_pump_thread(write_tx: Option<mpsc::Sender<RawFrame>>, passthru: bool) {
             // Writer thread is gone.
             return;
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_w2k_payload_array() {
+        let line = r#"{"pgn":60928,"payload":[147,19,6,0,238,0,255,0,255,255,255,255,8,163,195,33,34,0,130,50,192]}"#;
+        let mut out = Vec::new();
+        assert!(parse_w2k_payload(line, &mut out));
+        assert_eq!(out.len(), 21);
+        assert_eq!(out[0], N2K_MSG_RECEIVED);
+        assert_eq!(out[2], 6); // prio
+    }
+
+    #[test]
+    fn parse_w2k_payload_rejects_line_without_payload_key() {
+        let line = r#"{"pgn":60928,"data":[1,2,3]}"#;
+        let mut out = Vec::new();
+        assert!(!parse_w2k_payload(line, &mut out));
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn parse_w2k_payload_handles_spaces_and_trailing_newline() {
+        let line =
+            "{\"payload\":[ 147 , 19 ,6,0,238,0,255,0,255,255,255,255,8,1,2,3,4,5,6,7,8 ]}\n";
+        let mut out = Vec::new();
+        assert!(parse_w2k_payload(line, &mut out));
+        assert_eq!(out[0], 147);
+        assert_eq!(out.last(), Some(&8));
+    }
+
+    #[test]
+    fn parse_w2k_payload_rejects_out_of_range_value() {
+        let line = r#"{"payload":[256,0,0]}"#;
+        let mut out = Vec::new();
+        assert!(!parse_w2k_payload(line, &mut out));
+        assert!(out.is_empty());
+    }
+
+    /// One full W2K line should decode through `NgtMessage::to_raw_frame`
+    /// to the same prio/pgn/src/dst we hand-derived from the payload.
+    #[test]
+    fn w2k_payload_to_raw_frame_round_trip() {
+        let line = r#"{"pgn":127245,"payload":[147,19,2,13,241,1,255,5,255,255,255,255,8,0,255,255,127,27,0,255,255]}"#;
+        let mut payload = Vec::new();
+        assert!(parse_w2k_payload(line, &mut payload));
+        let msg = NgtMessage {
+            command: N2K_MSG_RECEIVED,
+            payload: payload[2..].to_vec(),
+        };
+        let frame = msg.to_raw_frame().expect("decodes");
+        assert_eq!(frame.prio, 2);
+        assert_eq!(frame.pgn, 127245);
+        assert_eq!(frame.src, 5);
+        assert_eq!(frame.dst, 255);
+        assert_eq!(frame.data.len(), 8);
     }
 }

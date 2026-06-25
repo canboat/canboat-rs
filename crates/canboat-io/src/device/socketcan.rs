@@ -104,6 +104,7 @@ mod imp {
 
     const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
     const CAN_ERR_FLAG: u32 = 0x2000_0000;
+    const CAN_EFF_FLAG: u32 = 0x8000_0000;
 
     const PGN_ISO_ACK: u32 = 59392;
     const PGN_ISO_REQUEST: u32 = 59904;
@@ -1091,6 +1092,13 @@ mod imp {
                     match recv_frame(fd) {
                         Ok(Some(rx)) => {
                             if rx.id & CAN_ERR_FLAG != 0 {
+                                continue;
+                            }
+                            // NMEA 2000 is always 29-bit extended. CAN 1.0
+                            // standard frames (11-bit, no EFF flag) cannot
+                            // be N2K, so skip them rather than reinterpret
+                            // the low 11 bits as a degenerate 29-bit id.
+                            if rx.id & CAN_EFF_FLAG == 0 {
                                 continue;
                             }
                             let mut bus = Bus {

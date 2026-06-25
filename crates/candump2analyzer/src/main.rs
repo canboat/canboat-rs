@@ -121,6 +121,14 @@ fn run(cli: Cli) -> Result<()> {
         };
         match parse(fmt, trimmed) {
             Some(record) => {
+                // NMEA 2000 always uses 29-bit extended CAN ids; an id
+                // that fits in 11 bits is a CAN 1.0 standard frame and
+                // can't be N2K. Log formats that aren't kernel-tagged
+                // can't tell us the width on their own, so filter here.
+                if record.canid <= 0x7ff {
+                    log::debug!("skipping CAN 1.0 standard frame: id={:#x}", record.canid);
+                    continue;
+                }
                 emit(&mut out, &record)?;
             }
             None => {

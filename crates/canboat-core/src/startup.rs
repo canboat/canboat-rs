@@ -57,7 +57,13 @@ fn now_iso() -> String {
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default();
-    let ms = now.as_millis() as u64;
+    format_iso_ms(now.as_millis() as u64)
+}
+
+/// Format Unix milliseconds as `YYYY-MM-DDTHH:MM:SS.mmmZ` (ISO-8601
+/// Zulu). Used by the EBL reader so timestamp records replay with their
+/// captured wall-clock time.
+pub fn format_iso_ms(ms: u64) -> String {
     let secs = (ms / 1000) as i64;
     let millis = ms % 1000;
     let days = secs.div_euclid(86_400);

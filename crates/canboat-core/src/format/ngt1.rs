@@ -29,6 +29,23 @@ use crate::frame::RawFrame;
 const DLE: u8 = 0x10;
 const STX: u8 = 0x02;
 const ETX: u8 = 0x03;
+/// Actisense `.ebl` log files frame each record with `ESC SOH ... ESC LF`
+/// (alongside the usual `DLE STX ... DLE ETX` NGT-1 frames inside). Inside
+/// any framed region ESC also doubles as an escape byte (`ESC ESC` for a
+/// literal 0x1b), so the framer can keep them distinguished from frame
+/// markers. ESC is only special in EBL mode.
+const ESC: u8 = 0x1b;
+const SOH: u8 = 0x01;
+const LF: u8 = 0x0a;
+
+/// Difference between the Windows FILETIME epoch (1601-01-01) and the
+/// Unix epoch (1970-01-01), in milliseconds. EBL timestamp records carry
+/// a FILETIME (100-ns ticks since 1601); divide by 10_000 to get ms and
+/// subtract this to land on Unix ms.
+const FILETIME_TO_UNIX_MS: u64 = 11_644_473_600_000;
+/// EBL header record types. Only `0x03` (timestamp) is currently emitted
+/// by Actisense's W2K-1 logger.
+const EBL_TIMESTAMP: u8 = 0x03;
 
 /// Receive an N2K frame off the bus.
 pub const N2K_MSG_RECEIVED: u8 = 0x93;
@@ -58,34 +75,67 @@ pub enum NgtError {
     BadEscape(u8),
 }
 
+/// EBL header records (only emitted when the decoder is in EBL mode).
+/// Actisense's `.ebl` logger writes a timestamp record before every NGT-1
+/// frame; the format reserves room for other record types, none of which
+/// are documented, so an unrecognised type is preserved verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EblHeader {
+    /// Wall-clock time of the record that follows, in Unix milliseconds.
+    Timestamp(u64),
+    /// Header type byte + payload, when the type isn't `EBL_TIMESTAMP`.
+    Unknown { kind: u8, payload: Vec<u8> },
+}
+
 /// Events emitted by [`Ngt1Decoder::push_byte`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum NgtEvent {
     /// A complete NGT-1 message was decoded.
     Message(NgtMessage),
+    /// An EBL header record (timestamp or other). EBL-only.
+    Header(EblHeader),
     /// The decoder rejected a frame (resync to next DLE STX).
     Error(NgtError),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum State {
-    /// Outside any frame, looking for DLE.
+    /// Outside any frame, looking for DLE (or ESC in EBL mode).
     Idle,
-    /// Saw DLE while idle — expecting STX to enter a frame.
-    AwaitStx,
-    /// Inside a frame, collecting bytes.
+    /// Inside a `DLE STX … DLE ETX` NGT-1 frame, collecting bytes.
     InFrame,
-    /// Saw DLE inside a frame; the next byte is either ETX (end of
-    /// frame), DLE (escaped 0x10 literal), STX (resync to new frame),
-    /// or something invalid.
-    InEscape,
+    /// Inside an `ESC SOH … ESC LF` EBL record, collecting bytes.
+    InHeader,
+    /// Just consumed an escape byte (DLE always; ESC in EBL mode).
+    /// `prev` carries the state we entered Escape from so the literal-
+    /// escape branch can restore it.
+    Escape { prev: PrevState },
+}
+
+/// Restricted shadow of [`State`] — only the states that can precede
+/// `State::Escape`. Keeps `State` self-referential noise out.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PrevState {
+    Idle,
+    InFrame,
+    InHeader,
 }
 
 /// Streaming NGT-1 byte decoder. Feed bytes; pull events.
+///
+/// Set EBL mode (via [`Ngt1Decoder::with_ebl`]) to parse Actisense `.ebl`
+/// log files, which interleave `ESC SOH … ESC LF` timestamp records with
+/// the usual NGT-1 frames and use ESC as a second escape byte inside
+/// either kind of framed region. ESC handling is gated on EBL specifically
+/// — non-EBL byte streams (live NGT-1, Yacht Device `.dle`, …) can carry
+/// 0x1b as ordinary data and must be parsed without ESC escaping.
 pub struct Ngt1Decoder {
     state: State,
     /// Accumulating frame payload (command + length + payload + checksum).
     buf: Vec<u8>,
+    /// Treat ESC as a second escape byte and recognise ESC SOH / ESC LF
+    /// as EBL record framing. Off by default.
+    ebl: bool,
 }
 
 impl Default for Ngt1Decoder {
@@ -100,65 +150,112 @@ impl Ngt1Decoder {
             state: State::Idle,
             // Worst-case frame: 1 cmd + 1 len + 255 payload + 1 cksum.
             buf: Vec::with_capacity(258),
+            ebl: false,
         }
+    }
+
+    /// Build a decoder that also recognises Actisense `.ebl` framing
+    /// (ESC SOH … ESC LF records and ESC as a second escape byte).
+    pub fn with_ebl() -> Self {
+        let mut d = Self::new();
+        d.ebl = true;
+        d
     }
 
     /// Feed one byte. Returns `Some(event)` when a frame completes or
     /// fails; `None` while bytes are accumulating.
+    ///
+    /// Mirrors the single state machine in canboat's `readNGT1Byte`,
+    /// which dispatches both NGT-1 (DLE STX … DLE ETX) and EBL
+    /// (ESC SOH … ESC LF) framing through a shared "Escape" state.
     pub fn push_byte(&mut self, b: u8) -> Option<NgtEvent> {
         match self.state {
             State::Idle => {
-                if b == DLE {
-                    self.state = State::AwaitStx;
+                if self.is_escape(b) {
+                    self.state = State::Escape {
+                        prev: PrevState::Idle,
+                    };
                 }
                 None
             }
-            State::AwaitStx => {
-                match b {
-                    STX => {
-                        self.buf.clear();
-                        self.state = State::InFrame;
-                        None
-                    }
-                    DLE => {
-                        // DLE DLE outside a frame — stay idle.
-                        self.state = State::Idle;
-                        None
-                    }
-                    _ => {
-                        self.state = State::Idle;
-                        None
-                    }
-                }
-            }
             State::InFrame => {
-                if b == DLE {
-                    self.state = State::InEscape;
+                if self.is_escape(b) {
+                    self.state = State::Escape {
+                        prev: PrevState::InFrame,
+                    };
                 } else {
                     self.buf.push(b);
                 }
                 None
             }
-            State::InEscape => match b {
-                ETX => self.finish_frame(),
-                DLE => {
-                    self.buf.push(DLE);
+            State::InHeader => {
+                // Per canboat, only ESC counts as escape inside a
+                // header record — DLE bytes within a timestamp body
+                // are literal data.
+                if self.ebl && b == ESC {
+                    self.state = State::Escape {
+                        prev: PrevState::InHeader,
+                    };
+                } else {
+                    self.buf.push(b);
+                }
+                None
+            }
+            State::Escape { prev } => match b {
+                STX => {
+                    self.buf.clear();
                     self.state = State::InFrame;
                     None
                 }
-                STX => {
-                    // DLE STX inside a frame = resync to a new frame.
+                ETX => {
+                    let r = self.finish_frame();
+                    self.state = State::Idle;
+                    r
+                }
+                SOH if self.ebl => {
                     self.buf.clear();
-                    self.state = State::InFrame;
+                    self.state = State::InHeader;
+                    None
+                }
+                LF if self.ebl => {
+                    let r = self.finish_header();
+                    self.state = State::Idle;
+                    r
+                }
+                DLE => {
+                    if matches!(prev, PrevState::InFrame | PrevState::InHeader) {
+                        self.buf.push(DLE);
+                    }
+                    self.state = restore(prev);
+                    None
+                }
+                ESC if self.ebl => {
+                    if matches!(prev, PrevState::InFrame | PrevState::InHeader) {
+                        self.buf.push(ESC);
+                    }
+                    self.state = restore(prev);
                     None
                 }
                 other => {
+                    let was_collecting = matches!(prev, PrevState::InFrame | PrevState::InHeader);
                     self.state = State::Idle;
                     self.buf.clear();
-                    Some(NgtEvent::Error(NgtError::BadEscape(other)))
+                    // An escape byte that wasn't followed by a frame
+                    // delimiter outside any frame is just stray serial
+                    // noise — surface no error. Only flag when we were
+                    // mid-message and the bad sequence corrupted it.
+                    if was_collecting {
+                        Some(NgtEvent::Error(NgtError::BadEscape(other)))
+                    } else {
+                        None
+                    }
                 }
             },
         }
+    }
+
+    fn is_escape(&self, b: u8) -> bool {
+        b == DLE || (self.ebl && b == ESC)
     }
 
     /// Convenience helper to feed a byte slice. Returns every event
@@ -194,6 +291,37 @@ impl Ngt1Decoder {
         }
         let payload = raw[2..raw.len() - 1].to_vec();
         Some(NgtEvent::Message(NgtMessage { command, payload }))
+    }
+
+    /// Dispatch a completed EBL header record. Type-0x03 records carry
+    /// an 8-byte little-endian Windows FILETIME; unknown types are
+    /// surfaced verbatim so a caller can log or skip them.
+    fn finish_header(&mut self) -> Option<NgtEvent> {
+        let raw = std::mem::take(&mut self.buf);
+        if raw.is_empty() {
+            return None;
+        }
+        match raw[0] {
+            EBL_TIMESTAMP if raw.len() >= 9 => {
+                let ticks = u64::from_le_bytes([
+                    raw[1], raw[2], raw[3], raw[4], raw[5], raw[6], raw[7], raw[8],
+                ]);
+                let unix_ms = (ticks / 10_000).saturating_sub(FILETIME_TO_UNIX_MS);
+                Some(NgtEvent::Header(EblHeader::Timestamp(unix_ms)))
+            }
+            kind => Some(NgtEvent::Header(EblHeader::Unknown {
+                kind,
+                payload: raw[1..].to_vec(),
+            })),
+        }
+    }
+}
+
+fn restore(prev: PrevState) -> State {
+    match prev {
+        PrevState::Idle => State::Idle,
+        PrevState::InFrame => State::InFrame,
+        PrevState::InHeader => State::InHeader,
     }
 }
 
@@ -314,6 +442,75 @@ impl NgtMessage {
             dst,
             data,
         })
+    }
+
+    /// Convert an N2K message into a [`RawFrame`] regardless of
+    /// direction. Mirrors canboat's `n2kMessageReceived(buf, len, cmd)`
+    /// which accepts both `N2K_MSG_RECEIVED` (0x93, the normal serial
+    /// stream) and `N2K_MSG_SEND` (0x94, used for the outbound side of
+    /// replay captures like `.ebl` logs). SEND messages omit the src
+    /// (the NGT-1 picks its own claim address) and the per-message
+    /// timestamp, so we report `src = 0` and leave the timestamp empty
+    /// for the caller to override (e.g. with an EBL header timestamp).
+    ///
+    /// NGT-1 internal messages (`NGT_MSG_RECEIVED` 0xA0 etc.) are
+    /// surfaced as synthetic PGNs in the `ACTISENSE_BEM` range
+    /// (0x40000 + payload[0]) with `prio = src = dst = 0`, matching
+    /// canboat's `ngtMessageReceived` dispatch. This keeps Actisense
+    /// system-status records flowing through downstream consumers that
+    /// know about the synthetic PGN range.
+    pub fn to_raw_frame_any_dir(&self) -> Option<RawFrame> {
+        match self.command {
+            N2K_MSG_RECEIVED => self.to_raw_frame(),
+            N2K_MSG_SEND => {
+                // Header: prio(1) pgn(3 LE) dst(1) dlen(1) — no src, no ts.
+                const HEADER: usize = 6;
+                if self.payload.len() < HEADER {
+                    return None;
+                }
+                let prio = self.payload[0];
+                let pgn = u32::from(self.payload[1])
+                    | (u32::from(self.payload[2]) << 8)
+                    | (u32::from(self.payload[3]) << 16);
+                let dst = self.payload[4];
+                let dlen = self.payload[5] as usize;
+                if HEADER + dlen > self.payload.len() {
+                    return None;
+                }
+                let data = self.payload[HEADER..HEADER + dlen]
+                    .iter()
+                    .copied()
+                    .collect::<smallvec::SmallVec<[u8; 8]>>();
+                Some(RawFrame {
+                    timestamp: None,
+                    prio,
+                    pgn,
+                    src: 0,
+                    dst,
+                    data,
+                })
+            }
+            // Any other NGT-1-internal message: synthesise a PGN in the
+            // ACTISENSE_BEM (0x40000) range as canboat C does.
+            _ => {
+                if self.payload.is_empty() {
+                    return None;
+                }
+                let pgn = 0x40000u32 + u32::from(self.payload[0]);
+                let data = self.payload[1..]
+                    .iter()
+                    .copied()
+                    .collect::<smallvec::SmallVec<[u8; 8]>>();
+                Some(RawFrame {
+                    timestamp: None,
+                    prio: 0,
+                    pgn,
+                    src: 0,
+                    dst: 0,
+                    data,
+                })
+            }
+        }
     }
 }
 
@@ -528,5 +725,123 @@ mod tests {
             &raw.data[..],
             &[0xe6, 0xf1, 0x3a, 0x80, 0x9c, 0xc6, 0x0d, 0xb3]
         );
+    }
+
+    /// EBL header record: ESC SOH 0x03 <8-byte FILETIME LE> ESC LF.
+    /// FILETIME is 100-ns ticks since 1601-01-01 UTC; subtract the
+    /// 1601→1970 ms offset to get Unix ms. The bytes here are from the
+    /// first record of `canboat/samples/actisense1.ebl`, captured on
+    /// 2025-04-25 17:05:21.993Z (Unix ms 1_745_600_721_993).
+    #[test]
+    fn ebl_timestamp_header_decodes() {
+        let body = [0x90, 0xe3, 0xc8, 0x3a, 0x04, 0xb6, 0xdb, 0x01];
+        let mut wire = vec![ESC, SOH, EBL_TIMESTAMP];
+        wire.extend_from_slice(&body);
+        wire.extend_from_slice(&[ESC, LF]);
+        let mut d = Ngt1Decoder::with_ebl();
+        let events = d.push_bytes(&wire);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            NgtEvent::Header(EblHeader::Timestamp(ms)) => {
+                assert_eq!(*ms, 1_745_600_721_993);
+            }
+            other => panic!("expected Timestamp, got {other:?}"),
+        }
+    }
+
+    /// ESC must NOT be treated as an escape byte in non-EBL mode — a
+    /// payload byte of 0x1b in a regular NGT-1 / Yacht Device `.dle`
+    /// stream is ordinary data, not a frame marker.
+    #[test]
+    fn esc_in_payload_is_literal_when_not_ebl() {
+        let payload = vec![0x1b, 0x00, 0x1b, 0xff];
+        let mut wire = Vec::new();
+        encode_ngt_message(0x42, &payload, &mut wire);
+        let mut d = Ngt1Decoder::new();
+        let events = d.push_bytes(&wire);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            NgtEvent::Message(m) => assert_eq!(m.payload, payload),
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// In EBL mode the same wire bytes (no DLE/ESC stuffing applied)
+    /// would corrupt the frame — because ESC is now an escape byte —
+    /// so the encoder couldn't be used here. Test instead that
+    /// `ESC ESC` escapes to a literal 0x1b inside an EBL header.
+    #[test]
+    fn ebl_escapes_esc_within_header() {
+        // Header carries an unrecognised type byte (so we get the
+        // verbatim payload back) and a literal 0x1b in the middle.
+        let mut wire = vec![ESC, SOH, 0xAA, 0x11, ESC, ESC, 0x22];
+        wire.extend_from_slice(&[ESC, LF]);
+        let mut d = Ngt1Decoder::with_ebl();
+        let events = d.push_bytes(&wire);
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            NgtEvent::Header(EblHeader::Unknown { kind, payload }) => {
+                assert_eq!(*kind, 0xAA);
+                assert_eq!(payload, &vec![0x11, ESC, 0x22]);
+            }
+            other => panic!("got {other:?}"),
+        }
+    }
+
+    /// End-to-end: a real Actisense `.ebl` sample interleaves timestamp
+    /// records with NGT-1 N2K messages. Decoding the canonical opener of
+    /// `samples/actisense1.ebl` should yield exactly: timestamp, then
+    /// timestamp, then an `N2K_MSG_RECEIVED` frame.
+    #[test]
+    fn ebl_decodes_two_timestamps_then_n2k_frame() {
+        // Bytes copied from samples/actisense1.ebl, offsets 0x00..0x30:
+        //   ESC SOH 03 90 e3 c8 3a 04 b6 db 01 ESC LF       (timestamp 1)
+        //   ESC SOH 01 01 03 90 e3 c8 3a 04 b6 db 01 ESC LF (timestamp 2)
+        //   DLE STX 93 48 04 10 10 fc 01 63 ff e5 03 …      (N2K msg, truncated)
+        // For this unit test we just include both headers plus a small
+        // synthetic NGT-1 frame so we don't have to ship the sample.
+        let mut wire = vec![
+            ESC,
+            SOH,
+            EBL_TIMESTAMP,
+            0x90,
+            0xe3,
+            0xc8,
+            0x3a,
+            0x04,
+            0xb6,
+            0xdb,
+            0x01,
+            ESC,
+            LF,
+        ];
+        wire.extend_from_slice(&[
+            ESC,
+            SOH,
+            EBL_TIMESTAMP,
+            0xa0,
+            0xe3,
+            0xc8,
+            0x3a,
+            0x04,
+            0xb6,
+            0xdb,
+            0x01,
+            ESC,
+            LF,
+        ]);
+        wire.extend_from_slice(&encode_frame(N2K_MSG_RECEIVED, &[0u8; 11]));
+        let mut d = Ngt1Decoder::with_ebl();
+        let events = d.push_bytes(&wire);
+        assert_eq!(events.len(), 3);
+        assert!(matches!(
+            events[0],
+            NgtEvent::Header(EblHeader::Timestamp(_))
+        ));
+        assert!(matches!(
+            events[1],
+            NgtEvent::Header(EblHeader::Timestamp(_))
+        ));
+        assert!(matches!(events[2], NgtEvent::Message(_)));
     }
 }

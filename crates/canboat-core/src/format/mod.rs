@@ -17,8 +17,8 @@ pub mod ydwg02;
 
 pub use ngt1::{
     encode_n2k_send_frame, encode_n2k_send_payload, encode_ngt_message, encode_startup_ping,
-    Ngt1Decoder, NgtError, NgtEvent, NgtMessage, N2K_MSG_RECEIVED, N2K_MSG_SEND, NGT_MSG_RECEIVED,
-    NGT_MSG_SEND, NGT_STARTUP_SEQ,
+    EblHeader, Ngt1Decoder, NgtError, NgtEvent, NgtMessage, N2K_MSG_RECEIVED, N2K_MSG_SEND,
+    NGT_MSG_RECEIVED, NGT_MSG_SEND, NGT_STARTUP_SEQ,
 };
 pub use plain::{parse_line as parse_plain, write_line as write_plain, ParseError as PlainError};
 

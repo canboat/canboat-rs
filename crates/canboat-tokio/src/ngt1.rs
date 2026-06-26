@@ -123,6 +123,10 @@ where
                     }
                 }
                 NgtEvent::Error(e) => log::warn!("NGT framing error: {e}"),
+                // EBL header records only appear when the decoder is
+                // built with `with_ebl()`; this stream sticks to the
+                // live NGT-1 path so this arm is dead.
+                NgtEvent::Header(_) => {}
             }
         }
     }

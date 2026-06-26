@@ -43,7 +43,10 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use canboat_core::format::{
-    encode_n2k_send_frame, encode_startup_ping, ngt1::NgtEvent, parse_plain, plain::ParseError,
+    encode_n2k_send_frame, encode_startup_ping,
+    ngt1::{EblHeader, NgtEvent},
+    parse_plain,
+    plain::ParseError,
     write_plain, Ngt1Decoder, NgtMessage, N2K_MSG_RECEIVED,
 };
 use canboat_core::RawFrame;
@@ -206,15 +209,27 @@ fn run(cli: Cli) -> Result<()> {
         InputSource::File(path) => {
             let mut file =
                 File::open(path).with_context(|| format!("opening file {}", path.display()))?;
-            // Peek the first byte to decide between raw NGT-1 bytes and
-            // a W2K-1 / OpenCPN JSON capture (`{"pgn":..,"payload":[..]}`
-            // per line). The peeked byte is prepended back via
-            // `Read::chain` so the read loop still sees it.
+            // Decide which framing the file carries. EBL is the only
+            // format keyed on extension — its bytes start with `ESC SOH`
+            // (0x1b 0x01), which makes for a fragile sniff signal vs.
+            // raw NGT-1 byte streams that begin with random data, so the
+            // canboat C tool also uses the `.ebl` suffix. JSON captures
+            // (`{"pgn":..,"payload":[..]}` per line, W2K-1 / OpenCPN) are
+            // sniffed from a leading `{` so they need no flag. The
+            // peeked byte is prepended back via `Read::chain`.
+            let is_ebl = path
+                .extension()
+                .and_then(|e| e.to_str())
+                .map(|e| e.eq_ignore_ascii_case("ebl"))
+                .unwrap_or(false);
             let mut first = [0u8; 1];
             let n = file
                 .read(&mut first)
                 .with_context(|| format!("sniffing {}", path.display()))?;
-            let kind = if n == 1 && first[0] == b'{' {
+            let kind = if is_ebl {
+                log::debug!("EBL mode selected for {}", path.display());
+                ReadKind::Ebl
+            } else if n == 1 && first[0] == b'{' {
                 log::debug!("W2K JSON mode selected for {}", path.display());
                 ReadKind::W2KJson
             } else {
@@ -265,6 +280,7 @@ fn run(cli: Cli) -> Result<()> {
                 run_read_loop(&mut read_handle, &mut out, cli.timeout, cli.write_only)?
             }
             ReadKind::W2KJson => run_w2k_read_loop(&mut read_handle, &mut out, cli.write_only)?,
+            ReadKind::Ebl => run_ebl_read_loop(&mut read_handle, &mut out, cli.write_only)?,
         }
     }
 
@@ -289,10 +305,14 @@ enum InputSource {
 
 /// Which device-side wire format we'll decode. NGT-1 byte stream is the
 /// default for serial / stdin / raw files; W2K-1 / OpenCPN JSON capture
-/// is auto-detected from a leading `{` and parsed line-at-a-time.
+/// is auto-detected from a leading `{` and parsed line-at-a-time; EBL
+/// (Actisense `.ebl` logs) is selected by file extension because its
+/// `ESC SOH …` header bytes aren't reliably distinct from raw NGT-1
+/// preamble noise.
 enum ReadKind {
     Ngt1,
     W2KJson,
+    Ebl,
 }
 
 /// `io::Stdin` exposes `Read` but the call holds a lock per `read`;
@@ -384,6 +404,69 @@ fn run_read_loop<R: Read>(
         }
     }
     log::info!("emitted {frames_emitted} N2K frames");
+    Ok(())
+}
+
+/// Read an Actisense `.ebl` log file: an interleave of `ESC SOH … ESC LF`
+/// timestamp records and `DLE STX … DLE ETX` NGT-1 frames. Drives the
+/// EBL-aware variant of [`Ngt1Decoder`]. Each NGT-1 N2K message is
+/// stamped with the most recent EBL header timestamp before emission, so
+/// the captured wall-clock time replays accurately.
+fn run_ebl_read_loop<R: Read>(
+    reader: &mut R,
+    out: &mut impl Write,
+    suppress_output: bool,
+) -> Result<()> {
+    let mut decoder = Ngt1Decoder::with_ebl();
+    let mut buf = [0u8; 4096];
+    let mut line = String::with_capacity(256);
+    let mut current_ts_ms: Option<u64> = None;
+    let mut frames_emitted: u64 = 0;
+    loop {
+        let n = match reader.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => n,
+            Err(e) => return Err(e).context("reading EBL file"),
+        };
+        for ev in decoder.push_bytes(&buf[..n]) {
+            match ev {
+                NgtEvent::Header(EblHeader::Timestamp(ms)) => {
+                    current_ts_ms = Some(ms);
+                }
+                NgtEvent::Header(EblHeader::Unknown { kind, .. }) => {
+                    log::debug!("unknown EBL header type 0x{kind:02x}");
+                }
+                NgtEvent::Message(msg) => {
+                    if suppress_output {
+                        continue;
+                    }
+                    // Replay captures interleave receive- and send-
+                    // direction N2K frames plus Actisense system-status
+                    // messages; `to_raw_frame_any_dir` handles all
+                    // three. The internal NGT-1 timestamp is a 32-bit
+                    // ms counter since device boot (meaningless for
+                    // replay), so override with the most recent EBL
+                    // header timestamp.
+                    let Some(mut frame) = msg.to_raw_frame_any_dir() else {
+                        continue;
+                    };
+                    if let Some(ms) = current_ts_ms {
+                        frame.timestamp = Some(canboat_core::format_iso_ms(ms));
+                    }
+                    line.clear();
+                    write_plain(&mut line, &frame).expect("write to String");
+                    out.write_all(line.as_bytes())?;
+                    out.write_all(b"\n")?;
+                    out.flush()?;
+                    frames_emitted += 1;
+                }
+                NgtEvent::Error(e) => {
+                    log::warn!("EBL framing error: {e}");
+                }
+            }
+        }
+    }
+    log::info!("emitted {frames_emitted} N2K frames (EBL)");
     Ok(())
 }
 

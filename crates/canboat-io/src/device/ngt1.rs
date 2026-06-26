@@ -60,6 +60,10 @@ impl DeviceDecoder for Decoder {
                     }
                 }
                 NgtEvent::Error(e) => events.push(DeviceEvent::Error(e.to_string())),
+                // EBL header records (timestamp etc.) only appear when
+                // the decoder is in EBL mode; this generic NGT-1 device
+                // decoder never enables that, so this arm is dead.
+                NgtEvent::Header(_) => {}
             }
         }
     }

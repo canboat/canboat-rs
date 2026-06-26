@@ -18,6 +18,16 @@ use crate::types::{FieldInfo, FieldType, PgnInfo};
 /// the bit-width max, the entire range is valid and no sentinel
 /// stripping is performed. Matches the threshold logic in
 /// `analyzer/print.c:418`.
+///
+/// The schema-2.4.0 per-field sentinel hints
+/// ([`FieldInfo::unknown_value`] etc.) are now parsed from the
+/// database but not yet consumed here: the existing `Extracted` carries
+/// the signed bit-width max, while the schema values are stated against
+/// the *unsigned* raw bit pattern. Threading the unsigned raw pattern
+/// through the decode pipeline is a follow-up — wiring naively breaks
+/// signed-field cases (e.g. PGN 130842/B = raw 0xFFFFFFFF which is
+/// valid -1, not the per-field `UnknownValue` for an unsigned 32-bit
+/// field).
 fn unavailable_with_range(f: &FieldInfo, ex: Extracted) -> bool {
     if let (Some(rmax), Some(res)) = (f.range_max, f.resolution) {
         if res > 0.0 {

@@ -126,6 +126,23 @@ pub struct FieldInfo {
     pub offset: Option<i64>,
     pub range_min: Option<f64>,
     pub range_max: Option<f64>,
+    /// Schema 2.4.0 optional sentinels per integer field — the raw
+    /// values reserved off the top of the unsigned range for "data not
+    /// available" (most-positive), "out of range" (max - 1, ≥4-bit
+    /// fields), and "reserved" (max - 2, ≥8-bit fields). Present only
+    /// for plain integer NUMBER/DURATION/DATE/TIME/DYNAMIC_FIELD_LENGTH
+    /// fields; absent for identifier-style (PGN, MMSI, FIELD_INDEX) and
+    /// for FLOAT/DECIMAL/ISO_NAME/lookup/string fields.
+    ///
+    /// canboat C ≥ v6.2.2 (`SchemaVersion` 2.4.0). Older databases omit
+    /// these and the decoder must fall back to the bit-width heuristic
+    /// in [`crate::bits::is_unavailable`].
+    #[serde(rename = "UnknownValue")]
+    pub unknown_value: Option<u64>,
+    #[serde(rename = "OutOfRangeValue")]
+    pub out_of_range_value: Option<u64>,
+    #[serde(rename = "ReservedValue")]
+    pub reserved_value: Option<u64>,
     #[serde(default, deserialize_with = "de_arc_str_opt")]
     pub unit: Option<Arc<str>>,
     pub physical_quantity: Option<String>,

@@ -144,6 +144,36 @@ pub fn is_unavailable(extracted: Extracted) -> bool {
     reserved > 0 && extracted.value > extracted.max - reserved
 }
 
+/// Per-field sentinel test. When the field carries schema-2.4.0 hints
+/// (any of `UnknownValue` / `OutOfRangeValue` / `ReservedValue`), exactly
+/// those raw values are treated as unavailable — no others. When all
+/// three are absent (older databases, or fields the upstream schema
+/// deliberately excludes from sentinel reservation like ISO Device
+/// Instance) the call falls back to the bit-width heuristic in
+/// [`is_unavailable`].
+///
+/// The comparison is against the *unsigned* raw extraction (`value &
+/// max`) so the call is stable between SI / user-units builds — same
+/// idiom canboat's `analyzer/fieldtype.c` uses to anchor the sentinel
+/// detection against the underlying unsigned representation regardless
+/// of the field's signed-ness.
+pub fn is_unavailable_with(
+    extracted: Extracted,
+    unknown: Option<u64>,
+    out_of_range: Option<u64>,
+    reserved: Option<u64>,
+) -> bool {
+    if unknown.is_none() && out_of_range.is_none() && reserved.is_none() {
+        return is_unavailable(extracted);
+    }
+    // Re-interpret the (possibly sign-extended) extracted value as the
+    // unsigned raw bit pattern that the schema values are stated in.
+    let raw = extracted.value as u64 & (extracted.max as u64);
+    [unknown, out_of_range, reserved]
+        .iter()
+        .any(|v| v.is_some_and(|s| s == raw))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

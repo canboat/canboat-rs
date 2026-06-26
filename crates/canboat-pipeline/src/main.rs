@@ -577,6 +577,7 @@ fn open_source(cli: &Cli) -> Result<OpenedSource> {
         let iface = iface.to_string();
         let config = device::socketcan::Config {
             address: cli.socketcan_address,
+            model_version: Some("canboat-pipeline-rs"),
             ..device::socketcan::Config::default()
         };
         // Shared across factory reconnects so the live claim address

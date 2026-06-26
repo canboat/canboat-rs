@@ -160,6 +160,7 @@ mod linux {
             heartbeat_ms: cli.heartbeat,
             no_claim: cli.no_claim,
             timeout_secs: cli.timeout,
+            model_version: None,
         };
         // Binary doesn't surface the claim address externally — pass
         // a fresh atom and discard the handle to it.

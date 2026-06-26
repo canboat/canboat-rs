@@ -56,6 +56,11 @@ mod config {
         pub no_claim: bool,
         /// Quit if no frame is received for this many seconds (0 disables).
         pub timeout_secs: u64,
+        /// Override the PGN 126996 Model Version string. `None` defaults
+        /// to `"socketcan-serial-rs"`; `canboat-pipeline` sets this to
+        /// `"canboat-pipeline-rs"` so a downstream display can tell which
+        /// canboat-rs binary is driving the bus.
+        pub model_version: Option<&'static str>,
     }
 
     impl Default for Config {
@@ -68,6 +73,7 @@ mod config {
                 heartbeat_ms: 60_000,
                 no_claim: false,
                 timeout_secs: 0,
+                model_version: None,
             }
         }
     }
@@ -122,7 +128,11 @@ mod imp {
     const PRODUCT_CODE: u16 = 1;
     const CERTIFICATION_LEVEL: u8 = 0; // Level A
     const LOAD_EQUIVALENCY: u8 = 1; // 1 LEN = 50 mA
-    const MODEL_ID: &str = "socketcan-serial";
+    // PGN 126996 "Model ID" carries our brand; the per-binary name
+    // ("socketcan-serial-rs" / "canboat-pipeline-rs") goes in
+    // "Model Version" via `Config::model_version`.
+    const MODEL_ID: &str = "CANboat";
+    const DEFAULT_MODEL_VERSION: &str = "socketcan-serial-rs";
 
     // Group Function (PGN 126208) function codes and DURATION sentinels.
     const GROUP_FUNCTION_REQUEST: u8 = 0;
@@ -232,8 +242,10 @@ mod imp {
         let unique = if config.unique != 0 {
             config.unique & 0x1fffff
         } else {
-            // SAFETY: getpid is always safe.
-            (unsafe { libc::getpid() } as u32) & 0x1fffff
+            // Per-machine, stable across restarts. Two CANboat gateways
+            // on the same host would collide; pass `--unique N` (or
+            // `Config.unique`) to disambiguate.
+            (canboat_core::os::get_machine_id() as u32) & 0x1fffff
         };
         let manufacturer = config.manufacturer as u64 & 0x7ff;
         let device_instance: u64 = 0;
@@ -413,6 +425,7 @@ mod imp {
         next_heartbeat: u64,    // ms
         last_product_info: u64, // ms; rate-limit broadcast bursts
         used: [bool; 256],
+        model_version: &'static str,
     }
 
     impl Claimer {
@@ -433,6 +446,7 @@ mod imp {
                 next_heartbeat: 0,
                 last_product_info: 0,
                 used: [false; 256],
+                model_version: config.model_version.unwrap_or(DEFAULT_MODEL_VERSION),
             }
         }
 
@@ -599,7 +613,7 @@ mod imp {
             data[2..4].copy_from_slice(&PRODUCT_CODE.to_le_bytes());
             put_string_fix(&mut data[4..36], MODEL_ID);
             put_string_fix(&mut data[36..68], env!("CARGO_PKG_VERSION"));
-            put_string_fix(&mut data[68..100], ""); // model version
+            put_string_fix(&mut data[68..100], self.model_version);
             put_string_fix(&mut data[100..132], &(self.name & 0x1fffff).to_string());
             data[132] = CERTIFICATION_LEVEL;
             data[133] = LOAD_EQUIVALENCY;

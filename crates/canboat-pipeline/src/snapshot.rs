@@ -36,6 +36,7 @@ impl SnapshotStore {
             is_ais,
             pgn_description: decoded.description.to_string(),
             line,
+            timestamp: decoded.timestamp.clone(),
         });
     }
 

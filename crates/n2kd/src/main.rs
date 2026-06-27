@@ -31,7 +31,7 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use canboat_core::snapshot::{SnapshotInput, SnapshotStore, SECONDARY_FIELDS};
@@ -41,8 +41,6 @@ use crate::nmea0183::RateLimiter;
 
 /// Default TCP base port.
 const DEFAULT_PORT: u16 = 2597;
-/// How often the status port emits a snapshot.
-const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
 /// AIS PGN list — these flow through the AIS port verbatim. Matches
 /// the `PGN_AIS_*` defines in nmea0183.c.
@@ -200,15 +198,8 @@ fn run(cli: Cli) -> Result<()> {
             Arc::clone(&hub),
             Subscription::AisStream,
         )?;
-        spawn_listener(
-            bind_addr,
-            cli.port + 5,
-            "status",
-            Arc::clone(&hub),
-            Subscription::StatusStream,
-        )?;
         spawn_snapshot_listener(bind_addr, cli.port, Arc::clone(&hub))?;
-        spawn_status_emitter(Arc::clone(&hub));
+        spawn_status_listener(bind_addr, cli.port + 5, Arc::clone(&hub))?;
     }
     // Default-on like canboat C; `-r` / `--restrict` and the explicit
     // `--no-request-claims` opt-out both turn it off. Skip in
@@ -268,8 +259,6 @@ enum Subscription {
     Nmea0183Stream,
     /// AIS-related PGNs only, as JSON.
     AisStream,
-    /// Periodic `{"clients":N,"pgns":[…]}` status snapshots.
-    StatusStream,
 }
 
 /// Open a UDP socket bound to an ephemeral local port; we'll
@@ -378,17 +367,31 @@ fn spawn_raw_input_listener(bind: Ipv4Addr, port: u16, copy_to_stdout: bool) -> 
     Ok(())
 }
 
-/// Periodic status emission. Sends `{"clients":N,"pgns":N}` etc. to
-/// every status subscriber every [`STATUS_INTERVAL`].
-fn spawn_status_emitter(hub: Arc<Hub>) {
+/// Status port — connect-and-dump, just like the JSON snapshot port,
+/// but emits the canboat C `{<pgn>:{description,<src>:{last,interval,
+/// count}}}` shape. Mirrors `n2kd/main.c`'s `CLIENT_STATUS_STREAM`
+/// behavior.
+fn spawn_status_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<()> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding status on {bind}:{port}"))?;
+    log::info!("listening on {bind}:{port} (status)");
     thread::Builder::new()
         .name("n2kd-status".into())
         .spawn(move || loop {
-            thread::sleep(STATUS_INTERVAL);
-            let snap = hub.status_snapshot();
-            hub.broadcast(Subscription::StatusStream, &snap);
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    log::warn!("accept on status: {e}");
+                    continue;
+                }
+            };
+            let hub2 = Arc::clone(&hub);
+            thread::Builder::new()
+                .spawn(move || run_status_client(stream, hub2))
+                .ok();
         })
-        .ok();
+        .context("spawning status listener")?;
+    Ok(())
 }
 
 /// Spawn the library `request_engine` with an emit closure that
@@ -444,6 +447,12 @@ fn run_stream_client(mut stream: TcpStream, hub: Arc<Hub>, sub: Subscription) {
 
 fn run_snapshot_client(mut stream: TcpStream, hub: Arc<Hub>) {
     let dump = hub.snapshot();
+    let _ = stream.write_all(dump.as_bytes());
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
+fn run_status_client(mut stream: TcpStream, hub: Arc<Hub>) {
+    let dump = hub.status_snapshot();
     let _ = stream.write_all(dump.as_bytes());
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
@@ -553,6 +562,9 @@ struct Meta {
     /// the snapshot wrapper. Empty when the analyzer didn't emit a
     /// `"description":` key.
     description: String,
+    /// Analyzer-JSON `"timestamp":` field, used as `"last":` on the
+    /// status port. `None` when the record carried no timestamp.
+    timestamp: Option<String>,
 }
 
 fn extract_meta(line: &str) -> Option<Meta> {
@@ -561,6 +573,7 @@ fn extract_meta(line: &str) -> Option<Meta> {
     let description = json::value(line, "description")
         .unwrap_or("")
         .to_string();
+    let timestamp = json::value(line, "timestamp").map(|s| s.to_string());
     // canboat C n2kd uses the *first* matching secondary key field
     // only (m_key2 is a single field per message). Match that — both
     // for the cache key and for the snapshot's `<src>_<secondary>`
@@ -583,6 +596,7 @@ fn extract_meta(line: &str) -> Option<Meta> {
         secondary,
         is_ais,
         description,
+        timestamp,
     })
 }
 
@@ -635,6 +649,7 @@ impl Hub {
             is_ais: meta.is_ais,
             pgn_description: meta.description.clone(),
             line,
+            timestamp: meta.timestamp.clone(),
         });
     }
 
@@ -644,17 +659,10 @@ impl Hub {
         self.cache.snapshot()
     }
 
+    /// Canboat C–compatible per-PGN status dump
+    /// (`{<pgn>:{description,<src>:{last,interval,count}}}`).
     fn status_snapshot(&self) -> String {
-        let cache_len = self.cache.len();
-        let devs_seen = self.engine.device_count();
-        let total_subs: usize = self
-            .subscribers
-            .lock()
-            .unwrap()
-            .values()
-            .map(|v| v.len())
-            .sum();
-        format!("{{\"clients\":{total_subs},\"devices\":{devs_seen},\"pgns\":{cache_len}}}\n")
+        self.cache.status_snapshot()
     }
 
     fn subscribe(&self, sub: Subscription, tx: Sender<String>) {

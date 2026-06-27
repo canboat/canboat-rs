@@ -112,6 +112,10 @@ pub struct SnapshotInput {
     pub pgn_description: String,
     /// The analyzer-JSON line for this record (no trailing newline).
     pub line: String,
+    /// The record's `"timestamp":` field as a verbatim string. Used as
+    /// the status port's `"last":` value. `None` when the input has
+    /// no timestamp (synthetic records, tests).
+    pub timestamp: Option<String>,
 }
 
 struct CacheEntry {
@@ -121,6 +125,21 @@ struct CacheEntry {
     /// `None` means "never expires" — set for PGNs in
     /// [`DEVICE_INFO_PGNS`].
     expires_at: Option<Instant>,
+    /// Most recent record's `"timestamp":` field — emitted verbatim
+    /// as `"last":` in the status port output.
+    last_timestamp: Option<String>,
+    /// Number of records stashed under this key so far.
+    count: u64,
+    /// Monotonic `Instant` of the previous [`SnapshotStore::store`]
+    /// call for this key. Used to compute [`Self::interval_ms`] when
+    /// the next record arrives.
+    previous_store_at: Option<Instant>,
+    /// Milliseconds between the two most recent records under this
+    /// key (i.e. `now - previous_store_at` evaluated at the last
+    /// `store` call). `0` until the second record arrives — matches
+    /// canboat C n2kd, where `m_interval` starts at 0 and updates on
+    /// each subsequent store.
+    interval_ms: u64,
 }
 
 /// `(pgn, src, secondary_text)`.
@@ -145,18 +164,34 @@ impl SnapshotStore {
 
     /// Stash one classified record. Overwrites any prior entry with
     /// the same `(pgn, src, secondary)` key in place — the entry's
-    /// insertion order is preserved.
+    /// insertion order is preserved. Status fields (`count`,
+    /// `interval_ms`) accumulate across stores for the same key.
     pub fn store(&self, input: SnapshotInput) {
-        let expires_at = ttl_for_pgn(input.pgn, input.is_ais).map(|ttl| Instant::now() + ttl);
+        let now = Instant::now();
+        let expires_at = ttl_for_pgn(input.pgn, input.is_ais).map(|ttl| now + ttl);
+        let key = (input.pgn, input.src, input.secondary);
+        let mut guard = self.cache.lock().expect("snapshot cache poisoned");
+
+        // Carry count + previous_store_at forward across overwrites
+        // so the status port's count/interval reflect the full history
+        // for this (pgn, src, secondary) — not just the latest record.
+        let prev_count = guard.get(&key).map(|e| e.count).unwrap_or(0);
+        let prev_store_at = guard.get(&key).and_then(|e| e.previous_store_at);
+        let interval_ms = match prev_store_at {
+            Some(t) => now.saturating_duration_since(t).as_millis() as u64,
+            None => 0,
+        };
+
         let entry = CacheEntry {
             line: input.line,
             pgn_short_description: short_description(&input.pgn_description),
             expires_at,
+            last_timestamp: input.timestamp,
+            count: prev_count + 1,
+            previous_store_at: Some(now),
+            interval_ms,
         };
-        self.cache
-            .lock()
-            .expect("snapshot cache poisoned")
-            .insert((input.pgn, input.src, input.secondary), entry);
+        guard.insert(key, entry);
     }
 
     /// Build the canboat-C-compatible nested JSON dump of every live
@@ -200,6 +235,68 @@ impl SnapshotStore {
                 }
                 out.push_str("\":");
                 out.push_str(&entry.line);
+            }
+            out.push_str("\n  }");
+        }
+        if first_pgn {
+            out.push('\n');
+        } else {
+            out.push_str("\n}\n");
+        }
+        out
+    }
+
+    /// Build the canboat-C-compatible status dump: same per-PGN
+    /// nested wrapper as [`Self::snapshot`], but each `<src>[_<sec>]`
+    /// value is `{"last":..,"interval":..,"count":..}` describing the
+    /// receive cadence rather than the latest line. Mirrors canboat
+    /// C n2kd's `CLIENT_STATUS_STREAM` path in
+    /// `n2kd/main.c:424-447`.
+    ///
+    /// Like [`Self::snapshot`], expired entries are pruned in-place
+    /// and the document ends in `}\n` (or `\n` when the cache is
+    /// empty).
+    pub fn status_snapshot(&self) -> String {
+        let now = Instant::now();
+        let mut guard = self.cache.lock().expect("snapshot cache poisoned");
+        guard.retain(|_, v| v.expires_at.is_none_or(|t| t > now));
+
+        type GroupKey<'a> = (u8, &'a Option<String>);
+        let mut by_pgn: IndexMap<u32, Vec<(GroupKey<'_>, &CacheEntry)>> = IndexMap::new();
+        for ((pgn, src, sec), entry) in guard.iter() {
+            by_pgn.entry(*pgn).or_default().push(((*src, sec), entry));
+        }
+
+        let mut out = String::with_capacity(4096);
+        let mut first_pgn = true;
+        for (pgn, entries) in by_pgn.iter() {
+            let desc = &entries[0].1.pgn_short_description;
+            if first_pgn {
+                out.push_str("{\"");
+                first_pgn = false;
+            } else {
+                out.push_str("\n,\"");
+            }
+            let _ = write!(out, "{pgn}\":\n  {{\"description\":");
+            write_json_string(&mut out, desc);
+            for ((src, sec), entry) in entries {
+                out.push_str("\n  ,\"");
+                let _ = write!(out, "{src}");
+                if let Some(s) = sec.as_deref() {
+                    out.push('_');
+                    out.push_str(s);
+                }
+                out.push_str("\":{\"last\":");
+                // canboat C always emits "last" as a quoted string,
+                // even when the source line had no timestamp — it
+                // falls back to "" in that case (a stored record
+                // would always have one in practice).
+                write_json_string(&mut out, entry.last_timestamp.as_deref().unwrap_or(""));
+                let _ = write!(
+                    out,
+                    ",\"interval\":{},\"count\":{}}}",
+                    entry.interval_ms, entry.count
+                );
             }
             out.push_str("\n  }");
         }
@@ -320,6 +417,7 @@ mod tests {
             is_ais: false,
             pgn_description: "Rate of Turn".to_string(),
             line: r#"{"pgn":127251,"src":7,"fields":{"Rate":0}}"#.to_string(),
+            timestamp: None,
         });
         let dump = s.snapshot();
         assert!(dump.starts_with("{\"127251\":\n  {\"description\":\"Rate of Turn\""));
@@ -337,6 +435,7 @@ mod tests {
             is_ais: true,
             pgn_description: "AIS Class B Position Report".to_string(),
             line: "{...}".to_string(),
+            timestamp: None,
         });
         let dump = s.snapshot();
         assert!(
@@ -365,6 +464,7 @@ mod tests {
                 is_ais: false,
                 pgn_description: desc.to_string(),
                 line: format!(r#"{{"pgn":{pgn},"src":{src}}}"#),
+                timestamp: None,
             });
         }
         let dump = s.snapshot();
@@ -392,6 +492,7 @@ mod tests {
                 is_ais: false,
                 pgn_description: "x".to_string(),
                 line: line.to_string(),
+                timestamp: None,
             });
         }
         s.store(SnapshotInput {
@@ -401,6 +502,7 @@ mod tests {
             is_ais: false,
             pgn_description: "x".to_string(),
             line: "first-line-updated".to_string(),
+            timestamp: None,
         });
         let dump = s.snapshot();
         let pos_first = dump.find("65305").expect("first pgn present");
@@ -423,6 +525,7 @@ mod tests {
             is_ais: false,
             pgn_description: "Rate of Turn".to_string(),
             line: "old".to_string(),
+            timestamp: None,
         };
         s.store(input.clone());
         input.line = "new".to_string();
@@ -430,5 +533,68 @@ mod tests {
         assert_eq!(s.len(), 1);
         assert!(s.snapshot().contains("new"));
         assert!(!s.snapshot().contains("old"));
+    }
+
+    #[test]
+    fn status_snapshot_emits_canboat_c_shape() {
+        let s = SnapshotStore::new();
+        s.store(SnapshotInput {
+            pgn: 65305,
+            src: 21,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Simnet: Device Mode Request".to_string(),
+            line: r#"{"pgn":65305}"#.to_string(),
+            timestamp: Some("2026-06-27T03:00:17.778Z".to_string()),
+        });
+        let status = s.status_snapshot();
+        // PGN-family header.
+        assert!(status.starts_with("{\"65305\":\n  {\"description\":\"Simnet\""));
+        // Per-(src,secondary) entry carries last/interval/count
+        // exactly in canboat C's order. First record: interval=0,
+        // count=1.
+        assert!(status.contains(
+            "\"21\":{\"last\":\"2026-06-27T03:00:17.778Z\",\"interval\":0,\"count\":1}"
+        ));
+        assert!(status.ends_with("}\n"));
+    }
+
+    #[test]
+    fn status_snapshot_count_increments_across_stores() {
+        let s = SnapshotStore::new();
+        let template = SnapshotInput {
+            pgn: 127251,
+            src: 7,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Rate of Turn".to_string(),
+            line: "ignored".to_string(),
+            timestamp: Some("t".to_string()),
+        };
+        for _ in 0..5 {
+            s.store(template.clone());
+        }
+        assert!(s.status_snapshot().contains("\"count\":5"));
+    }
+
+    #[test]
+    fn status_snapshot_uses_secondary_in_key() {
+        let s = SnapshotStore::new();
+        s.store(SnapshotInput {
+            pgn: 129039,
+            src: 23,
+            secondary: Some("244180106".to_string()),
+            is_ais: true,
+            pgn_description: "AIS Class B Position Report".to_string(),
+            line: "{}".to_string(),
+            timestamp: Some("2026-06-27T03:00:00Z".to_string()),
+        });
+        let status = s.status_snapshot();
+        assert!(status.contains("\"23_244180106\":{\"last\":"));
+    }
+
+    #[test]
+    fn status_snapshot_empty_is_blank_line() {
+        assert_eq!(SnapshotStore::new().status_snapshot(), "\n");
     }
 }

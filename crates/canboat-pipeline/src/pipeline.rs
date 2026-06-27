@@ -62,7 +62,7 @@ pub struct Hubs {
     /// Raw N2K input/output: every coalesced frame goes out as a
     /// `# format=FAST` PLAIN line; clients can write PLAIN/FAST back
     /// to inject onto the bus. Previously named `csv`.
-    pub raw_input: Arc<Hub>,
+    pub raw: Arc<Hub>,
     pub nmea: Arc<Hub>,
     pub analyzer: Arc<Hub>,
     /// Optional cache for the snapshot port. When `Some`, every
@@ -166,13 +166,13 @@ pub fn run(
             }
         }
 
-        // Lazy raw-input broadcast — one `# format=FAST` PLAIN line
+        // Lazy raw broadcast — one `# format=FAST` PLAIN line
         // per coalesced `RawFrame`.
-        if hubs.raw_input.has_subscribers() {
+        if hubs.raw.has_subscribers() {
             raw_line.clear();
             if write_plain(&mut raw_line, &frame).is_ok() {
                 raw_line.push('\n');
-                hubs.raw_input.broadcast(&raw_line);
+                hubs.raw.broadcast(&raw_line);
             }
         }
 

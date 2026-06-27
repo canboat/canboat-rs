@@ -16,7 +16,7 @@
 //!   to exist with `n2kd-inproc`.
 //! * **device**: a [`canboat_io::device`] reader stage opens the
 //!   chosen serial port / TCP socket and emits `RawFrame`s
-//!   directly. In this mode, the raw-input TCP port (write-N2K) and
+//!   directly. In this mode, the raw TCP port (write-N2K) and
 //!   the lazy CSV TCP server are also wired up.
 //!
 //! Output: NMEA 0183 sentences on stdout.
@@ -203,7 +203,7 @@ struct Cli {
     /// Port for the read-only analyzer JSON server — one decoded PGN
     /// per line. Matches canboat C `n2kd`'s `port+1` stream port —
     /// broadcast-only; clients that want to inject N2K traffic
-    /// should connect to `--raw-input-port` instead. Lazy: skipped
+    /// should connect to `--raw-port` instead. Lazy: skipped
     /// when no client is subscribed. `0` disables.
     #[arg(long, default_value_t = 2598)]
     analyzer_port: u16,
@@ -221,9 +221,10 @@ struct Cli {
     /// back to inject into the bus. Matches canboat C `n2kd`'s
     /// `port+3` input slot. Reading is lazy (skipped with no client);
     /// injection only takes effect in device mode. `0` disables.
-    /// (Previously known as `--csv-port`, default 2603.)
+    /// (Previously named `--csv-port` then `--raw-input-port`; the
+    /// short name `--raw-port` is the supported spelling.)
     #[arg(long, default_value_t = 2600)]
-    raw_input_port: u16,
+    raw_port: u16,
 
     /// Port for the AIS snapshot server — on connect, dumps the
     /// latest analyzer JSON line for every AIS-described PGN (plus
@@ -342,7 +343,7 @@ fn run(cli: Cli) -> Result<()> {
     // device sender and live inside `Hubs`.
     let quirks_kinds = cli.quirk.into_iter().collect();
     let hubs = Hubs {
-        raw_input: Arc::new(Hub::new()),
+        raw: Arc::new(Hub::new()),
         nmea: Arc::new(Hub::new()),
         analyzer: Arc::new(Hub::new()),
         snapshot: snapshot.clone(),
@@ -399,12 +400,12 @@ fn run(cli: Cli) -> Result<()> {
     // C `n2kd`'s `port+3` input slot (with the added live broadcast
     // and the actual encode-and-forward injection — canboat C n2kd's
     // input is passive).
-    if cli.raw_input_port != 0 {
+    if cli.raw_port != 0 {
         tcp_joins.push(tcp::spawn_stream_server(
-            "raw-input",
+            "raw",
             cli.bind,
-            cli.raw_input_port,
-            hubs.raw_input.clone(),
+            cli.raw_port,
+            hubs.raw.clone(),
             tcp::Direction::ReadWrite {
                 inject: inject.clone(),
             },
@@ -426,7 +427,7 @@ fn run(cli: Cli) -> Result<()> {
     if cli.analyzer_port != 0 {
         // Analyzer-JSON stream is read-only, matching canboat C
         // n2kd's `port+1` stream port. Injection lives on the
-        // raw-input port instead.
+        // raw port instead.
         tcp_joins.push(tcp::spawn_stream_server(
             "analyzer",
             cli.bind,
@@ -451,7 +452,7 @@ fn run(cli: Cli) -> Result<()> {
         }
     }
     // `inject` is no longer claimed by a dedicated write-only port —
-    // raw-input-port subsumed that role above.
+    // raw-port subsumed that role above.
     let _ = inject;
 
     let camel_case = if cli.upper_camel {

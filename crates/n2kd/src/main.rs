@@ -57,7 +57,7 @@ const AIS_PGNS: &[u32] = &[
     version
 )]
 struct Cli {
-    /// Base TCP port. `+1`=stream, `+2`=nmea0183, `+3`=ais, `+4`=status, `+5`=raw input.
+    /// Base TCP port. `+1`=stream, `+2`=nmea0183, `+3`=raw input, `+4`=ais, `+5`=status. Matches canboat C n2kd.
     #[arg(short = 'p', long, default_value_t = DEFAULT_PORT)]
     port: u16,
 
@@ -192,22 +192,22 @@ fn run(cli: Cli) -> Result<()> {
             Arc::clone(&hub),
             Subscription::Nmea0183Stream,
         )?;
+        spawn_raw_input_listener(bind_addr, cli.port + 3, cli.output_copy && !cli.restrict)?;
         spawn_listener(
             bind_addr,
-            cli.port + 3,
+            cli.port + 4,
             "ais-stream",
             Arc::clone(&hub),
             Subscription::AisStream,
         )?;
         spawn_listener(
             bind_addr,
-            cli.port + 4,
+            cli.port + 5,
             "status",
             Arc::clone(&hub),
             Subscription::StatusStream,
         )?;
         spawn_snapshot_listener(bind_addr, cli.port, Arc::clone(&hub))?;
-        spawn_raw_input_listener(bind_addr, cli.port + 5, cli.output_copy && !cli.restrict)?;
         spawn_status_emitter(Arc::clone(&hub));
     }
     // Default-on like canboat C; `-r` / `--restrict` and the explicit

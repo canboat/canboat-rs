@@ -201,12 +201,25 @@ impl SnapshotStore {
         guard.insert(key, entry);
     }
 
-    /// Build the canboat-C-compatible nested JSON dump of every live
-    /// entry. Expired entries are pruned in-place under the same
-    /// lock. Returns the document as one big `String` ending in `}\n`
-    /// (or `\n` if the cache is empty).
+    /// Build the canboat-C-compatible nested JSON dump.
+    ///
+    /// canboat C's JSON snapshot port (CLIENT_JSON) is the complement
+    /// of its AIS port: emit records whose description does NOT start
+    /// with `"AIS"`, plus the always-on special cases PGN 129026
+    /// (COG/SOG, Rapid Update) and PGN 129029 (Position, Rapid
+    /// Update). The comment in `n2kd/main.c:456` reads "AIS data only
+    /// goes to AIS clients, non-AIS data to non-AIS clients, but PRNs
+    /// 129026 and 129029 go to both."
+    ///
+    /// Expired entries are pruned in-place under the same lock.
+    /// Returns the document as one big `String` ending in `}\n` (or
+    /// `\n` if the cache is empty).
     pub fn snapshot(&self) -> String {
-        self.filtered_snapshot(|_, _| true)
+        self.filtered_snapshot(|pgn, entry| {
+            *pgn == 129026
+                || *pgn == 129029
+                || !entry.pgn_short_description.starts_with("AIS")
+        })
     }
 
     /// Build the canboat-C-compatible AIS snapshot dump: same shape
@@ -460,6 +473,30 @@ mod tests {
 
     #[test]
     fn snapshot_keys_src_with_secondary_when_present() {
+        // Non-AIS PGN with an Instance secondary so the entry isn't
+        // filtered out of the JSON snapshot dump.
+        let s = SnapshotStore::new();
+        s.store(SnapshotInput {
+            pgn: 127501,
+            src: 17,
+            secondary: Some("0".to_string()),
+            is_ais: false,
+            pgn_description: "Binary Switch Bank Status".to_string(),
+            line: r#"{"pgn":127501,"src":17}"#.to_string(),
+        });
+        let dump = s.snapshot();
+        assert!(
+            dump.contains("\"17_0\":"),
+            "expected src_secondary key, got:\n{dump}"
+        );
+        assert!(dump.contains("\"description\":\"Binary Switch Bank Status\""));
+    }
+
+    #[test]
+    fn snapshot_filters_ais_described_pgns() {
+        // canboat C's JSON snapshot port excludes AIS-described PGNs
+        // (n2kd/main.c:458). 129026/129029 are special-cased to
+        // appear on both the snapshot and AIS ports.
         let s = SnapshotStore::new();
         s.store(SnapshotInput {
             pgn: 129039,
@@ -467,16 +504,36 @@ mod tests {
             secondary: Some("244180106".to_string()),
             is_ais: true,
             pgn_description: "AIS Class B Position Report".to_string(),
-            line: "{...}".to_string(),
+            line: r#"{"pgn":129039}"#.to_string(),
+        });
+        s.store(SnapshotInput {
+            pgn: 129026,
+            src: 52,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "COG & SOG, Rapid Update".to_string(),
+            line: r#"{"pgn":129026}"#.to_string(),
+        });
+        s.store(SnapshotInput {
+            pgn: 127251,
+            src: 7,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Rate of Turn".to_string(),
+            line: r#"{"pgn":127251}"#.to_string(),
         });
         let dump = s.snapshot();
         assert!(
-            dump.contains("\"23_244180106\":"),
-            "expected src_secondary key, got:\n{dump}"
+            !dump.contains("\"129039\""),
+            "AIS-described PGN leaked into snapshot:\n{dump}"
         );
         assert!(
-            dump.contains("\"description\":\"AIS Class B Position Report\""),
-            "AIS description has no colon — should not be truncated"
+            dump.contains("\"129026\""),
+            "special-cased PGN 129026 missing from snapshot:\n{dump}"
+        );
+        assert!(
+            dump.contains("\"127251\""),
+            "non-AIS sensor PGN dropped from snapshot:\n{dump}"
         );
     }
 
@@ -747,7 +804,9 @@ mod tests {
 
     /// Byte-exact lock against canboat C n2kd's JSON snapshot port
     /// output. Any change to the wrapper format, ordering, separators,
-    /// or key shape will fail loudly here.
+    /// key shape, or the AIS-filter predicate will fail loudly here.
+    /// PGN 129039 (in `fill_canon_corpus`, description starts with
+    /// "AIS") is filtered out — it goes to the AIS port instead.
     #[test]
     fn snapshot_byte_exact_canboat_c_layout() {
         let s = SnapshotStore::new();
@@ -759,10 +818,6 @@ mod tests {
 ,"65305":
   {"description":"Simnet"
   ,"17":{"pgn":65305,"src":17,"fields":{"x":1}}
-  }
-,"129039":
-  {"description":"AIS Class B Position Report"
-  ,"23_244180106":{"pgn":129039,"src":23,"fields":{"User ID":"244180106"}}
   }
 ,"129026":
   {"description":"COG & SOG, Rapid Update"

@@ -525,6 +525,16 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
             log::debug!("ignoring non-PGN line: {trimmed:.80}");
             continue;
         }
+        // canboat C requires the line to end with `}}` (the closing
+        // brace of `fields` plus the outer brace) — see
+        // `n2kd/main.c:982`. Empty-fields records like `{"pgn":...,
+        // "description":"..."}` (no fields block) drop out; they
+        // would otherwise create cache entries with no payload and
+        // diverge from canboat C's view of the bus.
+        if !trimmed.ends_with("}}") {
+            log::debug!("ignoring fieldless record: {trimmed:.80}");
+            continue;
+        }
         let Some(meta) = extract_meta(trimmed) else {
             hub.broadcast(Subscription::JsonStream, &line);
             continue;
@@ -586,9 +596,6 @@ struct Meta {
     /// the snapshot wrapper. Empty when the analyzer didn't emit a
     /// `"description":` key.
     description: String,
-    /// Analyzer-JSON `"timestamp":` field, used as `"last":` on the
-    /// status port. `None` when the record carried no timestamp.
-    timestamp: Option<String>,
 }
 
 fn extract_meta(line: &str) -> Option<Meta> {
@@ -597,7 +604,6 @@ fn extract_meta(line: &str) -> Option<Meta> {
     let description = json::value(line, "description")
         .unwrap_or("")
         .to_string();
-    let timestamp = json::value(line, "timestamp").map(|s| s.to_string());
     // canboat C n2kd uses the *first* matching secondary key field
     // only (m_key2 is a single field per message). Match that — both
     // for the cache key and for the snapshot's `<src>_<secondary>`
@@ -605,7 +611,10 @@ fn extract_meta(line: &str) -> Option<Meta> {
     let mut secondary: Option<String> = None;
     let mut is_ais = false;
     for (name, ais) in SECONDARY_FIELDS {
-        if let Some(v) = json::value_or_name(line, name) {
+        // `lookup_text` matches canboat C's preferred-name /
+        // fallback-value behavior — `Instance":{"value":0,"key":true}`
+        // (no `name`) resolves to "0", same as canboat C n2kd.
+        if let Some(v) = json::lookup_text(line, name) {
             if secondary.is_none() {
                 secondary = Some(v.to_string());
             }
@@ -620,7 +629,6 @@ fn extract_meta(line: &str) -> Option<Meta> {
         secondary,
         is_ais,
         description,
-        timestamp,
     })
 }
 
@@ -673,7 +681,6 @@ impl Hub {
             is_ais: meta.is_ais,
             pgn_description: meta.description.clone(),
             line,
-            timestamp: meta.timestamp.clone(),
         });
     }
 
@@ -755,6 +762,15 @@ mod tests {
         let line = r#"{"src":7,"pgn":127250,"fields":{"Reference":{"value":1,"name":"True"}}}"#;
         let meta = extract_meta(line).unwrap();
         assert_eq!(meta.secondary.as_deref(), Some("True"));
+    }
+
+    #[test]
+    fn extract_meta_falls_back_to_lookup_value_when_no_name() {
+        // -nv "key":true lookups (e.g. PGN 127501 Instance) carry
+        // only `value` — canboat C uses that as the secondary text.
+        let line = r#"{"src":17,"pgn":127501,"fields":{"Instance":{"value":0,"key":true}}}"#;
+        let meta = extract_meta(line).unwrap();
+        assert_eq!(meta.secondary.as_deref(), Some("0"));
     }
 
     #[test]

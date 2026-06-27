@@ -139,6 +139,27 @@ pub fn value_or_name<'a>(msg: &'a str, field: &str) -> Option<&'a str> {
     Some(v)
 }
 
+/// Resolve `field`'s readable text following canboat C n2kd's
+/// secondary-key extraction (`n2kd/main.c:1022-1067`):
+///
+/// 1. If the field's value is a lookup object `{"value":N,"name":"X"}`,
+///    prefer `name`; otherwise fall back to `value` (so `"Instance":
+///    {"value":0,"key":true}` resolves to `"0"`).
+/// 2. Truncate the result at the first ASCII whitespace — so
+///    `"True (ground referenced to North)"` becomes `"True"`. This
+///    is how C collapses long readable names into a stable cache
+///    suffix and matches its `<src>_<secondary>` snapshot keys.
+pub fn lookup_text<'a>(msg: &'a str, field: &str) -> Option<&'a str> {
+    let v = value(msg, field)?;
+    let raw = if v.starts_with('{') {
+        value(v, "name").or_else(|| value(v, "value"))?
+    } else {
+        v
+    };
+    let end = raw.find(char::is_whitespace).unwrap_or(raw.len());
+    Some(&raw[..end])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,5 +191,33 @@ mod tests {
         let m = r#"{"foo":1}"#;
         assert_eq!(value(m, "bar"), None);
         assert_eq!(number(m, "bar"), None);
+    }
+
+    #[test]
+    fn lookup_text_prefers_name() {
+        let m = r#"{"Reference":{"value":1,"name":"Magnetic"}}"#;
+        assert_eq!(lookup_text(m, "Reference"), Some("Magnetic"));
+    }
+
+    #[test]
+    fn lookup_text_falls_back_to_value_when_no_name() {
+        // PGN 127501 Instance is `{"value":N,"key":true}` — no name.
+        let m = r#"{"Instance":{"value":0,"key":true}}"#;
+        assert_eq!(lookup_text(m, "Instance"), Some("0"));
+    }
+
+    #[test]
+    fn lookup_text_truncates_at_first_whitespace() {
+        // canboat C collapses long readable names at the first space —
+        // see the e=strchr(s,' ') / e2=strchr(s,'"') logic in
+        // n2kd/main.c:1064.
+        let m = r#"{"Reference":{"value":0,"name":"True (ground referenced to North)","key":true}}"#;
+        assert_eq!(lookup_text(m, "Reference"), Some("True"));
+    }
+
+    #[test]
+    fn lookup_text_returns_bare_value_when_no_object() {
+        let m = r#"{"User ID":"244180106"}"#;
+        assert_eq!(lookup_text(m, "User ID"), Some("244180106"));
     }
 }

@@ -33,9 +33,11 @@
 
 use std::fmt::Write;
 use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use indexmap::IndexMap;
+
+use crate::startup::format_iso_ms;
 
 /// TTL for ordinary sensor PGNs — matches canboat C's `SENSOR_TIMEOUT`.
 pub const SENSOR_TTL: Duration = Duration::from_secs(120);
@@ -112,10 +114,6 @@ pub struct SnapshotInput {
     pub pgn_description: String,
     /// The analyzer-JSON line for this record (no trailing newline).
     pub line: String,
-    /// The record's `"timestamp":` field as a verbatim string. Used as
-    /// the status port's `"last":` value. `None` when the input has
-    /// no timestamp (synthetic records, tests).
-    pub timestamp: Option<String>,
 }
 
 struct CacheEntry {
@@ -182,11 +180,20 @@ impl SnapshotStore {
             None => 0,
         };
 
+        // canboat C uses the wall-clock time of store as the status
+        // port's `"last":` field (`m->m_last = now`), not the
+        // record's analyzer-JSON timestamp. Mirror that so the status
+        // emitter stays byte-comparable with canboat C.
+        let wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
+
         let entry = CacheEntry {
             line: input.line,
             pgn_short_description: short_description(&input.pgn_description),
             expires_at,
-            last_timestamp: input.timestamp,
+            last_timestamp: Some(format_iso_ms(wall_ms)),
             count: prev_count + 1,
             previous_store_at: Some(now),
             interval_ms,
@@ -444,7 +451,6 @@ mod tests {
             is_ais: false,
             pgn_description: "Rate of Turn".to_string(),
             line: r#"{"pgn":127251,"src":7,"fields":{"Rate":0}}"#.to_string(),
-            timestamp: None,
         });
         let dump = s.snapshot();
         assert!(dump.starts_with("{\"127251\":\n  {\"description\":\"Rate of Turn\""));
@@ -462,7 +468,6 @@ mod tests {
             is_ais: true,
             pgn_description: "AIS Class B Position Report".to_string(),
             line: "{...}".to_string(),
-            timestamp: None,
         });
         let dump = s.snapshot();
         assert!(
@@ -491,7 +496,6 @@ mod tests {
                 is_ais: false,
                 pgn_description: desc.to_string(),
                 line: format!(r#"{{"pgn":{pgn},"src":{src}}}"#),
-                timestamp: None,
             });
         }
         let dump = s.snapshot();
@@ -519,7 +523,6 @@ mod tests {
                 is_ais: false,
                 pgn_description: "x".to_string(),
                 line: line.to_string(),
-                timestamp: None,
             });
         }
         s.store(SnapshotInput {
@@ -529,7 +532,6 @@ mod tests {
             is_ais: false,
             pgn_description: "x".to_string(),
             line: "first-line-updated".to_string(),
-            timestamp: None,
         });
         let dump = s.snapshot();
         let pos_first = dump.find("65305").expect("first pgn present");
@@ -552,7 +554,6 @@ mod tests {
             is_ais: false,
             pgn_description: "Rate of Turn".to_string(),
             line: "old".to_string(),
-            timestamp: None,
         };
         s.store(input.clone());
         input.line = "new".to_string();
@@ -572,17 +573,23 @@ mod tests {
             is_ais: false,
             pgn_description: "Simnet: Device Mode Request".to_string(),
             line: r#"{"pgn":65305}"#.to_string(),
-            timestamp: Some("2026-06-27T03:00:17.778Z".to_string()),
         });
         let status = s.status_snapshot();
         // PGN-family header.
         assert!(status.starts_with("{\"65305\":\n  {\"description\":\"Simnet\""));
         // Per-(src,secondary) entry carries last/interval/count
-        // exactly in canboat C's order. First record: interval=0,
-        // count=1.
-        assert!(status.contains(
-            "\"21\":{\"last\":\"2026-06-27T03:00:17.778Z\",\"interval\":0,\"count\":1}"
-        ));
+        // exactly in canboat C's order. `last` is a wall-clock ISO
+        // timestamp emitted at store time so we don't assert its
+        // exact value; the interval/count fields are deterministic
+        // for a first record (0, 1).
+        assert!(
+            status.contains("\"21\":{\"last\":\""),
+            "missing src key with last field: {status}"
+        );
+        assert!(
+            status.contains(",\"interval\":0,\"count\":1}"),
+            "missing interval/count tail: {status}"
+        );
         assert!(status.ends_with("}\n"));
     }
 
@@ -596,7 +603,6 @@ mod tests {
             is_ais: false,
             pgn_description: "Rate of Turn".to_string(),
             line: "ignored".to_string(),
-            timestamp: Some("t".to_string()),
         };
         for _ in 0..5 {
             s.store(template.clone());
@@ -614,7 +620,6 @@ mod tests {
             is_ais: true,
             pgn_description: "AIS Class B Position Report".to_string(),
             line: "{}".to_string(),
-            timestamp: Some("2026-06-27T03:00:00Z".to_string()),
         });
         let status = s.status_snapshot();
         assert!(status.contains("\"23_244180106\":{\"last\":"));
@@ -631,7 +636,6 @@ mod tests {
             is_ais: false,
             pgn_description: "Rate of Turn".to_string(),
             line: r#"{"pgn":127251}"#.to_string(),
-            timestamp: None,
         });
         // AIS-described record (description starts with "AIS").
         s.store(SnapshotInput {
@@ -641,7 +645,6 @@ mod tests {
             is_ais: true,
             pgn_description: "AIS Class B Position Report".to_string(),
             line: r#"{"pgn":129039}"#.to_string(),
-            timestamp: None,
         });
         // PGN 129026 (COG & SOG) — description doesn't start with
         // "AIS" but C still routes it to the AIS port.
@@ -652,7 +655,6 @@ mod tests {
             is_ais: false,
             pgn_description: "COG & SOG, Rapid Update".to_string(),
             line: r#"{"pgn":129026}"#.to_string(),
-            timestamp: None,
         });
         // PGN 129029 (Position) — same special case.
         s.store(SnapshotInput {
@@ -662,7 +664,6 @@ mod tests {
             is_ais: false,
             pgn_description: "Position, Rapid Update".to_string(),
             line: r#"{"pgn":129029}"#.to_string(),
-            timestamp: None,
         });
 
         let dump = s.ais_snapshot();
@@ -697,7 +698,6 @@ mod tests {
             is_ais: false,
             pgn_description: "Rate of Turn".to_string(),
             line: "{}".to_string(),
-            timestamp: None,
         });
         assert_eq!(s.ais_snapshot(), "\n");
     }
@@ -705,5 +705,147 @@ mod tests {
     #[test]
     fn status_snapshot_empty_is_blank_line() {
         assert_eq!(SnapshotStore::new().status_snapshot(), "\n");
+    }
+
+    /// Helper: realistic 4-record corpus covering the three port
+    /// emitters' interesting shapes — multi-PGN, `<src>_<sec>` keys,
+    /// AIS-described and special-cased PGNs, mixed timestamps.
+    fn fill_canon_corpus(s: &SnapshotStore) {
+        s.store(SnapshotInput {
+            pgn: 127251,
+            src: 7,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Rate of Turn".to_string(),
+            line: r#"{"pgn":127251,"src":7,"fields":{"Rate":0}}"#.to_string(),
+        });
+        s.store(SnapshotInput {
+            pgn: 65305,
+            src: 17,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Simnet: Device Status".to_string(),
+            line: r#"{"pgn":65305,"src":17,"fields":{"x":1}}"#.to_string(),
+        });
+        s.store(SnapshotInput {
+            pgn: 129039,
+            src: 23,
+            secondary: Some("244180106".to_string()),
+            is_ais: true,
+            pgn_description: "AIS Class B Position Report".to_string(),
+            line: r#"{"pgn":129039,"src":23,"fields":{"User ID":"244180106"}}"#.to_string(),
+        });
+        s.store(SnapshotInput {
+            pgn: 129026,
+            src: 52,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "COG & SOG, Rapid Update".to_string(),
+            line: r#"{"pgn":129026,"src":52,"fields":{"COG":239.6}}"#.to_string(),
+        });
+    }
+
+    /// Byte-exact lock against canboat C n2kd's JSON snapshot port
+    /// output. Any change to the wrapper format, ordering, separators,
+    /// or key shape will fail loudly here.
+    #[test]
+    fn snapshot_byte_exact_canboat_c_layout() {
+        let s = SnapshotStore::new();
+        fill_canon_corpus(&s);
+        let expected = r#"{"127251":
+  {"description":"Rate of Turn"
+  ,"7":{"pgn":127251,"src":7,"fields":{"Rate":0}}
+  }
+,"65305":
+  {"description":"Simnet"
+  ,"17":{"pgn":65305,"src":17,"fields":{"x":1}}
+  }
+,"129039":
+  {"description":"AIS Class B Position Report"
+  ,"23_244180106":{"pgn":129039,"src":23,"fields":{"User ID":"244180106"}}
+  }
+,"129026":
+  {"description":"COG & SOG, Rapid Update"
+  ,"52":{"pgn":129026,"src":52,"fields":{"COG":239.6}}
+  }
+}
+"#;
+        assert_eq!(s.snapshot(), expected);
+    }
+
+    /// Byte-exact lock against canboat C n2kd's AIS port output:
+    /// AIS-described PGNs + 129026/129029 only, otherwise identical
+    /// to the snapshot wrapper.
+    #[test]
+    fn ais_snapshot_byte_exact_canboat_c_layout() {
+        let s = SnapshotStore::new();
+        fill_canon_corpus(&s);
+        // 127251 and 65305 must be filtered out; 129039 (AIS-prefix)
+        // and 129026 (special-case) stay, in first-seen order.
+        let expected = r#"{"129039":
+  {"description":"AIS Class B Position Report"
+  ,"23_244180106":{"pgn":129039,"src":23,"fields":{"User ID":"244180106"}}
+  }
+,"129026":
+  {"description":"COG & SOG, Rapid Update"
+  ,"52":{"pgn":129026,"src":52,"fields":{"COG":239.6}}
+  }
+}
+"#;
+        assert_eq!(s.ais_snapshot(), expected);
+    }
+
+    /// Byte-exact lock for the status port. `last` is wall-clock at
+    /// store time (matches canboat C); redact every `"last":"<iso>"`
+    /// to a stable placeholder before comparing so the test stays
+    /// deterministic. `interval` is 0 for first-record entries —
+    /// each key here is stored exactly once.
+    #[test]
+    fn status_snapshot_byte_exact_canboat_c_layout() {
+        let s = SnapshotStore::new();
+        fill_canon_corpus(&s);
+        let actual = redact_iso_last(&s.status_snapshot());
+        let expected = r#"{"127251":
+  {"description":"Rate of Turn"
+  ,"7":{"last":"<ts>","interval":0,"count":1}
+  }
+,"65305":
+  {"description":"Simnet"
+  ,"17":{"last":"<ts>","interval":0,"count":1}
+  }
+,"129039":
+  {"description":"AIS Class B Position Report"
+  ,"23_244180106":{"last":"<ts>","interval":0,"count":1}
+  }
+,"129026":
+  {"description":"COG & SOG, Rapid Update"
+  ,"52":{"last":"<ts>","interval":0,"count":1}
+  }
+}
+"#;
+        assert_eq!(actual, expected);
+    }
+
+    /// Replace every `"last":"<24-char-ISO-timestamp>"` with
+    /// `"last":"<ts>"` so the byte-exact status test stays stable.
+    fn redact_iso_last(s: &str) -> String {
+        // Cheap state machine — find `"last":"`, skip to the next
+        // `"`, replace the body. No regex dep.
+        let mut out = String::with_capacity(s.len());
+        let needle = "\"last\":\"";
+        let mut rest = s;
+        while let Some(idx) = rest.find(needle) {
+            out.push_str(&rest[..idx + needle.len()]);
+            let after = &rest[idx + needle.len()..];
+            if let Some(end) = after.find('"') {
+                out.push_str("<ts>");
+                rest = &after[end..];
+            } else {
+                out.push_str(after);
+                return out;
+            }
+        }
+        out.push_str(rest);
+        out
     }
 }

@@ -31,14 +31,22 @@ use crate::types::{FieldInfo, FieldType, PgnInfo};
 fn unavailable_with_range(f: &FieldInfo, ex: Extracted) -> bool {
     if let (Some(rmax), Some(res)) = (f.range_max, f.resolution) {
         if res > 0.0 {
-            let range_max_raw = (rmax / res + 0.5) as i64;
-            if range_max_raw == ex.max {
+            // Mirror analyzer/print.c #651: guard the f64 → i64 cast.
+            // Rust saturates at i64::MAX rather than triggering UB, but
+            // a saturated value can still spuriously equal `ex.max` for
+            // a signed 64-bit field (where ex.max == i64::MAX), so skip
+            // the comparison when rmax/res exceeds 2^63.
+            let range_max_raw = rmax / res + 0.5;
+            if range_max_raw < TWO_POW_63 && (range_max_raw as i64) == ex.max {
                 return false;
             }
         }
     }
     is_unavailable(ex)
 }
+
+/// 2^63 as f64 — the smallest double that doesn't fit in i64.
+const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 
 /// One decoded field.
 #[derive(Debug, Clone)]

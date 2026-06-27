@@ -191,13 +191,7 @@ fn run(cli: Cli) -> Result<()> {
             Subscription::Nmea0183Stream,
         )?;
         spawn_raw_input_listener(bind_addr, cli.port + 3, cli.output_copy && !cli.restrict)?;
-        spawn_listener(
-            bind_addr,
-            cli.port + 4,
-            "ais-stream",
-            Arc::clone(&hub),
-            Subscription::AisStream,
-        )?;
+        spawn_ais_listener(bind_addr, cli.port + 4, Arc::clone(&hub))?;
         spawn_snapshot_listener(bind_addr, cli.port, Arc::clone(&hub))?;
         spawn_status_listener(bind_addr, cli.port + 5, Arc::clone(&hub))?;
     }
@@ -257,8 +251,6 @@ enum Subscription {
     JsonStream,
     /// Converted NMEA 0183 sentences.
     Nmea0183Stream,
-    /// AIS-related PGNs only, as JSON.
-    AisStream,
 }
 
 /// Open a UDP socket bound to an ephemeral local port; we'll
@@ -367,6 +359,33 @@ fn spawn_raw_input_listener(bind: Ipv4Addr, port: u16, copy_to_stdout: bool) -> 
     Ok(())
 }
 
+/// AIS port — connect-and-dump like the JSON snapshot port, but the
+/// filter is AIS-described PGNs plus the special-cased PGNs 129026
+/// (COG/SOG) and 129029 (Position). Mirrors canboat C n2kd's
+/// `CLIENT_AIS` path in `n2kd/main.c:757-765`.
+fn spawn_ais_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<()> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding ais on {bind}:{port}"))?;
+    log::info!("listening on {bind}:{port} (ais)");
+    thread::Builder::new()
+        .name("n2kd-ais".into())
+        .spawn(move || loop {
+            let stream = match listener.accept() {
+                Ok((s, _)) => s,
+                Err(e) => {
+                    log::warn!("accept on ais: {e}");
+                    continue;
+                }
+            };
+            let hub2 = Arc::clone(&hub);
+            thread::Builder::new()
+                .spawn(move || run_ais_client(stream, hub2))
+                .ok();
+        })
+        .context("spawning ais listener")?;
+    Ok(())
+}
+
 /// Status port — connect-and-dump, just like the JSON snapshot port,
 /// but emits the canboat C `{<pgn>:{description,<src>:{last,interval,
 /// count}}}` shape. Mirrors `n2kd/main.c`'s `CLIENT_STATUS_STREAM`
@@ -457,6 +476,12 @@ fn run_status_client(mut stream: TcpStream, hub: Arc<Hub>) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
+fn run_ais_client(mut stream: TcpStream, hub: Arc<Hub>) {
+    let dump = hub.ais_snapshot();
+    let _ = stream.write_all(dump.as_bytes());
+    let _ = stream.shutdown(std::net::Shutdown::Both);
+}
+
 fn run_raw_input_client(stream: TcpStream, copy_to_stdout: bool) {
     let reader = BufReader::new(stream);
     if !copy_to_stdout {
@@ -513,9 +538,8 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         // after every entry. Strip it before stashing.
         hub.store(&meta, trimmed.to_string());
         hub.broadcast(Subscription::JsonStream, &line);
-        if AIS_PGNS.contains(&meta.pgn) {
-            hub.broadcast(Subscription::AisStream, &line);
-        }
+        // The AIS port is a one-shot snapshot now, not a live stream —
+        // see `spawn_ais_listener`. No per-line broadcast.
         // NMEA 0183 conversion: append each generated sentence to a
         // small buffer and ship it once. AIS PGNs get the AIVDM
         // encoder; everything else goes through the simple-sentence
@@ -663,6 +687,13 @@ impl Hub {
     /// (`{<pgn>:{description,<src>:{last,interval,count}}}`).
     fn status_snapshot(&self) -> String {
         self.cache.status_snapshot()
+    }
+
+    /// Canboat C–compatible AIS snapshot dump — same shape as
+    /// `snapshot()` but filtered to AIS-described PGNs + 129026 +
+    /// 129029.
+    fn ais_snapshot(&self) -> String {
+        self.cache.ais_snapshot()
     }
 
     fn subscribe(&self, sub: Subscription, tx: Sender<String>) {

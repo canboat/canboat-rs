@@ -199,22 +199,49 @@ impl SnapshotStore {
     /// lock. Returns the document as one big `String` ending in `}\n`
     /// (or `\n` if the cache is empty).
     pub fn snapshot(&self) -> String {
+        self.filtered_snapshot(|_, _| true)
+    }
+
+    /// Build the canboat-C-compatible AIS snapshot dump: same shape
+    /// as [`Self::snapshot`] but filtered to AIS records.
+    ///
+    /// canboat C n2kd routes a PGN to the AIS port when:
+    ///
+    /// * its description starts with `"AIS"`, OR
+    /// * the PGN is 129026 (COG & SOG, Rapid Update), OR
+    /// * the PGN is 129029 (Position, Rapid Update).
+    ///
+    /// (See the `(stream == CLIENT_AIS) == (strncmp(desc,"AIS",3)==0)
+    /// || pgn == 129026 || pgn == 129029` predicate in
+    /// `n2kd/main.c:458`.)
+    pub fn ais_snapshot(&self) -> String {
+        self.filtered_snapshot(|pgn, entry| {
+            *pgn == 129026
+                || *pgn == 129029
+                || entry.pgn_short_description.starts_with("AIS")
+        })
+    }
+
+    /// Internal helper: nested-JSON dump like [`Self::snapshot`] but
+    /// only emits entries whose `(pgn, entry)` passes `keep`.
+    fn filtered_snapshot<F>(&self, keep: F) -> String
+    where
+        F: Fn(&u32, &CacheEntry) -> bool,
+    {
         let now = Instant::now();
         let mut guard = self.cache.lock().expect("snapshot cache poisoned");
         guard.retain(|_, v| v.expires_at.is_none_or(|t| t > now));
 
-        // Group live entries by PGN. `by_pgn` is itself ordered: the
-        // first time we encounter a given PGN, we append its bucket;
-        // subsequent records for that PGN extend the bucket in place.
-        // Combined with the IndexMap iteration above, this gives the
-        // emitter canboat C's first-seen PGN order.
         type GroupKey<'a> = (u8, &'a Option<String>);
         let mut by_pgn: IndexMap<u32, Vec<(GroupKey<'_>, &CacheEntry)>> = IndexMap::new();
         for ((pgn, src, sec), entry) in guard.iter() {
+            if !keep(pgn, entry) {
+                continue;
+            }
             by_pgn.entry(*pgn).or_default().push(((*src, sec), entry));
         }
 
-        let mut out = String::with_capacity(8192);
+        let mut out = String::with_capacity(2048);
         let mut first_pgn = true;
         for (pgn, entries) in by_pgn.iter() {
             let desc = &entries[0].1.pgn_short_description;
@@ -591,6 +618,88 @@ mod tests {
         });
         let status = s.status_snapshot();
         assert!(status.contains("\"23_244180106\":{\"last\":"));
+    }
+
+    #[test]
+    fn ais_snapshot_includes_ais_described_pgns_and_special_pgns() {
+        let s = SnapshotStore::new();
+        // Non-AIS sensor record — must not appear in the AIS dump.
+        s.store(SnapshotInput {
+            pgn: 127251,
+            src: 7,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Rate of Turn".to_string(),
+            line: r#"{"pgn":127251}"#.to_string(),
+            timestamp: None,
+        });
+        // AIS-described record (description starts with "AIS").
+        s.store(SnapshotInput {
+            pgn: 129039,
+            src: 23,
+            secondary: Some("244180106".to_string()),
+            is_ais: true,
+            pgn_description: "AIS Class B Position Report".to_string(),
+            line: r#"{"pgn":129039}"#.to_string(),
+            timestamp: None,
+        });
+        // PGN 129026 (COG & SOG) — description doesn't start with
+        // "AIS" but C still routes it to the AIS port.
+        s.store(SnapshotInput {
+            pgn: 129026,
+            src: 52,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "COG & SOG, Rapid Update".to_string(),
+            line: r#"{"pgn":129026}"#.to_string(),
+            timestamp: None,
+        });
+        // PGN 129029 (Position) — same special case.
+        s.store(SnapshotInput {
+            pgn: 129029,
+            src: 52,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Position, Rapid Update".to_string(),
+            line: r#"{"pgn":129029}"#.to_string(),
+            timestamp: None,
+        });
+
+        let dump = s.ais_snapshot();
+        assert!(
+            dump.contains("\"129039\""),
+            "AIS-described PGN missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("\"129026\""),
+            "special-cased PGN 129026 missing:\n{dump}"
+        );
+        assert!(
+            dump.contains("\"129029\""),
+            "special-cased PGN 129029 missing:\n{dump}"
+        );
+        assert!(
+            !dump.contains("\"127251\""),
+            "non-AIS sensor PGN leaked into ais dump:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn ais_snapshot_empty_returns_blank_line() {
+        let s = SnapshotStore::new();
+        // Empty cache.
+        assert_eq!(s.ais_snapshot(), "\n");
+        // Cache has only non-AIS entries — still empty after filter.
+        s.store(SnapshotInput {
+            pgn: 127251,
+            src: 7,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Rate of Turn".to_string(),
+            line: "{}".to_string(),
+            timestamp: None,
+        });
+        assert_eq!(s.ais_snapshot(), "\n");
     }
 
     #[test]

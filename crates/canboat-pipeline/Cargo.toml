@@ -16,7 +16,7 @@ path = "src/main.rs"
 canboat-core = { workspace = true }
 canboat-io   = { workspace = true }
 canboat-cli  = { workspace = true }
-n2kd         = { path = "../n2kd", version = "0.1.0" }
+n2kd         = { path = "../n2kd", version = "0.2.0" }
 anyhow       = { workspace = true }
 clap         = { workspace = true }
 log          = { workspace = true }

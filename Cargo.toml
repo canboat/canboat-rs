@@ -19,7 +19,7 @@ members = [
 ]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.0"
 edition = "2021"
 license = "Apache-2.0"
 authors = ["Kees Verruijt <kees@verruijt.net>"]
@@ -27,13 +27,13 @@ repository = "https://github.com/canboat/canboat-rs"
 rust-version = "1.77"
 
 [workspace.dependencies]
-canboat-core = { path = "crates/canboat-core", version = "0.1.0" }
-canboat-io   = { path = "crates/canboat-io",   version = "0.1.0" }
-canboat-cli  = { path = "crates/canboat-cli",  version = "0.1.0" }
+canboat-core = { path = "crates/canboat-core", version = "0.2.0" }
+canboat-io   = { path = "crates/canboat-io",   version = "0.2.0" }
+canboat-cli  = { path = "crates/canboat-cli",  version = "0.2.0" }
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"
-thiserror  = "1"
+thiserror  = "2"
 log        = "0.4"
 smallvec   = { version = "1", features = ["union"] }
 indexmap   = "2"

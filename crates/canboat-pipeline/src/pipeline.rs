@@ -59,7 +59,10 @@ fn is_ais_pgn(pgn: u32) -> bool {
 
 /// Bundle of broadcast hubs the pipeline writes into.
 pub struct Hubs {
-    pub csv: Arc<Hub>,
+    /// Raw N2K input/output: every coalesced frame goes out as a
+    /// `# format=FAST` PLAIN line; clients can write PLAIN/FAST back
+    /// to inject onto the bus. Previously named `csv`.
+    pub raw_input: Arc<Hub>,
     pub nmea: Arc<Hub>,
     pub analyzer: Arc<Hub>,
     /// Optional cache for the snapshot port. When `Some`, every
@@ -119,7 +122,7 @@ pub fn run(
 
     let mut reasm = Reassembler::new();
     let mut nmea_buf = String::with_capacity(256);
-    let mut csv_line = String::with_capacity(256);
+    let mut raw_line = String::with_capacity(256);
     let mut json_line = String::with_capacity(1024);
     let mut rl = n2kd::nmea0183::RateLimiter::new(false);
     let mut ais_seq: u8 = 0;
@@ -163,12 +166,13 @@ pub fn run(
             }
         }
 
-        // Lazy CSV broadcast — one PLAIN/FAST line per RawFrame.
-        if hubs.csv.has_subscribers() {
-            csv_line.clear();
-            if write_plain(&mut csv_line, &frame).is_ok() {
-                csv_line.push('\n');
-                hubs.csv.broadcast(&csv_line);
+        // Lazy raw-input broadcast — one `# format=FAST` PLAIN line
+        // per coalesced `RawFrame`.
+        if hubs.raw_input.has_subscribers() {
+            raw_line.clear();
+            if write_plain(&mut raw_line, &frame).is_ok() {
+                raw_line.push('\n');
+                hubs.raw_input.broadcast(&raw_line);
             }
         }
 

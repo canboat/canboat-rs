@@ -192,15 +192,19 @@ struct Cli {
 
     /// Port for the snapshot server — on connect, dumps the latest
     /// analyzer JSON line per `(pgn, src, secondary)` then closes.
-    /// Matches canboat C `n2kd`'s base port (`-p`). Enabling this
+    /// Matches canboat C `n2kd`'s base port (`-p`). AIS-described
+    /// PGNs are filtered out; they go to `--ais-port` instead, except
+    /// PGN 129026 and 129029 which appear in both. Enabling this
     /// forces JSON serialization for every decoded record so the
     /// cache stays current; disable with `0` if you don't need it.
     #[arg(long, default_value_t = 2597)]
     snapshot_port: u16,
 
     /// Port for the read-only analyzer JSON server — one decoded PGN
-    /// per line. Matches canboat C `n2kd`'s `port+1` stream port.
-    /// Lazy: skipped when no client is subscribed. `0` disables.
+    /// per line. Matches canboat C `n2kd`'s `port+1` stream port —
+    /// broadcast-only; clients that want to inject N2K traffic
+    /// should connect to `--raw-input-port` instead. Lazy: skipped
+    /// when no client is subscribed. `0` disables.
     #[arg(long, default_value_t = 2598)]
     analyzer_port: u16,
 
@@ -210,21 +214,23 @@ struct Cli {
     #[arg(long, default_value_t = 2599)]
     nmea0183_port: u16,
 
-    /// Port for the write-only N2K injection server. PLAIN/FAST lines
-    /// from clients are encoded and pushed to the device. Matches
-    /// canboat C `n2kd`'s `port+5` raw-input port. `0` disables.
-    /// Only active in device mode (otherwise there is no device to
-    /// send to).
-    #[arg(long, default_value_t = 2602)]
-    write_port: u16,
+    /// Port for the bidirectional raw N2K input/output server.
+    /// Clients receive every frame as a `# format=FAST` PLAIN line
+    /// (i.e. already-coalesced fast-packet payloads — never the
+    /// per-CAN-frame PLAIN format) and can send PLAIN/FAST lines
+    /// back to inject into the bus. Matches canboat C `n2kd`'s
+    /// `port+3` input slot. Reading is lazy (skipped with no client);
+    /// injection only takes effect in device mode. `0` disables.
+    /// (Previously known as `--csv-port`, default 2603.)
+    #[arg(long, default_value_t = 2600)]
+    raw_input_port: u16,
 
-    /// Port for the bidirectional CSV (PLAIN/FAST) server. Clients
-    /// receive every frame as a PLAIN/FAST line and can send
-    /// PLAIN/FAST lines back to inject into the N2K bus. New in
-    /// `canboat-pipeline`; no direct canboat C equivalent. Formatting
-    /// is lazy (skipped when no client is subscribed). `0` disables.
-    #[arg(long, default_value_t = 2603)]
-    csv_port: u16,
+    /// Port for the AIS snapshot server — on connect, dumps the
+    /// latest analyzer JSON line for every AIS-described PGN (plus
+    /// PGN 129026 and 129029) then closes. Matches canboat C
+    /// `n2kd`'s `port+4` AIS port. `0` disables.
+    #[arg(long, default_value_t = 2601)]
+    ais_port: u16,
 
     /// Also write NMEA 0183 sentences (including AIVDM) to stdout —
     /// mirrors canboat C `n2kd`'s `--nmea0183` flag. Off by default,
@@ -336,7 +342,7 @@ fn run(cli: Cli) -> Result<()> {
     // device sender and live inside `Hubs`.
     let quirks_kinds = cli.quirk.into_iter().collect();
     let hubs = Hubs {
-        csv: Arc::new(Hub::new()),
+        raw_input: Arc::new(Hub::new()),
         nmea: Arc::new(Hub::new()),
         analyzer: Arc::new(Hub::new()),
         snapshot: snapshot.clone(),
@@ -385,18 +391,20 @@ fn run(cli: Cli) -> Result<()> {
             store.clone(),
         )?);
     }
-    // Every readable port accepts PLAIN/FAST writes back from
-    // connected clients when a device sender is wired up — clients
-    // can inject N2K traffic on any port they're already subscribed
-    // to. The CSV port additionally emits the canboat `# format=FAST`
-    // header on connect so downstream PLAIN/FAST parsers (canboat C
-    // analyzer, canboatjs) know the stream is pre-coalesced.
-    if cli.csv_port != 0 {
+    // Raw-input port: bidirectional FAST-format raw N2K stream.
+    // Clients see every coalesced frame as a PLAIN line under a
+    // `# format=FAST` header so downstream tools (canboat C analyzer,
+    // canboatjs) know the stream is pre-coalesced; clients can send
+    // PLAIN/FAST lines back to inject onto the bus. Matches canboat
+    // C `n2kd`'s `port+3` input slot (with the added live broadcast
+    // and the actual encode-and-forward injection — canboat C n2kd's
+    // input is passive).
+    if cli.raw_input_port != 0 {
         tcp_joins.push(tcp::spawn_stream_server(
-            "csv",
+            "raw-input",
             cli.bind,
-            cli.csv_port,
-            hubs.csv.clone(),
+            cli.raw_input_port,
+            hubs.raw_input.clone(),
             tcp::Direction::ReadWrite {
                 inject: inject.clone(),
             },
@@ -416,20 +424,35 @@ fn run(cli: Cli) -> Result<()> {
         )?);
     }
     if cli.analyzer_port != 0 {
+        // Analyzer-JSON stream is read-only, matching canboat C
+        // n2kd's `port+1` stream port. Injection lives on the
+        // raw-input port instead.
         tcp_joins.push(tcp::spawn_stream_server(
             "analyzer",
             cli.bind,
             cli.analyzer_port,
             hubs.analyzer.clone(),
-            tcp::Direction::ReadWrite {
-                inject: inject.clone(),
-            },
+            tcp::Direction::ReadOnly,
             None,
         )?);
     }
-    if let (Some(i), true) = (inject, cli.write_port != 0) {
-        tcp_joins.push(tcp::spawn_writeonly(cli.bind, cli.write_port, i)?);
+    if cli.ais_port != 0 {
+        if let Some(store) = snapshot.as_ref() {
+            tcp_joins.push(tcp::spawn_ais_snapshot(
+                cli.bind,
+                cli.ais_port,
+                store.clone(),
+            )?);
+        } else {
+            log::warn!(
+                "--ais-port {} ignored: snapshot port is disabled, no AIS cache to dump",
+                cli.ais_port,
+            );
+        }
     }
+    // `inject` is no longer claimed by a dedicated write-only port —
+    // raw-input-port subsumed that role above.
+    let _ = inject;
 
     let camel_case = if cli.upper_camel {
         CamelCase::Upper

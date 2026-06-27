@@ -137,6 +137,53 @@ fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
     let _ = stream.shutdown(Shutdown::Both);
 }
 
+/// Bind the AIS-snapshot server. Same connect-and-dump behaviour as
+/// [`spawn_snapshot`], but the dump is filtered to AIS-described
+/// PGNs plus PGN 129026 / 129029 — matches canboat C `n2kd`'s
+/// `port+4` AIS port.
+pub fn spawn_ais_snapshot(
+    bind: Ipv4Addr,
+    port: u16,
+    store: Arc<SnapshotStore>,
+) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding ais TCP port {}:{}", bind, port))?;
+    log::info!("ais server listening on {}:{}", bind, port);
+    Ok(thread::Builder::new()
+        .name("ais-accept".into())
+        .spawn(move || ais_snapshot_accept(listener, store))
+        .expect("spawn ais accept"))
+}
+
+fn ais_snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("ais accept failed: {e}");
+                return;
+            }
+        };
+        log::info!("ais client connected: {peer}");
+        let s = store.clone();
+        thread::Builder::new()
+            .name("ais-client".into())
+            .spawn(move || run_ais_snapshot_client(stream, s))
+            .ok();
+    }
+}
+
+fn run_ais_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
+    set_nodelay(&stream, "ais");
+    if let Err(e) = stream.shutdown(Shutdown::Read) {
+        log::debug!("ais: shutdown(read) failed: {e}");
+    }
+    let doc = store.ais_snapshot();
+    let _ = stream.write_all(doc.as_bytes());
+    let _ = stream.flush();
+    let _ = stream.shutdown(Shutdown::Both);
+}
+
 /// Direction policy for [`spawn_stream_server`]. Mode `ReadOnly`
 /// shuts down the TCP read direction on every accept; `ReadWrite`
 /// spawns an inbound reader subthread that parses PLAIN/FAST lines
@@ -293,54 +340,6 @@ fn run_inbound_reader(name: &'static str, stream: TcpStream, inject: Option<Inje
                     log::debug!("{name}: no device wired up, dropping client line: {trimmed}");
                 }
             }
-        }
-    }
-}
-
-/// Bind a write-only TCP server. Each client's lines are parsed as
-/// PLAIN/FAST and sent to the device writer. Useful for clients that
-/// just want to inject N2K traffic without reading anything back.
-pub fn spawn_writeonly(bind: Ipv4Addr, port: u16, inject: InjectPoint) -> Result<JoinHandle<()>> {
-    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
-        .with_context(|| format!("binding write-only TCP port {}:{}", bind, port))?;
-    log::info!("write-only server listening on {}:{}", bind, port);
-    Ok(thread::Builder::new()
-        .name("write-accept".into())
-        .spawn(move || writeonly_accept(listener, inject))
-        .expect("spawn write-only accept"))
-}
-
-fn writeonly_accept(listener: TcpListener, inject: InjectPoint) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("write-only accept failed: {e}");
-                return;
-            }
-        };
-        log::info!("write-only client connected: {peer}");
-        let i = inject.clone();
-        thread::Builder::new()
-            .name("write-client".into())
-            .spawn(move || run_writeonly_client(stream, i))
-            .ok();
-    }
-}
-
-fn run_writeonly_client(stream: TcpStream, inject: InjectPoint) {
-    set_nodelay(&stream, "write-only");
-    let reader = BufReader::new(stream);
-    for line in reader.lines() {
-        let line = match line {
-            Ok(l) => l,
-            Err(e) => {
-                log::debug!("write-only client read error: {e}");
-                return;
-            }
-        };
-        if !forward_plain_line(&line, &inject) {
-            return;
         }
     }
 }

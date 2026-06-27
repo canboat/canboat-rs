@@ -39,9 +39,18 @@ impl SnapshotStore {
         });
     }
 
-    /// Build the canboat-C-compatible nested JSON snapshot dump.
+    /// Build the canboat-C-compatible nested JSON snapshot dump
+    /// (non-AIS PGNs + the always-shared 129026 / 129029).
     pub fn snapshot(&self) -> String {
         self.inner.snapshot()
+    }
+
+    /// Build the AIS snapshot dump — same nested wrapper as
+    /// [`Self::snapshot`] but filtered to AIS-described PGNs plus
+    /// PGN 129026 / 129029. Matches canboat C `n2kd`'s `port+4`
+    /// AIS port output.
+    pub fn ais_snapshot(&self) -> String {
+        self.inner.ais_snapshot()
     }
 
     /// Number of live entries (no pruning). For tests / future

@@ -14,6 +14,7 @@ serde_json    = { workspace = true }
 thiserror     = { workspace = true }
 log           = { workspace = true }
 smallvec      = { workspace = true }
+indexmap      = { workspace = true }
 # `itoa` for fast u64 → ASCII in the fixed-precision float formatter.
 # core::fmt::Display::<u64>::fmt was a measurable share of
 # output/json.rs's CPU on the merrimac-2022 workload; itoa is several

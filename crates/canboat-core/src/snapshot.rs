@@ -31,10 +31,11 @@
 //! walks the `DecodedPgn` struct — and they each build a
 //! [`SnapshotInput`] from it before calling [`SnapshotStore::store`].
 
-use std::collections::HashMap;
 use std::fmt::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
+
+use indexmap::IndexMap;
 
 /// TTL for ordinary sensor PGNs — matches canboat C's `SENSOR_TIMEOUT`.
 pub const SENSOR_TTL: Duration = Duration::from_secs(120);
@@ -126,19 +127,25 @@ struct CacheEntry {
 type CacheKey = (u32, u8, Option<String>);
 
 /// Shared snapshot cache. Thread-safe (interior `Mutex`).
+///
+/// Uses [`IndexMap`] so the snapshot emitter walks entries in
+/// insertion order — matching canboat C n2kd's `pgnList[]` first-seen
+/// ordering. The first record for a given PGN fixes its position;
+/// subsequent records under that key update the value in place.
 pub struct SnapshotStore {
-    cache: Mutex<HashMap<CacheKey, CacheEntry>>,
+    cache: Mutex<IndexMap<CacheKey, CacheEntry>>,
 }
 
 impl SnapshotStore {
     pub fn new() -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: Mutex::new(IndexMap::new()),
         }
     }
 
     /// Stash one classified record. Overwrites any prior entry with
-    /// the same `(pgn, src, secondary)` key.
+    /// the same `(pgn, src, secondary)` key in place — the entry's
+    /// insertion order is preserved.
     pub fn store(&self, input: SnapshotInput) {
         let expires_at = ttl_for_pgn(input.pgn, input.is_ais).map(|ttl| Instant::now() + ttl);
         let entry = CacheEntry {
@@ -161,10 +168,13 @@ impl SnapshotStore {
         let mut guard = self.cache.lock().expect("snapshot cache poisoned");
         guard.retain(|_, v| v.expires_at.is_none_or(|t| t > now));
 
-        // Group live entries by PGN, preserving per-PGN order by src
-        // for readability.
+        // Group live entries by PGN. `by_pgn` is itself ordered: the
+        // first time we encounter a given PGN, we append its bucket;
+        // subsequent records for that PGN extend the bucket in place.
+        // Combined with the IndexMap iteration above, this gives the
+        // emitter canboat C's first-seen PGN order.
         type GroupKey<'a> = (u8, &'a Option<String>);
-        let mut by_pgn: HashMap<u32, Vec<(GroupKey<'_>, &CacheEntry)>> = HashMap::new();
+        let mut by_pgn: IndexMap<u32, Vec<(GroupKey<'_>, &CacheEntry)>> = IndexMap::new();
         for ((pgn, src, sec), entry) in guard.iter() {
             by_pgn.entry(*pgn).or_default().push(((*src, sec), entry));
         }
@@ -337,6 +347,70 @@ mod tests {
             dump.contains("\"description\":\"AIS Class B Position Report\""),
             "AIS description has no colon — should not be truncated"
         );
+    }
+
+    #[test]
+    fn snapshot_walks_pgns_in_insertion_order() {
+        let s = SnapshotStore::new();
+        let inputs = [
+            (65305, 21, "Simnet"),
+            (60928, 7, "ISO Address Claim"),
+            (127251, 27, "Rate of Turn"),
+        ];
+        for (pgn, src, desc) in inputs {
+            s.store(SnapshotInput {
+                pgn,
+                src,
+                secondary: None,
+                is_ais: false,
+                pgn_description: desc.to_string(),
+                line: format!(r#"{{"pgn":{pgn},"src":{src}}}"#),
+            });
+        }
+        let dump = s.snapshot();
+        // First PGN inserted appears first; subsequent PGNs follow in
+        // first-seen order. Matches canboat C's pgnList[] ordering.
+        let pos_first = dump.find("65305").expect("first pgn present");
+        let pos_second = dump.find("60928").expect("second pgn present");
+        let pos_third = dump.find("127251").expect("third pgn present");
+        assert!(
+            pos_first < pos_second && pos_second < pos_third,
+            "expected insertion order 65305 < 60928 < 127251, got dump:\n{dump}"
+        );
+    }
+
+    #[test]
+    fn snapshot_preserves_position_when_existing_key_updated() {
+        let s = SnapshotStore::new();
+        // Insert two PGNs, then update the first with a new line —
+        // its position must not move to the end.
+        for (pgn, line) in [(65305u32, "first-line"), (127251, "second-line")] {
+            s.store(SnapshotInput {
+                pgn,
+                src: 7,
+                secondary: None,
+                is_ais: false,
+                pgn_description: "x".to_string(),
+                line: line.to_string(),
+            });
+        }
+        s.store(SnapshotInput {
+            pgn: 65305,
+            src: 7,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "x".to_string(),
+            line: "first-line-updated".to_string(),
+        });
+        let dump = s.snapshot();
+        let pos_first = dump.find("65305").expect("first pgn present");
+        let pos_second = dump.find("127251").expect("second pgn present");
+        assert!(
+            pos_first < pos_second,
+            "65305 must still precede 127251 after update; dump:\n{dump}"
+        );
+        assert!(dump.contains("first-line-updated"));
+        assert!(!dump.contains("\"first-line\""));
     }
 
     #[test]

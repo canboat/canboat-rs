@@ -31,19 +31,16 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use canboat_core::snapshot::{SnapshotInput, SnapshotStore, SECONDARY_FIELDS};
 use clap::Parser;
 
 use crate::nmea0183::RateLimiter;
 
 /// Default TCP base port.
 const DEFAULT_PORT: u16 = 2597;
-/// Sensor PGN cache TTL — matches canboat's `SENSOR_TIMEOUT`.
-const SENSOR_TIMEOUT: Duration = Duration::from_secs(120);
-/// AIS-shaped PGN cache TTL — matches canboat's `AIS_TIMEOUT`.
-const AIS_TIMEOUT: Duration = Duration::from_secs(3600);
 /// How often the status port emits a snapshot.
 const STATUS_INTERVAL: Duration = Duration::from_secs(5);
 
@@ -446,11 +443,8 @@ fn run_stream_client(mut stream: TcpStream, hub: Arc<Hub>, sub: Subscription) {
 }
 
 fn run_snapshot_client(mut stream: TcpStream, hub: Arc<Hub>) {
-    for line in hub.snapshot() {
-        if stream.write_all(line.as_bytes()).is_err() {
-            return;
-        }
-    }
+    let dump = hub.snapshot();
+    let _ = stream.write_all(dump.as_bytes());
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
@@ -505,7 +499,10 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
             continue;
         }
         hub.note_device_seen(meta.pgn, meta.src);
-        hub.store(meta, line.clone());
+        // `line` carries the trailing `\n` from `read_line`; the
+        // snapshot's nested wrapper would print that as a blank line
+        // after every entry. Strip it before stashing.
+        hub.store(&meta, trimmed.to_string());
         hub.broadcast(Subscription::JsonStream, &line);
         if AIS_PGNS.contains(&meta.pgn) {
             hub.broadcast(Subscription::AisStream, &line);
@@ -536,67 +533,61 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
     Ok(())
 }
 
-#[derive(Debug, Clone, Copy)]
+/// Classified record ready to hand to the snapshot store and to
+/// route to the broadcast subscribers.
+#[derive(Debug, Clone)]
 struct Meta {
     pgn: u32,
     src: u8,
-    secondary: u64,
-    is_ais_like: bool,
+    /// Readable value of the first matching
+    /// [`canboat_core::snapshot::SECONDARY_FIELDS`] entry on the
+    /// record, or `None` if none matched. Matches canboat C's
+    /// first-key-only behavior (`m_key2` is a single field per
+    /// message).
+    secondary: Option<String>,
+    /// Set when any AIS-marker secondary field is present on the
+    /// record. Drives the longer `AIS_TTL` and the AIS subscriber
+    /// fan-out.
+    is_ais: bool,
+    /// The PGN's full description (e.g. `"Simnet: Device Status"`) for
+    /// the snapshot wrapper. Empty when the analyzer didn't emit a
+    /// `"description":` key.
+    description: String,
 }
 
 fn extract_meta(line: &str) -> Option<Meta> {
     let pgn = json::int(line, "pgn")? as u32;
     let src = json::int(line, "src")? as u8;
-    // Combine *every* matching secondary-key field into a rolling hash
-    // rather than only the first hit. PGNs that need a tuple of fields
-    // to disambiguate variants (e.g. Furuno PGN 130845 "Multi Sats In
-    // View Extended" — same src, but distinct entries per
-    // (Antenna, Page) — or BEP Marine PGN 130817 — per Page) get a
-    // unique cache slot per tuple instead of overwriting each other.
-    let mut secondary: u64 = 0;
-    for (k, _) in SECONDARY_KEYS {
-        if let Some(idx) = line.find(k) {
-            let after = &line[idx + k.len()..];
-            let end = after.find([',', '}']).unwrap_or(after.len());
-            let v = after[..end].trim_matches(['"', ' ', ':']);
-            secondary = secondary.wrapping_mul(33).wrapping_add(djb2_hash(v));
+    let description = json::value(line, "description")
+        .unwrap_or("")
+        .to_string();
+    // canboat C n2kd uses the *first* matching secondary key field
+    // only (m_key2 is a single field per message). Match that — both
+    // for the cache key and for the snapshot's `<src>_<secondary>`
+    // suffix.
+    let mut secondary: Option<String> = None;
+    let mut is_ais = false;
+    for (name, ais) in SECONDARY_FIELDS {
+        if let Some(v) = json::value_or_name(line, name) {
+            if secondary.is_none() {
+                secondary = Some(v.to_string());
+            }
+            if *ais {
+                is_ais = true;
+            }
         }
     }
-    let is_ais_like = SECONDARY_KEYS
-        .iter()
-        .any(|(k, ais)| *ais && line.contains(k));
     Some(Meta {
         pgn,
         src,
         secondary,
-        is_ais_like,
+        is_ais,
+        description,
     })
 }
 
-fn djb2_hash(s: &str) -> u64 {
-    let mut h: u64 = 5381;
-    for b in s.bytes() {
-        h = (h.wrapping_shl(5)).wrapping_add(h).wrapping_add(b as u64);
-    }
-    h
-}
-
-const SECONDARY_KEYS: &[(&str, bool)] = &[
-    ("Instance\":", false),
-    ("\"Reference\":", false),
-    ("\"User ID\":", true),
-    ("\"Message ID\":", true),
-    ("\"Proprietary ID\":", false),
-    // Furuno PGN 130845 = per-(Antenna, Page); BEP Marine PGN 130817 =
-    // per-Page. Both are the only PGNs in canboat.json that name a
-    // field exactly `Antenna` / `Page`, and the trailing colon in the
-    // substring rules out the sibling `"Page type":` field.
-    ("\"Antenna\":", false),
-    ("\"Page\":", false),
-];
-
 struct Hub {
-    cache: Mutex<HashMap<(u32, u8, u64), CacheEntry>>,
+    cache: SnapshotStore,
     engine: Arc<RequestEngine>,
     subscribers: Mutex<HashMap<u8, Vec<Sender<String>>>>,
     src_filter: Option<SrcFilter>,
@@ -607,11 +598,6 @@ struct Hub {
     nmea_to_stdout: bool,
 }
 
-struct CacheEntry {
-    line: String,
-    expires_at: Instant,
-}
-
 impl Hub {
     fn new(
         src_filter: Option<SrcFilter>,
@@ -620,7 +606,7 @@ impl Hub {
         engine: Arc<RequestEngine>,
     ) -> Self {
         Self {
-            cache: Mutex::new(HashMap::new()),
+            cache: SnapshotStore::new(),
             engine,
             subscribers: Mutex::new(HashMap::new()),
             src_filter,
@@ -641,31 +627,25 @@ impl Hub {
         self.engine.note_device_seen(pgn, src);
     }
 
-    fn store(&self, meta: Meta, line: String) {
-        let ttl = if meta.is_ais_like {
-            AIS_TIMEOUT
-        } else {
-            SENSOR_TIMEOUT
-        };
-        let entry = CacheEntry {
+    fn store(&self, meta: &Meta, line: String) {
+        self.cache.store(SnapshotInput {
+            pgn: meta.pgn,
+            src: meta.src,
+            secondary: meta.secondary.clone(),
+            is_ais: meta.is_ais,
+            pgn_description: meta.description.clone(),
             line,
-            expires_at: Instant::now() + ttl,
-        };
-        self.cache
-            .lock()
-            .unwrap()
-            .insert((meta.pgn, meta.src, meta.secondary), entry);
+        });
     }
 
-    fn snapshot(&self) -> Vec<String> {
-        let now = Instant::now();
-        let mut guard = self.cache.lock().unwrap();
-        guard.retain(|_, v| v.expires_at > now);
-        guard.values().map(|v| v.line.clone()).collect()
+    /// Canboat C–compatible nested-JSON dump of every live cache
+    /// entry (one big string ending in `}\n`, or `\n` when empty).
+    fn snapshot(&self) -> String {
+        self.cache.snapshot()
     }
 
     fn status_snapshot(&self) -> String {
-        let cache_len = self.cache.lock().unwrap().len();
+        let cache_len = self.cache.len();
         let devs_seen = self.engine.device_count();
         let total_subs: usize = self
             .subscribers
@@ -709,62 +689,33 @@ mod tests {
 
     #[test]
     fn extracts_pgn_src() {
-        let line = r#"{"timestamp":"2026-01-01T00:00:00","prio":2,"src":7,"dst":255,"pgn":127251,"fields":{"Rate":0}}"#;
+        let line = r#"{"timestamp":"2026-01-01T00:00:00","prio":2,"src":7,"dst":255,"pgn":127251,"description":"Rate of Turn","fields":{"Rate":0}}"#;
         let meta = extract_meta(line).unwrap();
         assert_eq!(meta.pgn, 127251);
         assert_eq!(meta.src, 7);
-        assert!(!meta.is_ais_like);
+        assert!(!meta.is_ais);
+        assert_eq!(meta.description, "Rate of Turn");
+        assert!(meta.secondary.is_none());
     }
 
     #[test]
-    fn ais_message_marked_ais_like() {
+    fn ais_message_marks_is_ais_and_keys_on_user_id() {
         let line = r#"{"timestamp":"…","src":23,"pgn":129039,"fields":{"Message ID":18,"User ID":"244180106"}}"#;
         let meta = extract_meta(line).unwrap();
-        assert!(meta.is_ais_like);
-        // Regression guard: the AIS path's secondary must remain
-        // non-zero so different vessels (different User IDs) don't
-        // collide in the cache.
-        assert_ne!(meta.secondary, 0);
+        assert!(meta.is_ais);
+        // canboat C uses the first matching secondary key only.
+        // "User ID" sits ahead of "Message ID" in SECONDARY_FIELDS so
+        // it's the cache discriminator for AIS records.
+        assert_eq!(meta.secondary.as_deref(), Some("244180106"));
     }
 
-    /// Furuno PGN 130845 "Multi Sats In View Extended" arrives 4×2
-    /// times per cycle (4 antennas × 2 pages); without per-tuple
-    /// secondary the cache only retains the last variant. Confirm the
-    /// (Antenna, Page) tuple produces distinct secondary hashes.
     #[test]
-    fn extract_meta_distinguishes_furuno_130845_by_antenna_and_page() {
-        let mk = |antenna: u8, page: u8| {
-            format!(
-                r#"{{"timestamp":"x","src":52,"pgn":130845,"fields":{{"Manufacturer Code":{{"value":1855,"name":"Furuno"}},"Antenna":{antenna},"Page type":2,"Page":{page},"Sats in View":21}}}}"#
-            )
-        };
-        let mut seen: std::collections::HashSet<u64> = std::collections::HashSet::new();
-        for antenna in 0..4u8 {
-            for page in 1..=2u8 {
-                let m = extract_meta(&mk(antenna, page)).unwrap();
-                assert!(
-                    seen.insert(m.secondary),
-                    "antenna={antenna} page={page} hashed to {:#x}, already seen",
-                    m.secondary
-                );
-            }
-        }
-        assert_eq!(seen.len(), 8);
-    }
-
-    /// "Page type" must not match the "Page" substring (the trailing
-    /// `:` rules it out). Distinguish lines that differ only in
-    /// "Page type" without mismatching the Page-only logic.
-    #[test]
-    fn extract_meta_does_not_match_page_type_as_page() {
-        // Identical Page=1 but differing Page type values — secondary
-        // should be the same because Page type isn't in the key list.
-        let a = r#"{"src":52,"pgn":130845,"fields":{"Antenna":1,"Page type":2,"Page":1}}"#;
-        let b = r#"{"src":52,"pgn":130845,"fields":{"Antenna":1,"Page type":3,"Page":1}}"#;
-        assert_eq!(
-            extract_meta(a).unwrap().secondary,
-            extract_meta(b).unwrap().secondary,
-        );
+    fn extract_meta_uses_lookup_name_when_present() {
+        // -nv mode wraps a lookup as `{"value":1,"name":"True"}`; the
+        // snapshot key should be the readable name, not the integer.
+        let line = r#"{"src":7,"pgn":127250,"fields":{"Reference":{"value":1,"name":"True"}}}"#;
+        let meta = extract_meta(line).unwrap();
+        assert_eq!(meta.secondary.as_deref(), Some("True"));
     }
 
     #[test]

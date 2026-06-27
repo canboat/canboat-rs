@@ -13,6 +13,7 @@ pub mod frame;
 pub mod os;
 pub mod output;
 pub mod reassembly;
+pub mod snapshot;
 pub mod startup;
 pub mod types;
 

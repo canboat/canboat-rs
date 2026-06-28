@@ -433,7 +433,7 @@ fn run(cli: Cli) -> Result<()> {
             cli.bind,
             cli.analyzer_port,
             hubs.analyzer.clone(),
-            tcp::Direction::ReadOnly,
+            tcp::Direction::ReadWrite { inject: inject.clone(), },
             None,
         )?);
     }
@@ -451,9 +451,8 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
     }
-    // `inject` is no longer claimed by a dedicated write-only port —
-    // raw-port subsumed that role above.
-    let _ = inject;
+    
+    let _ = inject; // No further use in this function
 
     let camel_case = if cli.upper_camel {
         CamelCase::Upper

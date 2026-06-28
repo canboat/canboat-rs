@@ -89,7 +89,7 @@
     {
       "PGN": 262400,
       "Id": "ikonvertNetworkStatus",
-      "Description": "iKonvert: Network status",
+      "Description": "NMEA 2000 gateway: network status",
       "Type": "Fast",
       "Complete": true,
       "FieldCount": 6,

@@ -152,8 +152,12 @@ pub fn encode_tx_frame(frame: &crate::frame::RawFrame) -> String {
 /// `ikonvertNetworkStatus`.
 pub const IKONVERT_BEM: u32 = 0x40100;
 
-/// Synthesize an `iKonvert: Network status` (PGN [`IKONVERT_BEM`])
-/// frame from a `$PDGY,000000,…` body.
+/// Synthesize a `NMEA 2000 gateway: network status` (PGN
+/// [`IKONVERT_BEM`]) frame from an iKonvert `$PDGY,000000,…` body.
+/// The PGN is shared across gateways now — the same shape is also
+/// emitted by `socketcan-serial` and any other tool acting as an
+/// NMEA 2000 gateway — but iKonvert is the protocol-side source of
+/// this particular line format.
 ///
 /// `body` is the text after the `$PDGY,` prefix. Returns `None` for
 /// the keep-alive form (all six fields empty) and for any body that

@@ -120,6 +120,36 @@ mod imp {
     /// drowning the snapshot port in identical rows.
     const NETWORK_STATUS_INTERVAL_MS: u64 = 5_000;
 
+    /// Fallback CAN bitrate when `/sys/class/net/<iface>/can_bittiming/
+    /// bitrate` isn't readable. NMEA 2000 is fixed at 250 kbit/s so
+    /// this is the right default for ~every real bus.
+    const FALLBACK_BITRATE_BPS: u32 = 250_000;
+
+    /// Per-frame protocol overhead in bits for CAN 2.0B extended frames
+    /// (NMEA 2000 is always 29-bit). Sum of SOF (1) + Arbitration
+    /// (11+SRR+IDE+18+RTR = 32) + Control (6) + CRC (16) + ACK (2) +
+    /// EOF (7) + IFS (3). Excludes the data bytes themselves and the
+    /// bit-stuffing inflation (applied as a scalar below).
+    const CAN_EFF_OVERHEAD_BITS: u64 = 67;
+
+    /// Average bit-stuffing inflation across arbitration / control /
+    /// data / CRC. ~20% is the canonical estimate for NMEA 2000
+    /// traffic; close enough for a single-byte load percentage.
+    const STUFFING_NUMER: u64 = 120;
+    const STUFFING_DENOM: u64 = 100;
+
+    /// One read of the kernel CAN counters we need for load
+    /// computation. Sampled `prev` → `curr` deltas over the time
+    /// between consecutive `emit_network_status` calls.
+    #[derive(Debug, Clone, Copy)]
+    struct LoadSample {
+        rx_bytes: u64,
+        tx_bytes: u64,
+        rx_packets: u64,
+        tx_packets: u64,
+        at_ms: u64,
+    }
+
     const PGN_ISO_ACK: u32 = 59392;
     const PGN_ISO_REQUEST: u32 = 59904;
     const PGN_ISO_ADDRESS_CLAIM: u32 = 60928;
@@ -451,6 +481,16 @@ mod imp {
         /// many real devices never re-announce, so the claim table
         /// undercounts the bus.
         seen_addrs: [bool; 256],
+        /// Bus bitrate (bits/s), read once at construction from
+        /// `/sys/class/net/<iface>/can_bittiming/bitrate`. NMEA 2000
+        /// is fixed at 250 kbit/s so the fallback covers the common
+        /// case if the kernel hasn't filled in the bittiming yet.
+        bitrate_bps: u32,
+        /// Most recent `LoadSample`, or `None` before the first
+        /// network-status emission. Used to compute the bytes/packets
+        /// delta over the time between the previous and current emit.
+        /// First emit reports `load_pct = None` (no baseline yet).
+        prev_load_sample: Option<LoadSample>,
     }
 
     impl Claimer {
@@ -476,6 +516,8 @@ mod imp {
                 start_ms: now_ms(),
                 next_network_status: 0,
                 seen_addrs: [false; 256],
+                bitrate_bps: read_bitrate_bps(iface),
+                prev_load_sample: None,
             }
         }
 
@@ -775,7 +817,7 @@ mod imp {
         /// the wire — it's a BEM PGN by design. Errors / rejected-TX
         /// come from `/sys/class/net/<iface>/statistics/`; everything
         /// else from in-process counters.
-        fn emit_network_status(&self, bus: &mut Bus<'_>, now: u64) {
+        fn emit_network_status(&mut self, bus: &mut Bus<'_>, now: u64) {
             let uptime_s = ((now - self.start_ms) / 1000) as u32;
             let device_count = self
                 .seen_addrs
@@ -785,12 +827,21 @@ mod imp {
                 .min(u8::MAX as usize) as u8;
             let errors = read_sysfs_counter(&self.iface, "rx_errors");
             let rejected_tx = read_sysfs_counter(&self.iface, "tx_dropped");
+            // Load: delta against the previous sample. First emit has
+            // no baseline, so load_pct stays None and the canboat
+            // sentinel rides through; baseline shifts forward each
+            // call.
+            let curr_sample = read_load_sample(&self.iface, now);
+            let load_pct = match (self.prev_load_sample, curr_sample) {
+                (Some(prev), Some(curr)) => compute_load_pct(prev, curr, self.bitrate_bps),
+                _ => None,
+            };
+            if let Some(curr) = curr_sample {
+                self.prev_load_sample = Some(curr);
+            }
             let frame = build_network_status(
                 NetworkStatus {
-                    // canNetworkLoad requires sampling rx_bytes against
-                    // the bus bitrate over time — not wired up yet, so
-                    // leave the canboat "no data" sentinel in place.
-                    load_pct: None,
+                    load_pct,
                     errors,
                     device_count: Some(device_count),
                     uptime_s: Some(uptime_s),
@@ -838,6 +889,77 @@ mod imp {
         let path = format!("/sys/class/net/{iface}/statistics/{name}");
         let raw = std::fs::read_to_string(path).ok()?;
         raw.trim().parse::<u64>().ok().map(|v| v as u32)
+    }
+
+    /// Read the CAN bus bitrate (bits/s) from
+    /// `/sys/class/net/<iface>/can_bittiming/bitrate`. The file
+    /// exists for every SocketCAN device and contains a decimal
+    /// integer (e.g. `250000`). Returns `FALLBACK_BITRATE_BPS` when
+    /// missing, unreadable, or 0 — most production NMEA 2000 buses
+    /// are fixed at 250 kbit/s.
+    fn read_bitrate_bps(iface: &str) -> u32 {
+        let path = format!("/sys/class/net/{iface}/can_bittiming/bitrate");
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(s) => s,
+            Err(_) => return FALLBACK_BITRATE_BPS,
+        };
+        match raw.trim().parse::<u32>() {
+            Ok(0) | Err(_) => FALLBACK_BITRATE_BPS,
+            Ok(v) => v,
+        }
+    }
+
+    /// Take one read of `(rx_bytes, tx_bytes, rx_packets, tx_packets)`
+    /// from sysfs, timestamped with `now_ms`. Returns `None` if any
+    /// of the counters are unreadable; the emitter then reports
+    /// `load_pct = None` and the canboat sentinel survives.
+    fn read_load_sample(iface: &str, now_ms: u64) -> Option<LoadSample> {
+        Some(LoadSample {
+            rx_bytes: read_sysfs_counter(iface, "rx_bytes")? as u64,
+            tx_bytes: read_sysfs_counter(iface, "tx_bytes")? as u64,
+            rx_packets: read_sysfs_counter(iface, "rx_packets")? as u64,
+            tx_packets: read_sysfs_counter(iface, "tx_packets")? as u64,
+            at_ms: now_ms,
+        })
+    }
+
+    /// CAN bus load percentage from two samples and the bus bitrate.
+    /// Accounts for the per-frame CAN protocol overhead and a flat
+    /// 20% bit-stuffing inflation.
+    fn compute_load_pct(prev: LoadSample, curr: LoadSample, bitrate_bps: u32) -> Option<u8> {
+        let dt_ms = curr.at_ms.saturating_sub(prev.at_ms);
+        if dt_ms == 0 || bitrate_bps == 0 {
+            return None;
+        }
+        // Kernel counters are monotonic u64 internally — even though
+        // sysfs widens to u32 here, wrapping_sub keeps a wrap from
+        // showing up as 4 GiB of phantom traffic on a long-running
+        // gateway.
+        let d_bytes = curr
+            .rx_bytes
+            .wrapping_sub(prev.rx_bytes)
+            .saturating_add(curr.tx_bytes.wrapping_sub(prev.tx_bytes));
+        let d_packets = curr
+            .rx_packets
+            .wrapping_sub(prev.rx_packets)
+            .saturating_add(curr.tx_packets.wrapping_sub(prev.tx_packets));
+        // bits_raw = data bytes * 8 + packets * (SOF + arb + ctrl +
+        // CRC + ACK + EOF + IFS). bits_on_wire scales by the
+        // stuffing factor, then load_pct = bits / (bitrate * Δt).
+        let bits_raw = d_bytes
+            .saturating_mul(8)
+            .saturating_add(d_packets.saturating_mul(CAN_EFF_OVERHEAD_BITS));
+        let bits_on_wire = bits_raw
+            .saturating_mul(STUFFING_NUMER)
+            .saturating_div(STUFFING_DENOM);
+        // pct = bits * 100 / (bitrate * dt_seconds)
+        //     = bits * 100_000 / (bitrate * dt_ms)
+        let denom = (bitrate_bps as u64).saturating_mul(dt_ms);
+        if denom == 0 {
+            return None;
+        }
+        let pct = bits_on_wire.saturating_mul(100_000) / denom;
+        Some(pct.min(100) as u8)
     }
 
     /// Try to write the oldest queued frame. Returns true if a frame was

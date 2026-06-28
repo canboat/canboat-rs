@@ -152,20 +152,80 @@ pub fn encode_tx_frame(frame: &crate::frame::RawFrame) -> String {
 /// `ikonvertNetworkStatus`.
 pub const IKONVERT_BEM: u32 = 0x40100;
 
+/// All fields the [`IKONVERT_BEM`] PGN exposes. Each value is
+/// `Some` when the gateway can measure it; `None` leaves the
+/// canboat-canonical 0xff / 0xffffffff "no data" sentinel in the
+/// emitted payload. Used by [`build_network_status`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct NetworkStatus {
+    /// CAN network load (%).
+    pub load_pct: Option<u8>,
+    /// Cumulative error count.
+    pub errors: Option<u32>,
+    /// Distinct N2K source addresses seen on the bus.
+    pub device_count: Option<u8>,
+    /// Seconds since the gateway started.
+    pub uptime_s: Option<u32>,
+    /// Gateway's claimed source address. Also used as
+    /// [`RawFrame::src`] so downstream tools attribute the record
+    /// to this gateway, not to the well-known broadcast slot.
+    pub gateway_addr: u8,
+    /// Cumulative count of TX requests the gateway refused or
+    /// dropped (queue overflow, kernel ENOBUFS, etc).
+    pub rejected_tx: Option<u32>,
+}
+
+/// Build a `NMEA 2000 gateway: network status` (PGN [`IKONVERT_BEM`])
+/// frame from raw gateway-collected stats. Producers fill the fields
+/// they can measure and leave the rest at `None`; the encoder writes
+/// the canboat 0xff / 0xffffffff "no data" sentinel for each `None`.
+///
+/// 15-byte payload layout (matches `parseIKonvertAsciiMessage` in
+/// canboat C's `ikonvert-serial/ikonvert-serial.c`): u8 load, u32 LE
+/// errors, u8 device_count, u32 LE uptime_s, u8 gateway_addr, u32 LE
+/// rejected_tx.
+pub fn build_network_status(status: NetworkStatus, timestamp: Option<String>) -> RawFrame {
+    let mut data = [0xffu8; 15];
+    if let Some(v) = status.load_pct {
+        data[0] = v;
+    }
+    if let Some(v) = status.errors {
+        data[1..5].copy_from_slice(&v.to_le_bytes());
+    }
+    if let Some(v) = status.device_count {
+        data[5] = v;
+    }
+    if let Some(v) = status.uptime_s {
+        data[6..10].copy_from_slice(&v.to_le_bytes());
+    }
+    data[10] = status.gateway_addr;
+    if let Some(v) = status.rejected_tx {
+        data[11..15].copy_from_slice(&v.to_le_bytes());
+    }
+    RawFrame {
+        timestamp,
+        prio: 7,
+        pgn: IKONVERT_BEM,
+        src: status.gateway_addr,
+        dst: 255,
+        data: data.into_iter().collect(),
+    }
+}
+
 /// Synthesize a `NMEA 2000 gateway: network status` (PGN
 /// [`IKONVERT_BEM`]) frame from an iKonvert `$PDGY,000000,…` body.
-/// The PGN is shared across gateways now — the same shape is also
-/// emitted by `socketcan-serial` and any other tool acting as an
-/// NMEA 2000 gateway — but iKonvert is the protocol-side source of
-/// this particular line format.
+/// The PGN itself is gateway-agnostic — `socketcan-serial` and any
+/// other gateway producer should call [`build_network_status`]
+/// directly with their own stats — this helper is iKonvert-specific
+/// because it parses iKonvert's wire format.
 ///
 /// `body` is the text after the `$PDGY,` prefix. Returns `None` for
 /// the keep-alive form (all six fields empty) and for any body that
 /// does not start with `000000,`. Mirrors the heartbeat branch of
-/// `parseIKonvertAsciiMessage` in `canboat/ikonvert-serial/ikonvert-serial.c`:
-/// 15 bytes prefilled with `0xff`, then load/errors overlaid
-/// unconditionally and count/uptime/addr/rejected overlaid only when
-/// non-zero (so the N2K "no data" sentinel survives).
+/// `parseIKonvertAsciiMessage`: load and errors are written
+/// unconditionally (iKonvert always reports them, even as 0xff /
+/// -1), the rest only when iKonvert reports a non-zero value so the
+/// N2K "no data" sentinel survives.
 pub fn synthesize_network_status(body: &str, timestamp: String) -> Option<RawFrame> {
     let rest = body.strip_prefix("000000,")?;
     if rest == ",,,,," {
@@ -178,46 +238,17 @@ pub fn synthesize_network_status(body: &str, timestamp: String) -> Option<RawFra
     let uptime = parse_status_field(fields.next()).unwrap_or(0);
     let addr = parse_status_field(fields.next()).unwrap_or(0);
     let rejected = parse_status_field(fields.next()).unwrap_or(0);
-
-    let mut data = [0xffu8; 15];
-    data[0] = load as u8;
-    let errors_u = errors as u32;
-    data[1] = errors_u as u8;
-    data[2] = (errors_u >> 8) as u8;
-    data[3] = (errors_u >> 16) as u8;
-    data[4] = (errors_u >> 24) as u8;
-    if count != 0 {
-        data[5] = count as u8;
-    }
-    if uptime != 0 {
-        let uptime_u = uptime as u32;
-        data[6] = uptime_u as u8;
-        data[7] = (uptime_u >> 8) as u8;
-        data[8] = (uptime_u >> 16) as u8;
-        data[9] = (uptime_u >> 24) as u8;
-    }
-    if addr != 0 {
-        data[10] = addr as u8;
-    }
-    if rejected != 0 {
-        let rejected_u = rejected as u32;
-        data[11] = rejected_u as u8;
-        data[12] = (rejected_u >> 8) as u8;
-        data[13] = (rejected_u >> 16) as u8;
-        data[14] = (rejected_u >> 24) as u8;
-    }
-    Some(RawFrame {
-        timestamp: Some(timestamp),
-        prio: 7,
-        pgn: IKONVERT_BEM,
-        // Source = the gateway's claimed CAN address (5th heartbeat
-        // field). Lets downstream tools attribute the network-status
-        // PGN to the iKonvert itself instead of bucketing every
-        // gateway's status into src=0.
-        src: addr as u8,
-        dst: 255,
-        data: data.into_iter().collect(),
-    })
+    Some(build_network_status(
+        NetworkStatus {
+            load_pct: Some(load as u8),
+            errors: Some(errors as u32),
+            device_count: (count != 0).then_some(count as u8),
+            uptime_s: (uptime != 0).then_some(uptime as u32),
+            gateway_addr: addr as u8,
+            rejected_tx: (rejected != 0).then_some(rejected as u32),
+        },
+        Some(timestamp),
+    ))
 }
 
 fn parse_status_field(s: Option<&str>) -> Option<i32> {
@@ -382,6 +413,54 @@ mod tests {
     fn non_heartbeat_body_does_not_synthesize() {
         assert!(synthesize_network_status("ACK,whatever", "ts".into()).is_none());
         assert!(synthesize_network_status("TEXT,banner", "ts".into()).is_none());
+    }
+
+    #[test]
+    fn build_network_status_writes_provided_fields_and_keeps_sentinel_for_none() {
+        let f = build_network_status(
+            NetworkStatus {
+                load_pct: Some(42),
+                errors: Some(0x0102_0304),
+                device_count: Some(7),
+                uptime_s: None, // sentinel survives
+                gateway_addr: 17,
+                rejected_tx: Some(0xdead_beef),
+            },
+            None,
+        );
+        assert_eq!(f.pgn, IKONVERT_BEM);
+        assert_eq!(f.src, 17, "src mirrors gateway_addr");
+        assert_eq!(f.dst, 255);
+        assert_eq!(f.prio, 7);
+        let d = &f.data[..];
+        assert_eq!(d.len(), 15);
+        assert_eq!(d[0], 42, "load_pct");
+        assert_eq!(&d[1..5], &0x0102_0304u32.to_le_bytes());
+        assert_eq!(d[5], 7, "device_count");
+        // uptime: untouched 0xff sentinel.
+        assert_eq!(&d[6..10], &[0xff, 0xff, 0xff, 0xff]);
+        assert_eq!(d[10], 17, "gateway_addr");
+        assert_eq!(&d[11..15], &0xdead_beefu32.to_le_bytes());
+    }
+
+    #[test]
+    fn build_network_status_all_none_is_all_sentinel_except_gateway_addr() {
+        let f = build_network_status(
+            NetworkStatus {
+                gateway_addr: 0,
+                ..Default::default()
+            },
+            None,
+        );
+        // Every byte should be 0xff (sentinel) except byte 10 which
+        // carries gateway_addr = 0.
+        for (i, b) in f.data.iter().enumerate() {
+            let expected = if i == 10 { 0 } else { 0xff };
+            assert_eq!(
+                *b, expected,
+                "byte {i}: got {b:#04x}, expected {expected:#04x}",
+            );
+        }
     }
 
     #[test]

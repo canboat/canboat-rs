@@ -100,6 +100,7 @@ mod imp {
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use canboat_core::format::ikonvert::{build_network_status, NetworkStatus};
     use canboat_core::frame::RawFrame;
     use canboat_core::{FramePacketType, Reassembled, Reassembler};
     use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Socket};
@@ -111,6 +112,13 @@ mod imp {
     const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
     const CAN_ERR_FLAG: u32 = 0x2000_0000;
     const CAN_EFF_FLAG: u32 = 0x8000_0000;
+
+    /// How often to emit the synthetic `NMEA 2000 gateway: network
+    /// status` PGN (262400) into the upstream `frames_tx` channel.
+    /// Mirrors the ~1 Hz cadence the iKonvert pushes its `$PDGY`
+    /// heartbeat at; 5 s is plenty for human-visible status without
+    /// drowning the snapshot port in identical rows.
+    const NETWORK_STATUS_INTERVAL_MS: u64 = 5_000;
 
     const PGN_ISO_ACK: u32 = 59392;
     const PGN_ISO_REQUEST: u32 = 59904;
@@ -426,10 +434,27 @@ mod imp {
         last_product_info: u64, // ms; rate-limit broadcast bursts
         used: [bool; 256],
         model_version: &'static str,
+        // -- NMEA 2000 gateway: network status (PGN 262400) emission --
+        /// Interface name passed to `socketcan::CanSocket::open`, kept
+        /// so the network-status tick can read kernel CAN counters via
+        /// `/sys/class/net/<iface>/statistics/`.
+        iface: String,
+        /// Wall-clock ms at worker construction. The `uptime_s` field
+        /// is `(now - start_ms) / 1000`.
+        start_ms: u64,
+        /// Next wall-clock ms at which to emit the network-status PGN.
+        /// Set on first claim; reset on each emission.
+        next_network_status: u64,
+        /// Distinct N2K source addresses we have ever received a
+        /// (non-error, extended) frame from. Strictly bigger than
+        /// `self.used`, which is only updated on PGN 60928 claims —
+        /// many real devices never re-announce, so the claim table
+        /// undercounts the bus.
+        seen_addrs: [bool; 256],
     }
 
     impl Claimer {
-        fn new(config: &Config) -> Self {
+        fn new(config: &Config, iface: &str) -> Self {
             Self {
                 name: build_name(config),
                 address: config.address,
@@ -447,6 +472,10 @@ mod imp {
                 last_product_info: 0,
                 used: [false; 256],
                 model_version: config.model_version.unwrap_or(DEFAULT_MODEL_VERSION),
+                iface: iface.to_string(),
+                start_ms: now_ms(),
+                next_network_status: 0,
+                seen_addrs: [false; 256],
             }
         }
 
@@ -713,6 +742,10 @@ mod imp {
                 if self.heartbeat_interval > 0 {
                     self.next_heartbeat = now + self.heartbeat_interval;
                 }
+                // First network-status drop one interval after claim,
+                // so a downstream snapshot client has the data even
+                // before the first bus traffic.
+                self.next_network_status = now + NETWORK_STATUS_INTERVAL_MS;
             }
             if self.state == ClaimState::Claimed
                 && self.heartbeat_interval > 0
@@ -721,6 +754,52 @@ mod imp {
                 self.send_heartbeat(bus);
                 self.next_heartbeat = now + self.heartbeat_interval;
             }
+            if self.state == ClaimState::Claimed && now >= self.next_network_status {
+                self.emit_network_status(bus, now);
+                self.next_network_status = now + NETWORK_STATUS_INTERVAL_MS;
+            }
+        }
+
+        /// Note that we received a frame from `src`. Used by the
+        /// network-status emitter's device-count field — `self.used`
+        /// only tracks PGN 60928 announcers (many real devices never
+        /// re-announce), so this captures everything the wire shows.
+        fn note_seen(&mut self, src: u8) {
+            if (src as usize) < self.seen_addrs.len() {
+                self.seen_addrs[src as usize] = true;
+            }
+        }
+
+        /// Build and push a synthetic `NMEA 2000 gateway: network
+        /// status` (PGN 262400) frame into `frames_tx`. Never goes on
+        /// the wire — it's a BEM PGN by design. Errors / rejected-TX
+        /// come from `/sys/class/net/<iface>/statistics/`; everything
+        /// else from in-process counters.
+        fn emit_network_status(&self, bus: &mut Bus<'_>, now: u64) {
+            let uptime_s = ((now - self.start_ms) / 1000) as u32;
+            let device_count = self
+                .seen_addrs
+                .iter()
+                .filter(|seen| **seen)
+                .count()
+                .min(u8::MAX as usize) as u8;
+            let errors = read_sysfs_counter(&self.iface, "rx_errors");
+            let rejected_tx = read_sysfs_counter(&self.iface, "tx_dropped");
+            let frame = build_network_status(
+                NetworkStatus {
+                    // canNetworkLoad requires sampling rx_bytes against
+                    // the bus bitrate over time — not wired up yet, so
+                    // leave the canboat "no data" sentinel in place.
+                    load_pct: None,
+                    errors,
+                    device_count: Some(device_count),
+                    uptime_s: Some(uptime_s),
+                    gateway_addr: self.address,
+                    rejected_tx,
+                },
+                Some(format_iso(now)),
+            );
+            let _ = bus.frames_tx.send(frame);
         }
 
         // NMEA 2000 Heartbeat, PGN 126993. Sent every heartbeat_interval ms
@@ -746,6 +825,19 @@ mod imp {
                 self.heartbeat_seq + 1
             };
         }
+    }
+
+    /// Read a kernel-maintained counter from
+    /// `/sys/class/net/<iface>/statistics/<name>`. Returns `None` on
+    /// any error (interface gone, file missing, parse fail) so the
+    /// network-status emitter degrades to the "no data" sentinel
+    /// rather than failing loudly. Cheap: sysfs is a virtual fs and
+    /// each read is a handful of bytes; called once per emission
+    /// interval (default 5 s).
+    fn read_sysfs_counter(iface: &str, name: &str) -> Option<u32> {
+        let path = format!("/sys/class/net/{iface}/statistics/{name}");
+        let raw = std::fs::read_to_string(path).ok()?;
+        raw.trim().parse::<u64>().ok().map(|v| v as u32)
     }
 
     /// Try to write the oldest queued frame. Returns true if a frame was
@@ -885,6 +977,15 @@ mod imp {
             }
         }
 
+        // Track every distinct src for the network-status PGN's
+        // device-count field. `claimer.used` only fires on PGN 60928
+        // (ISO Address Claim), and many real devices don't
+        // re-announce after we attach, so a separate tracker is
+        // required for a realistic per-snapshot count.
+        if src != ADDR_NULL && src != ADDR_GLOBAL {
+            claimer.note_seen(src);
+        }
+
         // Classify with the build-time fastpacket table, push through
         // the reassembler, and forward the coalesced result. A real
         // single-frame PGN takes the `PassThrough` branch unchanged;
@@ -979,9 +1080,10 @@ mod imp {
         let (frames_tx, frames_rx) = mpsc::channel::<RawFrame>();
         let (cmd_tx, cmd_rx) = mpsc::channel::<WriterCmd>();
 
+        let iface_owned = iface.to_string();
         let join = thread::Builder::new()
             .name("socketcan-worker".into())
-            .spawn(move || worker(sock, fd, config, frames_tx, cmd_rx, claim_addr))?;
+            .spawn(move || worker(sock, fd, iface_owned, config, frames_tx, cmd_rx, claim_addr))?;
 
         Ok(from_parts(frames_rx, cmd_tx, vec![join]))
     }
@@ -993,12 +1095,13 @@ mod imp {
     fn worker(
         sock: CanSocket,
         fd: i32,
+        iface: String,
         config: Config,
         frames_tx: mpsc::Sender<RawFrame>,
         cmd_rx: mpsc::Receiver<WriterCmd>,
         claim_addr: Arc<AtomicU8>,
     ) {
-        let mut claimer = Claimer::new(&config);
+        let mut claimer = Claimer::new(&config, &iface);
         // Reset the claim atom to "unclaimed" so a reconnect resumes
         // with no stale value visible to consumers.
         claim_addr.store(super::CLAIM_UNCLAIMED, Ordering::Relaxed);

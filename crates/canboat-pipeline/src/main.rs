@@ -200,11 +200,16 @@ struct Cli {
     #[arg(long, default_value_t = 2597)]
     snapshot_port: u16,
 
-    /// Port for the read-only analyzer JSON server — one decoded PGN
-    /// per line. Matches canboat C `n2kd`'s `port+1` stream port —
-    /// broadcast-only; clients that want to inject N2K traffic
-    /// should connect to `--raw-port` instead. Lazy: skipped
-    /// when no client is subscribed. `0` disables.
+    /// Port for the analyzer JSON server — one decoded PGN per
+    /// line. Matches canboat C `n2kd`'s `port+1` stream port for
+    /// the broadcast direction, but bidirectional: clients may also
+    /// send PLAIN/FAST lines back to inject onto the bus over the
+    /// same socket they're subscribed on. (canboat C n2kd has no
+    /// analyzer stage to inject into; this is a pipeline-only
+    /// convenience.) Use `--raw-port` instead if you want
+    /// injection without subscribing to the JSON broadcast. Lazy:
+    /// formatting is skipped when no client is subscribed. `0`
+    /// disables.
     #[arg(long, default_value_t = 2598)]
     analyzer_port: u16,
 

@@ -26,7 +26,7 @@ use std::io::{self, BufWriter, Write};
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use clap::Parser;
 
 const PCAP_MAGIC_US: u32 = 0xa1b2c3d4;

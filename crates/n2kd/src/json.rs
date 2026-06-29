@@ -211,7 +211,8 @@ mod tests {
         // canboat C collapses long readable names at the first space —
         // see the e=strchr(s,' ') / e2=strchr(s,'"') logic in
         // n2kd/main.c:1064.
-        let m = r#"{"Reference":{"value":0,"name":"True (ground referenced to North)","key":true}}"#;
+        let m =
+            r#"{"Reference":{"value":0,"name":"True (ground referenced to North)","key":true}}"#;
         assert_eq!(lookup_text(m, "Reference"), Some("True"));
     }
 

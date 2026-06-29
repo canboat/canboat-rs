@@ -349,12 +349,14 @@ mod tests {
     #[test]
     fn disabled_quirks_produce_nothing() {
         let mut q = Quirks::new(vec![]);
-        assert!(q
-            .process_inbound(&claim_frame(52, SCX20_NAME_BYTES))
-            .is_empty());
-        assert!(q
-            .process_inbound(&iso_request(7, ADDR_GLOBAL, PGN_PRODUCT_INFO))
-            .is_empty());
+        assert!(
+            q.process_inbound(&claim_frame(52, SCX20_NAME_BYTES))
+                .is_empty()
+        );
+        assert!(
+            q.process_inbound(&iso_request(7, ADDR_GLOBAL, PGN_PRODUCT_INFO))
+                .is_empty()
+        );
     }
 
     #[test]

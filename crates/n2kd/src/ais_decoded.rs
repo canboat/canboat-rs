@@ -17,8 +17,8 @@
 use canboat_core::{DecodedPgn, FieldValue};
 
 use crate::ais::{
-    emit_sentences, BitVector, AIS_TRANSCEIVER_NAMES, POSITION_ACCURACY_NAMES, RAIM_NAMES,
-    REPEAT_NAMES,
+    AIS_TRANSCEIVER_NAMES, BitVector, POSITION_ACCURACY_NAMES, RAIM_NAMES, REPEAT_NAMES,
+    emit_sentences,
 };
 
 /// Convert a decoded AIS PGN into one or more `!AIVDM,…` sentences.
@@ -86,11 +86,7 @@ fn ais_channel(decoded: &DecodedPgn) -> char {
         "AIS Transceiver information",
         AIS_TRANSCEIVER_NAMES,
     );
-    if matches!(info, 1 | 3) {
-        'B'
-    } else {
-        'A'
-    }
+    if matches!(info, 1 | 3) { 'B' } else { 'A' }
 }
 
 fn ais_talker(decoded: &DecodedPgn) -> &'static str {
@@ -403,11 +399,7 @@ fn rate_of_turn(d: &DecodedPgn) -> i64 {
     let r = 4.733 * v.abs().sqrt();
     let r = (r + 0.5) as i64;
     let r = r.clamp(-127, 127) * sign as i64;
-    if (-127..=127).contains(&r) {
-        r
-    } else {
-        -128
-    }
+    if (-127..=127).contains(&r) { r } else { -128 }
 }
 
 fn sog(d: &DecodedPgn, field: &str) -> i64 {
@@ -415,11 +407,7 @@ fn sog(d: &DecodedPgn, field: &str) -> i64 {
         return 1023;
     };
     let n = (v * 19.438_444_92 + 0.5) as i64;
-    if (0..=1022).contains(&n) {
-        n
-    } else {
-        1023
-    }
+    if (0..=1022).contains(&n) { n } else { 1023 }
 }
 
 fn cog(d: &DecodedPgn, field: &str) -> i64 {
@@ -427,11 +415,7 @@ fn cog(d: &DecodedPgn, field: &str) -> i64 {
         return 3600;
     };
     let n = (v * 10.0 + 0.5) as i64;
-    if (0..=3599).contains(&n) {
-        n
-    } else {
-        3600
-    }
+    if (0..=3599).contains(&n) { n } else { 3600 }
 }
 
 fn heading(d: &DecodedPgn, field: &str) -> i64 {
@@ -439,11 +423,7 @@ fn heading(d: &DecodedPgn, field: &str) -> i64 {
         return 511;
     };
     let n = (v + 0.5) as i64;
-    if (0..=359).contains(&n) {
-        n
-    } else {
-        511
-    }
+    if (0..=359).contains(&n) { n } else { 511 }
 }
 
 fn longitude(d: &DecodedPgn, field: &str) -> i64 {
@@ -475,11 +455,7 @@ fn altitude(d: &DecodedPgn) -> i64 {
         return 4095;
     };
     let n = (v + 0.5) as i64;
-    if (0..=4094).contains(&n) {
-        n
-    } else {
-        4095
-    }
+    if (0..=4094).contains(&n) { n } else { 4095 }
 }
 
 fn draft(d: &DecodedPgn) -> i64 {

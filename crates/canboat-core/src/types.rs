@@ -6,7 +6,6 @@
 //! in [`crate::schema_data`].
 
 pub use canboat_schema::{
-    BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable,
-    IndirectLookupValue, LookupFieldTypeTable, LookupFieldTypeValue, LookupTable, LookupValue,
-    PacketType, PgnInfo,
+    BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable, IndirectLookupValue,
+    LookupFieldTypeTable, LookupFieldTypeValue, LookupTable, LookupValue, PacketType, PgnInfo,
 };

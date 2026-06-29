@@ -34,7 +34,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use canboat_core::snapshot::{SnapshotInput, SnapshotStore, SECONDARY_FIELDS};
+use canboat_core::snapshot::{SECONDARY_FIELDS, SnapshotInput, SnapshotStore};
 use clap::Parser;
 
 use crate::nmea0183::RateLimiter;
@@ -236,11 +236,7 @@ struct SrcFilter {
 impl SrcFilter {
     fn allows(&self, src: u8) -> bool {
         let hit = self.srcs.contains(&src);
-        if self.negate {
-            !hit
-        } else {
-            hit
-        }
+        if self.negate { !hit } else { hit }
     }
 }
 
@@ -291,24 +287,26 @@ fn spawn_listener(
     log::info!("listening on {bind}:{port} ({name})");
     thread::Builder::new()
         .name(format!("n2kd-{name}"))
-        .spawn(move || loop {
-            let stream = match listener.accept() {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    log::warn!("accept on {name}: {e}");
-                    continue;
-                }
-            };
-            let peer = stream
-                .peer_addr()
-                .map(|p| p.to_string())
-                .unwrap_or_else(|_| "?".into());
-            log::info!("{name} client connected from {peer}");
-            let hub2 = Arc::clone(&hub);
-            thread::Builder::new()
-                .name(format!("n2kd-{name}-{peer}"))
-                .spawn(move || run_stream_client(stream, hub2, sub))
-                .ok();
+        .spawn(move || {
+            loop {
+                let stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        log::warn!("accept on {name}: {e}");
+                        continue;
+                    }
+                };
+                let peer = stream
+                    .peer_addr()
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|_| "?".into());
+                log::info!("{name} client connected from {peer}");
+                let hub2 = Arc::clone(&hub);
+                thread::Builder::new()
+                    .name(format!("n2kd-{name}-{peer}"))
+                    .spawn(move || run_stream_client(stream, hub2, sub))
+                    .ok();
+            }
         })
         .context("spawning listener")?;
     Ok(())
@@ -320,18 +318,20 @@ fn spawn_snapshot_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<(
     log::info!("listening on {bind}:{port} (json-snapshot)");
     thread::Builder::new()
         .name("n2kd-json-snapshot".into())
-        .spawn(move || loop {
-            let stream = match listener.accept() {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    log::warn!("accept on json-snapshot: {e}");
-                    continue;
-                }
-            };
-            let hub2 = Arc::clone(&hub);
-            thread::Builder::new()
-                .spawn(move || run_snapshot_client(stream, hub2))
-                .ok();
+        .spawn(move || {
+            loop {
+                let stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        log::warn!("accept on json-snapshot: {e}");
+                        continue;
+                    }
+                };
+                let hub2 = Arc::clone(&hub);
+                thread::Builder::new()
+                    .spawn(move || run_snapshot_client(stream, hub2))
+                    .ok();
+            }
         })
         .context("spawning snapshot listener")?;
     Ok(())
@@ -343,17 +343,19 @@ fn spawn_raw_input_listener(bind: Ipv4Addr, port: u16, copy_to_stdout: bool) -> 
     log::info!("listening on {bind}:{port} (raw-input)");
     thread::Builder::new()
         .name("n2kd-raw-input".into())
-        .spawn(move || loop {
-            let stream = match listener.accept() {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    log::warn!("accept on raw-input: {e}");
-                    continue;
-                }
-            };
-            thread::Builder::new()
-                .spawn(move || run_raw_input_client(stream, copy_to_stdout))
-                .ok();
+        .spawn(move || {
+            loop {
+                let stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        log::warn!("accept on raw-input: {e}");
+                        continue;
+                    }
+                };
+                thread::Builder::new()
+                    .spawn(move || run_raw_input_client(stream, copy_to_stdout))
+                    .ok();
+            }
         })
         .context("spawning raw-input listener")?;
     Ok(())
@@ -369,18 +371,20 @@ fn spawn_ais_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<()> {
     log::info!("listening on {bind}:{port} (ais)");
     thread::Builder::new()
         .name("n2kd-ais".into())
-        .spawn(move || loop {
-            let stream = match listener.accept() {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    log::warn!("accept on ais: {e}");
-                    continue;
-                }
-            };
-            let hub2 = Arc::clone(&hub);
-            thread::Builder::new()
-                .spawn(move || run_ais_client(stream, hub2))
-                .ok();
+        .spawn(move || {
+            loop {
+                let stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        log::warn!("accept on ais: {e}");
+                        continue;
+                    }
+                };
+                let hub2 = Arc::clone(&hub);
+                thread::Builder::new()
+                    .spawn(move || run_ais_client(stream, hub2))
+                    .ok();
+            }
         })
         .context("spawning ais listener")?;
     Ok(())
@@ -396,18 +400,20 @@ fn spawn_status_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<()>
     log::info!("listening on {bind}:{port} (status)");
     thread::Builder::new()
         .name("n2kd-status".into())
-        .spawn(move || loop {
-            let stream = match listener.accept() {
-                Ok((s, _)) => s,
-                Err(e) => {
-                    log::warn!("accept on status: {e}");
-                    continue;
-                }
-            };
-            let hub2 = Arc::clone(&hub);
-            thread::Builder::new()
-                .spawn(move || run_status_client(stream, hub2))
-                .ok();
+        .spawn(move || {
+            loop {
+                let stream = match listener.accept() {
+                    Ok((s, _)) => s,
+                    Err(e) => {
+                        log::warn!("accept on status: {e}");
+                        continue;
+                    }
+                };
+                let hub2 = Arc::clone(&hub);
+                thread::Builder::new()
+                    .spawn(move || run_status_client(stream, hub2))
+                    .ok();
+            }
         })
         .context("spawning status listener")?;
     Ok(())
@@ -601,9 +607,7 @@ struct Meta {
 fn extract_meta(line: &str) -> Option<Meta> {
     let pgn = json::int(line, "pgn")? as u32;
     let src = json::int(line, "src")? as u8;
-    let description = json::value(line, "description")
-        .unwrap_or("")
-        .to_string();
+    let description = json::value(line, "description").unwrap_or("").to_string();
     // canboat C n2kd uses the *first* matching secondary key field
     // only (m_key2 is a single field per message). Match that — both
     // for the cache key and for the snapshot's `<src>_<secondary>`

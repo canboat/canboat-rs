@@ -55,7 +55,7 @@ async fn ngt1_stream_decodes_pgn60928_from_memory() {
     let mut stream = Ngt1Stream::new(reader, db());
     let decoded = stream.next().await.expect("one DecodedPgn");
     assert_eq!(decoded.pgn, 60928);
-    assert_eq!(&*decoded.id, "isoAddressClaim");
+    assert_eq!(decoded.id, "isoAddressClaim");
     // Manufacturer Code (field 2) resolves to Navico.
     let mfr = decoded
         .fields

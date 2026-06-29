@@ -28,9 +28,9 @@ use super::{effective_precision, write_fixed_float};
 fn field_display_name(field: &DecodedField, mode: CamelCase) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     match mode {
-        CamelCase::Off => Cow::Borrowed(field.name().as_ref()),
-        CamelCase::Lower => Cow::Borrowed(field.id().as_ref()),
-        CamelCase::Upper => Cow::Owned(upper_camel(field.id().as_ref())),
+        CamelCase::Off => Cow::Borrowed(field.name()),
+        CamelCase::Lower => Cow::Borrowed(field.id()),
+        CamelCase::Upper => Cow::Owned(upper_camel(field.id())),
     }
 }
 
@@ -39,9 +39,9 @@ fn field_display_name(field: &DecodedField, mode: CamelCase) -> std::borrow::Cow
 fn pgn_display_description(pgn: &DecodedPgn, mode: CamelCase) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     match mode {
-        CamelCase::Off => Cow::Borrowed(pgn.description.as_ref()),
-        CamelCase::Lower => Cow::Borrowed(pgn.id.as_ref()),
-        CamelCase::Upper => Cow::Owned(upper_camel(pgn.id.as_ref())),
+        CamelCase::Off => Cow::Borrowed(pgn.description),
+        CamelCase::Lower => Cow::Borrowed(pgn.id),
+        CamelCase::Upper => Cow::Owned(upper_camel(pgn.id)),
     }
 }
 
@@ -405,7 +405,7 @@ fn write_field_value_debug<W: fmt::Write>(
     match &f.value {
         FieldValue::Number(v) => {
             let p = effective_precision(f.precision(), f.resolution());
-            let min_w = if p == 7 && f.unit().as_deref() == Some("deg") {
+            let min_w = if p == 7 && f.unit() == Some("deg") {
                 10
             } else {
                 0
@@ -576,7 +576,7 @@ fn write_field_value<W: fmt::Write>(
             // (`5.1815566` → ` 5.1815566`). We detect that field type
             // by the load-time precision=7 + unit=deg signal set in
             // db.rs.
-            let min_w = if p == 7 && f.unit().as_deref() == Some("deg") {
+            let min_w = if p == 7 && f.unit() == Some("deg") {
                 10
             } else {
                 0
@@ -1008,7 +1008,7 @@ mod tests {
     #[test]
     fn escapes_quotes_in_strings() {
         let mut pgn = sample_pgn();
-        pgn.description = r#"He said "hi""#.into();
+        pgn.description = r#"He said "hi""#;
         let mut out = String::new();
         write_json(&mut out, &pgn, &JsonOptions::default()).unwrap();
         assert!(

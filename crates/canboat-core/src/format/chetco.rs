@@ -29,7 +29,7 @@
 use smallvec::SmallVec;
 
 use crate::format::plain::ParseError;
-use crate::frame::{RawFrame, FASTPACKET_MAX_SIZE};
+use crate::frame::{FASTPACKET_MAX_SIZE, RawFrame};
 
 pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let line = line.trim_end_matches(['\r', '\n']);

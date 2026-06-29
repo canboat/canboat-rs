@@ -12,8 +12,8 @@
 pub mod json;
 pub mod text;
 
-pub use json::{write_json, CamelCase, JsonOptions};
-pub use text::{write_text, GeoFormat, TextOptions};
+pub use json::{CamelCase, JsonOptions, write_json};
+pub use text::{GeoFormat, TextOptions, write_text};
 
 /// Round-up decimal precision implied by `resolution`, matching
 /// canboat's algorithm in `analyzer/print.c`:

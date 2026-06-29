@@ -16,11 +16,11 @@ pub mod plain;
 pub mod ydwg02;
 
 pub use ngt1::{
-    encode_n2k_send_frame, encode_n2k_send_payload, encode_ngt_message, encode_startup_ping,
-    EblHeader, Ngt1Decoder, NgtError, NgtEvent, NgtMessage, N2K_MSG_RECEIVED, N2K_MSG_SEND,
-    NGT_MSG_RECEIVED, NGT_MSG_SEND, NGT_STARTUP_SEQ,
+    EblHeader, N2K_MSG_RECEIVED, N2K_MSG_SEND, NGT_MSG_RECEIVED, NGT_MSG_SEND, NGT_STARTUP_SEQ,
+    Ngt1Decoder, NgtError, NgtEvent, NgtMessage, encode_n2k_send_frame, encode_n2k_send_payload,
+    encode_ngt_message, encode_startup_ping,
 };
-pub use plain::{parse_line as parse_plain, write_line as write_plain, ParseError as PlainError};
+pub use plain::{ParseError as PlainError, parse_line as parse_plain, write_line as write_plain};
 
 use crate::frame::RawFrame;
 

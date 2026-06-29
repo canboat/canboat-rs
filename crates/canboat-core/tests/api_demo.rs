@@ -128,9 +128,7 @@ fn iterate_all_top_level_fields() {
 fn field_handle_indexed_access() {
     // "Resolve a handle once, reuse for millions of records" pattern.
     let db = PgnDatabase::embedded();
-    let handle = db
-        .field("isoAddressClaim", "uniqueNumber")
-        .expect("handle");
+    let handle = db.field("isoAddressClaim", "uniqueNumber").expect("handle");
     let pgn = decode_iso_address_claim();
     let f = pgn.field(&handle).expect("field present");
     assert_eq!(f.value.as_i64(), Some(1_088_507));

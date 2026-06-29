@@ -15,8 +15,8 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use canboat_core::{
-    output::{write_text, TextOptions},
     PgnDatabase,
+    output::{TextOptions, write_text},
 };
 use canboat_tokio::Ngt1Stream;
 use clap::Parser;

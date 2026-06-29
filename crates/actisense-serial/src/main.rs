@@ -42,15 +42,15 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use canboat_core::RawFrame;
 use canboat_core::format::{
-    encode_n2k_send_frame, encode_startup_ping,
+    N2K_MSG_RECEIVED, Ngt1Decoder, NgtMessage, encode_n2k_send_frame, encode_startup_ping,
     ngt1::{EblHeader, NgtEvent},
     parse_plain,
     plain::ParseError,
-    write_plain, Ngt1Decoder, NgtMessage, N2K_MSG_RECEIVED,
+    write_plain,
 };
-use canboat_core::RawFrame;
-use canboat_io::{open_serial, BytePump};
+use canboat_io::{BytePump, open_serial};
 
 /// Default baud rate of the Actisense NGT-1.
 const DEFAULT_BAUD: u32 = 115_200;

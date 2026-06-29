@@ -29,16 +29,16 @@ mod tcp;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread;
 
-use anyhow::{bail, Result};
+use anyhow::{Result, bail};
 use clap::Parser;
 
 use canboat_core::format::{
-    detect, header_implies_coalesced, parse_format_header, parse_with, InputFormat,
+    InputFormat, detect, header_implies_coalesced, parse_format_header, parse_with,
 };
 use canboat_core::output::CamelCase;
 use canboat_core::{PgnDatabase, RawFrame};
@@ -408,7 +408,9 @@ fn run(cli: Cli) -> Result<()> {
             cli.bind,
             cli.analyzer_port,
             hubs.analyzer.clone(),
-            tcp::Direction::ReadWrite { inject: inject.clone(), },
+            tcp::Direction::ReadWrite {
+                inject: inject.clone(),
+            },
             None,
         )?);
     }
@@ -426,7 +428,7 @@ fn run(cli: Cli) -> Result<()> {
             );
         }
     }
-    
+
     let _ = inject; // No further use in this function
 
     let camel_case = if cli.upper_camel {

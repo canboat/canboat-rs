@@ -29,7 +29,7 @@
 use smallvec::SmallVec;
 
 use crate::format::plain::ParseError;
-use crate::frame::{RawFrame, FASTPACKET_MAX_SIZE};
+use crate::frame::{FASTPACKET_MAX_SIZE, RawFrame};
 
 /// Result of [`parse_line`] — either a parsed frame, a header row to
 /// skip, or an error. The caller treats `IsHeader` as a no-op
@@ -42,8 +42,7 @@ pub enum GarminCsvLine {
 }
 
 /// CSV1 header line (relative ms-since-boot timestamps).
-pub const CSV1_HEADER: &str =
-    "Sequence #,Timestamp,PGN,Name,Manufacturer,Remote Address,Local Address,Priority,Single Frame,Size,Packet";
+pub const CSV1_HEADER: &str = "Sequence #,Timestamp,PGN,Name,Manufacturer,Remote Address,Local Address,Priority,Single Frame,Size,Packet";
 
 /// CSV2 header line (absolute timestamps + Processed PGN column).
 pub const CSV2_HEADER: &str = "Sequence #,Month_Day_Year_Hours_Minutes_Seconds_msTicks,PGN,Processed PGN,Name,Manufacturer,Remote Address,Local Address,Priority,Single Frame,Size,Packet";

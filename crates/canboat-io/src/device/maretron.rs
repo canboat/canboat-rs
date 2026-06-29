@@ -11,12 +11,12 @@
 use std::io::{Read, Write};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use canboat_core::format::maretron_ipg::{
-    build_connect, build_frame, build_set_mode_binary, parse, MaretronFrame, ParseOutcome,
-    SessionState, RX_CONNECTED, RX_DETAILED_LICENSES_USED, RX_INSTANCE_DATA, RX_LICENSES_USED,
-    RX_NO, RX_SERVER_VERSION,
-};
 use canboat_core::RawFrame;
+use canboat_core::format::maretron_ipg::{
+    MaretronFrame, ParseOutcome, RX_CONNECTED, RX_DETAILED_LICENSES_USED, RX_INSTANCE_DATA,
+    RX_LICENSES_USED, RX_NO, RX_SERVER_VERSION, SessionState, build_connect, build_frame,
+    build_set_mode_binary, parse,
+};
 
 use super::{DeviceDecoder, DeviceEncoder, DeviceEvent, DeviceHandle};
 

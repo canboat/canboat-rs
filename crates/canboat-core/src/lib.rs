@@ -20,9 +20,9 @@ pub mod types;
 
 pub use db::{FieldHandle, PgnDatabase};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
-pub use frame::{RawFrame, FASTPACKET_MAX_SIZE};
+pub use frame::{FASTPACKET_MAX_SIZE, RawFrame};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
-pub use startup::{format_iso_ms, startup_record, CANBOAT_BEM};
+pub use startup::{CANBOAT_BEM, format_iso_ms, startup_record};
 pub use types::{
     BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable, IndirectLookupValue,
     LookupTable, LookupValue, PacketType, PgnInfo,

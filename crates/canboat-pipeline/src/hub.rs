@@ -12,9 +12,9 @@
 //! (PLAIN/FAST, NMEA 0183, JSON). When no one is connected, the
 //! steady-state cost per frame is a single relaxed atomic load.
 
+use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
-use std::sync::Mutex;
 
 pub struct Hub {
     subscribers: Mutex<Vec<Sender<String>>>,

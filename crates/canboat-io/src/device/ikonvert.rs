@@ -31,11 +31,11 @@ use std::io::{Read, Write};
 use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use canboat_core::format::ikonvert::{
-    self, synthesize_network_status, IkonvertLine, TX_LIMIT_OFF, TX_OFFLINE, TX_ONLINE_ALL,
-    TX_ONLINE_NORMAL,
-};
 use canboat_core::RawFrame;
+use canboat_core::format::ikonvert::{
+    self, IkonvertLine, TX_LIMIT_OFF, TX_OFFLINE, TX_ONLINE_ALL, TX_ONLINE_NORMAL,
+    synthesize_network_status,
+};
 
 use super::{DeviceDecoder, DeviceEncoder, DeviceEvent, DeviceHandle};
 

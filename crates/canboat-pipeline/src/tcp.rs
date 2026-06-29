@@ -29,13 +29,13 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{mpsc, Arc};
+use std::sync::{Arc, mpsc};
 use std::thread::{self, JoinHandle};
 
 use anyhow::{Context, Result};
 
-use canboat_core::format::{parse_plain, PlainError};
 use canboat_core::RawFrame;
+use canboat_core::format::{PlainError, parse_plain};
 use canboat_io::device::FrameSender;
 
 /// Where a client-written frame goes. In device mode, we forward to

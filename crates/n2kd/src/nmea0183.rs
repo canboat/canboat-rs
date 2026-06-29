@@ -198,11 +198,7 @@ pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> u
         // date/time through RMC alongside the GPS position fix.
         _ => {}
     }
-    if out.len() > before {
-        1
-    } else {
-        0
-    }
+    if out.len() > before { 1 } else { 0 }
 }
 
 fn pgn_to_rate(pgn: i64) -> Option<Rate> {
@@ -483,11 +479,7 @@ fn latlon_to_nmea(decimal: f64, is_lat: bool) -> (String, char) {
     let deg = abs.floor();
     let combined = deg * 100.0 + (abs - deg) * 60.0;
     let hem = if is_lat {
-        if decimal < 0.0 {
-            'S'
-        } else {
-            'N'
-        }
+        if decimal < 0.0 { 'S' } else { 'N' }
     } else if decimal < 0.0 {
         'W'
     } else {

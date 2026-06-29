@@ -96,17 +96,17 @@ mod imp {
     use std::collections::{HashMap, VecDeque};
     use std::os::fd::AsRawFd;
     use std::sync::atomic::{AtomicU8, Ordering};
-    use std::sync::{mpsc, Arc};
+    use std::sync::{Arc, mpsc};
     use std::thread;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use canboat_core::format::ikonvert::{build_network_status, NetworkStatus};
+    use canboat_core::format::ikonvert::{NetworkStatus, build_network_status};
     use canboat_core::frame::RawFrame;
     use canboat_core::{FramePacketType, Reassembled, Reassembler};
     use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Socket};
 
     use super::config::Config;
-    use crate::device::{from_parts, DeviceHandle, WriterCmd};
+    use crate::device::{DeviceHandle, WriterCmd, from_parts};
     use crate::fastpacket;
 
     const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
@@ -857,8 +857,8 @@ mod imp {
         // once we own an address so other nodes know we are alive.
         fn send_heartbeat(&mut self, bus: &mut Bus<'_>) {
             let offset = (self.heartbeat_interval / 10) as u16; // field resolution 0.01 s
-                                                                // Controller 1 State = Error Active (0), Controller 2 State = not
-                                                                // available (3), Equipment Status = Operational (0), reserved = 1.
+            // Controller 1 State = Error Active (0), Controller 2 State = not
+            // available (3), Equipment Status = Operational (0), reserved = 1.
             let data = [
                 offset as u8,
                 (offset >> 8) as u8,

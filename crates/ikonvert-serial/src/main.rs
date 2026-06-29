@@ -32,7 +32,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use canboat_core::format::{parse_plain, plain::ParseError, write_plain};
-use canboat_io::device::{ikonvert, DeviceHandle, FrameSender};
+use canboat_io::device::{DeviceHandle, FrameSender, ikonvert};
 use canboat_io::open_serial_rw;
 
 /// Default baud rate of the Digital Yacht iKonvert.

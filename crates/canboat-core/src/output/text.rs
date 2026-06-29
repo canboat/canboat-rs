@@ -193,10 +193,10 @@ fn write_text_debug_suffix<W: fmt::Write>(
 /// on the field's resolution/range; we don't carry that bit, so match
 /// by name + unit instead. Same `strstr(fieldName, "ongit")` shape.
 fn is_latlon(f: &DecodedField) -> bool {
-    if f.unit().as_deref() != Some("deg") {
+    if f.unit() != Some("deg") {
         return false;
     }
-    let n: &str = &f.name();
+    let n: &str = f.name();
     n.contains("atitude") || n.contains("ongitude") || n.contains("atit") || n.contains("ongit")
 }
 
@@ -210,11 +210,7 @@ fn write_latlon<W: fmt::Write>(w: &mut W, dd: f64, name: &str, geo: GeoFormat) -
     }
     let is_lon = name.contains("ongit");
     let dir = if is_lon {
-        if dd >= 0.0 {
-            'E'
-        } else {
-            'W'
-        }
+        if dd >= 0.0 { 'E' } else { 'W' }
     } else if dd >= 0.0 {
         'N'
     } else {
@@ -261,7 +257,7 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
             // with a lat/lon-shaped field name. `-geo dm` / `-geo dms`
             // switch to compass-style output.
             if is_latlon(f) {
-                return write_latlon(w, *v, &f.name(), geo);
+                return write_latlon(w, *v, f.name(), geo);
             }
             let p = effective_precision(f.precision(), f.resolution());
             write!(w, "{:.*}", p, v)?;

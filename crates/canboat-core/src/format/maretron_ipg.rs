@@ -22,7 +22,7 @@
 
 use smallvec::SmallVec;
 
-use crate::frame::{RawFrame, FASTPACKET_MAX_SIZE};
+use crate::frame::{FASTPACKET_MAX_SIZE, RawFrame};
 
 /// Sync byte that introduces every binary frame.
 pub const FRAME_SYNC: u8 = 0xA5;

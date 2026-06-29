@@ -146,10 +146,7 @@ pub struct LookupTable {
 impl LookupTable {
     /// O(log n) lookup of a single enum value.
     pub fn get(&self, value: u64) -> Option<&'static LookupValue> {
-        match self
-            .by_value
-            .binary_search_by_key(&value, |&(v, _)| v)
-        {
+        match self.by_value.binary_search_by_key(&value, |&(v, _)| v) {
             Ok(i) => Some(&self.values[self.by_value[i].1 as usize]),
             Err(_) => None,
         }

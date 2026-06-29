@@ -18,9 +18,9 @@
 //! pipeline alive.
 
 use std::io;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
 use std::thread::{self, JoinHandle};
 use std::time::Duration;
 
@@ -273,10 +273,10 @@ fn run_session(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::device::{run as run_device, DeviceDecoder, DeviceEncoder, DeviceEvent};
+    use crate::device::{DeviceDecoder, DeviceEncoder, DeviceEvent, run as run_device};
     use std::io::{self, Read, Write};
-    use std::sync::atomic::AtomicU32;
     use std::sync::Mutex;
+    use std::sync::atomic::AtomicU32;
 
     /// Test decoder: every byte becomes a fake `RawFrame` whose `pgn`
     /// equals that byte. Lets the test feed deterministic byte

@@ -24,8 +24,8 @@
 
 use std::io::{Read, Write};
 
-use canboat_core::format::{parse_plain, plain::ParseError, write_plain};
 use canboat_core::RawFrame;
+use canboat_core::format::{parse_plain, plain::ParseError, write_plain};
 
 use super::{DeviceDecoder, DeviceEncoder, DeviceEvent, DeviceHandle};
 

@@ -109,11 +109,7 @@ impl PgnDatabase {
     /// First definition for a PGN number, or `None`.
     pub fn first_pgn(&self, pgn: u32) -> Option<&'static PgnInfo> {
         match self.pgn_index.binary_search_by_key(&pgn, |&(p, _)| p) {
-            Ok(i) => self
-                .pgn_index[i]
-                .1
-                .first()
-                .map(|&j| &self.pgns[j as usize]),
+            Ok(i) => self.pgn_index[i].1.first().map(|&j| &self.pgns[j as usize]),
             Err(_) => None,
         }
     }
@@ -173,12 +169,11 @@ impl PgnDatabase {
 
     /// Resolve a DYNAMIC_FIELD_KEY value through a
     /// LookupFieldTypeEnumeration.
-    pub fn field_type_lookup(
-        &self,
-        name: &str,
-        key: u64,
-    ) -> Option<&'static LookupFieldTypeValue> {
-        let table = match self.field_type_lookups.binary_search_by(|t| t.name.cmp(name)) {
+    pub fn field_type_lookup(&self, name: &str, key: u64) -> Option<&'static LookupFieldTypeValue> {
+        let table = match self
+            .field_type_lookups
+            .binary_search_by(|t| t.name.cmp(name))
+        {
             Ok(i) => &self.field_type_lookups[i],
             Err(_) => return None,
         };

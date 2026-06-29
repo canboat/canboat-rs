@@ -13,7 +13,7 @@ use std::fmt;
 
 use smallvec::SmallVec;
 
-use crate::frame::{RawFrame, FASTPACKET_MAX_SIZE};
+use crate::frame::{FASTPACKET_MAX_SIZE, RawFrame};
 
 /// Byte → hex nibble lookup. `0xff` sentinel for non-hex bytes.
 /// Used by the PLAIN/FAST payload decoder to skip the cost of

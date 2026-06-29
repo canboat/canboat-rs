@@ -11,8 +11,8 @@ use std::pin::Pin;
 use std::task::{Context, Poll};
 
 use canboat_core::{
-    format::ikonvert::{self, IkonvertLine},
     DecodedPgn, FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
+    format::ikonvert::{self, IkonvertLine},
 };
 use futures::Stream;
 use tokio::io::{AsyncBufReadExt, AsyncRead, BufReader};

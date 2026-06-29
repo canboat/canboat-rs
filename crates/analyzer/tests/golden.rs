@@ -26,11 +26,7 @@ fn canboat_tests_dir() -> Option<PathBuf> {
         .join("canboat")
         .join("analyzer")
         .join("tests");
-    if p.is_dir() {
-        Some(p)
-    } else {
-        None
-    }
+    if p.is_dir() { Some(p) } else { None }
 }
 
 fn analyzer_path() -> PathBuf {

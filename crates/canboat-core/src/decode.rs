@@ -8,7 +8,7 @@
 //! No I/O. No formatting — the result is a structured event ready for
 //! the output formatter or for direct consumption by merrimac-rs.
 
-use crate::bits::{extract_bits, is_unavailable, Extracted};
+use crate::bits::{Extracted, extract_bits, is_unavailable};
 use crate::db::PgnDatabase;
 use crate::frame::RawFrame;
 use crate::types::{FieldInfo, FieldType, PgnInfo};
@@ -766,14 +766,13 @@ fn decode_one_field_at(
         // context slots. The override is stashed alongside the
         // DecodedField so `f.unit()` etc. resolve through it before
         // falling back to the FieldInfo.
-        let overrides = ctx
-            .dynamic_field_type
-            .as_ref()
-            .map(|v| Box::new(FieldOverrides {
+        let overrides = ctx.dynamic_field_type.as_ref().map(|v| {
+            Box::new(FieldOverrides {
                 unit: v.unit,
                 resolution: v.resolution,
                 precision: v.precision,
-            }));
+            })
+        });
         let (val, consumed_bits) = decode_dynamic_field_value(data, bit_offset, db, ctx);
         return Some((
             DecodedField {
@@ -999,7 +998,7 @@ fn decode_number(
         return FieldValue::NotAvailable;
     }
     let resolution = f.resolution.unwrap_or(1.0);
-    let unit = f.unit.as_deref();
+    let unit = f.unit;
     if resolution == 1.0
         && unit.is_none()
         && f.physical_quantity.is_none()
@@ -1115,10 +1114,7 @@ fn decode_bitlookup(
     // handle the empty case themselves: JSON drops it, text emits
     // "None" (matches canboat).
     let mut bits = Vec::new();
-    if let Some(t) = f
-        .lookup_bit_enumeration
-        .and_then(|n| db.bit_lookup(n))
-    {
+    if let Some(t) = f.lookup_bit_enumeration.and_then(|n| db.bit_lookup(n)) {
         for v in t.values {
             if raw & (1u64 << v.bit) != 0 {
                 bits.push((1u64 << v.bit, v.name));
@@ -1551,9 +1547,8 @@ fn decode_dynamic_field_value(
         // declared length (zero bytes is fine, comes out as "").
         return (decode_binary(data, bit_offset, bits), bits);
     };
-    let signed =
-        entry.signed || matches!(entry.field_type.as_deref(), Some(ft) if ft.starts_with("FIX"));
-    let val = match entry.field_type.as_deref() {
+    let signed = entry.signed || matches!(entry.field_type, Some(ft) if ft.starts_with("FIX"));
+    let val = match entry.field_type {
         Some(ft) if ft.starts_with("NUMBER") || ft.starts_with("FIX") || ft.starts_with("UFIX") => {
             decode_dynamic_number(data, bit_offset, bits, signed, &entry)
         }
@@ -1564,10 +1559,7 @@ fn decode_dynamic_field_value(
                     return (FieldValue::NotAvailable, bits);
                 };
                 let raw = ex.value as u64;
-                let nm = db
-                    .lookup(name)
-                    .and_then(|t| t.get(raw))
-                    .map(|v| v.name);
+                let nm = db.lookup(name).and_then(|t| t.get(raw)).map(|v| v.name);
                 FieldValue::Lookup {
                     value: raw,
                     name: nm,
@@ -1587,8 +1579,7 @@ fn decode_dynamic_field_value(
             // the lookup carries an explicit `Signed:true` or the
             // name is in the small set known to be signed in
             // canboat's pgn.h.
-            let known_signed_duration =
-                matches!(entry.name, "Race Timer" | "Timezone offset");
+            let known_signed_duration = matches!(entry.name, "Race Timer" | "Timezone offset");
             let want_signed = signed || known_signed_duration;
             // Always sentinel-check against the unsigned bit pattern,
             // even when the display interpretation is signed — canboat's
@@ -1679,7 +1670,7 @@ mod tests {
             data,
         };
         let dec = db().decode(&frame).expect("decode");
-        assert_eq!(&*dec.id, "isoAddressClaim");
+        assert_eq!(dec.id, "isoAddressClaim");
         assert_eq!(dec.fields.len(), 10);
 
         // Field 1: Unique Number (21-bit unsigned) = 1088507.
@@ -1739,7 +1730,7 @@ mod tests {
             data,
         };
         let picked = db().pick_variant(&frame).expect("variant");
-        assert_eq!(&*picked.id, "nmeaReadFieldsGroupFunction");
+        assert_eq!(picked.id, "nmeaReadFieldsGroupFunction");
     }
 
     #[test]

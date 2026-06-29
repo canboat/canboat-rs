@@ -108,8 +108,8 @@ fn test_binary_path() -> PathBuf {
 #[test]
 fn stdin_line_encodes_to_n2k_send_payload() {
     use canboat_core::format::{
-        encode_n2k_send_payload, encode_ngt_message, parse_plain, Ngt1Decoder, NgtEvent,
-        N2K_MSG_SEND,
+        N2K_MSG_SEND, Ngt1Decoder, NgtEvent, encode_n2k_send_payload, encode_ngt_message,
+        parse_plain,
     };
 
     let line = "12345,6,60928,5,255,8,fb,9b,70,22,00,9b,50,c0";

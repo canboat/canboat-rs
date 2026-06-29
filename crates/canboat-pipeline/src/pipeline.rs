@@ -22,12 +22,12 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, LineWriter, Write};
+use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
-use std::sync::Arc;
 
 use canboat_core::format::write_plain;
-use canboat_core::output::{write_json, CamelCase, JsonOptions};
+use canboat_core::output::{CamelCase, JsonOptions, write_json};
 use canboat_core::{FramePacketType, PgnDatabase, RawFrame, Reassembled, Reassembler};
 use canboat_io::device::FrameSender;
 use n2kd::request_engine::RequestEngine;
@@ -126,7 +126,7 @@ pub fn run(
     let mut json_line = String::with_capacity(1024);
     let mut rl = n2kd::nmea0183::RateLimiter::new(false);
     let mut ais_seq: u8 = 0;
-    let handles = n2kd::decoded::Handles::new(&db);
+    let handles = n2kd::decoded::Handles::new(db);
 
     let json_opts = JsonOptions {
         include_empty: false,

@@ -216,9 +216,7 @@ impl SnapshotStore {
     /// `\n` if the cache is empty).
     pub fn snapshot(&self) -> String {
         self.filtered_snapshot(|pgn, entry| {
-            *pgn == 129026
-                || *pgn == 129029
-                || !entry.pgn_short_description.starts_with("AIS")
+            *pgn == 129026 || *pgn == 129029 || !entry.pgn_short_description.starts_with("AIS")
         })
     }
 
@@ -236,9 +234,7 @@ impl SnapshotStore {
     /// `n2kd/main.c:458`.)
     pub fn ais_snapshot(&self) -> String {
         self.filtered_snapshot(|pgn, entry| {
-            *pgn == 129026
-                || *pgn == 129029
-                || entry.pgn_short_description.starts_with("AIS")
+            *pgn == 129026 || *pgn == 129029 || entry.pgn_short_description.starts_with("AIS")
         })
     }
 
@@ -362,7 +358,10 @@ impl SnapshotStore {
 
     /// `true` when the cache contains no live entries (no pruning).
     pub fn is_empty(&self) -> bool {
-        self.cache.lock().expect("snapshot cache poisoned").is_empty()
+        self.cache
+            .lock()
+            .expect("snapshot cache poisoned")
+            .is_empty()
     }
 }
 

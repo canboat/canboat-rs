@@ -16,12 +16,12 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use canboat_core::{
+    CANBOAT_BEM, FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
     format::{
-        detect, header_implies_coalesced, parse_format_header, parse_with, plain::ParseError,
-        InputFormat,
+        InputFormat, detect, header_implies_coalesced, parse_format_header, parse_with,
+        plain::ParseError,
     },
-    output::{write_json, write_text, CamelCase, GeoFormat, JsonOptions, TextOptions},
-    FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler, CANBOAT_BEM,
+    output::{CamelCase, GeoFormat, JsonOptions, TextOptions, write_json, write_text},
 };
 use canboat_io::LineReader;
 
@@ -358,4 +358,3 @@ fn run_loop<R: BufRead, W: Write>(
     }
     Ok(())
 }
-

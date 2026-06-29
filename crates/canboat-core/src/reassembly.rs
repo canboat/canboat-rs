@@ -18,7 +18,7 @@
 //!
 //! Slot eviction follows canboat: 64 slots, FIFO oldest-out on overflow.
 
-use crate::frame::{RawFrame, FASTPACKET_MAX_SIZE};
+use crate::frame::{FASTPACKET_MAX_SIZE, RawFrame};
 
 const REASSEMBLY_BUFFER_SIZE: usize = 64;
 const BUCKET_0_SIZE: usize = 6;

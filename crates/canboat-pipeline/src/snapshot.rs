@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use canboat_core::snapshot::{SnapshotInput, SECONDARY_FIELDS};
+use canboat_core::snapshot::{SECONDARY_FIELDS, SnapshotInput};
 use canboat_core::{DecodedField, DecodedPgn, FieldValue};
 
 /// Thin wrapper that keeps the existing `SnapshotStore::store(decoded,

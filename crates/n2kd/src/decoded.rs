@@ -152,11 +152,7 @@ pub fn convert_nmea0183(
         130311 => environmental(out, src, decoded, h),
         _ => {}
     }
-    if out.len() > before {
-        1
-    } else {
-        0
-    }
+    if out.len() > before { 1 } else { 0 }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -514,11 +510,7 @@ fn latlon_to_nmea(decimal: f64, is_lat: bool) -> (String, char) {
     let deg = abs.floor();
     let combined = deg * 100.0 + (abs - deg) * 60.0;
     let hem = if is_lat {
-        if decimal < 0.0 {
-            'S'
-        } else {
-            'N'
-        }
+        if decimal < 0.0 { 'S' } else { 'N' }
     } else if decimal < 0.0 {
         'W'
     } else {

@@ -186,11 +186,7 @@ fn pgn_to_msgid(pgn: i64, msg: &str) -> Option<i64> {
 /// transmission`) → 'A'; `1`/`3` → 'B'.
 fn ais_channel(msg: &str) -> char {
     let info = enum_or_name(msg, "AIS Transceiver information", AIS_TRANSCEIVER_NAMES);
-    if matches!(info, 1 | 3) {
-        'B'
-    } else {
-        'A'
-    }
+    if matches!(info, 1 | 3) { 'B' } else { 'A' }
 }
 
 /// `"VDM"` for receive-side messages, `"VDO"` for own-vessel.
@@ -566,11 +562,7 @@ fn rate_of_turn(msg: &str) -> i64 {
     let r = 4.733 * v.abs().sqrt();
     let r = (r + 0.5) as i64;
     let r = r.clamp(-127, 127) * sign as i64;
-    if (-127..=127).contains(&r) {
-        r
-    } else {
-        -128
-    }
+    if (-127..=127).contains(&r) { r } else { -128 }
 }
 
 fn sog(msg: &str, field: &str) -> i64 {
@@ -580,11 +572,7 @@ fn sog(msg: &str, field: &str) -> i64 {
     };
     // Knots-in-m/s = 1.943844492; times 10 = 19.43844492.
     let n = (v * 19.438_444_92 + 0.5) as i64;
-    if (0..=1022).contains(&n) {
-        n
-    } else {
-        1023
-    }
+    if (0..=1022).contains(&n) { n } else { 1023 }
 }
 
 fn cog(msg: &str, field: &str) -> i64 {
@@ -592,11 +580,7 @@ fn cog(msg: &str, field: &str) -> i64 {
         return 3600;
     };
     let n = (v * 10.0 + 0.5) as i64;
-    if (0..=3599).contains(&n) {
-        n
-    } else {
-        3600
-    }
+    if (0..=3599).contains(&n) { n } else { 3600 }
 }
 
 fn heading(msg: &str, field: &str) -> i64 {
@@ -604,11 +588,7 @@ fn heading(msg: &str, field: &str) -> i64 {
         return 511;
     };
     let n = (v + 0.5) as i64;
-    if (0..=359).contains(&n) {
-        n
-    } else {
-        511
-    }
+    if (0..=359).contains(&n) { n } else { 511 }
 }
 
 fn longitude(msg: &str, field: &str) -> i64 {
@@ -640,11 +620,7 @@ fn altitude(msg: &str) -> i64 {
         return 4095;
     };
     let n = (v + 0.5) as i64;
-    if (0..=4094).contains(&n) {
-        n
-    } else {
-        4095
-    }
+    if (0..=4094).contains(&n) { n } else { 4095 }
 }
 
 fn draft(msg: &str) -> i64 {

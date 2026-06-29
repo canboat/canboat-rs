@@ -10,11 +10,11 @@
 use std::io::{Read, Write};
 use std::time::Duration;
 
+use canboat_core::RawFrame;
 use canboat_core::format::{
     encode_n2k_send_frame, encode_startup_ping,
     ngt1::{Ngt1Decoder, NgtEvent},
 };
-use canboat_core::RawFrame;
 
 use super::{DeviceDecoder, DeviceEncoder, DeviceEvent, DeviceHandle};
 

@@ -33,17 +33,17 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use canboat_core::RawFrame;
 use canboat_core::format::{
     maretron_ipg::{
-        build_connect, build_frame, build_set_mode_binary, ensure_default_port, parse,
-        MaretronFrame, ParseOutcome, SessionState, RX_CONNECTED, RX_DETAILED_LICENSES_USED,
-        RX_INSTANCE_DATA, RX_LICENSES_USED, RX_NO, RX_SERVER_VERSION,
+        MaretronFrame, ParseOutcome, RX_CONNECTED, RX_DETAILED_LICENSES_USED, RX_INSTANCE_DATA,
+        RX_LICENSES_USED, RX_NO, RX_SERVER_VERSION, SessionState, build_connect, build_frame,
+        build_set_mode_binary, ensure_default_port, parse,
     },
     parse_plain,
     plain::ParseError,
     write_plain,
 };
-use canboat_core::RawFrame;
 
 /// Synthetic-PGN marker; canboat skips these on tx (they're fake
 /// internal PGNs the analyzer emits, never meant to hit the bus).

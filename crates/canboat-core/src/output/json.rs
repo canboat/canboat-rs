@@ -28,9 +28,9 @@ use super::{effective_precision, write_fixed_float};
 fn field_display_name(field: &DecodedField, mode: CamelCase) -> std::borrow::Cow<'_, str> {
     use std::borrow::Cow;
     match mode {
-        CamelCase::Off => Cow::Borrowed(field.name.as_ref()),
-        CamelCase::Lower => Cow::Borrowed(field.id.as_ref()),
-        CamelCase::Upper => Cow::Owned(upper_camel(field.id.as_ref())),
+        CamelCase::Off => Cow::Borrowed(field.name().as_ref()),
+        CamelCase::Lower => Cow::Borrowed(field.id().as_ref()),
+        CamelCase::Upper => Cow::Owned(upper_camel(field.id().as_ref())),
     }
 }
 
@@ -348,7 +348,7 @@ fn write_debug_suffix<W: fmt::Write>(w: &mut W, f: &DecodedField, payload: &[u8]
     use crate::bits::extract_bits;
     let signed = matches!(
         f.value,
-        FieldValue::Number(_) if f.unit.is_some()
+        FieldValue::Number(_) if f.unit().is_some()
     );
     let Some(ex) = extract_bits(payload, bo as usize, bl as usize, signed, 0) else {
         return Ok(());
@@ -404,8 +404,8 @@ fn write_field_value_debug<W: fmt::Write>(
     // The "bare value" emission for the inner `value` key.
     match &f.value {
         FieldValue::Number(v) => {
-            let p = effective_precision(f.precision, f.resolution);
-            let min_w = if p == 7 && f.unit.as_deref() == Some("deg") {
+            let p = effective_precision(f.precision(), f.resolution());
+            let min_w = if p == 7 && f.unit().as_deref() == Some("deg") {
                 10
             } else {
                 0
@@ -490,14 +490,14 @@ fn write_field_value_debug<W: fmt::Write>(
             }
         }
         FieldValue::Time { raw, seconds } => {
-            let p = effective_precision(f.precision, f.resolution);
+            let p = effective_precision(f.precision(), f.resolution());
             let mut buf = String::with_capacity(12);
             super::format_time(*seconds, p, false, &mut buf)?;
             if opts.name_value {
                 // Same scaling rule as the non-debug `Time` arm
                 // (canboat C's `fieldPrintTime`): emit `seconds` for
                 // resolution >= 1, raw for sub-second resolution.
-                let print_value: i64 = if f.resolution.is_some_and(|r| r >= 1.0) {
+                let print_value: i64 = if f.resolution().is_some_and(|r| r >= 1.0) {
                     *seconds as i64
                 } else {
                     *raw
@@ -553,7 +553,7 @@ fn write_field_value_debug<W: fmt::Write>(
         }
     }
     write_debug_suffix(w, f, payload)?;
-    if opts.name_value && f.part_of_primary_key {
+    if opts.name_value && f.part_of_primary_key() {
         w.write_str(",\"key\":true")?;
     }
     w.write_char('}')
@@ -570,13 +570,13 @@ fn write_field_value<W: fmt::Write>(
     }
     match &f.value {
         FieldValue::Number(v) => {
-            let p = effective_precision(f.precision, f.resolution);
+            let p = effective_precision(f.precision(), f.resolution());
             // canboat's fieldPrintLatLon uses `%10.7f` — width 10
             // + precision 7 — which left-pads short longitudes
             // (`5.1815566` → ` 5.1815566`). We detect that field type
             // by the load-time precision=7 + unit=deg signal set in
             // db.rs.
-            let min_w = if p == 7 && f.unit.as_deref() == Some("deg") {
+            let min_w = if p == 7 && f.unit().as_deref() == Some("deg") {
                 10
             } else {
                 0
@@ -586,7 +586,7 @@ fn write_field_value<W: fmt::Write>(
         FieldValue::Integer(v) => {
             // Under -nv, primary-key fields wear an annotation matching
             // canboat's JSON: {"value":N,"key":true}.
-            if opts.name_value && f.part_of_primary_key {
+            if opts.name_value && f.part_of_primary_key() {
                 write!(w, "{{\"value\":{},\"key\":true}}", v)
             } else {
                 write!(w, "{}", v)
@@ -626,7 +626,7 @@ fn write_field_value<W: fmt::Write>(
                     (None, false) => {}
                 }
                 // Same primary-key annotation rule as Integer.
-                if f.part_of_primary_key {
+                if f.part_of_primary_key() {
                     w.write_str(",\"key\":true")?;
                 }
                 w.write_char('}')
@@ -682,7 +682,7 @@ fn write_field_value<W: fmt::Write>(
             }
         }
         FieldValue::Time { raw, seconds } => {
-            let p = effective_precision(f.precision, f.resolution);
+            let p = effective_precision(f.precision(), f.resolution());
             let mut buf = String::with_capacity(12);
             super::format_time(*seconds, p, false, &mut buf)?;
             if opts.name_value {
@@ -693,7 +693,7 @@ fn write_field_value<W: fmt::Write>(
                 // < 1 (so a 0.0001-s System Time emits the raw
                 // 10000-units-per-second integer rather than a
                 // fractional second). Mirror that.
-                let print_value: i64 = if f.resolution.is_some_and(|r| r >= 1.0) {
+                let print_value: i64 = if f.resolution().is_some_and(|r| r >= 1.0) {
                     *seconds as i64
                 } else {
                     *raw
@@ -711,7 +711,7 @@ fn write_field_value<W: fmt::Write>(
             // canboat emits MMSI as a 9-digit zero-padded string. Under
             // -nv, primary-key MMSI fields wear the same {"value":...,
             // "key":true} annotation as primary-key integers.
-            if opts.name_value && f.part_of_primary_key {
+            if opts.name_value && f.part_of_primary_key() {
                 write!(w, "{{\"value\":\"{:09}\",\"key\":true}}", v)
             } else {
                 write!(w, "\"{:09}\"", v)
@@ -896,28 +896,32 @@ mod tests {
     use crate::decode::{DecodedField, FieldValue};
 
     fn sample_pgn() -> DecodedPgn {
+        // PGN 128267 (Water Depth) field 3 is `Offset` — m, res 0.001 —
+        // which matches the legacy hand-rolled fixture this test used
+        // before Phase 5 (when DecodedField duplicated id/name/unit
+        // inline). Use a real &'static FieldInfo so the new shape
+        // compiles without us standing up a parallel test schema.
+        let info = crate::PgnDatabase::embedded()
+            .first_pgn(128267)
+            .expect("PGN 128267 present");
+        let offset_field = &info.fields[2];
         DecodedPgn {
             timestamp: Some("2018-10-16T22:25:25.166".into()),
             prio: 3,
             pgn: 128267,
             src: 35,
             dst: 255,
-            description: "Water Depth".into(),
-            id: "waterDepth".into(),
+            description: "Water Depth",
+            id: "waterDepth",
             data: Vec::new(),
             fields: vec![DecodedField {
-                order: 1,
-                id: "depthOffset".into(),
-                name: "Offset".into(),
-                unit: Some("m".into()),
-                resolution: Some(0.001),
-                precision: 0,
-                repeat_index: None,
+                info: offset_field,
+                value: FieldValue::Number(0.0),
                 bit_offset: None,
                 bit_length: None,
+                repeat_index: None,
                 repeat_set: 0,
-                part_of_primary_key: false,
-                value: FieldValue::Number(0.0),
+                overrides: None,
             }],
             has_repeating_set: [false, false],
             index_by_order: [i8::MIN; 32],
@@ -973,10 +977,17 @@ mod tests {
         let mut pgn = sample_pgn();
         pgn.fields[0].value = FieldValue::Lookup {
             value: 275,
-            name: Some("Navico".into()),
+            name: Some("Navico"),
         };
-        pgn.fields[0].resolution = Some(1.0);
-        pgn.fields[0].unit = None;
+        // Suppress the sample fixture's resolution / unit so the
+        // formatter renders a plain lookup pair without numeric
+        // formatting. (Old test set the fields directly; with Phase 5
+        // those go through `overrides`.)
+        pgn.fields[0].overrides = Some(Box::new(crate::decode::FieldOverrides {
+            unit: None,
+            resolution: Some(1.0),
+            precision: 0,
+        }));
         let mut out = String::new();
         write_json(
             &mut out,

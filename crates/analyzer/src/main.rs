@@ -21,14 +21,9 @@ use canboat_core::{
         InputFormat,
     },
     output::{write_json, write_text, CamelCase, GeoFormat, JsonOptions, TextOptions},
-    FramePacketType, LoadOptions, PacketType, PgnDatabase, Reassembled, Reassembler, CANBOAT_BEM,
+    FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler, CANBOAT_BEM,
 };
 use canboat_io::LineReader;
-
-/// Synthetic PGN definitions (CANBOAT_BEM range) embedded at build
-/// time. Sourced from `data/synthetic-pgns.json`, which mirrors the
-/// hand-coded entries in canboat's `analyzer/pgn.h`.
-const SYNTHETIC_PGNS_JSON: &str = include_str!("../../../data/synthetic-pgns.json");
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,12 +32,6 @@ const SYNTHETIC_PGNS_JSON: &str = include_str!("../../../data/synthetic-pgns.jso
     version
 )]
 struct Cli {
-    /// Path to the canboat PGN database. Defaults to the workspace's
-    /// vendored `data/canboat.json`. Set the `CANBOAT_JSON` env var
-    /// to override.
-    #[arg(long, value_name = "PATH")]
-    db: Option<PathBuf>,
-
     /// Read input from this file instead of stdin.
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
@@ -70,13 +59,6 @@ struct Cli {
     /// decimal seconds). Matches canboat's `-geo {dd|dm|dms}`.
     #[arg(long, value_name = "FMT", default_value = "dd")]
     geo: String,
-
-    /// Keep fields in their canboat-declared SI base units (rad,
-    /// Pa, K, C/coulomb, …). Without this flag the analyzer
-    /// applies canboat's user-friendly fix-ups — Pa→bar, K→°C,
-    /// C→Ah, rad→deg. Matches canboat C's `-si`.
-    #[arg(long)]
-    si: bool,
 
     /// Emit field keys + PGN descriptions as camelCase identifiers
     /// (e.g. `"uniqueNumber"` instead of `"Unique Number"`). Matches
@@ -141,22 +123,11 @@ fn main() -> ExitCode {
 }
 
 fn run(cli: Cli) -> Result<()> {
-    let db_path = cli
-        .db
-        .clone()
-        .or_else(|| std::env::var_os("CANBOAT_JSON").map(PathBuf::from))
-        .or_else(default_db_path)
-        .context("no canboat.json path supplied (pass --db or set CANBOAT_JSON)")?;
-    let load_opts = LoadOptions { si: cli.si };
-    let mut db = PgnDatabase::load_with(&db_path, load_opts)
-        .with_context(|| format!("loading PGN database {}", db_path.display()))?;
-    // Synthetic PGNs (CANBOAT_BEM / ACTISENSE_BEM / IKONVERT_BEM
-    // range, 0x40000+) live in canboat's analyzer/pgn.h, not in
-    // canboat.json. Merge the workspace-vendored mirror so output
-    // for synthetic PGNs (e.g. PGN 262386 Actisense System status)
-    // matches the canboat reference.
-    db.merge_pgns_from_json_with(SYNTHETIC_PGNS_JSON, load_opts)
-        .context("merging synthetic PGN definitions")?;
+    // The schema is compiled into the binary; no JSON loading, no
+    // path discovery, no synthetic-PGN merge step — the build script
+    // already folded `data/synthetic-pgns.json` into the static
+    // tables. See `canboat-core/build.rs`.
+    let db = PgnDatabase::embedded();
 
     let camel_case = if cli.upper_camel {
         CamelCase::Upper
@@ -213,7 +184,7 @@ fn run(cli: Cli) -> Result<()> {
             File::open(path).with_context(|| format!("opening input file {}", path.display()))?;
         run_loop(
             LineReader::new(BufReader::new(file)),
-            &db,
+            db,
             &cli,
             &json_opts,
             &text_opts,
@@ -226,7 +197,7 @@ fn run(cli: Cli) -> Result<()> {
         let stdin = io::stdin();
         run_loop(
             LineReader::new(stdin.lock()),
-            &db,
+            db,
             &cli,
             &json_opts,
             &text_opts,
@@ -388,15 +359,3 @@ fn run_loop<R: BufRead, W: Write>(
     Ok(())
 }
 
-/// Try to find the workspace's vendored `data/canboat.json` next to
-/// the binary or relative to `CARGO_MANIFEST_DIR` in dev builds.
-fn default_db_path() -> Option<PathBuf> {
-    // In a cargo-built dev binary, the workspace root is two levels up
-    // from the crate's manifest.
-    let manifest_dir: PathBuf = env!("CARGO_MANIFEST_DIR").into();
-    let candidate = manifest_dir
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|root| root.join("data").join("canboat.json"));
-    candidate.filter(|p| p.exists())
-}

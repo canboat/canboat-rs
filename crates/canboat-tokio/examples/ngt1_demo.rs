@@ -8,11 +8,9 @@
 //!
 //! ```sh
 //!   cargo run -p canboat-tokio --example ngt1_demo -- \
-//!       --serial /dev/ttyUSB0 [--baud 115200] [--db data/canboat.json]
+//!       --serial /dev/ttyUSB0 [--baud 115200]
 //! ```
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -34,10 +32,6 @@ struct Cli {
     /// Baud rate (NGT-1's default is 115200).
     #[arg(long, default_value_t = 115_200)]
     baud: u32,
-    /// PGN database path. Defaults to ../../data/canboat.json relative
-    /// to the crate manifest.
-    #[arg(long)]
-    db: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -45,10 +39,7 @@ async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let db_path = cli.db.unwrap_or_else(default_db_path);
-    let db = Arc::new(
-        PgnDatabase::load(&db_path).with_context(|| format!("loading {}", db_path.display()))?,
-    );
+    let db = PgnDatabase::embedded();
 
     let port = tokio_serial::new(&cli.serial, cli.baud)
         .timeout(Duration::from_millis(250))
@@ -64,13 +55,4 @@ async fn main() -> Result<()> {
         println!("{buf}");
     }
     Ok(())
-}
-
-fn default_db_path() -> PathBuf {
-    let manifest: PathBuf = env!("CARGO_MANIFEST_DIR").into();
-    manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|root| root.join("data").join("canboat.json"))
-        .unwrap_or_else(|| PathBuf::from("data/canboat.json"))
 }

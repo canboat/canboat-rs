@@ -9,8 +9,7 @@ rust-version = { workspace = true }
 description = "Sans-I/O NMEA 2000 (canboat) PGN database, parsers, decoder, and formatters."
 
 [dependencies]
-serde         = { workspace = true }
-serde_json    = { workspace = true }
+canboat-schema = { workspace = true }
 thiserror     = { workspace = true }
 log           = { workspace = true }
 smallvec      = { workspace = true }
@@ -20,3 +19,7 @@ indexmap      = { workspace = true }
 # output/json.rs's CPU on the merrimac-2022 workload; itoa is several
 # x faster and writes into a stack buffer.
 itoa = "1"
+
+[build-dependencies]
+serde      = { workspace = true }
+serde_json = { workspace = true }

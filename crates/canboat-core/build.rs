@@ -1,0 +1,1087 @@
+//! Build script: read `data/canboat.json` (+ `data/synthetic-pgns.json`)
+//! and emit a Rust source file with the full schema as `&'static`
+//! tables. The output is `include!`d from `src/schema_data.rs` and
+//! published as a `static PgnDatabase` (see `src/db.rs`).
+//!
+//! Replaces what used to be a runtime `serde_json::from_reader` over a
+//! 2.3 MB JSON document plus a HashMap build pass. After this, decoder
+//! callers pay zero startup cost for the schema.
+
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::env;
+use std::fmt::Write as _;
+use std::fs;
+use std::path::{Path, PathBuf};
+
+// ---------------------------------------------------------------------
+// Build-script deserialization types.
+//
+// These mirror canboat.json's PascalCase shape. They are PRIVATE to the
+// build script and not exposed anywhere else — runtime types live in
+// `canboat-schema`. The mapping from these owned types to the const
+// form happens in the emit_* functions below.
+// ---------------------------------------------------------------------
+
+fn de_loose_string<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<String>, D::Error> {
+    use serde_json::Value;
+    let v = Option::<Value>::deserialize(d)?;
+    Ok(match v {
+        None | Some(Value::Null) => None,
+        Some(Value::String(s)) => Some(s),
+        Some(Value::Number(n)) => Some(n.to_string()),
+        Some(Value::Bool(b)) => Some(b.to_string()),
+        Some(other) => Some(other.to_string()),
+    })
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "PascalCase")]
+struct CanboatJson {
+    schema_version: String,
+    version: String,
+    #[serde(rename = "PGNs")]
+    pgns: Vec<RawPgn>,
+    #[serde(default)]
+    lookup_enumerations: Vec<RawLookup>,
+    #[serde(default)]
+    lookup_bit_enumerations: Vec<RawBitLookup>,
+    #[serde(default)]
+    lookup_indirect_enumerations: Vec<RawIndirectLookup>,
+    #[serde(default)]
+    lookup_field_type_enumerations: Vec<RawFieldTypeLookup>,
+}
+
+#[derive(Deserialize)]
+struct SyntheticJson {
+    #[serde(rename = "PGNs")]
+    pgns: Vec<RawPgn>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+struct RawPgn {
+    #[serde(rename = "PGN")]
+    pgn: u32,
+    id: String,
+    description: String,
+    explanation: Option<String>,
+    #[serde(rename = "URL")]
+    url: Option<String>,
+    #[serde(rename = "Type")]
+    packet_type: String,
+    complete: Option<bool>,
+    fallback: Option<bool>,
+    #[serde(default)]
+    missing: Option<Vec<String>>,
+    priority: Option<u8>,
+    transmission_interval: Option<u32>,
+    transmission_irregular: Option<bool>,
+    field_count: u32,
+    length: Option<u32>,
+    min_length: Option<u32>,
+    fields: Vec<RawField>,
+    repeating_field_set1_size: Option<u32>,
+    repeating_field_set1_start_field: Option<u32>,
+    repeating_field_set1_count_field: Option<u32>,
+    repeating_field_set2_size: Option<u32>,
+    repeating_field_set2_start_field: Option<u32>,
+    repeating_field_set2_count_field: Option<u32>,
+}
+
+#[derive(Deserialize, Clone)]
+#[serde(rename_all = "PascalCase")]
+struct RawField {
+    order: u8,
+    id: String,
+    name: String,
+    #[serde(default, deserialize_with = "de_loose_string")]
+    description: Option<String>,
+    bit_length: Option<u32>,
+    #[serde(default, deserialize_with = "de_loose_string")]
+    bit_length_field: Option<String>,
+    bit_length_variable: Option<bool>,
+    bit_offset: Option<u32>,
+    bit_start: Option<u32>,
+    resolution: Option<f64>,
+    signed: Option<bool>,
+    offset: Option<i64>,
+    range_min: Option<f64>,
+    range_max: Option<f64>,
+    #[serde(rename = "UnknownValue")]
+    unknown_value: Option<u64>,
+    #[serde(rename = "OutOfRangeValue")]
+    out_of_range_value: Option<u64>,
+    #[serde(rename = "ReservedValue")]
+    reserved_value: Option<u64>,
+    unit: Option<String>,
+    physical_quantity: Option<String>,
+    field_type: Option<String>,
+    lookup_enumeration: Option<String>,
+    lookup_bit_enumeration: Option<String>,
+    lookup_indirect_enumeration: Option<String>,
+    lookup_indirect_enumeration_field_order: Option<u8>,
+    lookup_field_type_enumeration: Option<String>,
+    #[serde(rename = "Match")]
+    match_value: Option<i64>,
+    part_of_primary_key: Option<bool>,
+    condition: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawLookup {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "MaxValue")]
+    max_value: Option<u64>,
+    #[serde(rename = "EnumValues")]
+    values: Vec<RawLookupValue>,
+}
+#[derive(Deserialize)]
+struct RawLookupValue {
+    #[serde(rename = "Value")]
+    value: u64,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Id")]
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawBitLookup {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "MaxValue")]
+    max_value: Option<u64>,
+    #[serde(rename = "EnumBitValues")]
+    values: Vec<RawBitLookupValue>,
+}
+#[derive(Deserialize)]
+struct RawBitLookupValue {
+    #[serde(rename = "Bit")]
+    bit: u8,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Id")]
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawIndirectLookup {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "MaxValue")]
+    max_value: Option<u64>,
+    #[serde(rename = "EnumValues")]
+    values: Vec<RawIndirectLookupValue>,
+}
+#[derive(Deserialize)]
+struct RawIndirectLookupValue {
+    #[serde(rename = "Value1")]
+    value1: u64,
+    #[serde(rename = "Value2")]
+    value2: u64,
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "Id")]
+    id: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawFieldTypeLookup {
+    #[serde(rename = "Name")]
+    name: String,
+    #[serde(rename = "MaxValue")]
+    max_value: Option<u64>,
+    #[serde(rename = "EnumFieldTypeValues")]
+    values: Vec<RawFieldTypeValue>,
+}
+#[derive(Deserialize, Clone)]
+struct RawFieldTypeValue {
+    #[serde(rename = "value")]
+    value: u64,
+    #[serde(rename = "name")]
+    name: String,
+    #[serde(rename = "FieldType")]
+    field_type: Option<String>,
+    #[serde(rename = "Bits", default, deserialize_with = "de_loose_string")]
+    bits: Option<String>,
+    #[serde(rename = "Resolution")]
+    resolution: Option<f64>,
+    #[serde(rename = "Unit")]
+    unit: Option<String>,
+    #[serde(rename = "LookupEnumeration")]
+    lookup_enumeration: Option<String>,
+    #[serde(rename = "LookupBitEnumeration")]
+    lookup_bit_enumeration: Option<String>,
+}
+
+// ---------------------------------------------------------------------
+// Non-SI unit fix-up — mirrors `db.rs::apply_non_si_unit_fixup`.
+//
+// Applied at codegen so the runtime tables already carry display units
+// (`deg`, `°C`, `bar`, `Ah`) instead of canboat.json's SI base units
+// (`rad`, `K`, `Pa`, `C`).
+// ---------------------------------------------------------------------
+
+const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
+
+/// Computed-at-codegen fields not present in canboat.json — returned
+/// alongside the raw record so the emitter can populate the `Copy`
+/// schema struct.
+#[derive(Default, Clone, Copy)]
+struct Computed {
+    unit_offset: f64,
+    precision: u8,
+    is_dynamic_length_marker: bool,
+}
+
+fn compute_field(f: &mut RawField) -> Computed {
+    let mut c = Computed::default();
+    c.is_dynamic_length_marker = f.name == "Length";
+
+    // canboat hard-codes 7-decimal display precision for lat/lon.
+    if let Some(pq) = f.physical_quantity.as_deref() {
+        if pq == "GEOGRAPHICAL_LATITUDE" || pq == "GEOGRAPHICAL_LONGITUDE" {
+            c.precision = 7;
+        }
+    }
+
+    let Some(unit) = f.unit.clone() else {
+        return c;
+    };
+    match unit.as_str() {
+        "rad" => {
+            if let Some(r) = f.resolution.as_mut() {
+                *r *= RAD_TO_DEG;
+            }
+            if let Some(v) = f.range_min.as_mut() {
+                *v *= RAD_TO_DEG;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                *v = (*v * RAD_TO_DEG).max(360.0);
+            }
+            f.unit = Some("deg".to_string());
+            c.precision = 1;
+        }
+        "rad/s" => {
+            if let Some(r) = f.resolution.as_mut() {
+                *r *= RAD_TO_DEG;
+            }
+            if let Some(v) = f.range_min.as_mut() {
+                *v *= RAD_TO_DEG;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                *v *= RAD_TO_DEG;
+            }
+            f.unit = Some("deg/s".to_string());
+        }
+        "K" if !f.signed.unwrap_or(false) => {
+            c.unit_offset = -273.15;
+            if let Some(v) = f.range_min.as_mut() {
+                *v += -273.15;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                // Match canboat's faithfully-quirky 275.15 subtraction.
+                *v += -275.15;
+            }
+            f.unit = Some("C".to_string());
+        }
+        "Pa" => {
+            if let Some(r) = f.resolution.as_mut() {
+                *r /= 100_000.0;
+            }
+            if let Some(v) = f.range_min.as_mut() {
+                *v /= 100_000.0;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                *v /= 100_000.0;
+            }
+            f.unit = Some("bar".to_string());
+            c.precision = 3;
+        }
+        "C" => {
+            if let Some(r) = f.resolution.as_mut() {
+                *r /= 3600.0;
+            }
+            if let Some(v) = f.range_min.as_mut() {
+                *v /= 3600.0;
+            }
+            if let Some(v) = f.range_max.as_mut() {
+                *v /= 3600.0;
+            }
+            f.unit = Some("Ah".to_string());
+        }
+        _ => {}
+    }
+    c
+}
+
+#[derive(Default, Clone, Copy)]
+struct ComputedFt {
+    signed: bool,
+    precision: u8,
+}
+
+fn compute_ft(v: &mut RawFieldTypeValue) -> ComputedFt {
+    let mut c = ComputedFt::default();
+    let Some(unit) = v.unit.clone() else {
+        return c;
+    };
+    if matches!(unit.as_str(), "rad" | "rad/s" | "deg" | "deg/s") {
+        c.signed = true;
+    }
+    match unit.as_str() {
+        "rad" => {
+            if let Some(r) = v.resolution.as_mut() {
+                *r *= RAD_TO_DEG;
+            }
+            v.unit = Some("deg".to_string());
+            c.precision = 1;
+        }
+        "rad/s" => {
+            if let Some(r) = v.resolution.as_mut() {
+                *r *= RAD_TO_DEG;
+            }
+            v.unit = Some("deg/s".to_string());
+        }
+        "Pa" => {
+            if let Some(r) = v.resolution.as_mut() {
+                *r /= 100_000.0;
+            }
+            v.unit = Some("bar".to_string());
+            c.precision = 3;
+        }
+        "C" => {
+            if let Some(r) = v.resolution.as_mut() {
+                *r /= 3600.0;
+            }
+            v.unit = Some("Ah".to_string());
+        }
+        _ => {}
+    }
+    c
+}
+
+// ---------------------------------------------------------------------
+// Emit helpers.
+// ---------------------------------------------------------------------
+
+/// Quote any `&str` as a valid Rust string literal. Uses `{:?}` which
+/// produces a debug-formatted string that round-trips (escapes quotes,
+/// backslashes, non-printable chars).
+fn quote(s: &str) -> String {
+    format!("{s:?}")
+}
+
+fn opt_str(s: &Option<String>) -> String {
+    match s {
+        Some(v) => format!("Some({})", quote(v)),
+        None => "None".to_string(),
+    }
+}
+
+fn opt_int<T: std::fmt::Display>(v: &Option<T>) -> String {
+    match v {
+        Some(x) => format!("Some({x})"),
+        None => "None".to_string(),
+    }
+}
+
+fn opt_bool(v: &Option<bool>) -> String {
+    match v {
+        Some(x) => format!("Some({x})"),
+        None => "None".to_string(),
+    }
+}
+
+/// Float emitter that round-trips bit-exactly. Falls back to a debug
+/// repr (`{:?}`) which Rust accepts as a literal for finite values; for
+/// the (unlikely) non-finite case in the schema we'd want to know loudly.
+fn float(v: f64) -> String {
+    if !v.is_finite() {
+        panic!("non-finite value in canboat schema: {v}");
+    }
+    // `{:?}` always emits with a decimal point (or e-notation) so the
+    // result is a valid `f64` literal in Rust source.
+    format!("{v:?}")
+}
+
+fn opt_float(v: &Option<f64>) -> String {
+    match v {
+        Some(x) => format!("Some({})", float(*x)),
+        None => "None".to_string(),
+    }
+}
+
+fn packet_type(t: &str) -> &'static str {
+    match t {
+        "Single" => "PacketType::Single",
+        "Fast" => "PacketType::Fast",
+        "ISO" => "PacketType::Iso",
+        "Mixed" => "PacketType::Mixed",
+        other => panic!("unknown PacketType in canboat.json: {other:?}"),
+    }
+}
+
+fn field_type(t: &str) -> &'static str {
+    match t {
+        "NUMBER" => "FieldType::Number",
+        "DECIMAL" => "FieldType::Decimal",
+        "FLOAT" => "FieldType::Float",
+        "BINARY" => "FieldType::Binary",
+        "LOOKUP" => "FieldType::Lookup",
+        "BITLOOKUP" => "FieldType::BitLookup",
+        "INDIRECT_LOOKUP" => "FieldType::IndirectLookup",
+        "DATE" => "FieldType::Date",
+        "TIME" => "FieldType::Time",
+        "DURATION" => "FieldType::Duration",
+        "STRING_FIX" => "FieldType::StringFix",
+        "STRING_LZ" => "FieldType::StringLz",
+        "STRING_LAU" => "FieldType::StringLau",
+        "VARIABLE" => "FieldType::Variable",
+        "MMSI" => "FieldType::Mmsi",
+        "PGN" => "FieldType::Pgn",
+        "ISO_NAME" => "FieldType::IsoName",
+        "RESERVED" => "FieldType::Reserved",
+        "SPARE" => "FieldType::Spare",
+        "DYNAMIC_FIELD_KEY" => "FieldType::DynamicFieldKey",
+        "DYNAMIC_FIELD_LENGTH" => "FieldType::DynamicFieldLength",
+        "DYNAMIC_FIELD_VALUE" => "FieldType::DynamicFieldValue",
+        "FIELD_INDEX" => "FieldType::FieldIndex",
+        other => panic!("unknown FieldType in canboat.json: {other:?}"),
+    }
+}
+
+fn opt_field_type(t: &Option<String>) -> String {
+    match t {
+        Some(s) => format!("Some({})", field_type(s)),
+        None => "None".to_string(),
+    }
+}
+
+fn missing_arr(m: &Option<Vec<String>>) -> String {
+    let mut out = String::from("&[");
+    if let Some(v) = m {
+        for s in v {
+            out.push_str(&quote(s));
+            out.push(',');
+        }
+    }
+    out.push(']');
+    out
+}
+
+fn emit_field(out: &mut String, f: &RawField, c: Computed) {
+    write!(
+        out,
+        "FieldInfo{{order:{order},id:{id},name:{name},description:{description},\
+         bit_length:{bit_length},bit_length_field:{blf},bit_length_variable:{blv},\
+         bit_offset:{bit_offset},bit_start:{bit_start},resolution:{resolution},\
+         signed:{signed},offset:{offset},range_min:{range_min},range_max:{range_max},\
+         unknown_value:{uv},out_of_range_value:{orv},reserved_value:{rv},\
+         unit:{unit},physical_quantity:{pq},field_type:{ft},\
+         lookup_enumeration:{le},lookup_bit_enumeration:{lbe},lookup_indirect_enumeration:{lie},\
+         lookup_indirect_enumeration_field_order:{liefo},lookup_field_type_enumeration:{lfte},\
+         match_value:{mv},part_of_primary_key:{popk},condition:{cond},\
+         unit_offset:{unit_offset},precision:{precision},is_dynamic_length_marker:{dlm}}},",
+        order = f.order,
+        id = quote(&f.id),
+        name = quote(&f.name),
+        description = opt_str(&f.description),
+        bit_length = opt_int(&f.bit_length),
+        blf = opt_str(&f.bit_length_field),
+        blv = opt_bool(&f.bit_length_variable),
+        bit_offset = opt_int(&f.bit_offset),
+        bit_start = opt_int(&f.bit_start),
+        resolution = opt_float(&f.resolution),
+        signed = opt_bool(&f.signed),
+        offset = opt_int(&f.offset),
+        range_min = opt_float(&f.range_min),
+        range_max = opt_float(&f.range_max),
+        uv = opt_int(&f.unknown_value),
+        orv = opt_int(&f.out_of_range_value),
+        rv = opt_int(&f.reserved_value),
+        unit = opt_str(&f.unit),
+        pq = opt_str(&f.physical_quantity),
+        ft = opt_field_type(&f.field_type),
+        le = opt_str(&f.lookup_enumeration),
+        lbe = opt_str(&f.lookup_bit_enumeration),
+        lie = opt_str(&f.lookup_indirect_enumeration),
+        liefo = opt_int(&f.lookup_indirect_enumeration_field_order),
+        lfte = opt_str(&f.lookup_field_type_enumeration),
+        mv = opt_int(&f.match_value),
+        popk = opt_bool(&f.part_of_primary_key),
+        cond = opt_str(&f.condition),
+        unit_offset = float(c.unit_offset),
+        precision = c.precision,
+        dlm = c.is_dynamic_length_marker,
+    )
+    .unwrap();
+}
+
+fn emit_pgn(out: &mut String, p: &RawPgn, fields_with_computed: &[(RawField, Computed)]) {
+    writeln!(
+        out,
+        "PgnInfo{{pgn:{pgn},id:{id},description:{description},explanation:{explanation},\
+         url:{url},packet_type:{packet_type},complete:{complete},fallback:{fallback},\
+         missing:{missing},priority:{priority},transmission_interval:{ti},\
+         transmission_irregular:{tirr},field_count:{fc},length:{length},min_length:{ml},\
+         fields:&[",
+        pgn = p.pgn,
+        id = quote(&p.id),
+        description = quote(&p.description),
+        explanation = opt_str(&p.explanation),
+        url = opt_str(&p.url),
+        packet_type = packet_type(&p.packet_type),
+        complete = opt_bool(&p.complete),
+        fallback = opt_bool(&p.fallback),
+        missing = missing_arr(&p.missing),
+        priority = opt_int(&p.priority),
+        ti = opt_int(&p.transmission_interval),
+        tirr = opt_bool(&p.transmission_irregular),
+        fc = p.field_count,
+        length = opt_int(&p.length),
+        ml = opt_int(&p.min_length),
+    )
+    .unwrap();
+    for (f, c) in fields_with_computed {
+        emit_field(out, f, *c);
+    }
+    writeln!(
+        out,
+        "],repeating_field_set1_size:{r1s},repeating_field_set1_start_field:{r1sf},\
+         repeating_field_set1_count_field:{r1cf},repeating_field_set2_size:{r2s},\
+         repeating_field_set2_start_field:{r2sf},repeating_field_set2_count_field:{r2cf}}},",
+        r1s = opt_int(&p.repeating_field_set1_size),
+        r1sf = opt_int(&p.repeating_field_set1_start_field),
+        r1cf = opt_int(&p.repeating_field_set1_count_field),
+        r2s = opt_int(&p.repeating_field_set2_size),
+        r2sf = opt_int(&p.repeating_field_set2_start_field),
+        r2cf = opt_int(&p.repeating_field_set2_count_field),
+    )
+    .unwrap();
+}
+
+fn emit_lookup_value(out: &mut String, v: &RawLookupValue) {
+    write!(
+        out,
+        "LookupValue{{value:{},name:{},id:{}}},",
+        v.value,
+        quote(&v.name),
+        opt_str(&v.id),
+    )
+    .unwrap();
+}
+
+fn emit_lookup(out: &mut String, t: &RawLookup) {
+    write!(
+        out,
+        "LookupTable{{name:{},max_value:{},values:&[",
+        quote(&t.name),
+        opt_int(&t.max_value),
+    )
+    .unwrap();
+    for v in &t.values {
+        emit_lookup_value(out, v);
+    }
+    write!(out, "],by_value:&[").unwrap();
+    // Build sorted (value, index) pairs.
+    let mut pairs: Vec<(u64, u32)> = t
+        .values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.value, i as u32))
+        .collect();
+    pairs.sort_by_key(|&(v, _)| v);
+    for (v, i) in pairs {
+        write!(out, "({v},{i}),").unwrap();
+    }
+    writeln!(out, "]}},").unwrap();
+}
+
+fn emit_bit_lookup_value(out: &mut String, v: &RawBitLookupValue) {
+    write!(
+        out,
+        "BitLookupValue{{bit:{},name:{},id:{}}},",
+        v.bit,
+        quote(&v.name),
+        opt_str(&v.id),
+    )
+    .unwrap();
+}
+
+fn emit_bit_lookup(out: &mut String, t: &RawBitLookup) {
+    write!(
+        out,
+        "BitLookupTable{{name:{},max_value:{},values:&[",
+        quote(&t.name),
+        opt_int(&t.max_value),
+    )
+    .unwrap();
+    for v in &t.values {
+        emit_bit_lookup_value(out, v);
+    }
+    write!(out, "],by_bit:&[").unwrap();
+    let mut pairs: Vec<(u8, u32)> = t
+        .values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.bit, i as u32))
+        .collect();
+    pairs.sort_by_key(|&(b, _)| b);
+    for (b, i) in pairs {
+        write!(out, "({b},{i}),").unwrap();
+    }
+    writeln!(out, "]}},").unwrap();
+}
+
+fn emit_indirect_lookup_value(out: &mut String, v: &RawIndirectLookupValue) {
+    write!(
+        out,
+        "IndirectLookupValue{{value1:{},value2:{},name:{},id:{}}},",
+        v.value1,
+        v.value2,
+        quote(&v.name),
+        opt_str(&v.id),
+    )
+    .unwrap();
+}
+
+fn emit_indirect_lookup(out: &mut String, t: &RawIndirectLookup) {
+    write!(
+        out,
+        "IndirectLookupTable{{name:{},max_value:{},values:&[",
+        quote(&t.name),
+        opt_int(&t.max_value),
+    )
+    .unwrap();
+    for v in &t.values {
+        emit_indirect_lookup_value(out, v);
+    }
+    write!(out, "],by_pair:&[").unwrap();
+    let mut pairs: Vec<((u64, u64), u32)> = t
+        .values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| ((v.value1, v.value2), i as u32))
+        .collect();
+    pairs.sort_by_key(|&(k, _)| k);
+    for ((a, b), i) in pairs {
+        write!(out, "(({a},{b}),{i}),").unwrap();
+    }
+    writeln!(out, "]}},").unwrap();
+}
+
+fn emit_ft_value(out: &mut String, v: &RawFieldTypeValue, c: ComputedFt) {
+    write!(
+        out,
+        "LookupFieldTypeValue{{value:{value},name:{name},field_type:{field_type},\
+         bits:{bits},resolution:{resolution},unit:{unit},\
+         lookup_enumeration:{le},lookup_bit_enumeration:{lbe},signed:{signed},precision:{precision}}},",
+        value = v.value,
+        name = quote(&v.name),
+        field_type = opt_str(&v.field_type),
+        bits = opt_int(&v.bits.as_ref().and_then(|s| s.parse::<u32>().ok())),
+        resolution = opt_float(&v.resolution),
+        unit = opt_str(&v.unit),
+        le = opt_str(&v.lookup_enumeration),
+        lbe = opt_str(&v.lookup_bit_enumeration),
+        signed = c.signed,
+        precision = c.precision,
+    )
+    .unwrap();
+}
+
+fn emit_ft_lookup(out: &mut String, t: &RawFieldTypeLookup, computed: &[ComputedFt]) {
+    write!(
+        out,
+        "LookupFieldTypeTable{{name:{},max_value:{},values:&[",
+        quote(&t.name),
+        opt_int(&t.max_value),
+    )
+    .unwrap();
+    for (v, c) in t.values.iter().zip(computed.iter()) {
+        emit_ft_value(out, v, *c);
+    }
+    write!(out, "],by_value:&[").unwrap();
+    let mut pairs: Vec<(u64, u32)> = t
+        .values
+        .iter()
+        .enumerate()
+        .map(|(i, v)| (v.value, i as u32))
+        .collect();
+    pairs.sort_by_key(|&(v, _)| v);
+    for (v, i) in pairs {
+        write!(out, "({v},{i}),").unwrap();
+    }
+    writeln!(out, "]}},").unwrap();
+}
+
+// ---------------------------------------------------------------------
+// main()
+// ---------------------------------------------------------------------
+
+fn main() {
+    let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
+    let workspace = manifest
+        .parent()
+        .and_then(Path::parent)
+        .expect("workspace root");
+    let canboat_path = workspace.join("data").join("canboat.json");
+    let synthetic_path = workspace.join("data").join("synthetic-pgns.json");
+
+    println!("cargo:rerun-if-changed={}", canboat_path.display());
+    println!("cargo:rerun-if-changed={}", synthetic_path.display());
+
+    let canboat_bytes =
+        fs::read(&canboat_path).unwrap_or_else(|e| panic!("read {}: {e}", canboat_path.display()));
+    let canboat: CanboatJson = serde_json::from_slice(&canboat_bytes)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", canboat_path.display()));
+
+    let synthetic_bytes = fs::read(&synthetic_path)
+        .unwrap_or_else(|e| panic!("read {}: {e}", synthetic_path.display()));
+    let synthetic: SyntheticJson = serde_json::from_slice(&synthetic_bytes)
+        .unwrap_or_else(|e| panic!("parse {}: {e}", synthetic_path.display()));
+
+    // Concatenate: main PGNs + synthetic PGNs. Synthetic come last so
+    // the in-load-order `fallback_pgn` walk still matches today's
+    // behaviour (the synthetic range is at 0x40000+, well above any
+    // proprietary catch-all).
+    let mut pgns: Vec<RawPgn> = canboat.pgns;
+    pgns.extend(synthetic.pgns);
+
+    // Apply non-SI fix-up to every field, capturing the derived
+    // unit_offset / precision / is_dynamic_length_marker.
+    let pgn_with_fields: Vec<(RawPgn, Vec<(RawField, Computed)>)> = pgns
+        .into_iter()
+        .map(|mut p| {
+            let fields = std::mem::take(&mut p.fields);
+            let mut out = Vec::with_capacity(fields.len());
+            for mut f in fields {
+                let c = compute_field(&mut f);
+                out.push((f, c));
+            }
+            (p, out)
+        })
+        .collect();
+
+    // Field-type lookups also need fix-up.
+    let mut ft_tables = canboat.lookup_field_type_enumerations;
+    let ft_computed: Vec<Vec<ComputedFt>> = ft_tables
+        .iter_mut()
+        .map(|t| t.values.iter_mut().map(compute_ft).collect())
+        .collect();
+
+    // Sort lookups alphabetically by name for binary-search lookup at
+    // runtime.
+    let mut lookups = canboat.lookup_enumerations;
+    lookups.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut bit_lookups = canboat.lookup_bit_enumerations;
+    bit_lookups.sort_by(|a, b| a.name.cmp(&b.name));
+    let mut indirect_lookups = canboat.lookup_indirect_enumerations;
+    indirect_lookups.sort_by(|a, b| a.name.cmp(&b.name));
+
+    // Sort ft_tables (and parallel computed array) by name.
+    let mut ft_indexed: Vec<(RawFieldTypeLookup, Vec<ComputedFt>)> =
+        ft_tables.into_iter().zip(ft_computed).collect();
+    ft_indexed.sort_by(|a, b| a.0.name.cmp(&b.0.name));
+
+    // pgn number -> list of indices (declaration order preserved).
+    let mut pgn_index: BTreeMap<u32, Vec<usize>> = BTreeMap::new();
+    for (i, (p, _)) in pgn_with_fields.iter().enumerate() {
+        pgn_index.entry(p.pgn).or_default().push(i);
+    }
+
+    let mut out = String::with_capacity(8 << 20); // 8 MiB initial.
+    writeln!(out, "// AUTO-GENERATED by canboat-core/build.rs — DO NOT EDIT.").unwrap();
+    writeln!(out, "// Source: data/canboat.json + data/synthetic-pgns.json").unwrap();
+    writeln!(
+        out,
+        "use canboat_schema::{{BitLookupTable, BitLookupValue, FieldInfo, FieldType, \
+         IndirectLookupTable, IndirectLookupValue, LookupFieldTypeTable, LookupFieldTypeValue, \
+         LookupTable, LookupValue, PacketType, PgnInfo}};"
+    )
+    .unwrap();
+
+    writeln!(
+        out,
+        "pub const SCHEMA_VERSION: &str = {};",
+        quote(&canboat.schema_version)
+    )
+    .unwrap();
+    writeln!(out, "pub const VERSION: &str = {};", quote(&canboat.version)).unwrap();
+
+    // PGNS array.
+    writeln!(out, "pub static PGNS: &[PgnInfo] = &[").unwrap();
+    for (p, fields) in &pgn_with_fields {
+        emit_pgn(&mut out, p, fields);
+    }
+    writeln!(out, "];").unwrap();
+
+    // PGN_INDEX — sorted by pgn number, value is &[u32] of indices.
+    writeln!(out, "pub static PGN_INDEX: &[(u32, &[u32])] = &[").unwrap();
+    for (pgn, idxs) in &pgn_index {
+        write!(out, "({},&[", pgn).unwrap();
+        for i in idxs {
+            write!(out, "{},", i).unwrap();
+        }
+        writeln!(out, "]),").unwrap();
+    }
+    writeln!(out, "];").unwrap();
+
+    // LOOKUPS — sorted by name.
+    writeln!(out, "pub static LOOKUPS: &[LookupTable] = &[").unwrap();
+    for t in &lookups {
+        emit_lookup(&mut out, t);
+    }
+    writeln!(out, "];").unwrap();
+
+    // BIT_LOOKUPS.
+    writeln!(out, "pub static BIT_LOOKUPS: &[BitLookupTable] = &[").unwrap();
+    for t in &bit_lookups {
+        emit_bit_lookup(&mut out, t);
+    }
+    writeln!(out, "];").unwrap();
+
+    // INDIRECT_LOOKUPS.
+    writeln!(out, "pub static INDIRECT_LOOKUPS: &[IndirectLookupTable] = &[").unwrap();
+    for t in &indirect_lookups {
+        emit_indirect_lookup(&mut out, t);
+    }
+    writeln!(out, "];").unwrap();
+
+    // FIELD_TYPE_LOOKUPS.
+    writeln!(
+        out,
+        "pub static FIELD_TYPE_LOOKUPS: &[LookupFieldTypeTable] = &["
+    )
+    .unwrap();
+    for (t, c) in &ft_indexed {
+        emit_ft_lookup(&mut out, t, c);
+    }
+    writeln!(out, "];").unwrap();
+
+    // --- Phase 3 codegen: per-PGN dispatch on Match fields. ---
+    //
+    // For each PGN number we know about, emit either:
+    //   * `pub fn dispatch_<pgn>(payload: &[u8]) -> Option<&'static PgnInfo>`
+    //     when at least one variant carries Match fields, or
+    //   * nothing (the top-level `dispatch` returns the single variant
+    //     directly).
+    //
+    // The per-PGN function extracts every unique (offset, length, signed,
+    // offset_k) tuple used by any variant's Match fields ONCE at the top,
+    // then checks each Match-having variant in JSON declaration order
+    // against the extracted values. The no-Match variant (if any) is
+    // returned as the in-PGN fallback at the bottom.
+    //
+    // What this saves vs. the old `pick_variant` linear scan:
+    //   * PGN 130820's 50 variants share the same two leading match
+    //     fields (Manufacturer Code, Industry Code). Old code called
+    //     extract_bits up to 100 times per frame; new code calls it
+    //     exactly 2 times and then runs a tight chain of integer
+    //     comparisons the compiler can lower to a jump table.
+    let mut multi: Vec<(u32, Vec<(usize, &RawPgn, &Vec<(RawField, Computed)>)>)> = Vec::new();
+    for (pgn_num, idxs) in &pgn_index {
+        let entries: Vec<_> = idxs
+            .iter()
+            .map(|&i| {
+                let (p, fs) = &pgn_with_fields[i];
+                (i, p, fs)
+            })
+            .collect();
+        multi.push((*pgn_num, entries));
+    }
+
+    for (pgn_num, variants) in &multi {
+        if !needs_dispatch_fn(variants) {
+            continue;
+        }
+        emit_per_pgn_dispatch(&mut out, *pgn_num, variants);
+    }
+
+    // Top-level dispatch entry point.
+    writeln!(
+        out,
+        "/// Pick the right PgnInfo variant for `pgn` given the frame payload."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "pub fn dispatch(pgn: u32, payload: &[u8]) -> Option<&'static PgnInfo> {{"
+    )
+    .unwrap();
+    writeln!(out, "    match pgn {{").unwrap();
+    for (pgn_num, variants) in &multi {
+        if needs_dispatch_fn(variants) {
+            writeln!(out, "        {pgn_num} => dispatch_{pgn_num}(payload),").unwrap();
+        } else {
+            // Single variant, no Match fields — direct return.
+            let idx = variants[0].0;
+            writeln!(out, "        {pgn_num} => Some(&PGNS[{idx}]),").unwrap();
+        }
+    }
+    writeln!(out, "        _ => None,").unwrap();
+    writeln!(out, "    }}").unwrap();
+    writeln!(out, "}}").unwrap();
+
+    // Sparse cross-PGN fallback table: `(pgn_number, idx_into_PGNS)`
+    // for every Fallback:true entry, in declaration (== ascending PGN)
+    // order. `find_catchall` is O(log n) via binary search instead of
+    // the previous 600-entry linear scan.
+    let fallbacks: Vec<(u32, usize)> = pgn_with_fields
+        .iter()
+        .enumerate()
+        .filter_map(|(i, (p, _))| {
+            if p.fallback == Some(true) {
+                Some((p.pgn, i))
+            } else {
+                None
+            }
+        })
+        .collect();
+    writeln!(out, "pub static FALLBACKS: &[(u32, u32)] = &[").unwrap();
+    for (pgn, idx) in &fallbacks {
+        writeln!(out, "    ({pgn}, {idx}),").unwrap();
+    }
+    writeln!(out, "];").unwrap();
+    writeln!(
+        out,
+        "/// Largest Fallback:true PgnInfo whose pgn number is <= `pgn`.\n\
+         /// Mirrors canboat's `searchForUnknownPgn`."
+    )
+    .unwrap();
+    writeln!(
+        out,
+        "pub fn find_catchall(pgn: u32) -> Option<&'static PgnInfo> {{"
+    )
+    .unwrap();
+    writeln!(out, "    let i = FALLBACKS.partition_point(|&(p, _)| p <= pgn);").unwrap();
+    writeln!(out, "    if i == 0 {{ None }} else {{ Some(&PGNS[FALLBACKS[i - 1].1 as usize]) }}")
+        .unwrap();
+    writeln!(out, "}}").unwrap();
+
+    let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
+    let out_path = out_dir.join("schema_generated.rs");
+    fs::write(&out_path, &out)
+        .unwrap_or_else(|e| panic!("write {}: {e}", out_path.display()));
+}
+
+/// `true` iff this PGN number needs a generated dispatch function —
+/// it has either (a) more than one variant or (b) a single variant
+/// with Match fields that gate decoding.
+fn needs_dispatch_fn(variants: &[(usize, &RawPgn, &Vec<(RawField, Computed)>)]) -> bool {
+    if variants.len() > 1 {
+        return true;
+    }
+    variants[0]
+        .2
+        .iter()
+        .any(|(f, _)| f.match_value.is_some())
+}
+
+/// Emit `fn dispatch_<pgn>(payload: &[u8]) -> Option<&'static PgnInfo>`.
+fn emit_per_pgn_dispatch(
+    out: &mut String,
+    pgn_num: u32,
+    variants: &[(usize, &RawPgn, &Vec<(RawField, Computed)>)],
+) {
+    use std::collections::BTreeSet;
+
+    // Collect every distinct (offset, length, signed, offset_k) used by
+    // a Match field anywhere in this PGN. We extract each once at the
+    // top of the function and bind it to a stable local name so the
+    // subsequent per-variant arms turn into integer comparisons.
+    let mut ranges: BTreeSet<(u32, u32, bool, i64)> = BTreeSet::new();
+    for (_, _, fields) in variants {
+        for (f, _) in *fields {
+            if f.match_value.is_none() {
+                continue;
+            }
+            let (Some(off), Some(len)) = (f.bit_offset, f.bit_length) else {
+                continue;
+            };
+            ranges.insert((off, len, f.signed.unwrap_or(false), f.offset.unwrap_or(0)));
+        }
+    }
+
+    let var_name = |off: u32, len: u32, signed: bool, off_k: i64| -> String {
+        let s = if signed { "s" } else { "u" };
+        let k = if off_k < 0 {
+            format!("n{}", -off_k)
+        } else {
+            format!("{off_k}")
+        };
+        format!("m_{off}_{len}_{s}_{k}")
+    };
+
+    writeln!(
+        out,
+        "fn dispatch_{pgn_num}(payload: &[u8]) -> Option<&'static PgnInfo> {{"
+    )
+    .unwrap();
+    // `let _ = payload;` keeps the parameter named (clearer at call sites)
+    // even on the rare PGN whose variants carry no usable Match fields,
+    // where no extract_bits call would otherwise reference it.
+    writeln!(out, "    let _ = payload;").unwrap();
+    for (off, len, signed, off_k) in &ranges {
+        let name = var_name(*off, *len, *signed, *off_k);
+        writeln!(
+            out,
+            "    let {name} = crate::bits::extract_bits(payload, {off}, {len}, {signed}, {off_k}).map(|e| e.value);"
+        )
+        .unwrap();
+    }
+
+    // First pass: Match-having variants in JSON declaration order.
+    // Second pass: select the in-PGN fallback (no-Match variant), prefer
+    // one with `Fallback: true`, otherwise the first no-Match seen.
+    let mut fallback_idx: Option<usize> = None;
+    for (idx, p, fields) in variants {
+        let match_fields: Vec<&(RawField, Computed)> = fields
+            .iter()
+            .filter(|(f, _)| f.match_value.is_some())
+            .collect();
+        if match_fields.is_empty() {
+            if fallback_idx.is_none() || p.fallback == Some(true) {
+                fallback_idx = Some(*idx);
+            }
+            continue;
+        }
+        write!(out, "    if ").unwrap();
+        let mut first = true;
+        let mut emitted_anything = false;
+        for (f, _) in &match_fields {
+            let (Some(off), Some(len)) = (f.bit_offset, f.bit_length) else {
+                if !first {
+                    write!(out, " && ").unwrap();
+                }
+                write!(out, "false").unwrap();
+                first = false;
+                emitted_anything = true;
+                continue;
+            };
+            if !first {
+                write!(out, " && ").unwrap();
+            }
+            let name = var_name(off, len, f.signed.unwrap_or(false), f.offset.unwrap_or(0));
+            write!(out, "{name} == Some({})", f.match_value.unwrap()).unwrap();
+            first = false;
+            emitted_anything = true;
+        }
+        if !emitted_anything {
+            // Pathological: variant claimed Match but had no usable fields. Skip.
+            writeln!(out, "false {{}}").unwrap();
+            continue;
+        }
+        writeln!(out, " {{ return Some(&PGNS[{idx}]); }}").unwrap();
+    }
+    match fallback_idx {
+        Some(idx) => writeln!(out, "    Some(&PGNS[{idx}])").unwrap(),
+        None => writeln!(out, "    None").unwrap(),
+    }
+    writeln!(out, "}}").unwrap();
+}

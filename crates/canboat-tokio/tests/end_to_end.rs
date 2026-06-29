@@ -2,22 +2,12 @@
 //! through tokio. Each test fabricates a byte stream in memory, hands
 //! it to a `Stream`, and verifies the emitted `DecodedPgn` events.
 
-use std::path::PathBuf;
-use std::sync::Arc;
-
 use canboat_core::PgnDatabase;
 use canboat_tokio::{IkonvertStream, Ngt1Stream};
 use futures::StreamExt;
 
-fn db() -> Arc<PgnDatabase> {
-    let manifest: PathBuf = env!("CARGO_MANIFEST_DIR").into();
-    let path = manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .unwrap()
-        .join("data")
-        .join("canboat.json");
-    Arc::new(PgnDatabase::load(path).expect("load canboat.json"))
+fn db() -> &'static PgnDatabase {
+    PgnDatabase::embedded()
 }
 
 /// Build the same NGT-1 wire bytes the actisense-serial replay test
@@ -70,7 +60,7 @@ async fn ngt1_stream_decodes_pgn60928_from_memory() {
     let mfr = decoded
         .fields
         .iter()
-        .find(|f| &*f.id == "manufacturerCode")
+        .find(|f| f.id() == "manufacturerCode")
         .expect("manufacturerCode field");
     match &mfr.value {
         canboat_core::FieldValue::Lookup { name, .. } => {

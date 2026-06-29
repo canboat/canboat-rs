@@ -8,7 +8,6 @@
 //! next send attempt.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use canboat_core::{
@@ -22,17 +21,14 @@ use tokio::sync::mpsc;
 /// Streams [`DecodedPgn`] events off an `AsyncRead` byte source
 /// carrying the Actisense NGT-1 binary protocol.
 ///
-/// Construct from a tokio-serial `SerialStream`:
-///
 /// ```no_run
 /// # async fn _example() -> Result<(), Box<dyn std::error::Error>> {
-/// use std::sync::Arc;
 /// use canboat_core::PgnDatabase;
 /// use canboat_tokio::Ngt1Stream;
 /// use futures::StreamExt;
 /// use tokio_serial::SerialPortBuilderExt;
 ///
-/// let db = Arc::new(PgnDatabase::load("data/canboat.json")?);
+/// let db = PgnDatabase::embedded();
 /// let port = tokio_serial::new("/dev/ttyUSB0", 115_200).open_native_async()?;
 /// let mut stream = Ngt1Stream::new(port, db);
 /// while let Some(decoded) = stream.next().await {
@@ -50,14 +46,14 @@ impl Ngt1Stream {
     /// pushes don't block while the consumer keeps up.
     pub const DEFAULT_CAPACITY: usize = 256;
 
-    pub fn new<R>(reader: R, db: Arc<PgnDatabase>) -> Self
+    pub fn new<R>(reader: R, db: &'static PgnDatabase) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
         Self::with_capacity(reader, db, Self::DEFAULT_CAPACITY)
     }
 
-    pub fn with_capacity<R>(reader: R, db: Arc<PgnDatabase>, capacity: usize) -> Self
+    pub fn with_capacity<R>(reader: R, db: &'static PgnDatabase, capacity: usize) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
@@ -74,7 +70,7 @@ impl Stream for Ngt1Stream {
     }
 }
 
-async fn reader_task<R>(mut reader: R, db: Arc<PgnDatabase>, tx: mpsc::Sender<DecodedPgn>)
+async fn reader_task<R>(mut reader: R, db: &'static PgnDatabase, tx: mpsc::Sender<DecodedPgn>)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {

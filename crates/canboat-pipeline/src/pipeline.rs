@@ -106,7 +106,7 @@ pub struct Hubs {
 ///   the analyzer JSON / snapshot output — `Off` / `Lower` (matches
 ///   canboat C `-camel`) / `Upper` (matches `-upper-camel`).
 pub fn run(
-    db: PgnDatabase,
+    db: &'static PgnDatabase,
     frames_rx: Receiver<RawFrame>,
     mut hubs: Hubs,
     emit_nmea_stdout: bool,

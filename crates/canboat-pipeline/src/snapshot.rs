@@ -95,7 +95,7 @@ fn classify(decoded: &DecodedPgn) -> (Option<String>, bool) {
 /// return `None`.
 fn field_value_text(field: &DecodedField) -> Option<String> {
     match &field.value {
-        FieldValue::Lookup { name: Some(n), .. } => Some(n.clone()),
+        FieldValue::Lookup { name: Some(n), .. } => Some((*n).to_string()),
         FieldValue::Lookup { value, name: None } => Some(value.to_string()),
         FieldValue::Integer(v) => Some(v.to_string()),
         FieldValue::Number(v) | FieldValue::Float(v) => Some(format!("{v}")),

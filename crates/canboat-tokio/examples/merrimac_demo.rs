@@ -6,11 +6,9 @@
 //!
 //! ```sh
 //!   cargo run -p canboat-tokio --example merrimac_demo -- \
-//!       --serial /dev/ttyUSB0 [--baud 230400] [--db data/canboat.json]
+//!       --serial /dev/ttyUSB0 [--baud 230400]
 //! ```
 
-use std::path::PathBuf;
-use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -28,8 +26,6 @@ struct Cli {
     /// Baud rate (iKonvert's default is 230400).
     #[arg(long, default_value_t = 230_400)]
     baud: u32,
-    #[arg(long)]
-    db: Option<PathBuf>,
 }
 
 #[tokio::main(flavor = "current_thread")]
@@ -37,10 +33,7 @@ async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let db_path = cli.db.unwrap_or_else(default_db_path);
-    let db = Arc::new(
-        PgnDatabase::load(&db_path).with_context(|| format!("loading {}", db_path.display()))?,
-    );
+    let db = PgnDatabase::embedded();
 
     let port = tokio_serial::new(&cli.serial, cli.baud)
         .timeout(Duration::from_millis(250))
@@ -49,8 +42,6 @@ async fn main() -> Result<()> {
 
     let mut stream = IkonvertStream::new(port, db);
     while let Some(decoded) = stream.next().await {
-        // This is what merrimac sees: typed DecodedPgn events with raw
-        // structured FieldValues — no parsing back from JSON required.
         println!(
             "[pgn {:>6} src {:>3}] {} ({} fields)",
             decoded.pgn,
@@ -60,13 +51,4 @@ async fn main() -> Result<()> {
         );
     }
     Ok(())
-}
-
-fn default_db_path() -> PathBuf {
-    let manifest: PathBuf = env!("CARGO_MANIFEST_DIR").into();
-    manifest
-        .parent()
-        .and_then(|p| p.parent())
-        .map(|root| root.join("data").join("canboat.json"))
-        .unwrap_or_else(|| PathBuf::from("data/canboat.json"))
 }

@@ -8,7 +8,6 @@
 //! `DecodedPgn` events on an mpsc channel.
 
 use std::pin::Pin;
-use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use canboat_core::{
@@ -26,14 +25,14 @@ pub struct IkonvertStream {
 impl IkonvertStream {
     pub const DEFAULT_CAPACITY: usize = 256;
 
-    pub fn new<R>(reader: R, db: Arc<PgnDatabase>) -> Self
+    pub fn new<R>(reader: R, db: &'static PgnDatabase) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
         Self::with_capacity(reader, db, Self::DEFAULT_CAPACITY)
     }
 
-    pub fn with_capacity<R>(reader: R, db: Arc<PgnDatabase>, capacity: usize) -> Self
+    pub fn with_capacity<R>(reader: R, db: &'static PgnDatabase, capacity: usize) -> Self
     where
         R: AsyncRead + Unpin + Send + 'static,
     {
@@ -50,7 +49,7 @@ impl Stream for IkonvertStream {
     }
 }
 
-async fn reader_task<R>(reader: R, db: Arc<PgnDatabase>, tx: mpsc::Sender<DecodedPgn>)
+async fn reader_task<R>(reader: R, db: &'static PgnDatabase, tx: mpsc::Sender<DecodedPgn>)
 where
     R: AsyncRead + Unpin + Send + 'static,
 {

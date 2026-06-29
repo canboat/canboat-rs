@@ -49,36 +49,121 @@ fn unavailable_with_range(f: &FieldInfo, ex: Extracted) -> bool {
 const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 
 /// One decoded field.
+///
+/// Schema metadata (`id`, `name`, `order`, `unit`, `resolution`,
+/// `precision`, `part_of_primary_key`) is read through accessor methods
+/// that delegate to [`Self::info`] — the corresponding
+/// [`FieldInfo`] entry in the static schema. Runtime values that the
+/// decoder owns (`bit_offset`, `bit_length`, `repeat_*`, `value`) stay
+/// as direct fields because they can legitimately differ from the
+/// schema's declared values (repeating-set iterations shift the offset;
+/// VARIABLE fields can be byte-aligned wider than the schema declares).
+///
+/// VARIABLE and DYNAMIC_FIELD_VALUE fields override unit / resolution /
+/// precision with metadata drawn from a target FieldInfo or
+/// LookupFieldTypeValue; those overrides live in a boxed
+/// [`FieldOverrides`] sidecar — `None` in the common path, so the
+/// 98 % of fields that don't override only carry an 8-byte null
+/// pointer in the slot.
 #[derive(Debug, Clone)]
 pub struct DecodedField {
-    pub order: u8,
-    pub id: std::sync::Arc<str>,
-    pub name: std::sync::Arc<str>,
-    pub unit: Option<std::sync::Arc<str>>,
-    /// Resolution as carried in canboat.json. The formatter uses this
-    /// to pick a sensible number of decimal digits.
-    pub resolution: Option<f64>,
-    /// Explicit decimal precision from the canboat unit fix-up (e.g.
-    /// `rad → deg` sets precision = 1). `0` means "derive from
-    /// resolution"; the formatter walks the resolution otherwise.
-    pub precision: u8,
+    /// Pointer back into the static [`FieldInfo`] this field was
+    /// decoded against.
+    pub info: &'static FieldInfo,
+    pub value: FieldValue,
+    /// Bit offset of this field within the parent payload. May differ
+    /// from `info.bit_offset` for fields inside repeating sets (each
+    /// iteration shifts) and for variable-length fields. `None` for
+    /// synthetic fields.
+    pub bit_offset: Option<u32>,
+    /// Effective bit length on the wire. May differ from
+    /// `info.bit_length` for STRING_LAU / VARIABLE / DYNAMIC_FIELD_VALUE
+    /// fields (resolved at decode time).
+    pub bit_length: Option<u32>,
     /// Zero-based iteration index for fields inside a repeating set;
     /// `None` for non-repeating fields.
     pub repeat_index: Option<u32>,
-    /// Which RepeatingFieldSet this field belongs to: 1 → emitted under
-    /// JSON `"list"`, 2 → under `"list2"`. `0` for non-repeating.
+    /// Which RepeatingFieldSet this field belongs to: 1 → emitted
+    /// under JSON `"list"`, 2 → under `"list2"`. `0` for non-repeating.
     pub repeat_set: u8,
-    /// True if this field participates in the PGN's primary key. The
-    /// JSON formatter under `-nv` annotates these with `"key":true`.
-    pub part_of_primary_key: bool,
-    /// Bit offset of this field within the PGN payload. The `-debug`
-    /// JSON formatter uses this to extract the matching bytes/bits from
-    /// the parent `DecodedPgn::data`. `None` for synthetic fields.
-    pub bit_offset: Option<u32>,
-    /// Bit length of this field. `None` for variable-length fields whose
-    /// length depends on payload content (STRING_LAU, VARIABLE).
-    pub bit_length: Option<u32>,
-    pub value: FieldValue,
+    /// VARIABLE / DYNAMIC_FIELD_VALUE override metadata. `None` for
+    /// the common path.
+    pub overrides: Option<Box<FieldOverrides>>,
+}
+
+/// Resolved-at-decode-time metadata override carried by VARIABLE and
+/// DYNAMIC_FIELD_VALUE fields. The accessors on [`DecodedField`]
+/// consult these first, falling back to [`FieldInfo`].
+///
+/// `None` on a field means "no override at this level — use the value
+/// from `info`".
+#[derive(Debug, Clone)]
+pub struct FieldOverrides {
+    pub unit: Option<&'static str>,
+    pub resolution: Option<f64>,
+    /// `0` means "no override" (use `info.precision`); non-zero
+    /// overrides.
+    pub precision: u8,
+}
+
+impl DecodedField {
+    /// canboat.json field `Order` (1-based schema position).
+    #[inline]
+    pub fn order(&self) -> u8 {
+        self.info.order
+    }
+
+    /// canboat.json field `Id` (camelCase identifier).
+    #[inline]
+    pub fn id(&self) -> &'static str {
+        self.info.id
+    }
+
+    /// canboat.json field `Name` (human label).
+    #[inline]
+    pub fn name(&self) -> &'static str {
+        self.info.name
+    }
+
+    /// Display unit. Overridden by VARIABLE / DYNAMIC_FIELD_VALUE
+    /// resolution; otherwise from [`FieldInfo::unit`].
+    #[inline]
+    pub fn unit(&self) -> Option<&'static str> {
+        if let Some(o) = self.overrides.as_deref() {
+            if o.unit.is_some() {
+                return o.unit;
+            }
+        }
+        self.info.unit
+    }
+
+    /// Display resolution.
+    #[inline]
+    pub fn resolution(&self) -> Option<f64> {
+        if let Some(o) = self.overrides.as_deref() {
+            if o.resolution.is_some() {
+                return o.resolution;
+            }
+        }
+        self.info.resolution
+    }
+
+    /// Decimal precision override (`0` = derive from resolution).
+    #[inline]
+    pub fn precision(&self) -> u8 {
+        if let Some(o) = self.overrides.as_deref() {
+            if o.precision > 0 {
+                return o.precision;
+            }
+        }
+        self.info.precision
+    }
+
+    /// `true` if this field participates in the PGN's primary key.
+    #[inline]
+    pub fn part_of_primary_key(&self) -> bool {
+        self.info.part_of_primary_key.unwrap_or(false)
+    }
 }
 
 /// The decoded value of one field.
@@ -94,12 +179,15 @@ pub enum FieldValue {
     /// Raw bytes (BINARY) — uninterpreted.
     Binary(Vec<u8>),
     /// LOOKUP / INDIRECT_LOOKUP result.
-    Lookup { value: u64, name: Option<String> },
+    Lookup {
+        value: u64,
+        name: Option<&'static str>,
+    },
     /// BITLOOKUP result — list of set bits with the bit-flag value
     /// (1 << bit) and resolved name for each.
     BitField {
         value: u64,
-        bits: Vec<(u64, String)>,
+        bits: Vec<(u64, &'static str)>,
     },
     /// Decoded text (STRING_FIX, STRING_LZ, STRING_LAU).
     String(String),
@@ -115,7 +203,7 @@ pub enum FieldValue {
     /// human-readable name from the database, if known.
     Pgn {
         value: u32,
-        description: Option<std::sync::Arc<str>>,
+        description: Option<&'static str>,
     },
     /// ISO_NAME — a 64-bit packed identifier that is also a valid
     /// PGN 60928 (ISO Address Claim) payload. We carry the raw value
@@ -195,7 +283,7 @@ impl FieldValue {
     pub fn as_str(&self) -> Option<&str> {
         match self {
             FieldValue::String(s) => Some(s.as_str()),
-            FieldValue::Lookup { name: Some(n), .. } => Some(n.as_str()),
+            FieldValue::Lookup { name: Some(n), .. } => Some(*n),
             _ => None,
         }
     }
@@ -217,9 +305,9 @@ pub struct DecodedPgn {
     pub pgn: u32,
     pub src: u8,
     pub dst: u8,
-    pub description: std::sync::Arc<str>,
+    pub description: &'static str,
     /// canboat.json `Id` — stable camelCase identifier.
-    pub id: std::sync::Arc<str>,
+    pub id: &'static str,
     /// The raw payload bytes the fields were decoded from. Kept on
     /// the DecodedPgn so the `-debug` JSON formatter can extract
     /// per-field `bytes` / `bits` annotations without holding the
@@ -261,10 +349,10 @@ impl DecodedPgn {
         // different PGN id than the record was decoded under. Free
         // in release builds.
         debug_assert!(
-            h.pgn_id_hash == crate::db::djb2_hash_str(&self.id),
+            h.pgn_id_hash == crate::db::djb2_hash_str(self.id),
             "FieldHandle/PGN mismatch: handle was minted for a different PGN id ({} != {})",
             h.pgn_id_hash,
-            crate::db::djb2_hash_str(&self.id),
+            crate::db::djb2_hash_str(self.id),
         );
         self.field_unchecked(h)
     }
@@ -295,7 +383,7 @@ impl DecodedPgn {
     pub fn field_by_name(&self, name: &str) -> Option<&DecodedField> {
         self.fields
             .iter()
-            .find(|f| f.repeat_set == 0 && &*f.name == name)
+            .find(|f| f.repeat_set == 0 && f.name() == name)
     }
 }
 
@@ -327,8 +415,8 @@ impl PgnDatabase {
             pgn: frame.pgn,
             src: frame.src,
             dst: frame.dst,
-            description: info.description.clone(),
-            id: info.id.clone(),
+            description: info.description,
+            id: info.id,
             data: frame.data.to_vec(),
             fields,
             has_repeating_set,
@@ -359,78 +447,15 @@ impl PgnDatabase {
     ///      that covers the range — e.g. unknown PGNs in
     ///      `[0x1ef00, 0x1ef00]` get
     ///      `0x1ef00ManufacturerProprietaryFastPacketAddressed`.
-    pub fn pick_variant(&self, frame: &RawFrame) -> Option<&PgnInfo> {
-        let mut in_pgn_fallback: Option<&PgnInfo> = None;
-        for info in self.pgn_variants(frame.pgn) {
-            let mut has_match = false;
-            let mut all_ok = true;
-            for f in &info.fields {
-                let Some(expected) = f.match_value else {
-                    continue;
-                };
-                has_match = true;
-                let Some(bit_offset) = f.bit_offset else {
-                    all_ok = false;
-                    break;
-                };
-                let Some(bit_length) = f.bit_length else {
-                    all_ok = false;
-                    break;
-                };
-                match extract_bits(
-                    &frame.data,
-                    bit_offset as usize,
-                    bit_length as usize,
-                    f.signed.unwrap_or(false),
-                    f.offset.unwrap_or(0),
-                ) {
-                    Some(ex) if ex.value == expected => {}
-                    _ => {
-                        all_ok = false;
-                        break;
-                    }
-                }
-            }
-            if has_match && all_ok {
-                return Some(info);
-            }
-            // Record the in-PGN fallback. Prefer an explicit
-            // `Fallback: true` over a happenstance no-Match variant if
-            // both exist; otherwise take the first no-Match variant
-            // (canboat keeps at most one no-Match variant per PGN, and
-            // it carries the Fallback flag).
-            if !has_match && (info.fallback.unwrap_or(false) || in_pgn_fallback.is_none()) {
-                in_pgn_fallback = Some(info);
-            }
-        }
-        if let Some(v) = in_pgn_fallback {
-            return Some(v);
-        }
-        // Either there were no entries for this PGN at all, or every
-        // entry had `Match` fields that didn't match the frame's bits
-        // (Maretron-specific PGN 130823 seen on a Navico bus, etc.).
-        // Mirror canboat's `searchForUnknownPgn` — walk the load order
-        // and return the most recent `Fallback: true` entry whose PGN
-        // is <= the unknown one. Same range stub used for PGNs that
-        // aren't in canboat.json.
-        self.find_catchall(frame.pgn)
-    }
-
-    /// Inter-PGN catch-all: the latest `Fallback: true` definition
-    /// whose PGN number is `<= pgn`. PGN numbers in canboat.json are
-    /// non-decreasing, so a linear scan finds the right one in JSON
-    /// order. Called only when no entry for `pgn` exists at all.
-    fn find_catchall(&self, pgn: u32) -> Option<&PgnInfo> {
-        let mut best: Option<&PgnInfo> = None;
-        for info in self.pgns() {
-            if info.pgn > pgn {
-                break;
-            }
-            if info.fallback.unwrap_or(false) {
-                best = Some(info);
-            }
-        }
-        best
+    pub fn pick_variant(&self, frame: &RawFrame) -> Option<&'static PgnInfo> {
+        // Generated by `build.rs`: a `match` jumps to a per-PGN dispatch
+        // function that extracts each unique Match-field bit-range
+        // exactly once and returns the right variant in JSON order
+        // (or the no-Match fallback for that PGN). Falls back to the
+        // sparse cross-PGN `find_catchall` when no entry for this PGN
+        // number exists at all.
+        crate::schema_data::dispatch(frame.pgn, &frame.data)
+            .or_else(|| crate::schema_data::find_catchall(frame.pgn))
     }
 }
 
@@ -468,7 +493,7 @@ struct DecodeContext {
 }
 
 fn decode_fields(
-    info: &PgnInfo,
+    info: &'static PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
 ) -> Result<(Vec<DecodedField>, [bool; 2]), DecodeError> {
@@ -577,7 +602,7 @@ fn build_index_by_order(fields: &[DecodedField]) -> [i8; 32] {
         if f.repeat_set != 0 {
             continue;
         }
-        if let Some(slot) = (f.order as usize).checked_sub(1) {
+        if let Some(slot) = (f.order() as usize).checked_sub(1) {
             if slot < idx.len() && pos < i8::MAX as usize {
                 idx[slot] = pos as i8;
             }
@@ -588,7 +613,7 @@ fn build_index_by_order(fields: &[DecodedField]) -> [i8; 32] {
 
 #[allow(clippy::too_many_arguments)]
 fn decode_repeating(
-    info: &PgnInfo,
+    info: &'static PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
     out: &mut Vec<DecodedField>,
@@ -612,7 +637,7 @@ fn decode_repeating(
     // when the count field is NotAvailable or otherwise unresolved.
     let raw_count: Option<u32> = count_field_order.and_then(|cf| {
         out.iter()
-            .find(|d| (d.order as u32) == cf)
+            .find(|d| (d.order() as u32) == cf)
             .and_then(|d| match &d.value {
                 FieldValue::Integer(n) if *n >= 0 => Some(*n as u32),
                 FieldValue::Number(n) if *n >= 0.0 => Some(*n as u32),
@@ -696,8 +721,8 @@ fn decode_repeating(
 /// payload bits it actually consumed (which differs from `bit_length`
 /// for variable-length types like STRING_LAU and VARIABLE).
 fn decode_one_field_at(
-    f: &FieldInfo,
-    info: &PgnInfo,
+    f: &'static FieldInfo,
+    info: &'static PgnInfo,
     data: &[u8],
     db: &PgnDatabase,
     bit_offset: u32,
@@ -711,18 +736,13 @@ fn decode_one_field_at(
         let (value, bits_consumed) = decode_string_lau(data, bit_offset);
         return Some((
             DecodedField {
-                order: f.order,
-                id: f.id.clone(),
-                name: f.name.clone(),
-                unit: f.unit.clone(),
-                resolution: f.resolution,
-                precision: f.precision,
-                repeat_index: None,
-                repeat_set: 0,
-                part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+                info: f,
+                value,
                 bit_offset: Some(bit_offset),
                 bit_length: Some(bits_consumed),
-                value,
+                repeat_index: None,
+                repeat_set: 0,
+                overrides: None,
             },
             bits_consumed,
         ));
@@ -743,38 +763,27 @@ fn decode_one_field_at(
     if matches!(f.field_type, Some(FieldType::DynamicFieldValue)) {
         // Capture unit / resolution / precision from the resolved key
         // entry *before* `decode_dynamic_field_value` drains the
-        // context slots.
-        let unit = ctx
+        // context slots. The override is stashed alongside the
+        // DecodedField so `f.unit()` etc. resolve through it before
+        // falling back to the FieldInfo.
+        let overrides = ctx
             .dynamic_field_type
             .as_ref()
-            .and_then(|v| v.unit.clone())
-            .or_else(|| f.unit.clone());
-        let resolution = ctx
-            .dynamic_field_type
-            .as_ref()
-            .and_then(|v| v.resolution)
-            .or(f.resolution);
-        let precision = ctx
-            .dynamic_field_type
-            .as_ref()
-            .map(|v| v.precision)
-            .filter(|&p| p > 0)
-            .unwrap_or(f.precision);
+            .map(|v| Box::new(FieldOverrides {
+                unit: v.unit,
+                resolution: v.resolution,
+                precision: v.precision,
+            }));
         let (val, consumed_bits) = decode_dynamic_field_value(data, bit_offset, db, ctx);
         return Some((
             DecodedField {
-                order: f.order,
-                id: f.id.clone(),
-                name: f.name.clone(),
-                unit,
-                resolution,
-                precision,
-                repeat_index: None,
-                repeat_set: 0,
-                part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+                info: f,
+                value: val,
                 bit_offset: Some(bit_offset),
                 bit_length: Some(consumed_bits),
-                value: val,
+                repeat_index: None,
+                repeat_set: 0,
+                overrides,
             },
             consumed_bits,
         ));
@@ -799,18 +808,13 @@ fn decode_one_field_at(
         };
         return Some((
             DecodedField {
-                order: f.order,
-                id: f.id.clone(),
-                name: f.name.clone(),
-                unit: f.unit.clone(),
-                resolution: f.resolution,
-                precision: f.precision,
-                repeat_index: None,
-                repeat_set: 0,
-                part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+                info: f,
+                value,
                 bit_offset: Some(bit_offset),
                 bit_length: Some(avail),
-                value,
+                repeat_index: None,
+                repeat_set: 0,
+                overrides: None,
             },
             avail,
         ));
@@ -887,18 +891,13 @@ fn decode_one_field_at(
 
     Some((
         DecodedField {
-            order: f.order,
-            id: f.id.clone(),
-            name: f.name.clone(),
-            unit: f.unit.clone(),
-            resolution: f.resolution,
-            precision: f.precision,
-            repeat_index: None,
-            repeat_set: 0,
-            part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
+            info: f,
+            value,
             bit_offset: Some(bit_offset),
             bit_length: Some(bit_length),
-            value,
+            repeat_index: None,
+            repeat_set: 0,
+            overrides: None,
         },
         bit_length,
     ))
@@ -912,7 +911,7 @@ fn decode_one_field_at(
 /// `FIELD_INDEX` field picks one of the target PGN's fields, and the
 /// next VARIABLE field carries that field's value in its native shape.
 fn decode_variable(
-    f: &FieldInfo,
+    f: &'static FieldInfo,
     data: &[u8],
     db: &PgnDatabase,
     bit_offset: u32,
@@ -942,26 +941,29 @@ fn decode_variable(
     // Without this, Set2 in PGN 126208 Read Fields lands 5 bits early
     // and reads the next Parameter's bits from the wrong nibble.
     let bits_byte_aligned = bits.div_ceil(8) * 8;
+    // VARIABLE override: take the target field's unit/resolution/precision
+    // verbatim. The outer field's id/name (e.g. "Value", "Selection Value")
+    // is still what JSON should render, so we keep `info: f`.
+    let overrides = Some(Box::new(FieldOverrides {
+        unit: target_field.unit,
+        resolution: target_field.resolution,
+        precision: target_field.precision,
+    }));
     Some((
         DecodedField {
-            order: f.order,
-            id: f.id.clone(),
-            name: f.name.clone(),
-            unit: target_field.unit.clone().or(f.unit.clone()),
-            resolution: target_field.resolution.or(f.resolution),
-            precision: target_field.precision,
-            repeat_index: None,
-            repeat_set: 0,
-            part_of_primary_key: f.part_of_primary_key.unwrap_or(false),
-            bit_offset: Some(bit_offset),
+            info: f,
             // For VARIABLE fields, the `-debug` formatter wants the
             // diagnostic to reflect the sub-field's actual width when
             // it has one (so a 3-bit LOOKUP target shows
             // `bits = "010"`). When the sub-field is itself variable-
             // length (e.g. STRING_LAU), fall back to the consumed
             // byte-aligned size so we still emit the bytes annotation.
-            bit_length: target_field.bit_length.or(Some(bits_byte_aligned)),
             value: sub.value,
+            bit_offset: Some(bit_offset),
+            bit_length: target_field.bit_length.or(Some(bits_byte_aligned)),
+            repeat_index: None,
+            repeat_set: 0,
+            overrides,
         },
         bits_byte_aligned,
     ))
@@ -1039,10 +1041,9 @@ fn decode_lookup(
     let raw = ex.value as u64;
     let name = f
         .lookup_enumeration
-        .as_deref()
         .and_then(|n| db.lookup(n))
         .and_then(|t| t.get(raw))
-        .map(|v| v.name.clone());
+        .map(|v| v.name);
     // canboat: if no name is resolved AND value is in the reserved
     // sentinel range, drop the field (matches print.c:718). The
     // lookup check is one off from `is_unavailable`: canboat uses
@@ -1080,15 +1081,14 @@ fn decode_indirect_lookup(
         return FieldValue::NotAvailable;
     };
     let raw = ex.value as u64;
-    let name = (|| -> Option<String> {
-        let table_name = f.lookup_indirect_enumeration.as_deref()?;
+    let name = (|| -> Option<&'static str> {
+        let table_name = f.lookup_indirect_enumeration?;
         let val1_order = f.lookup_indirect_enumeration_field_order?;
         let val1_field = info.fields.iter().find(|x| x.order == val1_order)?;
         let val1_off = val1_field.bit_offset?;
         let val1_len = val1_field.bit_length?;
         let val1 = extract_bits(data, val1_off as usize, val1_len as usize, false, 0)?;
-        let resolved = db.indirect_lookup(table_name, val1.value as u64, raw)?;
-        Some(resolved.to_string())
+        db.indirect_lookup(table_name, val1.value as u64, raw)
     })();
     // Same print.c:718 rule we apply to plain LOOKUP — unknown values
     // in the top sentinel range drop the field rather than emitting a
@@ -1117,12 +1117,11 @@ fn decode_bitlookup(
     let mut bits = Vec::new();
     if let Some(t) = f
         .lookup_bit_enumeration
-        .as_deref()
         .and_then(|n| db.bit_lookup(n))
     {
-        for v in &t.values {
+        for v in t.values {
             if raw & (1u64 << v.bit) != 0 {
-                bits.push((1u64 << v.bit, v.name.clone()));
+                bits.push((1u64 << v.bit, v.name));
             }
         }
     }
@@ -1285,10 +1284,10 @@ fn decode_pgn_field(data: &[u8], bit_offset: u32, bit_length: u32, db: &PgnDatab
     // (one Airmar-only variant gated on Manufacturer Code) both fall
     // back to "value only" because we can't tell which variant applies
     // without actually decoding payload data.
-    let variants: Vec<&PgnInfo> = db.pgn_variants(pgn).collect();
+    let variants: Vec<&'static PgnInfo> = db.pgn_variants(pgn).collect();
     let description =
         if variants.len() == 1 && !variants[0].fields.iter().any(|f| f.match_value.is_some()) {
-            Some(variants[0].description.clone())
+            Some(variants[0].description)
         } else {
             None
         };
@@ -1496,10 +1495,9 @@ fn decode_dynamic_field_key(
     let raw = ex.value as u64;
     let entry = f
         .lookup_field_type_enumeration
-        .as_deref()
         .and_then(|n| db.field_type_lookup(n, raw));
-    let name = entry.map(|e| e.name.clone());
-    ctx.dynamic_field_type = entry.cloned();
+    let name = entry.map(|e| e.name);
+    ctx.dynamic_field_type = entry.copied();
     // Carry over canboat's "no resolution + reserved sentinel = N/A"
     // semantics so out-of-range keys decode as Unknown.
     if name.is_none() && is_unavailable(ex) {
@@ -1559,7 +1557,7 @@ fn decode_dynamic_field_value(
         Some(ft) if ft.starts_with("NUMBER") || ft.starts_with("FIX") || ft.starts_with("UFIX") => {
             decode_dynamic_number(data, bit_offset, bits, signed, &entry)
         }
-        Some("LOOKUP") => match entry.lookup_enumeration.as_deref() {
+        Some("LOOKUP") => match entry.lookup_enumeration {
             Some(name) => {
                 let Some(ex) = extract_bits(data, bit_offset as usize, bits as usize, false, 0)
                 else {
@@ -1569,7 +1567,7 @@ fn decode_dynamic_field_value(
                 let nm = db
                     .lookup(name)
                     .and_then(|t| t.get(raw))
-                    .map(|v| v.name.clone());
+                    .map(|v| v.name);
                 FieldValue::Lookup {
                     value: raw,
                     name: nm,
@@ -1590,7 +1588,7 @@ fn decode_dynamic_field_value(
             // name is in the small set known to be signed in
             // canboat's pgn.h.
             let known_signed_duration =
-                matches!(entry.name.as_str(), "Race Timer" | "Timezone offset");
+                matches!(entry.name, "Race Timer" | "Timezone offset");
             let want_signed = signed || known_signed_duration;
             // Always sentinel-check against the unsigned bit pattern,
             // even when the display interpretation is signed — canboat's
@@ -1660,21 +1658,9 @@ fn decode_dynamic_number(
 mod tests {
     use super::*;
     use crate::PgnDatabase;
-    use std::path::PathBuf;
-    use std::sync::OnceLock;
 
     fn db() -> &'static PgnDatabase {
-        static DB: OnceLock<PgnDatabase> = OnceLock::new();
-        DB.get_or_init(|| {
-            let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-            let path = manifest
-                .parent()
-                .and_then(|p| p.parent())
-                .unwrap()
-                .join("data")
-                .join("canboat.json");
-            PgnDatabase::load(path).expect("load canboat.json")
-        })
+        PgnDatabase::embedded()
     }
 
     #[test]

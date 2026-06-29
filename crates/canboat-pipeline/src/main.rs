@@ -29,20 +29,19 @@ mod tcp;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
-use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread;
 
-use anyhow::{bail, Context, Result};
+use anyhow::{bail, Result};
 use clap::Parser;
 
 use canboat_core::format::{
     detect, header_implies_coalesced, parse_format_header, parse_with, InputFormat,
 };
 use canboat_core::output::CamelCase;
-use canboat_core::{LoadOptions, PgnDatabase, RawFrame};
+use canboat_core::{PgnDatabase, RawFrame};
 use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
 use n2kd::request_engine::{self, RequestEngine};
@@ -51,8 +50,6 @@ use crate::hub::Hub;
 use crate::pipeline::Hubs;
 use crate::snapshot::SnapshotStore;
 
-const SYNTHETIC_PGNS_JSON: &str = include_str!("../../../data/synthetic-pgns.json");
-
 #[derive(Debug, Parser)]
 #[command(
     name = "canboat-pipeline",
@@ -60,11 +57,6 @@ const SYNTHETIC_PGNS_JSON: &str = include_str!("../../../data/synthetic-pgns.jso
     version
 )]
 struct Cli {
-    /// Path to canboat.json. Falls back to CANBOAT_JSON env, then
-    /// to the workspace-vendored copy at data/canboat.json.
-    #[arg(long, value_name = "PATH")]
-    db: Option<PathBuf>,
-
     /// Read frames from an Actisense NGT-1 / W2K-1 on this serial
     /// device path (e.g. `/dev/ttyUSB0`).
     #[arg(
@@ -245,15 +237,6 @@ struct Cli {
     #[arg(long)]
     nmea0183_stdout: bool,
 
-    /// Keep fields in their canboat-declared SI base units (rad,
-    /// Pa, K, C, …). Without this flag the pipeline applies
-    /// canboat's user-friendly fix-ups — Pa→bar, K→°C, C→Ah,
-    /// rad→deg — matching the canboat C analyzer's default. The
-    /// flag affects the analyzer JSON / snapshot ports and any
-    /// NMEA 0183 conversion that consumes raw field values.
-    #[arg(long)]
-    si: bool,
-
     /// Emit field keys + PGN descriptions as camelCase
     /// identifiers (`"uniqueNumber"` instead of `"Unique Number"`)
     /// on the analyzer JSON / snapshot TCP ports. Matches canboat
@@ -273,13 +256,6 @@ struct Cli {
     /// Quiet — only errors.
     #[arg(short = 'q', long)]
     quiet: bool,
-}
-
-fn default_db_path() -> Option<PathBuf> {
-    let here = std::env::current_exe().ok()?;
-    let workspace = here.ancestors().nth(3)?;
-    let candidate = workspace.join("data").join("canboat.json");
-    candidate.exists().then_some(candidate)
 }
 
 fn main() -> Result<()> {
@@ -308,17 +284,11 @@ fn run(cli: Cli) -> Result<()> {
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
 
-    let db_path = cli
-        .db
-        .clone()
-        .or_else(|| std::env::var_os("CANBOAT_JSON").map(PathBuf::from))
-        .or_else(default_db_path)
-        .context("no canboat.json path supplied (pass --db or set CANBOAT_JSON)")?;
-    let load_opts = LoadOptions { si: cli.si };
-    let mut db = PgnDatabase::load_with(&db_path, load_opts)
-        .with_context(|| format!("loading PGN database {}", db_path.display()))?;
-    db.merge_pgns_from_json_with(SYNTHETIC_PGNS_JSON, load_opts)
-        .context("merging synthetic PGN definitions")?;
+    // The schema is compiled into the binary; no JSON loading, no
+    // path discovery, no synthetic-PGN merge — `canboat-core/build.rs`
+    // already folded `data/synthetic-pgns.json` into the static
+    // tables.
+    let db = PgnDatabase::embedded();
 
     let snapshot = if cli.snapshot_port != 0 {
         Some(Arc::new(SnapshotStore::new()))

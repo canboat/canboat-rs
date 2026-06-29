@@ -103,9 +103,9 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
         // canboat's `repetition` counter resets to 0 there, so the
         // suffix is suppressed for these fields only.
         if let (Some(iter), true) = (f.repeat_index, f.repeat_set != 0) {
-            write!(w, "{name} {iter} = ", name = f.name, iter = iter + 1)?;
+            write!(w, "{name} {iter} = ", name = f.name(), iter = iter + 1)?;
         } else {
-            write!(w, "{name} = ", name = f.name)?;
+            write!(w, "{name} = ", name = f.name())?;
         }
         write_field_value(w, f, opts.geo)?;
         if opts.debug {
@@ -156,7 +156,7 @@ fn write_text_debug_suffix<W: fmt::Write>(
     use crate::bits::extract_bits;
     let signed = matches!(
         f.value,
-        FieldValue::Number(_) if f.unit.is_some()
+        FieldValue::Number(_) if f.unit().is_some()
     );
     let Some(ex) = extract_bits(payload, bo as usize, bl as usize, signed, 0) else {
         return Ok(());
@@ -193,10 +193,10 @@ fn write_text_debug_suffix<W: fmt::Write>(
 /// on the field's resolution/range; we don't carry that bit, so match
 /// by name + unit instead. Same `strstr(fieldName, "ongit")` shape.
 fn is_latlon(f: &DecodedField) -> bool {
-    if f.unit.as_deref() != Some("deg") {
+    if f.unit().as_deref() != Some("deg") {
         return false;
     }
-    let n: &str = &f.name;
+    let n: &str = &f.name();
     n.contains("atitude") || n.contains("ongitude") || n.contains("atit") || n.contains("ongit")
 }
 
@@ -261,18 +261,18 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
             // with a lat/lon-shaped field name. `-geo dm` / `-geo dms`
             // switch to compass-style output.
             if is_latlon(f) {
-                return write_latlon(w, *v, &f.name, geo);
+                return write_latlon(w, *v, &f.name(), geo);
             }
-            let p = effective_precision(f.precision, f.resolution);
+            let p = effective_precision(f.precision(), f.resolution());
             write!(w, "{:.*}", p, v)?;
-            if let Some(unit) = &f.unit {
+            if let Some(unit) = &f.unit() {
                 write!(w, " {}", unit)?;
             }
             Ok(())
         }
         FieldValue::Integer(v) => {
             write!(w, "{}", v)?;
-            if let Some(unit) = &f.unit {
+            if let Some(unit) = &f.unit() {
                 write!(w, " {}", unit)?;
             }
             Ok(())
@@ -281,7 +281,7 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
             // canboat uses %g for floats — Rust's `{}` for f64 is close
             // enough for v0.
             write!(w, "{}", v)?;
-            if let Some(unit) = &f.unit {
+            if let Some(unit) = &f.unit() {
                 write!(w, " {}", unit)?;
             }
             Ok(())
@@ -320,7 +320,7 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
         FieldValue::String(s) => w.write_str(s),
         FieldValue::Date(d) => format_date(*d, w),
         FieldValue::Time { seconds, .. } => {
-            let p = effective_precision(f.precision, f.resolution);
+            let p = effective_precision(f.precision(), f.resolution());
             format_time(*seconds, p, true, w)
         }
         FieldValue::Mmsi(v) => write!(w, "\"{:09}\"", v),
@@ -348,7 +348,7 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
                         continue;
                     }
                     w.write_str(sep)?;
-                    write!(w, " {name} = ", name = sf.name)?;
+                    write!(w, " {name} = ", name = sf.name())?;
                     write_field_value(w, sf, geo)?;
                     sep = ";";
                 }
@@ -373,42 +373,40 @@ mod tests {
             pgn: 60928,
             src: 5,
             dst: 255,
-            description: "ISO Address Claim".into(),
-            id: "isoAddressClaim".into(),
+            description: "ISO Address Claim",
+            id: "isoAddressClaim",
             data: Vec::new(),
-            fields: vec![
-                DecodedField {
-                    order: 1,
-                    id: "uniqueNumber".into(),
-                    name: "Unique Number".into(),
-                    unit: None,
-                    resolution: Some(1.0),
-                    precision: 0,
-                    repeat_index: None,
-                    bit_offset: None,
-                    bit_length: None,
-                    repeat_set: 0,
-                    part_of_primary_key: false,
-                    value: FieldValue::Integer(1_088_507),
-                },
-                DecodedField {
-                    order: 2,
-                    id: "manufacturerCode".into(),
-                    name: "Manufacturer Code".into(),
-                    unit: None,
-                    resolution: Some(1.0),
-                    precision: 0,
-                    repeat_index: None,
-                    bit_offset: None,
-                    bit_length: None,
-                    repeat_set: 0,
-                    part_of_primary_key: false,
-                    value: FieldValue::Lookup {
-                        value: 275,
-                        name: Some("Navico".into()),
+            fields: {
+                // PGN 60928 fields 1 and 2 are Unique Number + Manufacturer
+                // Code — the exact two records the legacy fixture
+                // hand-rolled before Phase 5.
+                let info = crate::PgnDatabase::embedded()
+                    .first_pgn(60928)
+                    .expect("PGN 60928 present");
+                vec![
+                    DecodedField {
+                        info: &info.fields[0],
+                        value: FieldValue::Integer(1_088_507),
+                        bit_offset: None,
+                        bit_length: None,
+                        repeat_index: None,
+                        repeat_set: 0,
+                        overrides: None,
                     },
-                },
-            ],
+                    DecodedField {
+                        info: &info.fields[1],
+                        value: FieldValue::Lookup {
+                            value: 275,
+                            name: Some("Navico"),
+                        },
+                        bit_offset: None,
+                        bit_length: None,
+                        repeat_index: None,
+                        repeat_set: 0,
+                        overrides: None,
+                    },
+                ]
+            },
             has_repeating_set: [false, false],
             index_by_order: [i8::MIN; 32],
         }
@@ -442,15 +440,7 @@ mod tests {
         // verify the text header + first three fields render in the
         // expected shape.
         use crate::{PgnDatabase, RawFrame};
-        use std::path::PathBuf;
-        let manifest = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-        let path = manifest
-            .parent()
-            .and_then(|p| p.parent())
-            .unwrap()
-            .join("data")
-            .join("canboat.json");
-        let db = PgnDatabase::load(path).expect("load canboat.json");
+        let db = PgnDatabase::embedded();
         let frame = RawFrame {
             timestamp: Some("2022-09-10T12:10:16.614Z".into()),
             prio: 6,

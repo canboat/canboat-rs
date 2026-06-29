@@ -494,7 +494,15 @@ fn write_field_value_debug<W: fmt::Write>(
             let mut buf = String::with_capacity(12);
             super::format_time(*seconds, p, false, &mut buf)?;
             if opts.name_value {
-                write!(w, "{}", raw)?;
+                // Same scaling rule as the non-debug `Time` arm
+                // (canboat C's `fieldPrintTime`): emit `seconds` for
+                // resolution >= 1, raw for sub-second resolution.
+                let print_value: i64 = if f.resolution.is_some_and(|r| r >= 1.0) {
+                    *seconds as i64
+                } else {
+                    *raw
+                };
+                write!(w, "{}", print_value)?;
                 w.write_str(",\"name\":")?;
                 write_json_string(w, &buf)?;
             } else {
@@ -678,9 +686,20 @@ fn write_field_value<W: fmt::Write>(
             let mut buf = String::with_capacity(12);
             super::format_time(*seconds, p, false, &mut buf)?;
             if opts.name_value {
-                // canboat -nv: {"value":<raw>,"name":"HH:MM:SS.SSSS"}
+                // canboat -nv: `{"value":N,"name":"HH:MM:SS.SSSS"}`.
+                // `fieldPrintTime` in canboat C scales `value` by
+                // `resolution` when resolution >= 1 (so `value` ends
+                // up in seconds), and leaves it raw when resolution
+                // < 1 (so a 0.0001-s System Time emits the raw
+                // 10000-units-per-second integer rather than a
+                // fractional second). Mirror that.
+                let print_value: i64 = if f.resolution.is_some_and(|r| r >= 1.0) {
+                    *seconds as i64
+                } else {
+                    *raw
+                };
                 w.write_str("{\"value\":")?;
-                write!(w, "{}", raw)?;
+                write!(w, "{}", print_value)?;
                 w.write_str(",\"name\":")?;
                 write_json_string(w, &buf)?;
                 w.write_char('}')

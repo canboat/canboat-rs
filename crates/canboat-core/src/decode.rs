@@ -321,6 +321,11 @@ pub struct DecodedPgn {
     pub description: &'static str,
     /// canboat.json `Id` — stable camelCase identifier.
     pub id: &'static str,
+    /// Mirror of [`crate::types::PgnInfo::id_is_pinned`]: `true` when
+    /// the schema's canboat C source explicitly pinned this PGN's
+    /// `Id`. The JSON formatter wraps such records in `{"<id>":{…}}`
+    /// to flag the stability contract to consumers.
+    pub id_is_pinned: bool,
     /// The raw payload bytes the fields were decoded from. Kept on
     /// the DecodedPgn so the `-debug` JSON formatter can extract
     /// per-field `bytes` / `bits` annotations without holding the
@@ -430,6 +435,7 @@ impl PgnDatabase {
             dst: frame.dst,
             description: info.description,
             id: info.id,
+            id_is_pinned: info.id_is_pinned,
             data: frame.data.to_vec(),
             fields,
             has_repeating_set,

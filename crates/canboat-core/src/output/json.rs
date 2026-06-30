@@ -106,6 +106,18 @@ thread_local! {
 }
 
 pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions) -> fmt::Result {
+    // canboat 7.1.0: wrap the record in `{"<id>":{...}}` when the
+    // PGN's `Id` was explicitly pinned in the canboat C source. Today
+    // only PGN 130846 fires this — the Id was preserved across a
+    // Description rename. The trailing `}` is balanced after the body
+    // closes. See `analyzer/analyzer.c::printPgn` and
+    // `analyzer/pgn.c::camelCase` (PR canboat#705 / canboat-rs #9).
+    if pgn.id_is_pinned {
+        w.write_char('{')?;
+        w.write_str("\"")?;
+        w.write_str(pgn.id)?;
+        w.write_str("\":")?;
+    }
     w.write_char('{')?;
     if let Some(ts) = &pgn.timestamp {
         w.write_str("\"timestamp\":")?;
@@ -132,7 +144,11 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     fields_buf.clear();
     let result = write_json_inner(w, pgn, opts, &mut fields_buf);
     FIELDS_BUF.with(|c| *c.borrow_mut() = fields_buf);
-    result
+    result?;
+    if pgn.id_is_pinned {
+        w.write_char('}')?;
+    }
+    Ok(())
 }
 
 fn write_json_inner<W: fmt::Write>(
@@ -925,6 +941,7 @@ mod tests {
             dst: 255,
             description: "Water Depth",
             id: "waterDepth",
+            id_is_pinned: false,
             data: Vec::new(),
             fields: vec![DecodedField {
                 info: offset_field,

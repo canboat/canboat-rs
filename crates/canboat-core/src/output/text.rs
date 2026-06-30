@@ -373,6 +373,7 @@ mod tests {
             dst: 255,
             description: "ISO Address Claim",
             id: "isoAddressClaim",
+            id_is_pinned: false,
             data: Vec::new(),
             fields: {
                 // PGN 60928 fields 1 and 2 are Unique Number + Manufacturer

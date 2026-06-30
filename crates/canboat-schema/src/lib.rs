@@ -119,6 +119,14 @@ pub struct PgnInfo {
     pub repeating_field_set2_size: Option<u32>,
     pub repeating_field_set2_start_field: Option<u32>,
     pub repeating_field_set2_count_field: Option<u32>,
+    /// `true` when the canboat C source pinned the PGN's
+    /// `Id` explicitly (i.e. it doesn't match the natural camelCase
+    /// of [`Self::description`]). canboat 7.1.0's JSON formatter
+    /// wraps such PGNs in `{"<id>":{...}}` so downstream consumers
+    /// can rely on a stable id even after a Description rename. Only
+    /// PGN 130846 carries this today; the contract is documented in
+    /// canboat's `analyzer/pgn.c::camelCase()`.
+    pub id_is_pinned: bool,
 }
 
 /// One (value, name) entry inside a LOOKUP enumeration.

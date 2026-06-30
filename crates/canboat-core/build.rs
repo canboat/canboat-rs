@@ -380,6 +380,35 @@ fn quote(s: &str) -> String {
     format!("{s:?}")
 }
 
+/// Mirror canboat C's `camelize()` in `analyzer/pgn.c`. Strips every
+/// non-alphanumeric character, lowercases the first surviving char,
+/// and uppercases the first char following a separator.
+///
+/// Used at build time to decide whether a PGN's `Id` was explicitly
+/// pinned: when `camelize(description) != id`, the canboat C source
+/// set `.camelDescription` to override the naturally-derived id (the
+/// only case in v7.1.0 is PGN 130846 — `Id="simnetParameterSet"`
+/// preserving the v7.0.0 contract after the Description rename), and
+/// the JSON formatter wraps that PGN's record in `{"<id>":{…}}` to
+/// signal the stable id to downstream consumers.
+fn camelize_lower(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut last_is_alpha = true; // mirrors `!upperCamelCase`
+    for c in s.chars() {
+        if c.is_ascii_alphanumeric() {
+            if last_is_alpha {
+                out.extend(c.to_lowercase());
+            } else {
+                out.extend(c.to_uppercase());
+                last_is_alpha = true;
+            }
+        } else {
+            last_is_alpha = false;
+        }
+    }
+    out
+}
+
 fn opt_str(s: &Option<String>) -> String {
     match s {
         Some(v) => format!("Some({})", quote(v)),
@@ -526,7 +555,12 @@ fn emit_field(out: &mut String, f: &RawField, c: Computed) {
     .unwrap();
 }
 
-fn emit_pgn(out: &mut String, p: &RawPgn, fields_with_computed: &[(RawField, Computed)]) {
+fn emit_pgn(
+    out: &mut String,
+    p: &RawPgn,
+    fields_with_computed: &[(RawField, Computed)],
+    from_synthetic: bool,
+) {
     writeln!(
         out,
         "PgnInfo{{pgn:{pgn},id:{id},description:{description},explanation:{explanation},\
@@ -554,17 +588,24 @@ fn emit_pgn(out: &mut String, p: &RawPgn, fields_with_computed: &[(RawField, Com
     for (f, c) in fields_with_computed {
         emit_field(out, f, *c);
     }
+    // Synthetic PGNs (post-canboat.json list) never wrap — they're
+    // not in canboat C's PGN list, so the camelDescription contract
+    // doesn't apply. Otherwise: pinned iff the natural camelize of
+    // the description doesn't yield the declared Id.
+    let id_is_pinned = !from_synthetic && camelize_lower(&p.description) != p.id;
     writeln!(
         out,
         "],repeating_field_set1_size:{r1s},repeating_field_set1_start_field:{r1sf},\
          repeating_field_set1_count_field:{r1cf},repeating_field_set2_size:{r2s},\
-         repeating_field_set2_start_field:{r2sf},repeating_field_set2_count_field:{r2cf}}},",
+         repeating_field_set2_start_field:{r2sf},repeating_field_set2_count_field:{r2cf},\
+         id_is_pinned:{pinned}}},",
         r1s = opt_int(&p.repeating_field_set1_size),
         r1sf = opt_int(&p.repeating_field_set1_start_field),
         r1cf = opt_int(&p.repeating_field_set1_count_field),
         r2s = opt_int(&p.repeating_field_set2_size),
         r2sf = opt_int(&p.repeating_field_set2_start_field),
         r2cf = opt_int(&p.repeating_field_set2_count_field),
+        pinned = id_is_pinned,
     )
     .unwrap();
 }
@@ -755,6 +796,7 @@ fn main() {
     // behaviour (the synthetic range is at 0x40000+, well above any
     // proprietary catch-all).
     let mut pgns: Vec<RawPgn> = canboat.pgns;
+    let canboat_pgn_count = pgns.len();
     pgns.extend(synthetic.pgns);
 
     // Apply non-SI fix-up to every field, capturing the derived
@@ -831,10 +873,14 @@ fn main() {
     )
     .unwrap();
 
-    // PGNS array.
+    // PGNS array. Entries past `canboat_pgn_count` come from
+    // synthetic-pgns.json — canboat C doesn't know about those, so
+    // their Ids shouldn't trigger the camelDescription wrapping
+    // even when they happen to differ from camelize(description).
     writeln!(out, "pub static PGNS: &[PgnInfo] = &[").unwrap();
-    for (p, fields) in &pgn_with_fields {
-        emit_pgn(&mut out, p, fields);
+    for (i, (p, fields)) in pgn_with_fields.iter().enumerate() {
+        let from_synthetic = i >= canboat_pgn_count;
+        emit_pgn(&mut out, p, fields, from_synthetic);
     }
     writeln!(out, "];").unwrap();
 

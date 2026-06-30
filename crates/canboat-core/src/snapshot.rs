@@ -76,22 +76,66 @@ pub fn ttl_for_pgn(pgn: u32, is_ais: bool) -> Option<Duration> {
     }
 }
 
-/// Ordered list of secondary-discriminator field names. The first
-/// matching field becomes the suffix on the `<src>_<secondary>` key
-/// in the snapshot output; the bool flag marks fields that identify
-/// AIS records (which get [`AIS_TTL`]).
+/// PGN numbers that identify AIS messages (NMEA 2000 PGNs 129038
+/// through 129810 — both the position-report family and the safety /
+/// management messages). Used by [`is_ais_pgn`] to assign
+/// [`AIS_TTL`] regardless of which discriminator field carries the
+/// MMSI. Sorted ascending for binary-search lookup.
 ///
-/// Both binaries iterate this list with their own matching mechanism
-/// (n2kd does substring scan over the JSON line; canboat-pipeline
-/// reads `decoded.field_by_name`) so the *content* stays in lock-step
-/// even when the extraction differs.
-pub const SECONDARY_FIELDS: &[(&str, bool)] = &[
-    ("Instance", false),
-    ("Reference", false),
-    ("User ID", true),
-    ("Message ID", true),
-    ("Proprietary ID", false),
+/// This list replaces the canboat C n2kd "any field named `User ID`
+/// or `Message ID` is AIS" proxy — `Message ID` in particular is
+/// declared as a primary-key field on dozens of non-AIS PGNs in
+/// canboat 7.1.0, so the proxy over-fires today.
+pub const AIS_PGNS: &[u32] = &[
+    129038, 129039, 129040, 129041, 129793, 129794, 129795, 129796, 129797, 129798, 129801, 129802,
+    129803, 129804, 129805, 129806, 129807, 129808, 129809, 129810,
 ];
+
+/// `true` iff `pgn` identifies an AIS message that should get
+/// [`AIS_TTL`] in the snapshot store.
+#[inline]
+pub fn is_ais_pgn(pgn: u32) -> bool {
+    AIS_PGNS.binary_search(&pgn).is_ok()
+}
+
+/// Compose the schema-driven secondary discriminator for a record by
+/// walking every field marked `PartOfPrimaryKey` on the PGN's
+/// [`PgnInfo`], looking each one up via `get_text`, and joining the
+/// resolved values with `_`. Returns `None` when the PGN has no
+/// primary key declared, or when none of its PK fields produced a
+/// textual value.
+///
+/// This is canboat-rs's deliberate divergence from canboat C n2kd's
+/// "first-name-from-hardcoded-list wins" key extraction (#2). The
+/// canboat 7.1.0 schema declares primary keys on 115 PGNs, 26 of
+/// which are *composite* (multiple PK fields). The hand-rolled list
+/// picked one field, joined nothing, and collided whenever the
+/// remaining PK fields varied — e.g. PGN 127509's `Instance + AC
+/// Instance + DC Instance`, where two charger inverters on the same
+/// nominal Instance would overwrite each other in the cache. The
+/// schema-driven composite key gives them separate entries.
+///
+/// Fields inside repeating sets are skipped — primary keys are
+/// top-level in every canboat-declared PGN today.
+pub fn composite_secondary<F>(info: &crate::PgnInfo, mut get_text: F) -> Option<String>
+where
+    F: FnMut(&crate::FieldInfo) -> Option<String>,
+{
+    let mut parts: Vec<String> = Vec::new();
+    for f in info.fields {
+        if f.part_of_primary_key != Some(true) {
+            continue;
+        }
+        if let Some(s) = get_text(f) {
+            parts.push(s);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("_"))
+    }
+}
 
 /// One record to be stashed in the snapshot cache. The caller is
 /// responsible for classifying its input (analyzer-JSON line or
@@ -102,12 +146,13 @@ pub struct SnapshotInput {
     pub pgn: u32,
     /// Source address on the N2K bus.
     pub src: u8,
-    /// Readable value of the first matching [`SECONDARY_FIELDS`] entry,
-    /// or `None` if no discriminator field was present.
+    /// Schema-driven secondary discriminator from
+    /// [`composite_secondary`] — `_`-joined across every
+    /// `PartOfPrimaryKey` field declared on the PGN, or `None` when
+    /// the PGN has no primary key.
     pub secondary: Option<String>,
-    /// `true` when an AIS-marker secondary field was seen on this
-    /// record (separate from which discriminator produced the
-    /// `secondary` text).
+    /// `true` when [`is_ais_pgn`] flags this PGN. Drives the longer
+    /// [`AIS_TTL`] and routes the record to the AIS snapshot port.
     pub is_ais: bool,
     /// The PGN's full description, e.g. `"Simnet: Device Status"`.
     /// The store truncates at the first `:` for the snapshot wrapper.

@@ -139,25 +139,29 @@ pub fn value_or_name<'a>(msg: &'a str, field: &str) -> Option<&'a str> {
     Some(v)
 }
 
-/// Resolve `field`'s readable text following canboat C n2kd's
-/// secondary-key extraction (`n2kd/main.c:1022-1067`):
+/// Resolve `field`'s readable text for the schema-driven snapshot
+/// key:
 ///
-/// 1. If the field's value is a lookup object `{"value":N,"name":"X"}`,
-///    prefer `name`; otherwise fall back to `value` (so `"Instance":
-///    {"value":0,"key":true}` resolves to `"0"`).
-/// 2. Truncate the result at the first ASCII whitespace — so
-///    `"True (ground referenced to North)"` becomes `"True"`. This
-///    is how C collapses long readable names into a stable cache
-///    suffix and matches its `<src>_<secondary>` snapshot keys.
+/// 1. If the field's value is a `-nv` lookup object
+///    `{"value":N,"name":"X"}`, prefer `name`; otherwise fall back to
+///    `value` (so `"Instance":{"value":0,"key":true}` resolves to
+///    `"0"`).
+/// 2. Return the value verbatim — no whitespace truncation. canboat
+///    C n2kd's `n2kd/main.c:1064` cut at the first space so
+///    `"True (ground referenced to North)"` became `"True"`. We
+///    don't, because canboat-rs builds composite cache keys from
+///    every `PartOfPrimaryKey` field on the PGN (issue #2) and a
+///    consistent full-name representation is what the
+///    `canboat_core::snapshot::composite_secondary` walker on the
+///    pipeline path produces. Truncating only here would produce
+///    different keys depending on which backend wrote the entry.
 pub fn lookup_text<'a>(msg: &'a str, field: &str) -> Option<&'a str> {
     let v = value(msg, field)?;
-    let raw = if v.starts_with('{') {
-        value(v, "name").or_else(|| value(v, "value"))?
+    if v.starts_with('{') {
+        value(v, "name").or_else(|| value(v, "value"))
     } else {
-        v
-    };
-    let end = raw.find(char::is_whitespace).unwrap_or(raw.len());
-    Some(&raw[..end])
+        Some(v)
+    }
 }
 
 #[cfg(test)]
@@ -207,13 +211,18 @@ mod tests {
     }
 
     #[test]
-    fn lookup_text_truncates_at_first_whitespace() {
-        // canboat C collapses long readable names at the first space —
-        // see the e=strchr(s,' ') / e2=strchr(s,'"') logic in
-        // n2kd/main.c:1064.
+    fn lookup_text_returns_full_name_with_whitespace() {
+        // Schema-driven snapshot keys (issue #2) use the canboat enum
+        // name verbatim — no whitespace truncation. The matching
+        // canboat-pipeline path renders Lookups the same way, so the
+        // two backends agree on the cache key regardless of which
+        // wrote the entry.
         let m =
             r#"{"Reference":{"value":0,"name":"True (ground referenced to North)","key":true}}"#;
-        assert_eq!(lookup_text(m, "Reference"), Some("True"));
+        assert_eq!(
+            lookup_text(m, "Reference"),
+            Some("True (ground referenced to North)")
+        );
     }
 
     #[test]

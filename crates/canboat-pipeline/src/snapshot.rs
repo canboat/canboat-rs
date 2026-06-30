@@ -8,8 +8,8 @@
 
 use std::sync::Arc;
 
-use canboat_core::snapshot::{SECONDARY_FIELDS, SnapshotInput};
-use canboat_core::{DecodedField, DecodedPgn, FieldValue};
+use canboat_core::snapshot::{SnapshotInput, composite_secondary, is_ais_pgn};
+use canboat_core::{DecodedField, DecodedPgn, FieldValue, PgnDatabase};
 
 /// Thin wrapper that keeps the existing `SnapshotStore::store(decoded,
 /// line)` API used by pipeline callers, while delegating the cache /
@@ -67,26 +67,25 @@ impl Default for SnapshotStore {
     }
 }
 
-/// Find the secondary key value (as text) for `decoded`. Returns
-/// `(maybe_text, is_ais)`:
-///
-/// * `maybe_text` is `Some` when one of [`SECONDARY_FIELDS`] matched.
-/// * `is_ais` is true when any AIS-marker field name appears on the
-///   record (separate from which one produced the text).
+/// Find the schema-driven secondary discriminator and the AIS flag
+/// for `decoded`. The secondary key is `_`-joined across every field
+/// the canboat schema marks `PartOfPrimaryKey` (composite for the
+/// ~26 PGNs that declare multiple PK fields). The AIS flag is set
+/// purely from the PGN number — see
+/// [`canboat_core::snapshot::is_ais_pgn`].
 fn classify(decoded: &DecodedPgn) -> (Option<String>, bool) {
-    let mut text: Option<String> = None;
-    let mut is_ais = false;
-    for (name, ais) in SECONDARY_FIELDS {
-        if let Some(field) = decoded.field_by_name(name) {
-            if *ais {
-                is_ais = true;
-            }
-            if text.is_none() {
-                text = field_value_text(field);
-            }
-        }
-    }
-    (text, is_ais)
+    let is_ais = is_ais_pgn(decoded.pgn);
+    let Some(info) = PgnDatabase::embedded().first_pgn(decoded.pgn) else {
+        return (None, is_ais);
+    };
+    let secondary = composite_secondary(info, |f| {
+        decoded
+            .fields
+            .iter()
+            .find(|d| d.repeat_set == 0 && d.info.order == f.order)
+            .and_then(field_value_text)
+    });
+    (secondary, is_ais)
 }
 
 /// Render the discriminating value as the bare text canboat C would

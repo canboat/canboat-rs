@@ -34,7 +34,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use canboat_core::snapshot::{SECONDARY_FIELDS, SnapshotInput, SnapshotStore};
+use canboat_core::snapshot::{SnapshotInput, SnapshotStore};
 use clap::Parser;
 
 use crate::nmea0183::RateLimiter;
@@ -588,15 +588,15 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
 struct Meta {
     pgn: u32,
     src: u8,
-    /// Readable value of the first matching
-    /// [`canboat_core::snapshot::SECONDARY_FIELDS`] entry on the
-    /// record, or `None` if none matched. Matches canboat C's
-    /// first-key-only behavior (`m_key2` is a single field per
-    /// message).
+    /// Schema-driven secondary discriminator built by
+    /// [`canboat_core::snapshot::composite_secondary`] — `_`-joined
+    /// across every field the canboat database marks
+    /// `PartOfPrimaryKey` for this PGN. `None` when the PGN
+    /// declares no primary key.
     secondary: Option<String>,
-    /// Set when any AIS-marker secondary field is present on the
-    /// record. Drives the longer `AIS_TTL` and the AIS subscriber
-    /// fan-out.
+    /// Set when [`canboat_core::snapshot::is_ais_pgn`] flags this PGN
+    /// as AIS-described. Drives the longer `AIS_TTL` and the AIS
+    /// subscriber fan-out.
     is_ais: bool,
     /// The PGN's full description (e.g. `"Simnet: Device Status"`) for
     /// the snapshot wrapper. Empty when the analyzer didn't emit a
@@ -608,25 +608,23 @@ fn extract_meta(line: &str) -> Option<Meta> {
     let pgn = json::int(line, "pgn")? as u32;
     let src = json::int(line, "src")? as u8;
     let description = json::value(line, "description").unwrap_or("").to_string();
-    // canboat C n2kd uses the *first* matching secondary key field
-    // only (m_key2 is a single field per message). Match that — both
-    // for the cache key and for the snapshot's `<src>_<secondary>`
-    // suffix.
-    let mut secondary: Option<String> = None;
-    let mut is_ais = false;
-    for (name, ais) in SECONDARY_FIELDS {
-        // `lookup_text` matches canboat C's preferred-name /
-        // fallback-value behavior — `Instance":{"value":0,"key":true}`
-        // (no `name`) resolves to "0", same as canboat C n2kd.
-        if let Some(v) = json::lookup_text(line, name) {
-            if secondary.is_none() {
-                secondary = Some(v.to_string());
-            }
-            if *ais {
-                is_ais = true;
-            }
-        }
-    }
+    let is_ais = canboat_core::snapshot::is_ais_pgn(pgn);
+    // Schema-driven primary key: walk every field the canboat database
+    // marks `PartOfPrimaryKey` for this PGN, look each up in the
+    // analyzer JSON by its display name, and `_`-join the resolved
+    // values. canboat-rs's deliberate divergence from canboat C n2kd's
+    // first-name-from-hardcoded-list behavior; see issue #2 and
+    // [`canboat_core::snapshot::composite_secondary`].
+    let secondary = match canboat_core::PgnDatabase::embedded().first_pgn(pgn) {
+        Some(info) => canboat_core::snapshot::composite_secondary(info, |f| {
+            // `lookup_text` mirrors canboat C's preferred-name /
+            // fallback-value behavior — e.g. `"Instance":{"value":0,
+            // "key":true}` (no `name`) resolves to "0", same as
+            // canboat C n2kd.
+            json::lookup_text(line, f.name).map(|s| s.to_string())
+        }),
+        None => None,
+    };
     Some(Meta {
         pgn,
         src,
@@ -753,28 +751,52 @@ mod tests {
         let line = r#"{"timestamp":"…","src":23,"pgn":129039,"fields":{"Message ID":18,"User ID":"244180106"}}"#;
         let meta = extract_meta(line).unwrap();
         assert!(meta.is_ais);
-        // canboat C uses the first matching secondary key only.
-        // "User ID" sits ahead of "Message ID" in SECONDARY_FIELDS so
-        // it's the cache discriminator for AIS records.
+        // Schema 2.5.0 declares only `User ID` as PartOfPrimaryKey on
+        // PGN 129039 — Message ID is NOT a discriminator here. The
+        // hand-rolled SECONDARY_FIELDS list got the same answer by
+        // accident (User ID happened to sit ahead of Message ID); the
+        // schema-driven path is right for the right reason.
         assert_eq!(meta.secondary.as_deref(), Some("244180106"));
     }
 
     #[test]
     fn extract_meta_uses_lookup_name_when_present() {
-        // -nv mode wraps a lookup as `{"value":1,"name":"True"}`; the
-        // snapshot key should be the readable name, not the integer.
-        let line = r#"{"src":7,"pgn":127250,"fields":{"Reference":{"value":1,"name":"True"}}}"#;
+        // -nv mode wraps a lookup as `{"value":1,"name":"Outside
+        // Temperature"}`; the snapshot key should pick up the readable
+        // name, not the integer. PGN 130312 (Temperature) declares
+        // `Instance + Source` as a composite primary key, with Source
+        // being a LOOKUP into TEMPERATURE_SOURCE.
+        let line = r#"{"src":7,"pgn":130312,"fields":{"Instance":0,"Source":{"value":1,"name":"Outside Temperature"},"Actual Temperature":18.5}}"#;
         let meta = extract_meta(line).unwrap();
-        assert_eq!(meta.secondary.as_deref(), Some("True"));
+        // Composite PK: `<Instance>_<Source-name>`
+        assert_eq!(meta.secondary.as_deref(), Some("0_Outside Temperature"));
     }
 
     #[test]
     fn extract_meta_falls_back_to_lookup_value_when_no_name() {
         // -nv "key":true lookups (e.g. PGN 127501 Instance) carry
-        // only `value` — canboat C uses that as the secondary text.
+        // only `value` — `lookup_text` strips it to "0".
         let line = r#"{"src":17,"pgn":127501,"fields":{"Instance":{"value":0,"key":true}}}"#;
         let meta = extract_meta(line).unwrap();
         assert_eq!(meta.secondary.as_deref(), Some("0"));
+    }
+
+    #[test]
+    fn composite_pk_keys_distinguish_otherwise_identical_records() {
+        // PGN 127509 (Inverter Status) declares `Instance + AC Instance
+        // + DC Instance` as a composite PK. Two records that share
+        // Instance=0 but differ in AC Instance must get distinct cache
+        // keys — canboat C n2kd's first-match SECONDARY_FIELDS would
+        // collapse them into the same `<src>_0` entry, dropping data.
+        let a =
+            r#"{"src":35,"pgn":127509,"fields":{"Instance":0,"AC Instance":0,"DC Instance":1}}"#;
+        let b =
+            r#"{"src":35,"pgn":127509,"fields":{"Instance":0,"AC Instance":1,"DC Instance":0}}"#;
+        let ma = extract_meta(a).unwrap();
+        let mb = extract_meta(b).unwrap();
+        assert_eq!(ma.secondary.as_deref(), Some("0_0_1"));
+        assert_eq!(mb.secondary.as_deref(), Some("0_1_0"));
+        assert_ne!(ma.secondary, mb.secondary);
     }
 
     #[test]

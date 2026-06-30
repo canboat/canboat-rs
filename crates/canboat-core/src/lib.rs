@@ -5,6 +5,7 @@
 //! and bytes come out. The caller drives the I/O — see `canboat-io`
 //! (sync) and `canboat-tokio` (async) for adapters.
 
+pub mod analyzer_json;
 pub mod bits;
 pub mod db;
 pub mod decode;

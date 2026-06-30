@@ -34,7 +34,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
-use canboat_core::snapshot::{SnapshotInput, SnapshotStore};
+use canboat_core::snapshot::SnapshotStore;
 use clap::Parser;
 
 use crate::nmea0183::RateLimiter;
@@ -558,7 +558,7 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         // and emits one cache entry per iteration, each with a
         // spliced-down single-element `"list":[…]` so subsequent
         // records refresh the matching iteration in place.
-        hub.store(&meta, trimmed);
+        hub.store(trimmed);
         hub.broadcast(Subscription::JsonStream, &line);
         // The AIS port is a one-shot snapshot now, not a live stream —
         // see `spawn_ais_listener`. No per-line broadcast.
@@ -588,54 +588,28 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
     Ok(())
 }
 
-/// Classified record ready to hand to the snapshot store and to
-/// route to the broadcast subscribers.
+/// Minimal routing header pulled off an analyzer-JSON line — just
+/// what `run_stdin_pump` needs to decide src filtering, device-seen
+/// bookkeeping, and which NMEA-0183 converter to run.
 ///
-/// `secondary` is the top-level composite primary key (always
-/// computed). When the PGN's PK lives inside a repeating set, the
-/// per-iteration suffix is appended at store time inside
-/// [`Hub::store`] — `extract_meta` doesn't know how many
-/// iterations the `"list":[…]` array carries.
-#[derive(Debug, Clone)]
+/// All snapshot keying (top-level composite PK, per-iteration PK
+/// inside a repeating set) is done inside
+/// [`canboat_core::snapshot::classify_json_line`], which the hub
+/// invokes via [`Hub::store`] — `Meta` itself doesn't carry a
+/// secondary anymore. The AIS-vs-non-AIS branch in the NMEA-0183
+/// converter loop reads `meta.pgn` and tests `AIS_PGNS.contains` at
+/// the call site, so `Meta` also doesn't need to carry an `is_ais`
+/// flag.
+#[derive(Debug, Clone, Copy)]
 struct Meta {
     pgn: u32,
     src: u8,
-    /// Schema-driven secondary discriminator (top-level PK only).
-    /// `None` when the PGN has no top-level PK.
-    secondary: Option<String>,
-    /// Set when [`canboat_core::snapshot::is_ais_pgn`] flags this PGN
-    /// as AIS-described. Drives the longer `AIS_TTL` and the AIS
-    /// subscriber fan-out.
-    is_ais: bool,
-    /// The PGN's full description (e.g. `"Simnet: Device Status"`) for
-    /// the snapshot wrapper. Empty when the analyzer didn't emit a
-    /// `"description":` key.
-    description: String,
 }
 
 fn extract_meta(line: &str) -> Option<Meta> {
     let pgn = json::int(line, "pgn")? as u32;
     let src = json::int(line, "src")? as u8;
-    let description = json::value(line, "description").unwrap_or("").to_string();
-    let is_ais = canboat_core::snapshot::is_ais_pgn(pgn);
-    // Schema-driven primary key: walk every top-level field marked
-    // `PartOfPrimaryKey` on this PGN and `_`-join the resolved
-    // numeric/text values. canboat-rs's deliberate divergence from
-    // canboat C n2kd's first-name-from-hardcoded-list behavior; see
-    // issue #2 and [`canboat_core::snapshot::composite_secondary`].
-    let secondary = match canboat_core::PgnDatabase::embedded().first_pgn(pgn) {
-        Some(info) => canboat_core::snapshot::composite_secondary(info, |f| {
-            json::lookup_text(line, f.name).map(|s| s.to_string())
-        }),
-        None => None,
-    };
-    Some(Meta {
-        pgn,
-        src,
-        secondary,
-        is_ais,
-        description,
-    })
+    Some(Meta { pgn, src })
 }
 
 struct Hub {
@@ -679,68 +653,8 @@ impl Hub {
         self.engine.note_device_seen(pgn, src);
     }
 
-    fn store(&self, meta: &Meta, line: &str) {
-        // Fast path: PGN has no PK fields inside a repeating set, so
-        // one record → one cache entry.
-        let info = canboat_core::PgnDatabase::embedded().first_pgn(meta.pgn);
-        let repeat_set = info.and_then(canboat_core::snapshot::repeating_pk_set);
-        let Some(rs) = repeat_set else {
-            self.cache.store(SnapshotInput {
-                pgn: meta.pgn,
-                src: meta.src,
-                secondary: meta.secondary.clone(),
-                is_ais: meta.is_ais,
-                pgn_description: meta.description.clone(),
-                line: line.to_string(),
-            });
-            return;
-        };
-        // Per-iteration path (PGN 130824 family). The repeating set
-        // is emitted as `"<key>":[{…},{…}]` inside `"fields":{…}`;
-        // canboat uses `"list"` for set 1 and `"list2"` for set 2.
-        let list_key = if rs == 1 { "list" } else { "list2" };
-        let Some((arr_start, arr_end)) = json::array_span(line, list_key) else {
-            // The repeating set declared no iterations on the wire
-            // (count=0). Nothing to deconstruct — store the single
-            // record under the top-level PK alone.
-            self.cache.store(SnapshotInput {
-                pgn: meta.pgn,
-                src: meta.src,
-                secondary: meta.secondary.clone(),
-                is_ais: meta.is_ais,
-                pgn_description: meta.description.clone(),
-                line: line.to_string(),
-            });
-            return;
-        };
-        let arr = &line[arr_start..arr_end];
-        let elements = json::split_object_array(arr);
-        let pgn_info = info.expect("repeat_set source implies info present");
-        for (iter, elem) in elements.iter().enumerate() {
-            let secondary = canboat_core::snapshot::per_iteration_secondary(
-                pgn_info,
-                rs,
-                iter as u32,
-                |f| json::lookup_text(line, f.name).map(|s| s.to_string()),
-                |f, _| json::lookup_text(elem, f.name).map(|s| s.to_string()),
-            );
-            // Splice the array down to just this element so the
-            // cached line shows only its own iteration's fields.
-            let mut spliced = String::with_capacity(line.len() - arr.len() + elem.len() + 2);
-            spliced.push_str(&line[..arr_start]);
-            spliced.push('[');
-            spliced.push_str(elem);
-            spliced.push(']');
-            spliced.push_str(&line[arr_end..]);
-            self.cache.store(SnapshotInput {
-                pgn: meta.pgn,
-                src: meta.src,
-                secondary,
-                is_ais: meta.is_ais,
-                pgn_description: meta.description.clone(),
-                line: spliced,
-            });
-        }
+    fn store(&self, line: &str) {
+        canboat_core::snapshot::classify_json_line(line, |input| self.cache.store(input));
     }
 
     /// Canboat C–compatible nested-JSON dump of every live cache
@@ -798,45 +712,42 @@ mod tests {
         let meta = extract_meta(line).unwrap();
         assert_eq!(meta.pgn, 127251);
         assert_eq!(meta.src, 7);
-        assert!(!meta.is_ais);
-        assert_eq!(meta.description, "Rate of Turn");
-        assert!(meta.secondary.is_none());
+    }
+
+    /// Helper: classify and return the single emitted secondary.
+    /// Panics when the classifier emits 0 or >1 records — the cases
+    /// below are all top-level-PK PGNs.
+    fn classify_secondary(line: &str) -> Option<String> {
+        let mut got = Vec::new();
+        canboat_core::snapshot::classify_json_line(line, |i| got.push(i));
+        assert_eq!(got.len(), 1, "expected one record, got {got:?}");
+        got.remove(0).secondary
     }
 
     #[test]
     fn ais_message_marks_is_ais_and_keys_on_user_id() {
-        let line = r#"{"timestamp":"…","src":23,"pgn":129039,"fields":{"Message ID":18,"User ID":"244180106"}}"#;
-        let meta = extract_meta(line).unwrap();
-        assert!(meta.is_ais);
         // Schema 2.5.0 declares only `User ID` as PartOfPrimaryKey on
-        // PGN 129039 — Message ID is NOT a discriminator here. The
-        // hand-rolled SECONDARY_FIELDS list got the same answer by
-        // accident (User ID happened to sit ahead of Message ID); the
-        // schema-driven path is right for the right reason.
-        assert_eq!(meta.secondary.as_deref(), Some("244180106"));
+        // PGN 129039 — Message ID is NOT a discriminator here.
+        let line = r#"{"timestamp":"…","src":23,"pgn":129039,"fields":{"Message ID":18,"User ID":"244180106"}}"#;
+        assert!(canboat_core::snapshot::is_ais_pgn(129039));
+        assert_eq!(classify_secondary(line).as_deref(), Some("244180106"));
     }
 
     #[test]
-    fn extract_meta_uses_lookup_numeric_value() {
+    fn classify_uses_lookup_numeric_value() {
         // -nv mode wraps a lookup as `{"value":1,"name":"Outside
         // Temperature"}`; the composite snapshot key uses the raw
         // numeric `value` (short, stable across schema label edits).
-        // PGN 130312 (Temperature) declares `Instance + Source` as a
-        // composite primary key, with Source being a LOOKUP into
-        // TEMPERATURE_SOURCE.
         let line = r#"{"src":7,"pgn":130312,"fields":{"Instance":0,"Source":{"value":1,"name":"Outside Temperature"},"Actual Temperature":18.5}}"#;
-        let meta = extract_meta(line).unwrap();
-        // Composite PK: `<Instance>_<Source-value>`
-        assert_eq!(meta.secondary.as_deref(), Some("0_1"));
+        assert_eq!(classify_secondary(line).as_deref(), Some("0_1"));
     }
 
     #[test]
-    fn extract_meta_handles_key_true_lookup_objects() {
+    fn classify_handles_key_true_lookup_objects() {
         // PGN 127501 Instance is a `{"value":N,"key":true}` lookup —
         // no name to consider, value extraction still works.
         let line = r#"{"src":17,"pgn":127501,"fields":{"Instance":{"value":0,"key":true}}}"#;
-        let meta = extract_meta(line).unwrap();
-        assert_eq!(meta.secondary.as_deref(), Some("0"));
+        assert_eq!(classify_secondary(line).as_deref(), Some("0"));
     }
 
     #[test]
@@ -844,17 +755,16 @@ mod tests {
         // PGN 127509 (Inverter Status) declares `Instance + AC Instance
         // + DC Instance` as a composite PK. Two records that share
         // Instance=0 but differ in AC Instance must get distinct cache
-        // keys — canboat C n2kd's first-match SECONDARY_FIELDS would
-        // collapse them into the same `<src>_0` entry, dropping data.
+        // keys.
         let a =
             r#"{"src":35,"pgn":127509,"fields":{"Instance":0,"AC Instance":0,"DC Instance":1}}"#;
         let b =
             r#"{"src":35,"pgn":127509,"fields":{"Instance":0,"AC Instance":1,"DC Instance":0}}"#;
-        let ma = extract_meta(a).unwrap();
-        let mb = extract_meta(b).unwrap();
-        assert_eq!(ma.secondary.as_deref(), Some("0_0_1"));
-        assert_eq!(mb.secondary.as_deref(), Some("0_1_0"));
-        assert_ne!(ma.secondary, mb.secondary);
+        let sa = classify_secondary(a);
+        let sb = classify_secondary(b);
+        assert_eq!(sa.as_deref(), Some("0_0_1"));
+        assert_eq!(sb.as_deref(), Some("0_1_0"));
+        assert_ne!(sa, sb);
     }
 
     /// Build a Hub with no source filter / rate limit / UDP — just
@@ -872,11 +782,10 @@ mod tests {
         // object whose `value` becomes the per-iteration cache key.
         let line = r#"{"timestamp":"…","prio":3,"src":27,"dst":255,"pgn":130824,"description":"B&G: key-value data","fields":{"Manufacturer Code":{"value":381,"name":"B & G"},"Industry Code":{"value":4,"name":"Marine Industry"},"list":[{"Key":{"value":126,"name":"Polar Speed"},"Length":2,"Value":2.03},{"Key":{"value":124,"name":"Polar Performance"},"Length":2,"Value":128.0},{"Key":{"value":306,"name":"Opposite Tack COG"},"Length":2,"Value":103.6}]}}"#;
         let hub = test_hub();
-        let meta = extract_meta(line).expect("extract meta");
-        // Top-level secondary is None for 130824 — the PK lives in
-        // the `list`.
-        assert!(meta.secondary.is_none());
-        hub.store(&meta, line);
+        // PGN 130824's primary key lives inside the repeating set,
+        // so the per-iteration `27_<key>` entries asserted below
+        // verify the classifier emits them correctly.
+        hub.store(line);
         let dump = hub.snapshot();
         assert!(
             dump.contains("\"27_126\":"),
@@ -903,13 +812,11 @@ mod tests {
     fn store_pgn_130824_preserves_other_iterations_on_partial_update() {
         let initial = r#"{"src":27,"pgn":130824,"description":"B&G: key-value data","fields":{"list":[{"Key":{"value":126},"Length":2,"Value":2.03},{"Key":{"value":124},"Length":2,"Value":128.0}]}}"#;
         let hub = test_hub();
-        let meta = extract_meta(initial).unwrap();
-        hub.store(&meta, initial);
+        hub.store(initial);
 
         // Second record carries only key 126 with a refreshed value.
         let update = r#"{"src":27,"pgn":130824,"description":"B&G: key-value data","fields":{"list":[{"Key":{"value":126},"Length":2,"Value":4.00}]}}"#;
-        let meta = extract_meta(update).unwrap();
-        hub.store(&meta, update);
+        hub.store(update);
 
         let dump = hub.snapshot();
         // Both Keys still present — partial update didn't blow away

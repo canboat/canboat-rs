@@ -232,6 +232,116 @@ fn field_in_any_repeat_set(pgn: &crate::PgnInfo, field: &crate::FieldInfo) -> Op
     None
 }
 
+/// Classify one analyzer-JSON line into one or more
+/// [`SnapshotInput`]s and pass each to `sink`. Returns the number of
+/// records emitted (0 when the line is missing `pgn` or `src`).
+///
+/// This is the shared ingest path used by:
+///
+/// * `n2kd::Hub::store` — feeds the TCP snapshot port.
+/// * `canboat-tui` — keeps the on-screen device → PGN map current.
+///
+/// Splitting / keying logic matches the pipeline snapshot 1:1:
+///
+/// * PGNs with a top-level `PartOfPrimaryKey` set get one
+///   [`SnapshotInput`] per line, with `secondary` joined via
+///   [`composite_secondary`].
+/// * PGNs whose primary key lives inside a repeating set
+///   ([`repeating_pk_set`] returns `Some`) get one
+///   [`SnapshotInput`] per iteration of the `"list"` (set 1) or
+///   `"list2"` (set 2) array, with the iteration spliced into the
+///   stored line so each cache entry shows only its own iteration's
+///   fields. PGNs 130824 (B&G + Mercury), 129796, 129816 are the
+///   canboat 7.1.0 members of this set.
+/// * Lines whose repeating set is empty fall back to the
+///   single-record path with the top-level PK only.
+pub fn classify_json_line<F>(line: &str, mut sink: F) -> usize
+where
+    F: FnMut(SnapshotInput),
+{
+    let Some(pgn) = crate::analyzer_json::int(line, "pgn") else {
+        return 0;
+    };
+    let pgn = pgn as u32;
+    let Some(src) = crate::analyzer_json::int(line, "src") else {
+        return 0;
+    };
+    let src = src as u8;
+    let description = crate::analyzer_json::value(line, "description")
+        .unwrap_or("")
+        .to_string();
+    let is_ais = is_ais_pgn(pgn);
+    let info = crate::PgnDatabase::embedded().first_pgn(pgn);
+    let repeat_set = info.and_then(repeating_pk_set);
+
+    let Some(rs) = repeat_set else {
+        let secondary = info.and_then(|info| {
+            composite_secondary(info, |f| {
+                crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string())
+            })
+        });
+        sink(SnapshotInput {
+            pgn,
+            src,
+            secondary,
+            is_ais,
+            pgn_description: description,
+            line: line.to_string(),
+        });
+        return 1;
+    };
+
+    let list_key = if rs == 1 { "list" } else { "list2" };
+    let Some((arr_start, arr_end)) = crate::analyzer_json::array_span(line, list_key) else {
+        // Repeating set declared zero iterations — store the line as
+        // one record under the top-level PK alone.
+        let secondary = info.and_then(|info| {
+            composite_secondary(info, |f| {
+                crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string())
+            })
+        });
+        sink(SnapshotInput {
+            pgn,
+            src,
+            secondary,
+            is_ais,
+            pgn_description: description,
+            line: line.to_string(),
+        });
+        return 1;
+    };
+
+    let arr = &line[arr_start..arr_end];
+    let elements = crate::analyzer_json::split_object_array(arr);
+    let pgn_info = info.expect("repeat_set source implies PgnInfo present");
+    let mut emitted = 0usize;
+    for (iter, elem) in elements.iter().enumerate() {
+        let secondary = per_iteration_secondary(
+            pgn_info,
+            rs,
+            iter as u32,
+            |f| crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string()),
+            |f, _| crate::analyzer_json::lookup_text(elem, f.name).map(|s| s.to_string()),
+        );
+        let mut spliced = String::with_capacity(line.len() - arr.len() + elem.len() + 2);
+        spliced.push_str(&line[..arr_start]);
+        spliced.push('[');
+        spliced.push_str(elem);
+        spliced.push(']');
+        spliced.push_str(&line[arr_end..]);
+        sink(SnapshotInput {
+            pgn,
+            src,
+            secondary,
+            is_ais,
+            pgn_description: description.clone(),
+            line: spliced,
+        });
+        emitted += 1;
+    }
+    emitted
+}
+
 /// One record to be stashed in the snapshot cache. The caller is
 /// responsible for classifying its input (analyzer-JSON line or
 /// `DecodedPgn`) and producing this struct.
@@ -590,6 +700,51 @@ mod tests {
             |f, iter| (f.name == "Destination ID").then(|| format!("dst{iter}")),
         );
         assert_eq!(key.as_deref(), Some("111_dst2"));
+    }
+
+    #[test]
+    fn classify_json_line_emits_single_record_with_composite_secondary() {
+        // PGN 127501 (Binary Switch Bank Status) — top-level PK is
+        // `Instance`. composite_secondary must resolve it to "0".
+        let line = r#"{"pgn":127501,"src":17,"description":"Binary Switch Bank Status","fields":{"Instance":0}}"#;
+        let mut got = Vec::new();
+        let n = classify_json_line(line, |input| got.push(input));
+        assert_eq!(n, 1);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].pgn, 127501);
+        assert_eq!(got[0].src, 17);
+        assert_eq!(got[0].secondary.as_deref(), Some("0"));
+        assert!(!got[0].is_ais);
+    }
+
+    #[test]
+    fn classify_json_line_splits_repeating_pk_pgn_into_per_iteration_records() {
+        // PGN 130824 (B&G key/value pairs) — each iteration of the
+        // repeating set must produce its own record with its own
+        // secondary, and the spliced line must contain only that
+        // iteration's element.
+        let line = r#"{"pgn":130824,"src":21,"description":"Manufacturer Proprietary fast-packet addressed","fields":{"Manufacturer Code":381,"Industry Code":4,"list":[{"Key":1,"Value":42},{"Key":2,"Value":99}]}}"#;
+        let mut got = Vec::new();
+        let n = classify_json_line(line, |input| got.push(input));
+        assert_eq!(n, 2, "expected one record per iteration, got {got:?}");
+        assert!(got[0].secondary.is_some());
+        assert!(got[1].secondary.is_some());
+        assert_ne!(
+            got[0].secondary, got[1].secondary,
+            "per-iteration keys must differ"
+        );
+        // Spliced line for record 0 must contain only its element.
+        assert!(got[0].line.contains("\"Key\":1"));
+        assert!(!got[0].line.contains("\"Key\":2"));
+        assert!(got[1].line.contains("\"Key\":2"));
+        assert!(!got[1].line.contains("\"Key\":1"));
+    }
+
+    #[test]
+    fn classify_json_line_returns_zero_when_pgn_or_src_missing() {
+        assert_eq!(classify_json_line("{}", |_| {}), 0);
+        assert_eq!(classify_json_line(r#"{"pgn":127251}"#, |_| {}), 0);
+        assert_eq!(classify_json_line(r#"{"src":7}"#, |_| {}), 0);
     }
 
     #[test]

@@ -644,14 +644,36 @@ fn format_entry_row(e: &Entry) -> Line<'static> {
 }
 
 /// Render a measured transmission interval as a fixed-width string
-/// for the PGN row. Sub-second cadences read as milliseconds (the
-/// usual canboat unit); slower ones as seconds. `None` (count < 2)
-/// prints `—` so the column stays right-aligned.
+/// for the PGN row. The raw average bounces around as new samples
+/// arrive (one slow frame at 100 ms nominal will read 102, 99, 103…),
+/// which is distracting at a glance; snap each cadence to a step
+/// sized for its magnitude so the displayed number stays put unless
+/// the real rate actually changes.
+///
+/// Step ladder:
+///
+/// * `<  200 ms` → nearest 10 ms
+/// * `<  1   s`  → nearest 50 ms
+/// * `<  10  s`  → nearest 100 ms (displayed as ms)
+/// * `≥ 10  s`   → nearest 1 s
+///
+/// `None` (count < 2) prints `—` so the column stays right-aligned.
 fn format_interval(d: Option<std::time::Duration>) -> String {
-    match d {
-        None => format!("{:>7}", "—"),
-        Some(d) if d.as_millis() < 10_000 => format!("{:>5}ms", d.as_millis()),
-        Some(d) => format!("{:>6.1}s", d.as_secs_f32()),
+    let Some(d) = d else {
+        return format!("{:>7}", "—");
+    };
+    let ms = d.as_millis() as u64;
+    let step = match ms {
+        0..=199 => 10,
+        200..=999 => 50,
+        1_000..=9_999 => 100,
+        _ => 1000,
+    };
+    let rounded = ((ms + step / 2) / step) * step;
+    if rounded < 10_000 {
+        format!("{rounded:>5}ms")
+    } else {
+        format!("{:>6.1}s", rounded as f32 / 1000.0)
     }
 }
 

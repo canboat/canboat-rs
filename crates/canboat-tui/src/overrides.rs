@@ -7,11 +7,14 @@
 //!    re-sent to the bus when the TUI reconnects, so a change you
 //!    made yesterday survives a target reboot.
 //!
-//! 2. **Authorisation gate for "turn off"** — the user is permitted
-//!    to set `interval_ms = 0` ("stop transmitting") only when a
-//!    matching entry already exists on disk with
-//!    `allow_disable: true`. This file is the persistent record the
-//!    spec asks us to require before silencing a PGN.
+//! 2. **Re-enable silenced PGNs** — once an override sets `interval_ms
+//!    = 0` ("stop transmitting"), no more records arrive for the
+//!    PGN and the live cache drops it. The TUI's DeviceDetail
+//!    screen reads this file directly to keep the silenced PGN in
+//!    its list so the user can later open the `o` dialog and set a
+//!    non-zero cadence again. That re-enable path is the reason
+//!    `manufacturer_code` / `industry_code` / `description` are
+//!    persisted alongside `interval_ms`.
 //!
 //! The file lives at `~/.config/canboat-tui/overrides.json` by
 //! default (or `$XDG_CONFIG_HOME/canboat-tui/overrides.json` when
@@ -26,35 +29,34 @@ use serde::{Deserialize, Serialize};
 /// 32-bit Transmission interval field (1 ms units). The captured
 /// Furuno SCX-20 setting-tool traffic in
 /// `../canboat/samples/scx20-setting-tool-pgn-130578to130846-off.raw`
-/// uses `0` here, not the `0xFFFFFFFE` sentinel I had originally
-/// written from the spec — that sentinel is a feature of the older
-/// Command form (function code 1), which real targets don't
-/// implement for rate changes.
+/// uses `0` here.
 pub const INTERVAL_OFF: u32 = 0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Override {
     pub src: u8,
     pub pgn: u32,
-    /// Desired interval in milliseconds. `0` means "stop
-    /// transmitting" (see [`INTERVAL_OFF`]); any positive value is
-    /// the new cadence in milliseconds.
+    /// Desired interval in milliseconds. [`INTERVAL_OFF`] (= `0`)
+    /// means "stop transmitting"; any positive value is the new
+    /// cadence in milliseconds.
     pub interval_ms: u32,
-    /// Required to be `true` before the TUI is allowed to send an
-    /// override with `interval_ms == INTERVAL_OFF`. The TUI itself
-    /// never flips this — the user must edit the file by hand,
-    /// which serves as the explicit acknowledgement that a PGN is
-    /// being silenced.
-    #[serde(default)]
-    pub allow_disable: bool,
-    /// Required for proprietary PGNs (range 0xFF00-0xFFFF / 0x1FF00-
-    /// 0x1FFFF): the manufacturer that scopes the group function.
+    /// Manufacturer Code for proprietary PGNs (range 0xFF00-0xFFFF
+    /// / 0x1FF00-0x1FFFF). Required to scope the PGN 126208 Request
+    /// to the right vendor. Mirrors the live record's `fields
+    /// .Manufacturer Code` at the time the override was first
+    /// stored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub manufacturer_code: Option<u16>,
-    /// Required for proprietary PGNs: the industry code. Defaults to
-    /// 4 (Marine) at the call site when omitted.
+    /// Industry Code (typically 4 = Marine) for proprietary PGNs;
+    /// see [`Override::manufacturer_code`].
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub industry_code: Option<u8>,
+    /// Human-readable PGN description (e.g. `"Furuno: Six Degrees
+    /// Of Freedom Movement"`), captured at override time so the
+    /// DeviceDetail screen can label a silenced row even after the
+    /// live cache entry has aged out.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub description: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -96,10 +98,14 @@ impl Overrides {
         }
     }
 
-    pub fn allows_disable(&self, src: u8, pgn: u32) -> bool {
+    /// Iterate over overrides that currently silence a PGN
+    /// (`interval_ms == INTERVAL_OFF`). The DeviceDetail screen uses
+    /// this to inject synthetic rows for PGNs that have stopped
+    /// transmitting so the user can re-enable them.
+    pub fn silenced(&self) -> impl Iterator<Item = &Override> {
         self.entries
             .iter()
-            .any(|e| e.src == src && e.pgn == pgn && e.allow_disable)
+            .filter(|e| e.interval_ms == INTERVAL_OFF)
     }
 }
 
@@ -112,4 +118,27 @@ pub fn default_path() -> PathBuf {
         return PathBuf::from(home).join(".config/canboat-tui/overrides.json");
     }
     PathBuf::from("canboat-tui-overrides.json")
+}
+
+/// Test whether `path` is writable as the overrides file. Creates
+/// the parent directory and probes the file with `OpenOptions::open`
+/// (write + create) — no content is written, so a no-overrides
+/// session leaves the file empty/untouched (or non-existent if the
+/// caller doesn't subsequently `save()`).
+///
+/// The TUI calls this once at startup; on `false` it hides the `o`
+/// override affordance entirely (no key handler, no hint-bar entry)
+/// so the user isn't shown a feature whose state can't be persisted.
+pub fn is_writable(path: &PathBuf) -> bool {
+    if let Some(parent) = path.parent()
+        && std::fs::create_dir_all(parent).is_err()
+    {
+        return false;
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)
+        .is_ok()
 }

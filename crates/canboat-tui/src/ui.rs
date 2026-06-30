@@ -26,9 +26,13 @@
 //!    (success or failure). Auto-dismisses on clean two-way success;
 //!    any key dismisses it manually.
 //! 3. **Override** — opened with `o` from `DeviceDetail` for the
-//!    highlighted PGN. Accepts a transmission interval in ms. Entering
-//!    `0` ("stop transmitting") is only accepted when the persistent
-//!    overrides file already authorises it with `allow_disable: true`.
+//!    highlighted PGN. Accepts a transmission interval in ms; `0`
+//!    means "stop transmitting". Hidden entirely (no key binding,
+//!    not advertised in the hint bar) when the overrides file
+//!    can't be persisted — see `App::overrides_writable`. A
+//!    silenced PGN stays visible on its device's list (with an OFF
+//!    marker, sourced from the overrides file) so the user can
+//!    later re-enable it.
 
 use std::io::Stdout;
 
@@ -44,7 +48,7 @@ use ratatui::widgets::{
 };
 
 use crate::iso;
-use crate::overrides::{INTERVAL_OFF, Override, Overrides, default_path};
+use crate::overrides::{self, INTERVAL_OFF, Override, Overrides, default_path};
 use crate::state::{AppState, DeviceInfo, Entry};
 
 /// Per-PGN well-known transmit defaults, used purely as UI hints
@@ -81,6 +85,14 @@ pub struct App {
     pub entry_scroll: u16,
     pub overrides: Overrides,
     pub overrides_path: std::path::PathBuf,
+    /// Set at startup by probing the overrides file with
+    /// [`overrides::is_writable`]. When `false` the `o` override
+    /// affordance is removed everywhere — the key binding does
+    /// nothing and the per-screen hint bar omits it — so the user
+    /// isn't shown a feature whose state can't be persisted. If a
+    /// later `save()` fails (disk full, perms revoked) we flip this
+    /// back to `false` and surface the error.
+    pub overrides_writable: bool,
     pub modal: Option<OverrideModal>,
     /// Last status / error toast (cleared on next keystroke).
     pub toast: Option<String>,
@@ -102,12 +114,17 @@ pub struct OverrideModal {
     pub input: String,
     pub manufacturer_code: Option<u16>,
     pub industry_code: Option<u8>,
+    /// PGN description captured at modal open time — stored on the
+    /// resulting [`Override`] so a later silenced-row display can
+    /// label the PGN even after the live cache entry ages out.
+    pub description: Option<String>,
 }
 
 impl App {
     pub fn new() -> Self {
         let overrides_path = default_path();
         let overrides = Overrides::load_or_default(&overrides_path);
+        let overrides_writable = overrides::is_writable(&overrides_path);
         let mut devices_state = ListState::default();
         devices_state.select(Some(0));
         let mut detail_state = ListState::default();
@@ -119,12 +136,38 @@ impl App {
             entry_scroll: 0,
             overrides,
             overrides_path,
+            overrides_writable,
             modal: None,
             toast: None,
             should_quit: false,
             connecting_dismissed: false,
             last_acknowledged_error: None,
         }
+    }
+
+    /// Composed row list for the DeviceDetail screen: live cached
+    /// entries for `src`, plus a synthetic row for every silenced
+    /// override on this `src` whose PGN isn't already represented
+    /// by a live entry. The synthetic row has `count = 0` (which
+    /// [`format_entry_row`] reads as "show OFF instead of every
+    /// X ms") and carries the description we captured when the
+    /// user set the override, so even an aged-out PGN stays
+    /// visible and labelled.
+    pub fn detail_rows(&self, src: u8, state: &AppState) -> Vec<Entry> {
+        let mut rows: Vec<Entry> = state.entries_for_src(src).into_iter().cloned().collect();
+        let live_pgns: std::collections::HashSet<u32> = rows.iter().map(|e| e.pgn).collect();
+        for ov in self.overrides.silenced() {
+            if ov.src != src || live_pgns.contains(&ov.pgn) {
+                continue;
+            }
+            rows.push(synthesize_silenced_entry(ov));
+        }
+        rows.sort_by(|a, b| {
+            a.pgn
+                .cmp(&b.pgn)
+                .then_with(|| a.secondary.cmp(&b.secondary))
+        });
+        rows
     }
 
     /// Re-emit every stored override to the bus. Called on startup
@@ -190,26 +233,29 @@ impl App {
             }
             (Screen::DeviceDetail { src }, KeyCode::Down)
             | (Screen::DeviceDetail { src }, KeyCode::Char('j')) => {
-                let n = state.entries_for_src(*src).len();
+                let n = self.detail_rows(*src, state).len();
                 navigate_list(&mut self.detail_state, n, 1);
             }
             (Screen::DeviceDetail { src }, KeyCode::Up)
             | (Screen::DeviceDetail { src }, KeyCode::Char('k')) => {
-                let n = state.entries_for_src(*src).len();
+                let n = self.detail_rows(*src, state).len();
                 navigate_list(&mut self.detail_state, n, -1);
             }
             (Screen::DeviceDetail { src }, KeyCode::Enter) => {
-                let entries = state.entries_for_src(*src);
-                if let Some(e) = self
-                    .detail_state
-                    .selected()
-                    .and_then(|i| entries.get(i).copied())
-                {
+                let rows = self.detail_rows(*src, state);
+                if let Some(row) = self.detail_state.selected().and_then(|i| rows.get(i)) {
+                    // Silenced rows (`count == 0`) have a Null `line`
+                    // and no live data to show in EntryDetail; skip
+                    // the drill-in so the user doesn't land on a
+                    // pretty-printed `null`.
+                    if row.count == 0 {
+                        return;
+                    }
                     self.entry_scroll = 0;
                     self.screen = Screen::EntryDetail {
                         src: *src,
-                        pgn: e.pgn,
-                        secondary: e.secondary.clone(),
+                        pgn: row.pgn,
+                        secondary: row.secondary.clone(),
                     };
                 }
             }
@@ -222,20 +268,36 @@ impl App {
                     self.toast = Some("Writer channel closed".into());
                 }
             }
-            (Screen::DeviceDetail { src }, KeyCode::Char('o')) => {
-                let entries = state.entries_for_src(*src);
-                if let Some(e) = self
-                    .detail_state
-                    .selected()
-                    .and_then(|i| entries.get(i).copied())
-                {
-                    let (mfr, ind) = proprietary_codes(e);
+            (Screen::DeviceDetail { src }, KeyCode::Char('o')) if self.overrides_writable => {
+                let rows = self.detail_rows(*src, state);
+                if let Some(row) = self.detail_state.selected().and_then(|i| rows.get(i)) {
+                    // Live row: read mfr/ind off the cached JSON.
+                    // Silenced row (`count == 0`): line is Null — pull
+                    // mfr/ind/description back from the override file
+                    // entry that put it on the list in the first place.
+                    let (mfr, ind, desc) = if row.count == 0 {
+                        let ov = self
+                            .overrides
+                            .entries
+                            .iter()
+                            .find(|o| o.src == row.src && o.pgn == row.pgn);
+                        (
+                            ov.and_then(|o| o.manufacturer_code),
+                            ov.and_then(|o| o.industry_code),
+                            ov.and_then(|o| o.description.clone()),
+                        )
+                    } else {
+                        let (m, i) = proprietary_codes(row);
+                        let d = (!row.description.is_empty()).then(|| row.description.clone());
+                        (m, i, d)
+                    };
                     self.modal = Some(OverrideModal {
                         src: *src,
-                        pgn: e.pgn,
-                        input: default_interval_hint(e.pgn).to_string(),
+                        pgn: row.pgn,
+                        input: default_interval_hint(row.pgn).to_string(),
                         manufacturer_code: mfr,
                         industry_code: ind,
+                        description: desc,
                     });
                 }
             }
@@ -299,18 +361,6 @@ impl App {
                         return;
                     }
                 };
-                if interval_ms == INTERVAL_OFF
-                    && !self.overrides.allows_disable(modal.src, modal.pgn)
-                {
-                    self.toast = Some(format!(
-                        "Refusing to disable PGN {} on src {} — add an entry with allow_disable: true in {} first",
-                        modal.pgn,
-                        modal.src,
-                        self.overrides_path.display(),
-                    ));
-                    self.modal = None;
-                    return;
-                }
                 let line = match (modal.manufacturer_code, modal.industry_code) {
                     (Some(mfr), Some(ind)) => iso::request_transmission_interval_proprietary(
                         modal.src,
@@ -326,19 +376,31 @@ impl App {
                     src: modal.src,
                     pgn: modal.pgn,
                     interval_ms,
-                    allow_disable: self.overrides.allows_disable(modal.src, modal.pgn),
                     manufacturer_code: modal.manufacturer_code,
                     industry_code: modal.industry_code,
+                    description: modal.description.clone(),
                 });
-                if let Err(e) = self.overrides.save(&self.overrides_path) {
-                    self.toast = Some(format!("Override saved in memory; disk write failed: {e}"));
-                } else if sent {
-                    self.toast = Some(format!(
-                        "Sent PGN 126208 override → src {} pgn {} = {} ms",
-                        modal.src, modal.pgn, interval_ms
-                    ));
-                } else {
-                    self.toast = Some("Override saved; writer channel closed".into());
+                match self.overrides.save(&self.overrides_path) {
+                    Ok(()) if sent => {
+                        self.toast = Some(format!(
+                            "Sent PGN 126208 override → src {} pgn {} = {} ms",
+                            modal.src, modal.pgn, interval_ms
+                        ));
+                    }
+                    Ok(()) => {
+                        self.toast = Some("Override saved; writer channel closed".into());
+                    }
+                    Err(e) => {
+                        // Persistence just broke (e.g. disk full or
+                        // perms revoked). Hide the override
+                        // affordance for the rest of the session so
+                        // the user isn't shown a feature whose state
+                        // can no longer be persisted.
+                        self.overrides_writable = false;
+                        self.toast = Some(format!(
+                            "Override sent but persist failed: {e} — disabling further overrides this session"
+                        ));
+                    }
                 }
                 self.modal = None;
             }
@@ -506,7 +568,10 @@ fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
             ),
             Span::styled(e.clone(), Style::default().fg(Color::Red)),
         ]),
-        _ => Line::from(format!(" {}", screen_hint(&app.screen))),
+        _ => Line::from(format!(
+            " {}",
+            screen_hint(&app.screen, app.overrides_writable)
+        )),
     };
     let lines = vec![Line::from(first), second];
     let p = Paragraph::new(lines).style(Style::default().bg(Color::Blue).fg(Color::White));
@@ -514,8 +579,11 @@ fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
 }
 
 fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
-    let p = Paragraph::new(format!(" {}", screen_hint(&app.screen)))
-        .style(Style::default().fg(Color::DarkGray));
+    let p = Paragraph::new(format!(
+        " {}",
+        screen_hint(&app.screen, app.overrides_writable)
+    ))
+    .style(Style::default().fg(Color::DarkGray));
     f.render_widget(p, area);
 }
 
@@ -524,11 +592,16 @@ fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 /// sync, and so a binding that doesn't apply (e.g. `i`/`o` on the
 /// EntryDetail screen) doesn't get advertised where it would do
 /// nothing.
-fn screen_hint(screen: &Screen) -> &'static str {
+fn screen_hint(screen: &Screen, overrides_writable: bool) -> &'static str {
     match screen {
         Screen::Devices => "q quit | ↑↓ move | Enter open device",
-        Screen::DeviceDetail { .. } => {
+        Screen::DeviceDetail { .. } if overrides_writable => {
             "q quit | ↑↓ move | Enter open entry | Esc back | i ISO 126464 | o override interval"
+        }
+        // `o` is omitted here when the overrides file isn't writable —
+        // showing the binding while it does nothing would be a lie.
+        Screen::DeviceDetail { .. } => {
+            "q quit | ↑↓ move | Enter open entry | Esc back | i ISO 126464"
         }
         Screen::EntryDetail { .. } => {
             "q quit | ↑↓ scroll 1 | PgUp/PgDn scroll 10 | g/G top/bottom | Esc back"
@@ -593,8 +666,8 @@ fn draw_device_detail(
         .constraints([Constraint::Min(1), Constraint::Length(bottom_h)])
         .split(area);
 
-    let entries = state.entries_for_src(src);
-    let items: Vec<ListItem> = entries
+    let rows = app.detail_rows(src, state);
+    let items: Vec<ListItem> = rows
         .iter()
         .map(|e| ListItem::new(format_entry_row(e)))
         .collect();
@@ -604,14 +677,14 @@ fn draw_device_detail(
             src,
             d.manufacturer,
             d.model,
-            entries.len(),
+            rows.len(),
         ),
-        None => format!("src {} ({} entries)", src, entries.len()),
+        None => format!("src {} ({} entries)", src, rows.len()),
     };
     // Same trick as `draw_devices`: select row 0 on first sight of a
     // non-empty list so the marker is visible and the layout is
     // stable from the first frame.
-    if !entries.is_empty() && app.detail_state.selected().is_none() {
+    if !rows.is_empty() && app.detail_state.selected().is_none() {
         app.detail_state.select(Some(0));
     }
     let list = List::new(items)
@@ -627,6 +700,26 @@ fn draw_device_detail(
 }
 
 fn format_entry_row(e: &Entry) -> Line<'static> {
+    // `count == 0` is the sentinel for a synthetic silenced-override
+    // row — no live data, no measured interval, no meaningful age.
+    // Render it as an OFF row in dim grey so the user can see at a
+    // glance which PGNs they've silenced.
+    if e.count == 0 {
+        let description = if e.description.is_empty() {
+            "(disabled)"
+        } else {
+            e.description.as_str()
+        };
+        let dim = Style::default().fg(Color::DarkGray);
+        return Line::from(vec![
+            Span::styled(format!(" {:6} ", e.pgn), Style::default().fg(Color::Yellow)),
+            Span::styled(format!("{:14.14}", ""), dim),
+            Span::styled(format!(" {description:30.30}"), dim),
+            Span::styled(format!(" {:>13}", "OFF"), Style::default().fg(Color::Red)),
+            Span::styled(format!(" {:>10}", ""), dim),
+            Span::styled(format!(" {:>13}", "(silenced)"), dim),
+        ]);
+    }
     let age = e.last_update.elapsed().as_secs();
     let sec = e
         .secondary
@@ -641,6 +734,26 @@ fn format_entry_row(e: &Entry) -> Line<'static> {
         Span::raw(format!(" age {age:>4}s")),
         Span::raw(format!(" count {:>6}", e.count)),
     ])
+}
+
+/// Build a placeholder `Entry` for a silenced override so it can
+/// appear in the DeviceDetail row list alongside live entries. The
+/// `count == 0` sentinel is what tells [`format_entry_row`] to draw
+/// it as an OFF row and what tells the `o` key handler to read
+/// mfr / industry / description back from the override file rather
+/// than the (null) `line`.
+fn synthesize_silenced_entry(ov: &Override) -> Entry {
+    let now = std::time::Instant::now();
+    Entry {
+        pgn: ov.pgn,
+        src: ov.src,
+        secondary: None,
+        description: ov.description.clone().unwrap_or_default(),
+        line: serde_json::Value::Null,
+        last_update: now,
+        count: 0,
+        first_seen: now,
+    }
 }
 
 /// Render a measured transmission interval as a fixed-width string

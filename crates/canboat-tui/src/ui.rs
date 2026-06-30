@@ -506,21 +506,34 @@ fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
             ),
             Span::styled(e.clone(), Style::default().fg(Color::Red)),
         ]),
-        _ => Line::from(
-            " (q quit  ↑/↓ move  Enter drill in  Esc back  i = ISO 126464  o = override interval)",
-        ),
+        _ => Line::from(format!(" {}", screen_hint(&app.screen))),
     };
     let lines = vec![Line::from(first), second];
     let p = Paragraph::new(lines).style(Style::default().bg(Color::Blue).fg(Color::White));
     f.render_widget(p, area);
 }
 
-fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, _app: &App) {
-    let p = Paragraph::new(
-        " q quit | ↑↓ move | Enter open | Esc back | i ISO 126464 | o override interval",
-    )
-    .style(Style::default().fg(Color::DarkGray));
+fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+    let p = Paragraph::new(format!(" {}", screen_hint(&app.screen)))
+        .style(Style::default().fg(Color::DarkGray));
     f.render_widget(p, area);
+}
+
+/// Per-screen one-line keybinding cheat sheet. Kept in one place so
+/// the top status-bar fallback line and the bottom hint bar stay in
+/// sync, and so a binding that doesn't apply (e.g. `i`/`o` on the
+/// EntryDetail screen) doesn't get advertised where it would do
+/// nothing.
+fn screen_hint(screen: &Screen) -> &'static str {
+    match screen {
+        Screen::Devices => "q quit | ↑↓ move | Enter open device",
+        Screen::DeviceDetail { .. } => {
+            "q quit | ↑↓ move | Enter open entry | Esc back | i ISO 126464 | o override interval"
+        }
+        Screen::EntryDetail { .. } => {
+            "q quit | ↑↓ scroll 1 | PgUp/PgDn scroll 10 | g/G top/bottom | Esc back"
+        }
+    }
 }
 
 fn draw_devices(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &AppState) {

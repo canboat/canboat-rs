@@ -74,6 +74,9 @@ pub struct App {
     pub screen: Screen,
     pub devices_state: ListState,
     pub detail_state: ListState,
+    /// Vertical scroll offset for the pretty-printed JSON in the
+    /// `EntryDetail` screen. Reset to 0 when drilling in.
+    pub entry_scroll: u16,
     pub overrides: Overrides,
     pub overrides_path: std::path::PathBuf,
     pub modal: Option<OverrideModal>,
@@ -111,6 +114,7 @@ impl App {
             screen: Screen::Devices,
             devices_state,
             detail_state,
+            entry_scroll: 0,
             overrides,
             overrides_path,
             modal: None,
@@ -199,6 +203,7 @@ impl App {
                     .selected()
                     .and_then(|i| entries.get(i).copied())
                 {
+                    self.entry_scroll = 0;
                     self.screen = Screen::EntryDetail {
                         src: *src,
                         pgn: e.pgn,
@@ -236,6 +241,29 @@ impl App {
             | (Screen::DeviceDetail { .. }, KeyCode::Backspace)
             | (Screen::DeviceDetail { .. }, KeyCode::Char('h')) => {
                 self.screen = Screen::Devices;
+            }
+            (Screen::EntryDetail { .. }, KeyCode::Down)
+            | (Screen::EntryDetail { .. }, KeyCode::Char('j')) => {
+                self.entry_scroll = self.entry_scroll.saturating_add(1);
+            }
+            (Screen::EntryDetail { .. }, KeyCode::Up)
+            | (Screen::EntryDetail { .. }, KeyCode::Char('k')) => {
+                self.entry_scroll = self.entry_scroll.saturating_sub(1);
+            }
+            (Screen::EntryDetail { .. }, KeyCode::PageDown)
+            | (Screen::EntryDetail { .. }, KeyCode::Char(' ')) => {
+                self.entry_scroll = self.entry_scroll.saturating_add(10);
+            }
+            (Screen::EntryDetail { .. }, KeyCode::PageUp) => {
+                self.entry_scroll = self.entry_scroll.saturating_sub(10);
+            }
+            (Screen::EntryDetail { .. }, KeyCode::Home)
+            | (Screen::EntryDetail { .. }, KeyCode::Char('g')) => {
+                self.entry_scroll = 0;
+            }
+            (Screen::EntryDetail { .. }, KeyCode::End)
+            | (Screen::EntryDetail { .. }, KeyCode::Char('G')) => {
+                self.entry_scroll = u16::MAX;
             }
             (Screen::EntryDetail { src, .. }, KeyCode::Esc)
             | (Screen::EntryDetail { src, .. }, KeyCode::Backspace)
@@ -360,6 +388,26 @@ fn navigate_list(state: &mut ListState, len: usize, delta: i32) {
 pub type Tty = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
+    // Clamp the entry-detail scroll offset to whatever the visible
+    // entry's content needs — `End`/`G` set it to `u16::MAX` so the
+    // user can jump to the bottom without knowing the line count.
+    if let Screen::EntryDetail {
+        src,
+        pgn,
+        secondary,
+    } = &app.screen
+    {
+        let key = (*pgn, *src, secondary.clone());
+        if let Some(entry) = state.entries.get(&key) {
+            let pretty = serde_json::to_string_pretty(&entry.line)
+                .unwrap_or_else(|_| entry.line.to_string());
+            let lines = pretty.lines().count() as u16;
+            let max_scroll = lines.saturating_sub(1);
+            if app.entry_scroll > max_scroll {
+                app.entry_scroll = max_scroll;
+            }
+        }
+    }
     // Auto-dismiss the connecting modal once both connections are up
     // and clean — successful startup shouldn't require a keystroke.
     if !app.connecting_dismissed
@@ -388,7 +436,15 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
                 pgn,
                 secondary,
             } => {
-                draw_entry_detail(f, chunks[1], state, *src, *pgn, secondary.as_deref());
+                draw_entry_detail(
+                    f,
+                    chunks[1],
+                    state,
+                    *src,
+                    *pgn,
+                    secondary.as_deref(),
+                    app.entry_scroll,
+                );
             }
         }
         draw_hint_bar(f, chunks[2], app);
@@ -594,6 +650,7 @@ fn draw_entry_detail(
     src: u8,
     pgn: u32,
     secondary: Option<&str>,
+    scroll: u16,
 ) {
     let key = (pgn, src, secondary.map(|s| s.to_string()));
     let Some(entry) = state.entries.get(&key) else {
@@ -621,7 +678,8 @@ fn draw_entry_detail(
     );
     let p = Paragraph::new(pretty)
         .block(Block::default().borders(Borders::ALL).title(title))
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
     f.render_widget(p, area);
 }
 

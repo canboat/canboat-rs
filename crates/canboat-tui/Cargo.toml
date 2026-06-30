@@ -1,0 +1,28 @@
+[package]
+name        = "canboat-tui"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "Interactive terminal UI for an NMEA 2000 bus, fed by n2kd or canboat-pipeline."
+
+[[bin]]
+name = "canboat-tui"
+path = "src/main.rs"
+
+[dependencies]
+canboat-core = { workspace = true }
+canboat-cli  = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+env_logger   = { workspace = true }
+log          = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true }
+tokio        = { workspace = true, features = ["rt", "rt-multi-thread", "io-util", "macros", "sync", "net", "time", "fs"] }
+crossterm    = { version = "0.28", features = ["event-stream"] }
+ratatui      = "0.29"
+indexmap     = { workspace = true }
+futures      = { workspace = true }

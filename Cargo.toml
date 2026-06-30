@@ -17,6 +17,7 @@ members = [
     "crates/socketcan-serial",
     "crates/n2kd",
     "crates/canboat-pipeline",
+    "crates/canboat-tui",
 ]
 
 [workspace.package]

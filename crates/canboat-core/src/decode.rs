@@ -1787,6 +1787,34 @@ mod tests {
     }
 
     #[test]
+    fn pgn_59392_picks_iso_acknowledgement_over_range_catchall() {
+        // Both PGN 59392 variants in canboat.json are no-Match,
+        // 8-byte single-frame:
+        //   * `0xE800-0xEE00: Standardized single-frame addressed`
+        //     — Fallback: true, listed first
+        //   * `ISO Acknowledgement` — Fallback: null, listed second
+        //
+        // The dispatch must pick `isoAcknowledgement` here — the
+        // catch-all is only a tie-breaker when no specific variant
+        // exists. Real-world bug: NAC3 autopilot ACK records used to
+        // surface as the range catch-all.
+        //
+        // Payload bytes are a real PGN 59392 NAK observed on the bus:
+        // control=1 (NAK), reserved, then PGN 126998 (0x01F016) LE.
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 6,
+            pgn: 59392,
+            src: 17,
+            dst: 200,
+            data: smallvec::smallvec![0x01, 0xff, 0xff, 0xff, 0xff, 0x16, 0xf0, 0x01],
+        };
+        let picked = db().pick_variant(&frame).expect("variant");
+        assert_eq!(picked.id, "isoAcknowledgement", "got id={}", picked.id);
+        assert_eq!(picked.fallback, None);
+    }
+
+    #[test]
     fn cross_pgn_catchall_for_unknown_proprietary() {
         // PGN 65500 is not defined in canboat.json. The latest
         // Fallback:true PGN with pgn <= 65500 covers it — that's

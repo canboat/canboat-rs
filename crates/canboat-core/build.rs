@@ -1102,18 +1102,37 @@ fn emit_per_pgn_dispatch(out: &mut String, pgn_num: u32, variants: &[VariantEntr
         .unwrap();
     }
 
-    // First pass: Match-having variants in JSON declaration order.
-    // Second pass: select the in-PGN fallback (no-Match variant), prefer
-    // one with `Fallback: true`, otherwise the first no-Match seen.
-    let mut fallback_idx: Option<usize> = None;
+    // First pass: Match-having variants in JSON declaration order
+    // (emitted as `if … { return … }` arms below).
+    //
+    // Second pass: pick the in-PGN no-Match "fallback" variant that
+    // runs when nothing matched. A `Fallback: true` variant is a
+    // *catch-all* for the whole PGN-range bracket — it should only
+    // win when no other no-Match variant for this PGN exists.
+    // Otherwise the first non-Fallback no-Match variant in JSON
+    // order wins.
+    //
+    // Concrete case: PGN 59392 has the range catch-all
+    // (`Fallback: true`) listed first and `isoAcknowledgement`
+    // (no Match, no Fallback) second. The previous logic preferred
+    // `Fallback: true` and decoded every ISO Ack as
+    // "0xE800-0xEE00: Standardized single-frame addressed" — a
+    // NAC3 autopilot's PGN 59392 reply surfaces correctly as ISO
+    // Acknowledgement only with this preference flipped.
+    let mut specific_no_match: Option<usize> = None;
+    let mut catchall_no_match: Option<usize> = None;
     for (idx, p, fields) in variants {
         let match_fields: Vec<&(RawField, Computed)> = fields
             .iter()
             .filter(|(f, _)| f.match_value.is_some())
             .collect();
         if match_fields.is_empty() {
-            if fallback_idx.is_none() || p.fallback == Some(true) {
-                fallback_idx = Some(*idx);
+            if p.fallback == Some(true) {
+                if catchall_no_match.is_none() {
+                    catchall_no_match = Some(*idx);
+                }
+            } else if specific_no_match.is_none() {
+                specific_no_match = Some(*idx);
             }
             continue;
         }
@@ -1145,7 +1164,7 @@ fn emit_per_pgn_dispatch(out: &mut String, pgn_num: u32, variants: &[VariantEntr
         }
         writeln!(out, " {{ return Some(&PGNS[{idx}]); }}").unwrap();
     }
-    match fallback_idx {
+    match specific_no_match.or(catchall_no_match) {
         Some(idx) => writeln!(out, "    Some(&PGNS[{idx}])").unwrap(),
         None => writeln!(out, "    None").unwrap(),
     }

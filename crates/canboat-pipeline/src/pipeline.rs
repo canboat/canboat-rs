@@ -27,7 +27,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 
 use canboat_core::format::write_plain;
-use canboat_core::output::{CamelCase, JsonOptions, write_json};
+use canboat_core::output::{JsonOptions, write_json};
 use canboat_core::{FramePacketType, PgnDatabase, RawFrame, Reassembled, Reassembler};
 use canboat_io::device::FrameSender;
 use n2kd::request_engine::RequestEngine;
@@ -102,16 +102,18 @@ pub struct Hubs {
 ///   `RAWFORMAT_PLAIN_OR_FAST` → `FAST` lock-in). Once true it
 ///   stays true. The stdin pump also flips it when it sees a
 ///   `# format=<NAME>` header declaring a coalesced format.
-/// * `camel_case` selects field-key + PGN-description style for
-///   the analyzer JSON / snapshot output — `Off` / `Lower` (matches
-///   canboat C `-camel`) / `Upper` (matches `-upper-camel`).
+/// * `json_opts` configures the analyzer JSON / snapshot serializer
+///   — `camel_case` selects field-key + PGN-description style
+///   (`Off` / `Lower` matches canboat C `-camel`, `Upper` matches
+///   `-upper-camel`), and the same options drive per-iteration
+///   snapshot lines for PGNs with PK fields in a repeating set.
 pub fn run(
     db: &'static PgnDatabase,
     frames_rx: Receiver<RawFrame>,
     mut hubs: Hubs,
     emit_nmea_stdout: bool,
     pre_coalesced: Arc<AtomicBool>,
-    camel_case: CamelCase,
+    json_opts: JsonOptions,
 ) {
     // LineWriter (rather than BufWriter) so each NMEA 0183 sentence
     // is flushed as soon as its trailing newline arrives. Long-
@@ -127,13 +129,6 @@ pub fn run(
     let mut rl = n2kd::nmea0183::RateLimiter::new(false);
     let mut ais_seq: u8 = 0;
     let handles = n2kd::decoded::Handles::new(db);
-
-    let json_opts = JsonOptions {
-        include_empty: false,
-        name_value: true,
-        debug: false,
-        camel_case,
-    };
 
     // Quirk synthesisers can produce extra `RawFrame`s in response to
     // an inbound bus frame. We re-feed them through this same loop so

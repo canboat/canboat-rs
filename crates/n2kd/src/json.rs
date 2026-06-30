@@ -139,29 +139,119 @@ pub fn value_or_name<'a>(msg: &'a str, field: &str) -> Option<&'a str> {
     Some(v)
 }
 
-/// Resolve `field`'s readable text for the schema-driven snapshot
-/// key:
+/// Resolve `field`'s text for the schema-driven snapshot key.
 ///
-/// 1. If the field's value is a `-nv` lookup object
-///    `{"value":N,"name":"X"}`, prefer `name`; otherwise fall back to
-///    `value` (so `"Instance":{"value":0,"key":true}` resolves to
-///    `"0"`).
-/// 2. Return the value verbatim — no whitespace truncation. canboat
-///    C n2kd's `n2kd/main.c:1064` cut at the first space so
-///    `"True (ground referenced to North)"` became `"True"`. We
-///    don't, because canboat-rs builds composite cache keys from
-///    every `PartOfPrimaryKey` field on the PGN (issue #2) and a
-///    consistent full-name representation is what the
-///    `canboat_core::snapshot::composite_secondary` walker on the
-///    pipeline path produces. Truncating only here would produce
-///    different keys depending on which backend wrote the entry.
+/// For `-nv` lookup objects `{"value":N,"name":"X"}` we emit the
+/// numeric `value` rather than the display `name`: composite keys
+/// stay short and remain stable when canboat renames an enum label
+/// (e.g. tweaking `"True"` → `"True (ground referenced to North)"`
+/// would otherwise reshuffle cache entries between schema bumps).
+///
+/// Bare-string fields (non-`-nv` input, plain integers) pass through
+/// verbatim — no numeric is available in that path. When a `-nv`
+/// object is missing `value` for any reason, fall back to `name`.
 pub fn lookup_text<'a>(msg: &'a str, field: &str) -> Option<&'a str> {
     let v = value(msg, field)?;
     if v.starts_with('{') {
-        value(v, "name").or_else(|| value(v, "value"))
+        value(v, "value").or_else(|| value(v, "name"))
     } else {
         Some(v)
     }
+}
+
+/// Locate `"<field>":[...]` in `msg` and return the half-open byte
+/// span covering the array (`[` through `]` inclusive). Used by the
+/// per-iteration snapshot path to splice one element out of a
+/// repeating-set `"list":[…]` while leaving the rest of the JSON
+/// line byte-identical.
+pub fn array_span(msg: &str, field: &str) -> Option<(usize, usize)> {
+    let needle = format!("\"{field}\":");
+    let mut start = msg.find(&needle)? + needle.len();
+    let bytes = msg.as_bytes();
+    while start < bytes.len() && (bytes[start] == b' ' || bytes[start] == b'\t') {
+        start += 1;
+    }
+    if start >= bytes.len() || bytes[start] != b'[' {
+        return None;
+    }
+    let mut depth = 0;
+    let mut idx = start;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b'[' => depth += 1,
+            b']' => {
+                depth -= 1;
+                if depth == 0 {
+                    return Some((start, idx + 1));
+                }
+            }
+            b'"' => {
+                // Skip string body so brackets inside strings don't
+                // throw off the depth count. Honour `\"` escapes.
+                idx += 1;
+                while idx < bytes.len() && bytes[idx] != b'"' {
+                    if bytes[idx] == b'\\' && idx + 1 < bytes.len() {
+                        idx += 2;
+                        continue;
+                    }
+                    idx += 1;
+                }
+            }
+            _ => {}
+        }
+        idx += 1;
+    }
+    None
+}
+
+/// Split an array body like `[{e1},{e2},{e3}]` into its `{…}`
+/// element substrings (without the outer brackets). Skips
+/// non-object elements — every analyzer-emitted repeating set is
+/// an array of objects.
+pub fn split_object_array(arr: &str) -> Vec<&str> {
+    let bytes = arr.as_bytes();
+    if bytes.first() != Some(&b'[') {
+        return Vec::new();
+    }
+    let mut out = Vec::new();
+    let mut idx = 1;
+    while idx < bytes.len() {
+        match bytes[idx] {
+            b' ' | b'\t' | b',' => idx += 1,
+            b']' => break,
+            b'{' => {
+                let start = idx;
+                let mut depth = 0;
+                while idx < bytes.len() {
+                    match bytes[idx] {
+                        b'{' => depth += 1,
+                        b'}' => {
+                            depth -= 1;
+                            if depth == 0 {
+                                idx += 1;
+                                break;
+                            }
+                        }
+                        b'"' => {
+                            idx += 1;
+                            while idx < bytes.len() && bytes[idx] != b'"' {
+                                if bytes[idx] == b'\\' && idx + 1 < bytes.len() {
+                                    idx += 2;
+                                    continue;
+                                }
+                                idx += 1;
+                            }
+                        }
+                        _ => {}
+                    }
+                    idx += 1;
+                }
+                out.push(&arr[start..idx]);
+            }
+            _ => idx += 1,
+        }
+    }
+    out
 }
 
 #[cfg(test)]
@@ -198,36 +288,72 @@ mod tests {
     }
 
     #[test]
-    fn lookup_text_prefers_name() {
+    fn lookup_text_prefers_numeric_value() {
+        // Composite snapshot keys use the raw numeric `value` rather
+        // than the display `name` — short and stable across schema
+        // label edits.
         let m = r#"{"Reference":{"value":1,"name":"Magnetic"}}"#;
-        assert_eq!(lookup_text(m, "Reference"), Some("Magnetic"));
+        assert_eq!(lookup_text(m, "Reference"), Some("1"));
     }
 
     #[test]
-    fn lookup_text_falls_back_to_value_when_no_name() {
-        // PGN 127501 Instance is `{"value":N,"key":true}` — no name.
+    fn lookup_text_handles_key_true_objects() {
+        // PGN 127501 Instance is `{"value":N,"key":true}` — same path.
         let m = r#"{"Instance":{"value":0,"key":true}}"#;
         assert_eq!(lookup_text(m, "Instance"), Some("0"));
     }
 
     #[test]
-    fn lookup_text_returns_full_name_with_whitespace() {
-        // Schema-driven snapshot keys (issue #2) use the canboat enum
-        // name verbatim — no whitespace truncation. The matching
-        // canboat-pipeline path renders Lookups the same way, so the
-        // two backends agree on the cache key regardless of which
-        // wrote the entry.
-        let m =
-            r#"{"Reference":{"value":0,"name":"True (ground referenced to North)","key":true}}"#;
-        assert_eq!(
-            lookup_text(m, "Reference"),
-            Some("True (ground referenced to North)")
-        );
+    fn lookup_text_falls_back_to_name_when_value_missing() {
+        // Defensive: if a -nv object has no `value` for any reason,
+        // fall back to the display name rather than dropping the key.
+        let m = r#"{"Reference":{"name":"Magnetic"}}"#;
+        assert_eq!(lookup_text(m, "Reference"), Some("Magnetic"));
     }
 
     #[test]
     fn lookup_text_returns_bare_value_when_no_object() {
         let m = r#"{"User ID":"244180106"}"#;
         assert_eq!(lookup_text(m, "User ID"), Some("244180106"));
+    }
+
+    #[test]
+    fn array_span_locates_top_level_list() {
+        let line = r#"{"pgn":130824,"fields":{"list":[{"a":1},{"a":2}]}}"#;
+        let (s, e) = array_span(line, "list").expect("list found");
+        assert_eq!(&line[s..e], "[{\"a\":1},{\"a\":2}]");
+    }
+
+    #[test]
+    fn array_span_skips_brackets_inside_strings() {
+        // Brackets inside JSON string literals must not throw off the
+        // depth counter — the analyzer occasionally emits strings
+        // containing `]` (e.g. a Free-Text Message with brackets).
+        let line = r#"{"fields":{"Note":"a]b","list":[{"a":1}]}}"#;
+        let (s, e) = array_span(line, "list").expect("list span");
+        assert_eq!(&line[s..e], "[{\"a\":1}]");
+    }
+
+    #[test]
+    fn split_object_array_breaks_top_level_objects_only() {
+        let arr = r#"[{"a":1,"b":[2,3]},{"a":4},{"a":{"nested":5}}]"#;
+        let elems = split_object_array(arr);
+        assert_eq!(
+            elems,
+            vec![
+                r#"{"a":1,"b":[2,3]}"#,
+                r#"{"a":4}"#,
+                r#"{"a":{"nested":5}}"#,
+            ]
+        );
+    }
+
+    #[test]
+    fn split_object_array_handles_empty_and_whitespace() {
+        assert!(split_object_array("[]").is_empty());
+        assert_eq!(
+            split_object_array("[ {\"a\":1} , {\"a\":2} ]"),
+            vec!["{\"a\":1}", "{\"a\":2}"]
+        );
     }
 }

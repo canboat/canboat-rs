@@ -99,11 +99,11 @@ pub fn is_ais_pgn(pgn: u32) -> bool {
 }
 
 /// Compose the schema-driven secondary discriminator for a record by
-/// walking every field marked `PartOfPrimaryKey` on the PGN's
-/// [`PgnInfo`], looking each one up via `get_text`, and joining the
-/// resolved values with `_`. Returns `None` when the PGN has no
-/// primary key declared, or when none of its PK fields produced a
-/// textual value.
+/// walking every top-level field marked `PartOfPrimaryKey` on the
+/// PGN's [`PgnInfo`], looking each one up via `get_text`, and joining
+/// the resolved values with `_`. Returns `None` when the PGN has no
+/// top-level primary key, or when none of its top-level PK fields
+/// produced a textual value.
 ///
 /// This is canboat-rs's deliberate divergence from canboat C n2kd's
 /// "first-name-from-hardcoded-list wins" key extraction (#2). The
@@ -115,8 +115,12 @@ pub fn is_ais_pgn(pgn: u32) -> bool {
 /// nominal Instance would overwrite each other in the cache. The
 /// schema-driven composite key gives them separate entries.
 ///
-/// Fields inside repeating sets are skipped — primary keys are
-/// top-level in every canboat-declared PGN today.
+/// Fields inside a repeating set are intentionally skipped here.
+/// PGNs whose PK lives inside a repeating set (PGNs 129796, 129816,
+/// 130824 — `Destination ID`, `Key`, …) yield one cache entry per
+/// iteration; callers should detect that case via
+/// [`repeating_pk_set`] and use [`per_iteration_secondary`] to build
+/// each iteration's key.
 pub fn composite_secondary<F>(info: &crate::PgnInfo, mut get_text: F) -> Option<String>
 where
     F: FnMut(&crate::FieldInfo) -> Option<String>,
@@ -124,6 +128,9 @@ where
     let mut parts: Vec<String> = Vec::new();
     for f in info.fields {
         if f.part_of_primary_key != Some(true) {
+            continue;
+        }
+        if field_in_any_repeat_set(info, f).is_some() {
             continue;
         }
         if let Some(s) = get_text(f) {
@@ -135,6 +142,94 @@ where
     } else {
         Some(parts.join("_"))
     }
+}
+
+/// `Some(N)` when the PGN has at least one `PartOfPrimaryKey` field
+/// inside repeating field set `N` (1 or 2). `None` when the PGN's
+/// PK is purely top-level (the common case — only 4 PGNs in canboat
+/// 7.1.0 carry PK fields inside a repeating set: 129796 / 129816 /
+/// 130824 [B&G] / 130824 [Mercury]).
+///
+/// Callers use this to decide between a single cache entry
+/// ([`composite_secondary`]) and one cache entry per iteration
+/// ([`per_iteration_secondary`]).
+pub fn repeating_pk_set(info: &crate::PgnInfo) -> Option<u8> {
+    for f in info.fields {
+        if f.part_of_primary_key != Some(true) {
+            continue;
+        }
+        if let Some(set) = field_in_any_repeat_set(info, f) {
+            return Some(set);
+        }
+    }
+    None
+}
+
+/// Build the secondary discriminator for iteration `iter` of
+/// `repeat_set` on a PGN whose PK includes per-iteration fields.
+/// Top-level PK values are joined first (in field-`order`), then
+/// each iteration-level PK value — exactly the same `_` join as
+/// [`composite_secondary`] for a non-repeating PGN.
+///
+/// `get_top(field)` resolves a top-level field's text. `get_iter
+/// (field, iter)` resolves a field's text for iteration `iter` of
+/// the repeating set. Returns `None` when every PK field came back
+/// `None` for this iteration.
+pub fn per_iteration_secondary<F, G>(
+    info: &crate::PgnInfo,
+    repeat_set: u8,
+    iter: u32,
+    mut get_top: F,
+    mut get_iter: G,
+) -> Option<String>
+where
+    F: FnMut(&crate::FieldInfo) -> Option<String>,
+    G: FnMut(&crate::FieldInfo, u32) -> Option<String>,
+{
+    let mut parts: Vec<String> = Vec::new();
+    for f in info.fields {
+        if f.part_of_primary_key != Some(true) {
+            continue;
+        }
+        let resolved = match field_in_any_repeat_set(info, f) {
+            None => get_top(f),
+            Some(set) if set == repeat_set => get_iter(f, iter),
+            Some(_) => None,
+        };
+        if let Some(s) = resolved {
+            parts.push(s);
+        }
+    }
+    if parts.is_empty() {
+        None
+    } else {
+        Some(parts.join("_"))
+    }
+}
+
+/// `Some(set)` (1 or 2) when `field`'s `order` falls inside one of
+/// `pgn`'s declared repeating field sets; `None` for top-level
+/// fields. Repeating-set bounds are half-open: `[start, start +
+/// size)`.
+fn field_in_any_repeat_set(pgn: &crate::PgnInfo, field: &crate::FieldInfo) -> Option<u8> {
+    let order = field.order as u32;
+    if let (Some(start), Some(size)) = (
+        pgn.repeating_field_set1_start_field,
+        pgn.repeating_field_set1_size,
+    ) {
+        if order >= start && order < start + size {
+            return Some(1);
+        }
+    }
+    if let (Some(start), Some(size)) = (
+        pgn.repeating_field_set2_start_field,
+        pgn.repeating_field_set2_size,
+    ) {
+        if order >= start && order < start + size {
+            return Some(2);
+        }
+    }
+    None
 }
 
 /// One record to be stashed in the snapshot cache. The caller is
@@ -448,6 +543,54 @@ fn write_json_string(out: &mut String, s: &str) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn repeating_pk_set_detects_pgn_130824() {
+        // canboat 7.1.0 lists exactly four PGNs with PartOfPrimaryKey
+        // inside a repeating set — the B&G and Mercury 130824 variants
+        // plus 129796 / 129816. PGN 130824 is the one driving this
+        // feature (one cache entry per Key/Value pair instead of all
+        // pairs collapsing into a single src-keyed entry).
+        let info = crate::PgnDatabase::embedded()
+            .first_pgn(130824)
+            .expect("PGN 130824 present in embedded db");
+        assert_eq!(repeating_pk_set(info), Some(1));
+    }
+
+    #[test]
+    fn repeating_pk_set_returns_none_for_top_level_pk() {
+        // PGN 127251 (Rate of Turn) declares no primary key at all.
+        let info = crate::PgnDatabase::embedded()
+            .first_pgn(127251)
+            .expect("PGN 127251 present in embedded db");
+        assert_eq!(repeating_pk_set(info), None);
+        // PGN 127509 (Inverter Status): composite top-level PK
+        // (`Instance`, `AC Instance`, `DC Instance`), no repeating
+        // set involved.
+        let info = crate::PgnDatabase::embedded()
+            .first_pgn(127509)
+            .expect("PGN 127509 present in embedded db");
+        assert_eq!(repeating_pk_set(info), None);
+    }
+
+    #[test]
+    fn per_iteration_secondary_joins_top_and_iter_values() {
+        // PGN 129796 (AIS Acknowledge): `Source ID` is top-level PK,
+        // `Destination ID` lives in repeating set 1 — composite key
+        // is `<Source ID>_<Destination ID>`.
+        let info = crate::PgnDatabase::embedded()
+            .first_pgn(129796)
+            .expect("PGN 129796 present in embedded db");
+        let set = repeating_pk_set(info).expect("129796 has repeating PK");
+        let key = per_iteration_secondary(
+            info,
+            set,
+            2,
+            |f| (f.name == "Source ID").then(|| "111".to_string()),
+            |f, iter| (f.name == "Destination ID").then(|| format!("dst{iter}")),
+        );
+        assert_eq!(key.as_deref(), Some("111_dst2"));
+    }
 
     #[test]
     fn ttl_for_device_info_pgns_is_none() {

@@ -40,7 +40,7 @@ use clap::Parser;
 use canboat_core::format::{
     InputFormat, detect, header_implies_coalesced, parse_format_header, parse_with,
 };
-use canboat_core::output::CamelCase;
+use canboat_core::output::{CamelCase, JsonOptions};
 use canboat_core::{PgnDatabase, RawFrame};
 use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
@@ -290,8 +290,25 @@ fn run(cli: Cli) -> Result<()> {
     // tables.
     let db = PgnDatabase::embedded();
 
+    let camel_case = if cli.upper_camel {
+        CamelCase::Upper
+    } else if cli.camel {
+        CamelCase::Lower
+    } else {
+        CamelCase::Off
+    };
+    // JsonOptions mirror the pipeline's per-record serializer settings
+    // so per-iteration snapshot lines (PGN 130824 etc.) come out
+    // byte-identical to the regular `analyzer` port stream.
+    let json_opts = JsonOptions {
+        include_empty: false,
+        name_value: true,
+        debug: false,
+        camel_case,
+    };
+
     let snapshot = if cli.snapshot_port != 0 {
-        Some(Arc::new(SnapshotStore::new()))
+        Some(Arc::new(SnapshotStore::new(json_opts.clone())))
     } else {
         None
     };
@@ -431,20 +448,13 @@ fn run(cli: Cli) -> Result<()> {
 
     let _ = inject; // No further use in this function
 
-    let camel_case = if cli.upper_camel {
-        CamelCase::Upper
-    } else if cli.camel {
-        CamelCase::Lower
-    } else {
-        CamelCase::Off
-    };
     pipeline::run(
         db,
         frames_rx,
         hubs,
         cli.nmea0183_stdout,
         pre_coalesced,
-        camel_case,
+        json_opts,
     );
 
     // After the pipeline drains, signal the supervisor to stop

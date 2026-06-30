@@ -15,6 +15,7 @@ path = "src/main.rs"
 [dependencies]
 canboat-core = { workspace = true }
 canboat-cli  = { workspace = true }
+analyzer     = { path = "../analyzer", version = "0.2.0" }
 anyhow       = { workspace = true }
 clap         = { workspace = true }
 env_logger   = { workspace = true }

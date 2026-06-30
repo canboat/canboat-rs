@@ -21,6 +21,7 @@
 //! a contract) — for now we just surface the IP/port and document the
 //! limitation.
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -70,6 +71,74 @@ impl Writer {
 pub fn make_writer() -> (Writer, mpsc::UnboundedReceiver<String>) {
     let (tx, rx) = mpsc::unbounded_channel();
     (Writer { tx }, rx)
+}
+
+/// Spawn the background log-replay task. Decodes `path` through the
+/// analyzer's library pipeline (`analyzer::replay::decode_file`) in
+/// a blocking thread, ships each decoded record's JSON form through
+/// an unbounded channel, and a sibling async task applies them to
+/// `state` the same way the live stream reader does. Errors land in
+/// `AppState::status.last_error` so the existing fatal-error modal
+/// surfaces them.
+pub fn spawn_log_load(path: PathBuf, state: Arc<Mutex<AppState>>) {
+    use canboat_core::output::JsonOptions;
+    use canboat_core::output::write_json;
+    use canboat_core::snapshot::{SnapshotInput, classify_json_line};
+
+    let (tx, mut rx) = mpsc::unbounded_channel::<SnapshotInput>();
+
+    // CPU-bound: run analyzer decode in a blocking thread so the
+    // tokio reactor isn't starved on big captures.
+    let path_for_blocker = path.clone();
+    let state_for_err = state.clone();
+    tokio::task::spawn_blocking(move || {
+        let cfg = analyzer::replay::Config::default();
+        let json_opts = JsonOptions::default();
+        let mut buf = String::with_capacity(512);
+        let result = analyzer::replay::decode_file(&path_for_blocker, &cfg, |decoded| {
+            buf.clear();
+            // Re-render to JSON so the per-line classifier path here
+            // is identical to the live-stream one — same composite
+            // keys, same per-iteration splits for repeating-PK PGNs.
+            // The cost is one serialize per record; cheap relative
+            // to the upstream decode.
+            if write_json(&mut buf, decoded, &json_opts).is_err() {
+                return;
+            }
+            classify_json_line(&buf, |input| {
+                let _ = tx.send(input);
+            });
+        });
+        if let Err(e) = result {
+            // Lock briefly to surface the read / parse failure to the UI.
+            tokio::runtime::Handle::current().block_on(async {
+                let mut s = state_for_err.lock().await;
+                s.status.last_error = Some(format!("log: {e:#}"));
+            });
+        }
+    });
+
+    // Drain the channel on the tokio runtime — applies one record at
+    // a time, so a long-running ingest doesn't lock the UI out.
+    tokio::spawn(async move {
+        while let Some(input) = rx.recv().await {
+            let value: Value = match serde_json::from_str(&input.line) {
+                Ok(v) => v,
+                Err(_) => continue,
+            };
+            let mut s = state.lock().await;
+            s.upsert(
+                input.pgn,
+                input.src,
+                input.secondary,
+                input.pgn_description,
+                value,
+            );
+        }
+        // Channel closed → analyzer pipeline finished.
+        let mut s = state.lock().await;
+        s.status.snapshot_loaded = true;
+    });
 }
 
 /// Spawn the background snapshot-load task. Failures are surfaced

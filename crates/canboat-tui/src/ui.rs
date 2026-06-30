@@ -49,7 +49,7 @@ use ratatui::widgets::{
 
 use crate::iso;
 use crate::overrides::{self, INTERVAL_OFF, Override, Overrides, default_path};
-use crate::state::{AppState, DeviceInfo, Entry};
+use crate::state::{AppState, DeviceInfo, Entry, Mode};
 
 /// Per-PGN well-known transmit defaults, used purely as UI hints
 /// when the user opens the override dialog. Picking the right default
@@ -269,7 +269,9 @@ impl App {
                     };
                 }
             }
-            (Screen::DeviceDetail { src }, KeyCode::Char('i')) => {
+            (Screen::DeviceDetail { src }, KeyCode::Char('i'))
+                if state.status.mode == Mode::Live =>
+            {
                 // Ask the device to publish its PGN List (Transmit/Receive).
                 let line = iso::iso_request(*src, 126464);
                 if writer.send(line) {
@@ -278,7 +280,9 @@ impl App {
                     self.toast = Some("Writer channel closed".into());
                 }
             }
-            (Screen::DeviceDetail { src }, KeyCode::Char('o')) if self.overrides_writable => {
+            (Screen::DeviceDetail { src }, KeyCode::Char('o'))
+                if state.status.mode == Mode::Live && self.overrides_writable =>
+            {
                 let rows = self.detail_rows(*src, state);
                 if let Some(row) = self.detail_state.selected().and_then(|i| rows.get(i)) {
                     // Live row: read mfr/ind off the cached JSON.
@@ -521,7 +525,7 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
                 );
             }
         }
-        draw_hint_bar(f, chunks[2], app);
+        draw_hint_bar(f, chunks[2], app, state);
         // Modal stack — last drawn wins. Override dialog is least
         // important, connecting overlay sits above it, fatal-error
         // modal trumps everything.
@@ -555,17 +559,35 @@ fn has_unacknowledged_error(app: &App, state: &AppState) -> bool {
 
 fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &AppState) {
     let s = &state.status;
-    let conn = if s.stream_connected { "live" } else { "disc" };
-    let snap = if s.snapshot_loaded { "ok" } else { "…" };
-    let first = format!(
-        " canboat-tui  endpoint {host}:{snap_port}/{stream_port}  snap:{snap}  stream:{conn}  msgs:{msgs}  devs:{devs}  entries:{entries}",
-        host = s.host,
-        snap_port = s.snapshot_port,
-        stream_port = s.stream_port,
-        msgs = s.messages_seen,
-        devs = state.device_list().len(),
-        entries = state.entries.len(),
-    );
+    let first = match s.mode {
+        Mode::Live => {
+            let conn = if s.stream_connected { "live" } else { "disc" };
+            let snap = if s.snapshot_loaded { "ok" } else { "…" };
+            format!(
+                " canboat-tui  endpoint {host}:{snap_port}/{stream_port}  snap:{snap}  stream:{conn}  msgs:{msgs}  devs:{devs}  entries:{entries}",
+                host = s.host,
+                snap_port = s.snapshot_port,
+                stream_port = s.stream_port,
+                msgs = s.messages_seen,
+                devs = state.device_list().len(),
+                entries = state.entries.len(),
+            )
+        }
+        Mode::Log => {
+            let load = if s.snapshot_loaded {
+                "loaded"
+            } else {
+                "loading…"
+            };
+            format!(
+                " canboat-tui  log: {host}  {load}  msgs:{msgs}  devs:{devs}  entries:{entries}",
+                host = s.host,
+                msgs = s.messages_seen,
+                devs = state.device_list().len(),
+                entries = state.entries.len(),
+            )
+        }
+    };
     // Second line priority: alert > toast > error > hint.
     //
     // * `alert` is a bus-side warning (e.g. a NAKed PGN 126208 ACK)
@@ -596,7 +618,7 @@ fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
         ]),
         _ => Line::from(format!(
             " {}",
-            screen_hint(&app.screen, app.overrides_writable)
+            screen_hint(&app.screen, app.overrides_writable, s.mode)
         )),
     };
     let lines = vec![Line::from(first), second];
@@ -604,10 +626,10 @@ fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
     f.render_widget(p, area);
 }
 
-fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
+fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &AppState) {
     let p = Paragraph::new(format!(
         " {}",
-        screen_hint(&app.screen, app.overrides_writable)
+        screen_hint(&app.screen, app.overrides_writable, state.status.mode)
     ))
     .style(Style::default().fg(Color::DarkGray));
     f.render_widget(p, area);
@@ -616,20 +638,23 @@ fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App) {
 /// Per-screen one-line keybinding cheat sheet. Kept in one place so
 /// the top status-bar fallback line and the bottom hint bar stay in
 /// sync, and so a binding that doesn't apply (e.g. `i`/`o` on the
-/// EntryDetail screen) doesn't get advertised where it would do
-/// nothing.
-fn screen_hint(screen: &Screen, overrides_writable: bool) -> &'static str {
-    match screen {
-        Screen::Devices => "q quit | ↑↓ move | Enter open device",
-        Screen::DeviceDetail { .. } if overrides_writable => {
+/// EntryDetail screen, or on the DeviceDetail screen in log mode)
+/// doesn't get advertised where it would do nothing.
+fn screen_hint(screen: &Screen, overrides_writable: bool, mode: Mode) -> &'static str {
+    match (screen, mode) {
+        (Screen::Devices, _) => "q quit | ↑↓ move | Enter open device",
+        // Log mode: no live bus → no `i` / `o`.
+        (Screen::DeviceDetail { .. }, Mode::Log) => {
+            "q quit | ↑↓ move | Enter open entry | Esc back"
+        }
+        (Screen::DeviceDetail { .. }, Mode::Live) if overrides_writable => {
             "q quit | ↑↓ move | Enter open entry | Esc back | i ISO 126464 | o override interval"
         }
-        // `o` is omitted here when the overrides file isn't writable —
-        // showing the binding while it does nothing would be a lie.
-        Screen::DeviceDetail { .. } => {
+        // `o` omitted when the overrides file isn't writable.
+        (Screen::DeviceDetail { .. }, Mode::Live) => {
             "q quit | ↑↓ move | Enter open entry | Esc back | i ISO 126464"
         }
-        Screen::EntryDetail { .. } => {
+        (Screen::EntryDetail { .. }, _) => {
             "q quit | ↑↓ scroll 1 | PgUp/PgDn scroll 10 | g/G top/bottom | Esc back"
         }
     }

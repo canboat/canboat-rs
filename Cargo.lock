@@ -195,6 +195,7 @@ dependencies = [
 name = "canboat-tui"
 version = "0.2.0"
 dependencies = [
+ "analyzer",
  "anyhow",
  "canboat-cli",
  "canboat-core",

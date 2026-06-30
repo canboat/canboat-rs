@@ -45,16 +45,25 @@ use crate::state::{AppState, Status};
 )]
 struct Args {
     /// Hostname or IP of the n2kd / canboat-pipeline endpoint.
+    /// Ignored when `--log` is set.
     #[arg(long, default_value = "127.0.0.1")]
     host: String,
     /// Snapshot port (default 2597 — canboat-pipeline `--snapshot-port`
-    /// or n2kd JSON snapshot).
+    /// or n2kd JSON snapshot). Ignored when `--log` is set.
     #[arg(long, default_value_t = 2597)]
     snapshot_port: u16,
     /// Live JSON stream port (default 2598 — canboat-pipeline
-    /// `--analyzer-port` or n2kd JSON stream).
+    /// `--analyzer-port` or n2kd JSON stream). Ignored when `--log`
+    /// is set.
     #[arg(long, default_value_t = 2598)]
     stream_port: u16,
+    /// Replay a captured log file instead of connecting to a live
+    /// endpoint. Accepts any analyzer-readable format (PLAIN, FAST,
+    /// Actisense, iKonvert, YDWG02 — auto-detected on the first
+    /// content line). The `o` (override) and `i` (ISO request) keys
+    /// are disabled in this mode since they need a live bus.
+    #[arg(long, value_name = "PATH")]
+    log: Option<std::path::PathBuf>,
 }
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
@@ -66,27 +75,43 @@ async fn main() -> Result<()> {
         .try_init();
 
     let args = Args::parse();
-    let status = Status::new(args.host.clone(), args.snapshot_port, args.stream_port);
+    let status = match &args.log {
+        Some(path) => Status::new_log(path.display().to_string()),
+        None => Status::new_live(args.host.clone(), args.snapshot_port, args.stream_port),
+    };
     let state = Arc::new(Mutex::new(AppState::new(status)));
 
-    // Create the writer channel up front so the UI is usable from the
-    // first frame — sends queue here until the stream task connects.
+    // Writer channel is created up front in both modes — in log mode
+    // nothing ever sends through it (the `o` / `i` handlers are gated
+    // on Mode::Live), but having the same `Writer` shape keeps the
+    // UI code path uniform.
     let (writer, writer_rx) = client::make_writer();
-
-    // Kick off both network tasks in the background; the UI loop
-    // surfaces their progress / errors via the status bar.
-    client::spawn_snapshot_load(args.host.clone(), args.snapshot_port, state.clone());
-    client::spawn_stream_connection(
-        args.host.clone(),
-        args.stream_port,
-        state.clone(),
-        writer_rx,
-    );
+    if let Some(path) = args.log.clone() {
+        // Log mode: drive the analyzer's library decode pipeline on a
+        // blocking thread; no snapshot/stream sockets. Drop
+        // `writer_rx` — nothing will write to the channel.
+        drop(writer_rx);
+        client::spawn_log_load(path, state.clone());
+    } else {
+        // Live mode: kick off both network tasks in the background;
+        // the UI loop surfaces their progress / errors via the status
+        // bar.
+        client::spawn_snapshot_load(args.host.clone(), args.snapshot_port, state.clone());
+        client::spawn_stream_connection(
+            args.host.clone(),
+            args.stream_port,
+            state.clone(),
+            writer_rx,
+        );
+    }
 
     let mut app = ui::App::new();
-    // Persisted overrides are queued to the writer immediately; they
-    // flush to the socket as soon as the stream task connects.
-    app.replay_overrides(&writer);
+    if args.log.is_none() {
+        // Persisted overrides are queued to the writer immediately;
+        // they flush to the socket as soon as the stream task
+        // connects. Log mode has nothing to write back to, so skip.
+        app.replay_overrides(&writer);
+    }
 
     let mut tty = setup_tty()?;
     let res = run_loop(&mut tty, &mut app, state, writer).await;

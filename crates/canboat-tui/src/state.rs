@@ -103,24 +103,59 @@ pub struct DeviceInfo {
     pub pgn_count: usize,
 }
 
-/// Snapshot of network / connection state shown in the status bar.
+/// What's feeding the cache — a live bus / pipeline endpoint or a
+/// captured log file. Drives several UI affordances:
+///
+/// * `Mode::Log` hides the `i` (ISO Request) and `o` (override)
+///   bindings; both rely on writing back to a live bus and would
+///   silently do nothing against a file.
+/// * The status bar's "endpoint" label switches between
+///   `host:snap/stream` and `log: <path>` shapes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mode {
+    Live,
+    Log,
+}
+
+/// Snapshot of source / connection state shown in the status bar.
 #[derive(Debug, Clone)]
 pub struct Status {
+    pub mode: Mode,
+    /// Live mode: hostname. Log mode: log file path (display form).
     pub host: String,
+    /// Live mode: snapshot port; ignored / `0` in Log mode.
     pub snapshot_port: u16,
+    /// Live mode: stream port; ignored / `0` in Log mode.
     pub stream_port: u16,
+    /// Live: snapshot blob fully drained. Log: log file fully
+    /// decoded.
     pub snapshot_loaded: bool,
+    /// Live: stream socket up. Log: always `false`.
     pub stream_connected: bool,
     pub messages_seen: u64,
     pub last_error: Option<String>,
 }
 
 impl Status {
-    pub fn new(host: String, snapshot_port: u16, stream_port: u16) -> Self {
+    pub fn new_live(host: String, snapshot_port: u16, stream_port: u16) -> Self {
         Self {
+            mode: Mode::Live,
             host,
             snapshot_port,
             stream_port,
+            snapshot_loaded: false,
+            stream_connected: false,
+            messages_seen: 0,
+            last_error: None,
+        }
+    }
+
+    pub fn new_log(path_display: String) -> Self {
+        Self {
+            mode: Mode::Log,
+            host: path_display,
+            snapshot_port: 0,
+            stream_port: 0,
             snapshot_loaded: false,
             stream_connected: false,
             messages_seen: 0,

@@ -16,16 +16,51 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
-/// Where the canboat C repo lives, relative to this crate.
+/// Where the canboat C repo's `analyzer/tests/` lives, relative to
+/// this crate.
+///
+/// Resolution order, first match wins:
+///
+/// 1. `$CANBOAT_DIR` (when set) — explicit override for CI / local
+///    development against an in-flight branch.
+/// 2. `../canboat-*` — every sibling worktree (alphabetical, so a
+///    `canboat-fix-pk` worktree carrying staged schema changes is
+///    preferred over the main `canboat/` checkout while the PR is
+///    open). Skip non-directories and any entry whose
+///    `analyzer/tests/` doesn't exist.
+/// 3. `../canboat` — the default sibling clone.
+///
+/// Returns `None` only when none of the above resolves — in that
+/// case `run_case_skipping` skips the test gracefully so users
+/// building canboat-rs in isolation aren't blocked.
 fn canboat_tests_dir() -> Option<PathBuf> {
+    if let Ok(dir) = std::env::var("CANBOAT_DIR") {
+        let p = PathBuf::from(dir).join("analyzer").join("tests");
+        if p.is_dir() {
+            return Some(p);
+        }
+    }
     let manifest: PathBuf = env!("CARGO_MANIFEST_DIR").into();
-    let p = manifest
-        .parent()?
-        .parent()? // canboat-rs/
-        .parent()? // ../  (github/)
-        .join("canboat")
-        .join("analyzer")
-        .join("tests");
+    let github_root = manifest.parent()?.parent()?.parent()?; // …/github
+    let mut worktree_candidates: Vec<PathBuf> = std::fs::read_dir(github_root)
+        .ok()?
+        .filter_map(|e| e.ok())
+        .map(|e| e.path())
+        .filter(|p| {
+            p.file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("canboat-"))
+                && p.is_dir()
+        })
+        .collect();
+    worktree_candidates.sort();
+    for p in worktree_candidates {
+        let cand = p.join("analyzer").join("tests");
+        if cand.is_dir() {
+            return Some(cand);
+        }
+    }
+    let p = github_root.join("canboat").join("analyzer").join("tests");
     if p.is_dir() { Some(p) } else { None }
 }
 

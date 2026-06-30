@@ -103,21 +103,17 @@ pub fn is_ais_pgn(pgn: u32) -> bool {
 /// cache to distinguish records that the spec treats as distinct.
 ///
 /// Entries are `(pgn, field_id)` pairs. The `field_id` is canboat's
-/// camelCase identifier (e.g. `"functionCode"`), matched against
-/// [`FieldInfo::id`]. [`is_part_of_primary_key`] returns `true` for
-/// any (pgn, field) listed here, on top of what the schema already
-/// marks.
+/// camelCase identifier matched against [`FieldInfo::id`].
+/// [`is_part_of_primary_key`] returns `true` for any (pgn, field)
+/// listed here, on top of what the schema already marks.
 ///
-/// Current entries:
-///
-/// * `(126464, "functionCode")` — PGN 126464 "PGN List (Transmit
-///   and Receive)" is sent as two distinct records per source: one
-///   with Function Code = 0 (Transmit) and one with Function Code =
-///   1 (Receive). The canboat 7.1.0 schema doesn't flag Function
-///   Code as PK, so both records would otherwise share key
-///   `(126464, src, None)` and the second received overwrites the
-///   first.
-const PRIMARY_KEY_OVERRIDES: &[(u32, &str)] = &[(126464, "functionCode")];
+/// Currently empty — every PK fix we've needed has been pushed
+/// upstream into `data/canboat.json` (PGN 126464 `functionCode`,
+/// the five PGN 65305 Simnet variants' `report` field, …) and is
+/// flagged by the schema directly. This table stays in place as
+/// the escape hatch for the next "the schema is missing a PK" bug
+/// we find in the field.
+const PRIMARY_KEY_OVERRIDES: &[(u32, &str)] = &[];
 
 /// `true` iff `field` should be treated as part of `pgn`'s primary
 /// key — i.e. the schema says so OR [`PRIMARY_KEY_OVERRIDES`] lists

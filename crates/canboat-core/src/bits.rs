@@ -10,12 +10,21 @@
 /// Result of an integer field extraction.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Extracted {
-    /// The decoded raw integer value (sign-extended if signed).
+    /// The decoded raw integer value (sign-extended if signed,
+    /// post-offset).
     pub value: i64,
     /// The maximum representable value for this field's bit width
     /// (also sign-shifted if signed). Used to detect the canboat
     /// "not-available" / "error" sentinels.
     pub max: i64,
+    /// The unsigned bit pattern that was extracted — before any
+    /// sign extension or offset was applied. This is what the
+    /// schema-2.4.0 `UnknownValue` / `OutOfRangeValue` /
+    /// `ReservedValue` hints are stated against, and it round-trips
+    /// losslessly through u64 for any field width up to 64 bits
+    /// (where `value: i64` would lose the sign bit and `value as
+    /// f64` would lose precision for >53-bit fields).
+    pub raw: u64,
 }
 
 /// Extract `bits` bits starting at the bit offset `bit_offset` from
@@ -124,6 +133,7 @@ pub fn extract_bits(
     Some(Extracted {
         value: value_signed,
         max: max_signed,
+        raw: value,
     })
 }
 
@@ -144,34 +154,64 @@ pub fn is_unavailable(extracted: Extracted) -> bool {
     reserved > 0 && extracted.value > extracted.max - reserved
 }
 
-/// Per-field sentinel test. When the field carries schema-2.4.0 hints
-/// (any of `UnknownValue` / `OutOfRangeValue` / `ReservedValue`), exactly
-/// those raw values are treated as unavailable — no others. When all
-/// three are absent (older databases, or fields the upstream schema
-/// deliberately excludes from sentinel reservation like ISO Device
-/// Instance) the call falls back to the bit-width heuristic in
-/// [`is_unavailable`].
+/// One of the four classifications [`classify_sentinel`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Sentinel {
+    /// Raw value is a legitimate reading.
+    None,
+    /// "Data not available" — `UnknownValue` hit, or (when no hints
+    /// are present) the bit-width-heuristic top sentinel.
+    Unknown,
+    /// `OutOfRangeValue` hit. Schema 2.4.0 only.
+    OutOfRange,
+    /// `ReservedValue` hit — top-of-range value reserved for future
+    /// use. Schema 2.4.0 only. Distinct from the `RESERVED` FieldType
+    /// (which marks an explicit reserved/padding field in the schema).
+    Reserved,
+}
+
+/// Classify a numeric extraction against the field's schema-2.4.0
+/// sentinel hints.
 ///
-/// The comparison is against the *unsigned* raw extraction (`value &
-/// max`) so the call is stable between SI / user-units builds — same
-/// idiom canboat's `analyzer/fieldtype.c` uses to anchor the sentinel
-/// detection against the underlying unsigned representation regardless
-/// of the field's signed-ness.
+/// All three of [`unknown`, `out_of_range`, `reserved`] are matched
+/// against [`Extracted::raw`] — the pre-sign-extension / pre-offset
+/// unsigned bit pattern that the schema values are stated against.
+///
+/// When **all three are `None`**, the field reserves no sentinels and
+/// every raw value is a legitimate reading — the call returns
+/// [`Sentinel::None`]. This is the canboat 2.4.0 "all values valid"
+/// idiom for fields like `Device Instance`, MMSI, PGN, FIELD_INDEX,
+/// and the ~5 % of NUMBER fields where the declared range spans the
+/// full bit width. There is **no fallback to a bit-width heuristic**:
+/// the schema is fully prescriptive, and the pre-2.4.0 heuristic
+/// flagged legitimate near-max values as unavailable.
+pub fn classify_sentinel(
+    extracted: Extracted,
+    unknown: Option<u64>,
+    out_of_range: Option<u64>,
+    reserved: Option<u64>,
+) -> Sentinel {
+    let raw = extracted.raw;
+    if unknown == Some(raw) {
+        Sentinel::Unknown
+    } else if out_of_range == Some(raw) {
+        Sentinel::OutOfRange
+    } else if reserved == Some(raw) {
+        Sentinel::Reserved
+    } else {
+        Sentinel::None
+    }
+}
+
+/// Yes/no wrapper around [`classify_sentinel`] — `true` iff `raw`
+/// matches any of the three hint values.
 pub fn is_unavailable_with(
     extracted: Extracted,
     unknown: Option<u64>,
     out_of_range: Option<u64>,
     reserved: Option<u64>,
 ) -> bool {
-    if unknown.is_none() && out_of_range.is_none() && reserved.is_none() {
-        return is_unavailable(extracted);
-    }
-    // Re-interpret the (possibly sign-extended) extracted value as the
-    // unsigned raw bit pattern that the schema values are stated in.
-    let raw = extracted.value as u64 & (extracted.max as u64);
-    [unknown, out_of_range, reserved]
-        .iter()
-        .any(|v| v.is_some_and(|s| s == raw))
+    classify_sentinel(extracted, unknown, out_of_range, reserved) != Sentinel::None
 }
 
 #[cfg(test)]
@@ -221,24 +261,35 @@ mod tests {
         let e = Extracted {
             value: 255,
             max: 255,
+            raw: 255,
         };
         assert!(is_unavailable(e));
         // 254 also reserved
         assert!(is_unavailable(Extracted {
             value: 254,
             max: 255,
+            raw: 254,
         }));
         // 253 valid
         assert!(!is_unavailable(Extracted {
             value: 253,
             max: 255,
+            raw: 253,
         }));
     }
 
     #[test]
     fn one_bit_never_unavailable() {
-        assert!(!is_unavailable(Extracted { value: 1, max: 1 }));
-        assert!(!is_unavailable(Extracted { value: 0, max: 1 }));
+        assert!(!is_unavailable(Extracted {
+            value: 1,
+            max: 1,
+            raw: 1
+        }));
+        assert!(!is_unavailable(Extracted {
+            value: 0,
+            max: 1,
+            raw: 0
+        }));
     }
 
     #[test]

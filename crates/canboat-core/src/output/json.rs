@@ -544,6 +544,16 @@ fn write_field_value_debug<W: fmt::Write>(
         FieldValue::Spare { .. } | FieldValue::NotAvailable => {
             w.write_str("null")?;
         }
+        FieldValue::OutOfRange { .. } => {
+            // Schema-2.4.0 `OutOfRangeValue` sentinel — render as the
+            // canboat C label. Matches `analyzer/print.c` after PR #672.
+            // TODO: thread the raw u64 through `-debug` byte/bit suffix.
+            write_json_string(w, "Out Of Range")?;
+        }
+        FieldValue::ReservedValue { .. } => {
+            // Schema-2.4.0 `ReservedValue` sentinel. See above.
+            write_json_string(w, "Reserved")?;
+        }
         FieldValue::Unsupported { field_type } => {
             let mut buf = String::with_capacity(field_type.len() + 16);
             buf.push_str("<unsupported:");
@@ -787,6 +797,8 @@ fn write_field_value<W: fmt::Write>(
             }
         }
         FieldValue::NotAvailable => w.write_str("null"),
+        FieldValue::OutOfRange { .. } => write_json_string(w, "Out Of Range"),
+        FieldValue::ReservedValue { .. } => write_json_string(w, "Reserved"),
         FieldValue::Unsupported { field_type } => {
             // Encode as a string so the JSON stays valid; consumers can
             // detect by leading "<".

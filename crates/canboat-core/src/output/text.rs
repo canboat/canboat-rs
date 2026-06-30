@@ -353,6 +353,8 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
             Ok(())
         }
         FieldValue::NotAvailable => w.write_str("Unknown"),
+        FieldValue::OutOfRange { .. } => w.write_str("Out Of Range"),
+        FieldValue::ReservedValue { .. } => w.write_str("Reserved"),
         FieldValue::Unsupported { field_type } => write!(w, "<unsupported:{}>", field_type),
     }
 }

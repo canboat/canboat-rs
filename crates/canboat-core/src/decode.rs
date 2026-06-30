@@ -8,45 +8,29 @@
 //! No I/O. No formatting — the result is a structured event ready for
 //! the output formatter or for direct consumption by merrimac-rs.
 
-use crate::bits::{Extracted, extract_bits, is_unavailable};
+use crate::bits::{Extracted, Sentinel, classify_sentinel, extract_bits, is_unavailable};
 use crate::db::PgnDatabase;
 use crate::frame::RawFrame;
 use crate::types::{FieldInfo, FieldType, PgnInfo};
 
-/// canboat-style "not available" check with the RangeMax exception:
-/// if the field's explicit `RangeMax` (after applying resolution) equals
-/// the bit-width max, the entire range is valid and no sentinel
-/// stripping is performed. Matches the threshold logic in
-/// `analyzer/print.c:418`.
+/// Run the schema-2.5.0 sentinel classifier against a numeric
+/// extraction using the field's own `UnknownValue` / `OutOfRangeValue`
+/// / `ReservedValue` hints, and map any hit to the matching
+/// [`FieldValue`] sentinel variant. Returns `None` when the extracted
+/// value is a legitimate reading (no hint matched).
 ///
-/// The schema-2.4.0 per-field sentinel hints
-/// ([`FieldInfo::unknown_value`] etc.) are now parsed from the
-/// database but not yet consumed here: the existing `Extracted` carries
-/// the signed bit-width max, while the schema values are stated against
-/// the *unsigned* raw bit pattern. Threading the unsigned raw pattern
-/// through the decode pipeline is a follow-up — wiring naively breaks
-/// signed-field cases (e.g. PGN 130842/B = raw 0xFFFFFFFF which is
-/// valid -1, not the per-field `UnknownValue` for an unsigned 32-bit
-/// field).
-fn unavailable_with_range(f: &FieldInfo, ex: Extracted) -> bool {
-    if let (Some(rmax), Some(res)) = (f.range_max, f.resolution) {
-        if res > 0.0 {
-            // Mirror analyzer/print.c #651: guard the f64 → i64 cast.
-            // Rust saturates at i64::MAX rather than triggering UB, but
-            // a saturated value can still spuriously equal `ex.max` for
-            // a signed 64-bit field (where ex.max == i64::MAX), so skip
-            // the comparison when rmax/res exceeds 2^63.
-            let range_max_raw = rmax / res + 0.5;
-            if range_max_raw < TWO_POW_63 && (range_max_raw as i64) == ex.max {
-                return false;
-            }
-        }
+/// `raw` is read from [`Extracted::raw`] — the pre-sign-extension /
+/// pre-offset unsigned bit pattern that the schema hints are stated
+/// against. f64 conversion is never involved, so >53-bit fields and
+/// signed-field cases round-trip bit-exactly.
+fn sentinel_field_value(f: &FieldInfo, ex: Extracted) -> Option<FieldValue> {
+    match classify_sentinel(ex, f.unknown_value, f.out_of_range_value, f.reserved_value) {
+        Sentinel::Unknown => Some(FieldValue::NotAvailable),
+        Sentinel::OutOfRange => Some(FieldValue::OutOfRange { value: ex.raw }),
+        Sentinel::Reserved => Some(FieldValue::ReservedValue { value: ex.raw }),
+        Sentinel::None => None,
     }
-    is_unavailable(ex)
 }
-
-/// 2^63 as f64 — the smallest double that doesn't fit in i64.
-const TWO_POW_63: f64 = 9_223_372_036_854_775_808.0;
 
 /// One decoded field.
 ///
@@ -226,8 +210,23 @@ pub enum FieldValue {
         bytes: Vec<u8>,
         bit_length: u32,
     },
-    /// Field exists but raw value is the canboat "not-available" sentinel.
+    /// Field exists but raw value is the canboat "not-available"
+    /// sentinel (`UnknownValue` for schema-2.4.0 fields; the top-of-
+    /// range heuristic value for older databases).
     NotAvailable,
+    /// Raw value hit the field's `OutOfRangeValue` sentinel (schema
+    /// 2.4.0). The formatter renders this as `"Out Of Range"` to
+    /// match canboat C `analyzer/print.c`. The raw value rides along
+    /// as `u64` so callers that want the wire pattern bit-exactly —
+    /// including for >53-bit fields where `f64` would lose precision
+    /// — can read it without going back to `RawFrame`.
+    OutOfRange { value: u64 },
+    /// Raw value hit the field's `ReservedValue` sentinel (schema
+    /// 2.4.0 "reserved for future use"). Distinct from the
+    /// [`FieldValue::Reserved`] variant above which represents an
+    /// explicit `RESERVED` FieldType field (padding / structural).
+    /// Formatter renders as `"Reserved"`.
+    ReservedValue { value: u64 },
     /// Field decoding not yet implemented for this `FieldType`.
     Unsupported { field_type: &'static str },
 }
@@ -294,6 +293,20 @@ impl FieldValue {
     #[inline]
     pub fn is_not_available(&self) -> bool {
         matches!(self, FieldValue::NotAvailable)
+    }
+
+    /// `true` when the field decoded to ANY of the three schema-2.4.0
+    /// sentinels — Unknown, Out Of Range, or Reserved-value. Callers
+    /// that just want "skip this field, the wire didn't carry a real
+    /// reading" can check this in one call.
+    #[inline]
+    pub fn is_sentinel(&self) -> bool {
+        matches!(
+            self,
+            FieldValue::NotAvailable
+                | FieldValue::OutOfRange { .. }
+                | FieldValue::ReservedValue { .. }
+        )
     }
 }
 
@@ -840,7 +853,7 @@ fn decode_one_field_at(
         Some(FieldType::Binary) => decode_binary(data, bit_offset, bit_length),
         Some(FieldType::Mmsi) => decode_mmsi(data, bit_offset, bit_length),
         Some(FieldType::Pgn) => decode_pgn_field(data, bit_offset, bit_length, db),
-        Some(FieldType::Date) => decode_date(data, bit_offset, bit_length),
+        Some(FieldType::Date) => decode_date(f, data, bit_offset, bit_length),
         Some(FieldType::Time) | Some(FieldType::Duration) => {
             decode_time(f, data, bit_offset, bit_length, signed)
         }
@@ -853,7 +866,7 @@ fn decode_one_field_at(
             decode_dynamic_field_key(f, data, db, bit_offset, bit_length, ctx)
         }
         Some(FieldType::DynamicFieldLength) => {
-            decode_dynamic_field_length(data, bit_offset, bit_length, ctx)
+            decode_dynamic_field_length(f, data, bit_offset, bit_length, ctx)
         }
         Some(FieldType::DynamicFieldValue) => unreachable!("DYNAMIC_FIELD_VALUE handled above"),
         Some(FieldType::FieldIndex) => decode_number(f, data, bit_offset, bit_length, signed, 0),
@@ -994,8 +1007,8 @@ fn decode_number(
     ) else {
         return FieldValue::NotAvailable;
     };
-    if unavailable_with_range(f, ex) {
-        return FieldValue::NotAvailable;
+    if let Some(sent) = sentinel_field_value(f, ex) {
+        return sent;
     }
     let resolution = f.resolution.unwrap_or(1.0);
     let unit = f.unit;
@@ -1034,35 +1047,31 @@ fn decode_lookup(
     let Some(ex) = extract_bits(data, bit_offset as usize, bit_length as usize, false, 0) else {
         return FieldValue::NotAvailable;
     };
-    // canboat allows reserved sentinels in some lookup tables, so don't
-    // pre-filter via is_unavailable here — emit the raw value and let
-    // the formatter decide.
-    let raw = ex.value as u64;
+    // Name wins: when the enumeration explicitly maps the raw value,
+    // emit the name even if the same raw value would have been a
+    // sentinel hint on the field. This mirrors the canboat 7.1.0
+    // schema-2.5.0 contract — "an enumeration name always wins, so a
+    // sentinel position the lookup names is not emitted" (PR #704).
+    let raw = ex.raw;
     let name = f
         .lookup_enumeration
         .and_then(|n| db.lookup(n))
         .and_then(|t| t.get(raw))
         .map(|v| v.name);
-    // canboat: if no name is resolved AND value is in the reserved
-    // sentinel range, drop the field (matches print.c:718). The
-    // lookup check is one off from `is_unavailable`: canboat uses
-    // `>=` against the threshold and a `bits>2 ? 2 : 1` reserved
-    // count, both of which include one more sentinel than the NUMBER
-    // path would.
-    if name.is_none() && is_lookup_unavailable(ex, bit_length as usize) {
-        return FieldValue::NotAvailable;
+    if name.is_some() {
+        return FieldValue::Lookup { value: raw, name };
     }
-    FieldValue::Lookup { value: raw, name }
-}
-
-/// `print.c:718` rule for unknown LOOKUP values: in a `bits>1` field,
-/// drop the top `bits>2 ? 2 : 1` raw values (`value >= max - reserved`).
-fn is_lookup_unavailable(ex: crate::bits::Extracted, bits: usize) -> bool {
-    if bits <= 1 {
-        return false;
+    // No name resolved — fall through to the per-field sentinel hints
+    // (schema 2.5.0 carries them on ~35 % of LOOKUP fields). For the
+    // remaining "all values valid" tables (MMSI-style identifier
+    // lookups) the hints are all None and we emit the raw value.
+    if let Some(sent) = sentinel_field_value(f, ex) {
+        return sent;
     }
-    let reserved: i64 = if bits > 2 { 2 } else { 1 };
-    ex.value >= ex.max - reserved
+    FieldValue::Lookup {
+        value: raw,
+        name: None,
+    }
 }
 
 /// INDIRECT_LOOKUP: resolve `(value1, value2)` where `value1` is
@@ -1079,7 +1088,7 @@ fn decode_indirect_lookup(
     let Some(ex) = extract_bits(data, bit_offset as usize, bit_length as usize, false, 0) else {
         return FieldValue::NotAvailable;
     };
-    let raw = ex.value as u64;
+    let raw = ex.raw;
     let name = (|| -> Option<&'static str> {
         let table_name = f.lookup_indirect_enumeration?;
         let val1_order = f.lookup_indirect_enumeration_field_order?;
@@ -1087,16 +1096,21 @@ fn decode_indirect_lookup(
         let val1_off = val1_field.bit_offset?;
         let val1_len = val1_field.bit_length?;
         let val1 = extract_bits(data, val1_off as usize, val1_len as usize, false, 0)?;
-        db.indirect_lookup(table_name, val1.value as u64, raw)
+        db.indirect_lookup(table_name, val1.raw, raw)
     })();
-    // Same print.c:718 rule we apply to plain LOOKUP — unknown values
-    // in the top sentinel range drop the field rather than emitting a
-    // bare integer. Without this, PGN 60928's Device Function comes
-    // through as `"Device Function":255` where canboat C drops it.
-    if name.is_none() && is_lookup_unavailable(ex, bit_length as usize) {
-        return FieldValue::NotAvailable;
+    if name.is_some() {
+        return FieldValue::Lookup { value: raw, name };
     }
-    FieldValue::Lookup { value: raw, name }
+    // Name didn't resolve — try the per-field sentinel hints. Schema
+    // 2.5.0 declares them on both INDIRECT_LOOKUP fields in the
+    // database (PGN 60928 Device Function / Class).
+    if let Some(sent) = sentinel_field_value(f, ex) {
+        return sent;
+    }
+    FieldValue::Lookup {
+        value: raw,
+        name: None,
+    }
 }
 
 fn decode_bitlookup(
@@ -1249,9 +1263,9 @@ fn decode_mmsi(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
     let Some(ex) = extract_bits(data, bit_offset as usize, 32, false, 0) else {
         return FieldValue::NotAvailable;
     };
-    if is_unavailable(ex) {
-        return FieldValue::NotAvailable;
-    }
+    // MMSI is an identifier — schema 2.5.0 declares Sentinels='None'
+    // on the FieldType. All 0..=2^32-1 values are legitimate (broadcast
+    // is 0xFFFFFFFF). No sentinel detection.
     FieldValue::Mmsi(ex.value as u32)
 }
 
@@ -1293,7 +1307,7 @@ fn decode_pgn_field(data: &[u8], bit_offset: u32, bit_length: u32, db: &PgnDatab
     }
 }
 
-fn decode_date(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
+fn decode_date(f: &FieldInfo, data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
     if bit_length != 16 {
         return FieldValue::Unsupported {
             field_type: "DATE (non-16-bit)",
@@ -1302,8 +1316,8 @@ fn decode_date(data: &[u8], bit_offset: u32, bit_length: u32) -> FieldValue {
     let Some(ex) = extract_bits(data, bit_offset as usize, 16, false, 0) else {
         return FieldValue::NotAvailable;
     };
-    if ex.value == 0xffff {
-        return FieldValue::NotAvailable;
+    if let Some(sent) = sentinel_field_value(f, ex) {
+        return sent;
     }
     FieldValue::Date(ex.value as u16)
 }
@@ -1324,8 +1338,8 @@ fn decode_time(
     ) else {
         return FieldValue::NotAvailable;
     };
-    if is_unavailable(ex) {
-        return FieldValue::NotAvailable;
+    if let Some(sent) = sentinel_field_value(f, ex) {
+        return sent;
     }
     let resolution = f.resolution.unwrap_or(1.0);
     FieldValue::Time {
@@ -1488,23 +1502,30 @@ fn decode_dynamic_field_key(
     let Some(ex) = extract_bits(data, bit_offset as usize, bit_length as usize, false, 0) else {
         return FieldValue::NotAvailable;
     };
-    let raw = ex.value as u64;
+    let raw = ex.raw;
     let entry = f
         .lookup_field_type_enumeration
         .and_then(|n| db.field_type_lookup(n, raw));
     let name = entry.map(|e| e.name);
     ctx.dynamic_field_type = entry.copied();
-    // Carry over canboat's "no resolution + reserved sentinel = N/A"
-    // semantics so out-of-range keys decode as Unknown.
-    if name.is_none() && is_unavailable(ex) {
-        return FieldValue::NotAvailable;
+    if name.is_some() {
+        return FieldValue::Lookup { value: raw, name };
     }
-    FieldValue::Lookup { value: raw, name }
+    // Schema 2.5.0 declares all three hints on every DYNAMIC_FIELD_KEY
+    // field in the database — fall through to the field-aware check.
+    if let Some(sent) = sentinel_field_value(f, ex) {
+        return sent;
+    }
+    FieldValue::Lookup {
+        value: raw,
+        name: None,
+    }
 }
 
 /// DYNAMIC_FIELD_LENGTH: decode as a plain integer count of bytes
 /// that the next DYNAMIC_FIELD_VALUE consumes.
 fn decode_dynamic_field_length(
+    f: &FieldInfo,
     data: &[u8],
     bit_offset: u32,
     bit_length: u32,
@@ -1513,9 +1534,14 @@ fn decode_dynamic_field_length(
     let Some(ex) = extract_bits(data, bit_offset as usize, bit_length as usize, false, 0) else {
         return FieldValue::NotAvailable;
     };
-    let len = ex.value as u32;
+    // A sentinel-length value can't be used to drive the next
+    // DYNAMIC_FIELD_VALUE decode, so don't update the context.
+    if let Some(sent) = sentinel_field_value(f, ex) {
+        return sent;
+    }
+    let len = ex.raw as u32;
     ctx.dynamic_length_bytes = Some(len);
-    FieldValue::Integer(len as i64)
+    FieldValue::Integer(ex.value)
 }
 
 /// DYNAMIC_FIELD_VALUE: read the resolved field-type metadata from

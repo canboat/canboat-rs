@@ -236,6 +236,16 @@ async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<Ap
                 Ok(v) => v,
                 Err(_) => continue,
             };
+            // Surface every non-OK PGN 126208 Acknowledge as a
+            // user-visible alert. Devices that accept a Request
+            // typically stay silent (the SCX-20 only ACKs failures
+            // — see device-scx20 memory) so reacting only to
+            // failures is the right signal.
+            if input.pgn == 126208
+                && let Some(alert) = nak_alert(input.src, &value)
+            {
+                s.push_alert(alert);
+            }
             s.upsert(
                 input.pgn,
                 input.src,
@@ -247,6 +257,62 @@ async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<Ap
     }
     let mut s = state.lock().await;
     s.status.stream_connected = false;
+}
+
+/// If `line` is a PGN 126208 Acknowledge (Function Code = 2) carrying
+/// at least one non-zero error code, format a one-line summary
+/// suitable for the UI toast slot. Returns `None` for non-ACKs and
+/// for ACKs whose error codes are all zero ("Acknowledge" — no
+/// error). The summary names both the acknowledging device
+/// (`src` of the inbound record) and the PGN the ACK references, so
+/// the user can match it back to whichever Request they just sent.
+fn nak_alert(ack_src: u8, line: &Value) -> Option<String> {
+    let function_code = read_lookup_int(line.pointer("/fields/Function Code"))?;
+    if function_code != 2 {
+        return None;
+    }
+    let pgn_field = line.pointer("/fields/PGN");
+    let acked_pgn = read_lookup_int(pgn_field).unwrap_or(0);
+    let acked_pgn_name = pgn_field
+        .and_then(|v| v.pointer("/name").and_then(Value::as_str))
+        .unwrap_or("");
+    let pgn_err = read_lookup_int(line.pointer("/fields/PGN error code")).unwrap_or(0);
+    let pgn_err_name = read_lookup_name(line.pointer("/fields/PGN error code")).unwrap_or_default();
+    let interval_err =
+        read_lookup_int(line.pointer("/fields/Transmission interval/Priority error code"))
+            .unwrap_or(0);
+    let interval_err_name =
+        read_lookup_name(line.pointer("/fields/Transmission interval/Priority error code"))
+            .unwrap_or_default();
+    if pgn_err == 0 && interval_err == 0 {
+        return None;
+    }
+    let pgn_label = if acked_pgn_name.is_empty() {
+        format!("PGN {acked_pgn}")
+    } else {
+        format!("PGN {acked_pgn} ({acked_pgn_name})")
+    };
+    Some(format!(
+        "⚠ src {ack_src} NAK {pgn_label} — PGN err {pgn_err} {pgn_err_name} / interval err {interval_err} {interval_err_name}"
+    ))
+}
+
+/// Pull a numeric value out of a canboat lookup field — handles both
+/// the bare integer shape and the `-nv` `{value, name, key}` object.
+fn read_lookup_int(v: Option<&Value>) -> Option<i64> {
+    let v = v?;
+    if let Some(n) = v.as_i64() {
+        return Some(n);
+    }
+    v.pointer("/value").and_then(Value::as_i64)
+}
+
+/// Pull the display name from a canboat lookup field (the `-nv`
+/// object's `.name`). Returns `None` for plain-integer shapes.
+fn read_lookup_name(v: Option<&Value>) -> Option<String> {
+    v?.pointer("/name")
+        .and_then(Value::as_str)
+        .map(|s| s.to_string())
 }
 
 async fn writer_task(

@@ -124,7 +124,15 @@ async fn run_loop(
         if app.should_quit {
             break;
         }
-        let s = state.lock().await;
+        let mut s = state.lock().await;
+        // Drain one queued bus-side alert into the UI's display slot
+        // per draw. The reader task pushes alerts onto `state.alerts`
+        // as they arrive; the UI shows them in the status bar and
+        // clears them on any keystroke, so the user sees each one in
+        // turn instead of just the most recent.
+        if app.alert.is_none() {
+            app.alert = s.alerts.pop_front();
+        }
         ui::draw(tty, app, &s)?;
     }
     Ok(())

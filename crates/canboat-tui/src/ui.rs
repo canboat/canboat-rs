@@ -96,6 +96,14 @@ pub struct App {
     pub modal: Option<OverrideModal>,
     /// Last status / error toast (cleared on next keystroke).
     pub toast: Option<String>,
+    /// Current bus-side alert shown in the status bar — drained one
+    /// per draw from `AppState::alerts` (e.g. a NAKed PGN 126208
+    /// Acknowledge). Cleared on any keystroke, at which point the
+    /// next draw pulls the next pending alert if any. Has higher
+    /// priority than `toast` in the status-bar render path so
+    /// device-reported failures don't get drowned out by our own
+    /// "Sent override" confirmations.
+    pub alert: Option<String>,
     pub should_quit: bool,
     /// True once the user has dismissed the startup "Connecting…"
     /// modal (or it auto-dismissed itself after both connections
@@ -139,6 +147,7 @@ impl App {
             overrides_writable,
             modal: None,
             toast: None,
+            alert: None,
             should_quit: false,
             connecting_dismissed: false,
             last_acknowledged_error: None,
@@ -216,6 +225,7 @@ impl App {
             return;
         }
         self.toast = None;
+        self.alert = None;
         match (&self.screen, key.code) {
             (_, KeyCode::Char('q')) => self.should_quit = true,
             (Screen::Devices, KeyCode::Down) | (Screen::Devices, KeyCode::Char('j')) => {
@@ -556,12 +566,28 @@ fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
         devs = state.device_list().len(),
         entries = state.entries.len(),
     );
-    // Second line: toast > error > hint.  Errors get a red foreground
-    // so they're visible at a glance even after the modal has been
-    // dismissed.
-    let second: Line<'static> = match (&app.toast, &s.last_error) {
-        (Some(t), _) => Line::from(format!(" {t}")),
-        (_, Some(e)) => Line::from(vec![
+    // Second line priority: alert > toast > error > hint.
+    //
+    // * `alert` is a bus-side warning (e.g. a NAKed PGN 126208 ACK)
+    //   surfaced from the stream reader. Yellow + bold so it stands
+    //   out against our own action confirmations.
+    // * `toast` is a confirmation / hint for an action the user
+    //   just took (override sent, ISO request fired).
+    // * `error` is a persistent connection / I/O error that hasn't
+    //   yet been dismissed; rendered red so it stays visible.
+    //
+    // Alerts trump toasts so a device-reported failure isn't
+    // drowned out by an immediately-prior "Sent override → …"
+    // confirmation.
+    let second: Line<'static> = match (&app.alert, &app.toast, &s.last_error) {
+        (Some(a), _, _) => Line::from(Span::styled(
+            format!(" {a}"),
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD),
+        )),
+        (_, Some(t), _) => Line::from(format!(" {t}")),
+        (_, _, Some(e)) => Line::from(vec![
             Span::styled(
                 " error: ",
                 Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),

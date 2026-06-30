@@ -23,11 +23,17 @@
 //! apply each incoming line. No background derivation runs; views are
 //! computed on demand from the cached JSON values.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, VecDeque};
 use std::time::Instant;
 
 use indexmap::IndexMap;
 use serde_json::Value;
+
+/// Cap on how many pending alerts (e.g. NAKed PGN 126208 ACKs) we
+/// keep before dropping the oldest. Twenty is more than the user
+/// can plausibly dismiss in one breath, but small enough that a
+/// chatty bus can't grow the queue without bound.
+pub const MAX_PENDING_ALERTS: usize = 20;
 
 /// `(pgn, src, secondary)` — same shape as
 /// [`canboat_core::snapshot`]'s internal cache key.
@@ -130,6 +136,13 @@ pub struct AppState {
     /// the slot in place.
     pub entries: IndexMap<EntryKey, Entry>,
     pub status: Status,
+    /// Bus-side warnings queued by the stream reader (e.g. a device
+    /// NAKed one of our PGN 126208 Requests with a non-zero error
+    /// code). The UI drains them one per draw into its toast slot
+    /// so the user sees each alert and can dismiss it with any key.
+    /// Bounded to [`MAX_PENDING_ALERTS`] entries — oldest dropped
+    /// when the bus is shouting faster than the user can read.
+    pub alerts: VecDeque<String>,
 }
 
 impl AppState {
@@ -137,7 +150,17 @@ impl AppState {
         Self {
             entries: IndexMap::new(),
             status,
+            alerts: VecDeque::new(),
         }
+    }
+
+    /// Append an alert to [`AppState::alerts`], evicting the oldest
+    /// entry when the queue is full.
+    pub fn push_alert(&mut self, message: String) {
+        if self.alerts.len() == MAX_PENDING_ALERTS {
+            self.alerts.pop_front();
+        }
+        self.alerts.push_back(message);
     }
 
     /// Insert or refresh one record. `line` has already been parsed

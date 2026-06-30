@@ -20,7 +20,7 @@ clap         = { workspace = true }
 env_logger   = { workspace = true }
 log          = { workspace = true }
 serde        = { workspace = true }
-serde_json   = { workspace = true }
+serde_json   = { workspace = true, features = ["preserve_order"] }
 tokio        = { workspace = true, features = ["rt", "rt-multi-thread", "io-util", "macros", "sync", "net", "time", "fs"] }
 crossterm    = { version = "0.28", features = ["event-stream"] }
 ratatui      = "0.29"

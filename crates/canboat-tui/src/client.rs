@@ -34,11 +34,12 @@ use tokio::time::timeout;
 
 use crate::state::AppState;
 
-/// Per-connection timeout for the initial TCP connect + first read.
-/// Without this the TUI sits black forever when the endpoint isn't
-/// reachable (the OS default connect timeout is ~75 s on Linux,
-/// longer on macOS).
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+/// Per-connection timeout for the initial TCP connect. Without this
+/// the TUI sits black forever when the endpoint isn't reachable (the
+/// OS default connect timeout is ~75 s on Linux, longer on macOS).
+/// 10 s is a tight upper bound that still survives a slow link and a
+/// busy peer.
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Cap on the snapshot read. canboat-pipeline / n2kd both write the
 /// whole dump and close, so this only fires when the peer is

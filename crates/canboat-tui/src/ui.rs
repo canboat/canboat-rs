@@ -1,6 +1,6 @@
 //! ratatui rendering + keyboard handling.
 //!
-//! Three screens, plus a modal:
+//! Three screens, plus three modals:
 //!
 //! * [`Screen::Devices`] — top-level list of source addresses with
 //!   manufacturer / model / PGN-count columns. `Enter` drills in;
@@ -16,10 +16,19 @@
 //! * [`Screen::EntryDetail`] — the latest JSON line for the selected
 //!   `(pgn, src, secondary)` tuple, pretty-printed.
 //!
-//! * Modal: `o` from `DeviceDetail` opens the override dialog for
-//!   the highlighted PGN — accepts a transmission interval in ms.
-//!   "Disable" (`0xFFFFFFFE`) is only accepted when the persistent
-//!   overrides file already authorises it.
+//! Modals (rendered on top of whichever screen is active, in priority
+//! order — the highest-priority match wins for both rendering and
+//! key handling):
+//!
+//! 1. **Error** — shown whenever `AppState::status.last_error` carries
+//!    a string the user hasn't yet acknowledged. Any key dismisses it.
+//! 2. **Connecting** — shown at startup until both connections settle
+//!    (success or failure). Auto-dismisses on clean two-way success;
+//!    any key dismisses it manually.
+//! 3. **Override** — opened with `o` from `DeviceDetail` for the
+//!    highlighted PGN. Accepts a transmission interval in ms. Entering
+//!    `0` ("stop transmitting") is only accepted when the persistent
+//!    overrides file already authorises it with `allow_disable: true`.
 
 use std::io::Stdout;
 
@@ -71,6 +80,15 @@ pub struct App {
     /// Last status / error toast (cleared on next keystroke).
     pub toast: Option<String>,
     pub should_quit: bool,
+    /// True once the user has dismissed the startup "Connecting…"
+    /// modal (or it auto-dismissed itself after both connections
+    /// came up clean).
+    pub connecting_dismissed: bool,
+    /// The most recent error message the user has already
+    /// acknowledged. Whenever `state.status.last_error` is `Some(e)`
+    /// and `e != last_acknowledged_error`, a fatal-error modal is
+    /// drawn over everything until the user presses a key.
+    pub last_acknowledged_error: Option<String>,
 }
 
 pub struct OverrideModal {
@@ -98,6 +116,8 @@ impl App {
             modal: None,
             toast: None,
             should_quit: false,
+            connecting_dismissed: false,
+            last_acknowledged_error: None,
         }
     }
 
@@ -124,16 +144,29 @@ impl App {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return;
         }
+        // Ctrl-C always quits, even with a modal open.
+        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
+            self.should_quit = true;
+            return;
+        }
+        // The fatal-error modal trumps every other input — dismiss
+        // it by acknowledging the current error string, then return.
+        if has_unacknowledged_error(self, state) {
+            self.last_acknowledged_error = state.status.last_error.clone();
+            return;
+        }
+        // The connecting modal eats every other keypress so a user
+        // tapping a key while reading "Connecting…" doesn't accidentally
+        // start navigating the (still empty) device list.
+        if !self.connecting_dismissed {
+            self.connecting_dismissed = true;
+            return;
+        }
         if self.modal.is_some() {
             self.handle_modal_key(key, writer);
             return;
         }
         self.toast = None;
-        // Ctrl-C always quits.
-        if key.modifiers.contains(KeyModifiers::CONTROL) && matches!(key.code, KeyCode::Char('c')) {
-            self.should_quit = true;
-            return;
-        }
         match (&self.screen, key.code) {
             (_, KeyCode::Char('q')) => self.should_quit = true,
             (Screen::Devices, KeyCode::Down) | (Screen::Devices, KeyCode::Char('j')) => {
@@ -327,6 +360,15 @@ fn navigate_list(state: &mut ListState, len: usize, delta: i32) {
 pub type Tty = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
+    // Auto-dismiss the connecting modal once both connections are up
+    // and clean — successful startup shouldn't require a keystroke.
+    if !app.connecting_dismissed
+        && state.status.snapshot_loaded
+        && state.status.stream_connected
+        && state.status.last_error.is_none()
+    {
+        app.connecting_dismissed = true;
+    }
     tty.draw(|f| {
         let area = f.area();
         let chunks = Layout::default()
@@ -350,11 +392,35 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
             }
         }
         draw_hint_bar(f, chunks[2], app);
+        // Modal stack — last drawn wins. Override dialog is least
+        // important, connecting overlay sits above it, fatal-error
+        // modal trumps everything.
         if let Some(modal) = &app.modal {
             draw_modal(f, area, modal);
         }
+        if !app.connecting_dismissed {
+            draw_connecting_modal(f, area, state);
+        }
+        if has_unacknowledged_error(app, state) {
+            if let Some(err) = state.status.last_error.as_deref() {
+                draw_error_modal(f, area, err);
+            }
+        }
     })?;
     Ok(())
+}
+
+/// True when there's an error in `state.status.last_error` that the
+/// user hasn't yet dismissed via a keystroke.
+fn has_unacknowledged_error(app: &App, state: &AppState) -> bool {
+    match (
+        state.status.last_error.as_deref(),
+        app.last_acknowledged_error.as_deref(),
+    ) {
+        (Some(cur), Some(ack)) => cur != ack,
+        (Some(_), None) => true,
+        _ => false,
+    }
 }
 
 fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &AppState) {
@@ -370,14 +436,23 @@ fn draw_status_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
         devs = state.device_list().len(),
         entries = state.entries.len(),
     );
-    let second = match (&app.toast, &s.last_error) {
-        (Some(t), _) => format!(" {t}"),
-        (_, Some(e)) => format!(" error: {e}"),
-        _ => String::from(
+    // Second line: toast > error > hint.  Errors get a red foreground
+    // so they're visible at a glance even after the modal has been
+    // dismissed.
+    let second: Line<'static> = match (&app.toast, &s.last_error) {
+        (Some(t), _) => Line::from(format!(" {t}")),
+        (_, Some(e)) => Line::from(vec![
+            Span::styled(
+                " error: ",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(e.clone(), Style::default().fg(Color::Red)),
+        ]),
+        _ => Line::from(
             " (q quit  ↑/↓ move  Enter drill in  Esc back  i = ISO 126464  o = override interval)",
         ),
     };
-    let lines = vec![Line::from(first), Line::from(second)];
+    let lines = vec![Line::from(first), second];
     let p = Paragraph::new(lines).style(Style::default().bg(Color::Blue).fg(Color::White));
     f.render_widget(p, area);
 }
@@ -550,17 +625,23 @@ fn draw_entry_detail(
     f.render_widget(p, area);
 }
 
-fn draw_modal(f: &mut ratatui::Frame<'_>, area: Rect, modal: &OverrideModal) {
-    let w = 60.min(area.width.saturating_sub(2));
-    let h = 8.min(area.height.saturating_sub(2));
-    let x = area.x + (area.width - w) / 2;
-    let y = area.y + (area.height - h) / 2;
-    let rect = Rect {
+/// Compute a centered rect of at most `max_w` × `max_h`, clamped to
+/// `area`. Used by every modal so they end up in the same place.
+fn centered_rect(area: Rect, max_w: u16, max_h: u16) -> Rect {
+    let w = max_w.min(area.width.saturating_sub(2));
+    let h = max_h.min(area.height.saturating_sub(2));
+    let x = area.x + (area.width.saturating_sub(w)) / 2;
+    let y = area.y + (area.height.saturating_sub(h)) / 2;
+    Rect {
         x,
         y,
         width: w,
         height: h,
-    };
+    }
+}
+
+fn draw_modal(f: &mut ratatui::Frame<'_>, area: Rect, modal: &OverrideModal) {
+    let rect = centered_rect(area, 60, 8);
     f.render_widget(Clear, rect);
     let mfr = modal
         .manufacturer_code
@@ -588,6 +669,117 @@ fn draw_modal(f: &mut ratatui::Frame<'_>, area: Rect, modal: &OverrideModal) {
             Block::default()
                 .borders(Borders::ALL)
                 .title("PGN 126208 Command"),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, rect);
+}
+
+/// Centered "Connecting…" overlay shown at startup until both the
+/// snapshot and live-stream connections terminate (success or
+/// failure). The body live-updates from `state.status` so the user
+/// sees each connection's progress.
+fn draw_connecting_modal(f: &mut ratatui::Frame<'_>, area: Rect, state: &AppState) {
+    let rect = centered_rect(area, 64, 10);
+    f.render_widget(Clear, rect);
+    let s = &state.status;
+    let snap_status = if s.snapshot_loaded {
+        Span::styled(
+            "✓ loaded",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if s
+        .last_error
+        .as_deref()
+        .is_some_and(|e| e.starts_with("snapshot"))
+    {
+        Span::styled(
+            "✗ failed",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("… connecting", Style::default().fg(Color::Yellow))
+    };
+    let stream_status = if s.stream_connected {
+        Span::styled(
+            "✓ connected",
+            Style::default()
+                .fg(Color::Green)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else if s
+        .last_error
+        .as_deref()
+        .is_some_and(|e| e.starts_with("stream"))
+    {
+        Span::styled(
+            "✗ failed",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled("… connecting", Style::default().fg(Color::Yellow))
+    };
+    let text = vec![
+        Line::from(format!("Connecting to {}", s.host)),
+        Line::from(""),
+        Line::from(vec![
+            Span::raw(format!("  Snapshot  :{:<5}  ", s.snapshot_port)),
+            snap_status,
+        ]),
+        Line::from(vec![
+            Span::raw(format!("  Stream    :{:<5}  ", s.stream_port)),
+            stream_status,
+        ]),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press any key to continue (auto-dismisses when both up)",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let p = Paragraph::new(text)
+        .block(
+            Block::default().borders(Borders::ALL).title(Span::styled(
+                " canboat-tui ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        )
+        .wrap(Wrap { trim: true });
+    f.render_widget(p, rect);
+}
+
+/// Centered red-bordered modal shown whenever
+/// `state.status.last_error` carries a value the user hasn't yet
+/// acknowledged. Dismissed with any keystroke.
+fn draw_error_modal(f: &mut ratatui::Frame<'_>, area: Rect, message: &str) {
+    // Word-wrapped lines fit in a generous box; cap height at 12 so a
+    // multi-paragraph error never eats the whole terminal.
+    let rect = centered_rect(area, 72, 12);
+    f.render_widget(Clear, rect);
+    let text = vec![
+        Line::from(Span::styled(
+            "Fatal error",
+            Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+        )),
+        Line::from(""),
+        Line::from(message.to_string()),
+        Line::from(""),
+        Line::from(Span::styled(
+            "Press any key to dismiss",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    let p = Paragraph::new(text)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(Style::default().fg(Color::Red))
+                .title(Span::styled(
+                    " Error ",
+                    Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+                )),
         )
         .wrap(Wrap { trim: true });
     f.render_widget(p, rect);

@@ -98,6 +98,42 @@ pub fn is_ais_pgn(pgn: u32) -> bool {
     AIS_PGNS.binary_search(&pgn).is_ok()
 }
 
+/// Local overrides for PGNs whose canboat-schema definition is
+/// missing a `PartOfPrimaryKey` flag they need for the snapshot
+/// cache to distinguish records that the spec treats as distinct.
+///
+/// Entries are `(pgn, field_id)` pairs. The `field_id` is canboat's
+/// camelCase identifier (e.g. `"functionCode"`), matched against
+/// [`FieldInfo::id`]. [`is_part_of_primary_key`] returns `true` for
+/// any (pgn, field) listed here, on top of what the schema already
+/// marks.
+///
+/// Current entries:
+///
+/// * `(126464, "functionCode")` — PGN 126464 "PGN List (Transmit
+///   and Receive)" is sent as two distinct records per source: one
+///   with Function Code = 0 (Transmit) and one with Function Code =
+///   1 (Receive). The canboat 7.1.0 schema doesn't flag Function
+///   Code as PK, so both records would otherwise share key
+///   `(126464, src, None)` and the second received overwrites the
+///   first.
+const PRIMARY_KEY_OVERRIDES: &[(u32, &str)] = &[(126464, "functionCode")];
+
+/// `true` iff `field` should be treated as part of `pgn`'s primary
+/// key — i.e. the schema says so OR [`PRIMARY_KEY_OVERRIDES`] lists
+/// the pair. The composite-key / repeating-PK helpers below all go
+/// through this so a single override entry covers every snapshot
+/// path.
+#[inline]
+pub fn is_part_of_primary_key(pgn: u32, field: &crate::FieldInfo) -> bool {
+    if field.part_of_primary_key == Some(true) {
+        return true;
+    }
+    PRIMARY_KEY_OVERRIDES
+        .iter()
+        .any(|&(p, id)| p == pgn && id == field.id)
+}
+
 /// Compose the schema-driven secondary discriminator for a record by
 /// walking every top-level field marked `PartOfPrimaryKey` on the
 /// PGN's [`PgnInfo`], looking each one up via `get_text`, and joining
@@ -127,7 +163,7 @@ where
 {
     let mut parts: Vec<String> = Vec::new();
     for f in info.fields {
-        if f.part_of_primary_key != Some(true) {
+        if !is_part_of_primary_key(info.pgn, f) {
             continue;
         }
         if field_in_any_repeat_set(info, f).is_some() {
@@ -155,7 +191,7 @@ where
 /// ([`per_iteration_secondary`]).
 pub fn repeating_pk_set(info: &crate::PgnInfo) -> Option<u8> {
     for f in info.fields {
-        if f.part_of_primary_key != Some(true) {
+        if !is_part_of_primary_key(info.pgn, f) {
             continue;
         }
         if let Some(set) = field_in_any_repeat_set(info, f) {
@@ -188,7 +224,7 @@ where
 {
     let mut parts: Vec<String> = Vec::new();
     for f in info.fields {
-        if f.part_of_primary_key != Some(true) {
+        if !is_part_of_primary_key(info.pgn, f) {
             continue;
         }
         let resolved = match field_in_any_repeat_set(info, f) {
@@ -738,6 +774,38 @@ mod tests {
         assert!(!got[0].line.contains("\"Key\":2"));
         assert!(got[1].line.contains("\"Key\":2"));
         assert!(!got[1].line.contains("\"Key\":1"));
+    }
+
+    #[test]
+    fn classify_json_line_keys_pgn_126464_on_function_code() {
+        // PGN 126464 carries two records per source — Function Code 0
+        // (Transmit PGN list) and Function Code 1 (Receive PGN list).
+        // The canboat 7.1.0 schema doesn't mark Function Code as
+        // PartOfPrimaryKey, so without PRIMARY_KEY_OVERRIDES both
+        // records collide on `(126464, src, None)` and only the
+        // second received survives in the snapshot — a real-world
+        // problem for the TUI's "show what this device transmits"
+        // pane.
+        let tx = r#"{"pgn":126464,"src":17,"description":"PGN List","fields":{"Function Code":0,"list":[{"PGN":127251}]}}"#;
+        let rx = r#"{"pgn":126464,"src":17,"description":"PGN List","fields":{"Function Code":1,"list":[{"PGN":59904}]}}"#;
+        let mut tx_inputs = Vec::new();
+        classify_json_line(tx, |i| tx_inputs.push(i));
+        let mut rx_inputs = Vec::new();
+        classify_json_line(rx, |i| rx_inputs.push(i));
+        assert_eq!(tx_inputs.len(), 1);
+        assert_eq!(rx_inputs.len(), 1);
+        // Override produces distinct secondaries — "0" vs "1".
+        assert_eq!(tx_inputs[0].secondary.as_deref(), Some("0"));
+        assert_eq!(rx_inputs[0].secondary.as_deref(), Some("1"));
+        // And the cache stores both side-by-side instead of
+        // overwriting.
+        let store = SnapshotStore::new();
+        store.store(tx_inputs.remove(0));
+        store.store(rx_inputs.remove(0));
+        assert_eq!(store.len(), 2);
+        let dump = store.snapshot();
+        assert!(dump.contains("\"17_0\":"), "TX entry missing:\n{dump}");
+        assert!(dump.contains("\"17_1\":"), "RX entry missing:\n{dump}");
     }
 
     #[test]

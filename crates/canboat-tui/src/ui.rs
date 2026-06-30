@@ -39,7 +39,9 @@ use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::widgets::{
+    Block, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
+};
 
 use crate::iso;
 use crate::overrides::{INTERVAL_OFF, Override, Overrides, default_path};
@@ -527,6 +529,15 @@ fn draw_devices(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &A
         .iter()
         .map(|d| ListItem::new(format_device_row(d)))
         .collect();
+    // Force-select row 0 the moment the list is non-empty (and the
+    // user hasn't picked something else yet). Combined with
+    // `HighlightSpacing::Always` below this keeps the column layout
+    // stable from the first frame: the marker slot is reserved and
+    // row 0 already wears the highlight, so the first ↓ keystroke
+    // moves cursor → row 1 without shifting any column to the right.
+    if !devices.is_empty() && app.devices_state.selected().is_none() {
+        app.devices_state.select(Some(0));
+    }
     let list = List::new(items)
         .block(
             Block::default()
@@ -534,7 +545,8 @@ fn draw_devices(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &A
                 .title(format!("Devices ({} src)", devices.len())),
         )
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol(" ▶ ");
+        .highlight_symbol(" ▶ ")
+        .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, area, &mut app.devices_state);
 }
 
@@ -583,10 +595,17 @@ fn draw_device_detail(
         ),
         None => format!("src {} ({} entries)", src, entries.len()),
     };
+    // Same trick as `draw_devices`: select row 0 on first sight of a
+    // non-empty list so the marker is visible and the layout is
+    // stable from the first frame.
+    if !entries.is_empty() && app.detail_state.selected().is_none() {
+        app.detail_state.select(Some(0));
+    }
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
-        .highlight_symbol(" ▶ ");
+        .highlight_symbol(" ▶ ")
+        .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, chunks[0], &mut app.detail_state);
 
     if bottom_h > 0 {

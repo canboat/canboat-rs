@@ -22,6 +22,7 @@
 //! limitation.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use serde_json::Value;
@@ -29,13 +30,28 @@ use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
 use tokio::net::tcp::OwnedWriteHalf;
 use tokio::sync::{Mutex, mpsc};
+use tokio::time::timeout;
 
 use crate::state::AppState;
+
+/// Per-connection timeout for the initial TCP connect + first read.
+/// Without this the TUI sits black forever when the endpoint isn't
+/// reachable (the OS default connect timeout is ~75 s on Linux,
+/// longer on macOS).
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Cap on the snapshot read. canboat-pipeline / n2kd both write the
+/// whole dump and close, so this only fires when the peer is
+/// pathological (open socket, no FIN). Generous so a large cache
+/// fits.
+const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Handle to the writer half of the live stream connection. The UI
 /// pushes outgoing canboat PLAIN lines (without the trailing newline)
 /// onto this channel; a background task tacks on `\n` and writes
-/// them to the socket.
+/// them to the socket. The channel is created upfront — sends queue
+/// here until the stream task connects, so the UI is usable from the
+/// first frame.
 #[derive(Clone)]
 pub struct Writer {
     tx: mpsc::UnboundedSender<String>,
@@ -47,18 +63,59 @@ impl Writer {
     }
 }
 
+/// Build the writer channel and return both halves — the `Writer`
+/// for the UI, and the receiver for the stream task to drain once
+/// the connection comes up.
+pub fn make_writer() -> (Writer, mpsc::UnboundedReceiver<String>) {
+    let (tx, rx) = mpsc::unbounded_channel();
+    (Writer { tx }, rx)
+}
+
+/// Spawn the background snapshot-load task. Failures are surfaced
+/// via [`AppState::status`] (`snapshot_loaded` + `last_error`); the
+/// caller is not blocked.
+pub fn spawn_snapshot_load(host: String, port: u16, state: Arc<Mutex<AppState>>) {
+    tokio::spawn(async move {
+        if let Err(e) = load_snapshot(&host, port, state.clone()).await {
+            let mut s = state.lock().await;
+            s.status.last_error = Some(format!("snapshot: {e:#}"));
+        }
+    });
+}
+
+/// Spawn the background stream-connection task — connects to the
+/// live-JSON port, then runs the reader (decoding into `state`) and
+/// writer (draining `rx` to the socket) until the connection
+/// drops. Failures are surfaced via [`AppState::status`].
+pub fn spawn_stream_connection(
+    host: String,
+    port: u16,
+    state: Arc<Mutex<AppState>>,
+    rx: mpsc::UnboundedReceiver<String>,
+) {
+    tokio::spawn(async move {
+        if let Err(e) = connect_stream(&host, port, state.clone(), rx).await {
+            let mut s = state.lock().await;
+            s.status.last_error = Some(format!("stream: {e:#}"));
+        }
+    });
+}
+
 /// Pull the entire snapshot blob from `host:port` and seed `state`
 /// with it. Connection is closed by the server when the dump
-/// completes.
-pub async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Result<()> {
-    let stream = TcpStream::connect((host, port))
+/// completes; both the connect and the read are bounded by
+/// [`CONNECT_TIMEOUT`] / [`SNAPSHOT_READ_TIMEOUT`] so a black-hole
+/// peer can't hang the UI.
+async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Result<()> {
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
         .await
+        .with_context(|| format!("connect snapshot port {host}:{port} timed out"))?
         .with_context(|| format!("connecting snapshot port {host}:{port}"))?;
     let mut reader = BufReader::new(stream);
     let mut buf = String::with_capacity(64 * 1024);
-    reader
-        .read_to_string(&mut buf)
+    timeout(SNAPSHOT_READ_TIMEOUT, reader.read_to_string(&mut buf))
         .await
+        .context("reading snapshot blob timed out (peer did not close)")?
         .context("reading snapshot blob")?;
 
     let trimmed = buf.trim();
@@ -104,17 +161,19 @@ pub async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -
     Ok(())
 }
 
-/// Connect to the live stream port and spawn two tasks: a reader that
-/// classifies each incoming line and applies it to `state`, and a
-/// writer that drains a [`mpsc::UnboundedReceiver`] to the socket.
-/// Returns the [`Writer`] half.
-///
-/// The connection is held for the lifetime of the returned tasks;
-/// if either half errors the receiver-side `Writer::send` calls will
-/// start returning `false`.
-pub async fn spawn_stream(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Result<Writer> {
-    let stream = TcpStream::connect((host, port))
+/// Open the live stream socket and run reader + writer concurrently
+/// on the current task. Returns when either half ends (peer closed,
+/// I/O error). The Writer channel's `rx` is owned by this task — any
+/// queued sends drain to the socket as soon as the connection is up.
+async fn connect_stream(
+    host: &str,
+    port: u16,
+    state: Arc<Mutex<AppState>>,
+    rx: mpsc::UnboundedReceiver<String>,
+) -> Result<()> {
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
         .await
+        .with_context(|| format!("connect stream port {host}:{port} timed out"))?
         .with_context(|| format!("connecting stream port {host}:{port}"))?;
     stream.set_nodelay(true).ok();
     let (read_half, write_half) = stream.into_split();
@@ -124,11 +183,15 @@ pub async fn spawn_stream(host: &str, port: u16, state: Arc<Mutex<AppState>>) ->
         s.status.stream_connected = true;
     }
 
-    let (tx, rx) = mpsc::unbounded_channel::<String>();
-    tokio::spawn(reader_task(read_half, state.clone()));
-    tokio::spawn(writer_task(write_half, rx, state));
-
-    Ok(Writer { tx })
+    // Run both halves; first to finish unblocks the other (because the
+    // socket halves share a Drop tree once the task exits).
+    tokio::select! {
+        _ = reader_task(read_half, state.clone()) => {}
+        _ = writer_task(write_half, rx, state.clone()) => {}
+    }
+    let mut s = state.lock().await;
+    s.status.stream_connected = false;
+    Ok(())
 }
 
 async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<AppState>>) {

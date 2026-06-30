@@ -69,23 +69,23 @@ async fn main() -> Result<()> {
     let status = Status::new(args.host.clone(), args.snapshot_port, args.stream_port);
     let state = Arc::new(Mutex::new(AppState::new(status)));
 
-    if let Err(e) = client::load_snapshot(&args.host, args.snapshot_port, state.clone()).await {
-        let mut s = state.lock().await;
-        s.status.last_error = Some(format!("snapshot: {e:#}"));
-    }
+    // Create the writer channel up front so the UI is usable from the
+    // first frame — sends queue here until the stream task connects.
+    let (writer, writer_rx) = client::make_writer();
 
-    let writer = match client::spawn_stream(&args.host, args.stream_port, state.clone()).await {
-        Ok(w) => w,
-        Err(e) => {
-            eprintln!(
-                "canboat-tui: could not connect stream port {}:{} — {e:#}",
-                args.host, args.stream_port
-            );
-            return Err(e);
-        }
-    };
+    // Kick off both network tasks in the background; the UI loop
+    // surfaces their progress / errors via the status bar.
+    client::spawn_snapshot_load(args.host.clone(), args.snapshot_port, state.clone());
+    client::spawn_stream_connection(
+        args.host.clone(),
+        args.stream_port,
+        state.clone(),
+        writer_rx,
+    );
 
     let mut app = ui::App::new();
+    // Persisted overrides are queued to the writer immediately; they
+    // flush to the socket as soon as the stream task connects.
     app.replay_overrides(&writer);
 
     let mut tty = setup_tty()?;

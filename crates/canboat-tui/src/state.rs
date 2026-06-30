@@ -47,8 +47,34 @@ pub struct Entry {
     /// one.
     pub description: String,
     pub line: Value,
+    /// Wall-clock-ish moment we processed the most recent record for
+    /// this key — drives both the "age" column and the interval
+    /// estimate.
     pub last_update: Instant,
+    /// Total records seen for this key since the entry was first
+    /// inserted. Combined with [`Entry::first_seen`] and
+    /// [`Entry::last_update`] this gives the average measured
+    /// inter-arrival time (see [`Entry::interval`]).
     pub count: u64,
+    /// First time we saw a record for this key. Anchors the
+    /// interval average so the displayed cadence is `(last − first)
+    /// / (count − 1)` and not perturbed by a single late frame.
+    pub first_seen: Instant,
+}
+
+impl Entry {
+    /// Average measured transmission interval. Returns `None` until
+    /// the second record arrives (one observation isn't enough to
+    /// measure a cadence). Computed as `(last_update − first_seen) /
+    /// (count − 1)`, i.e. the mean inter-arrival time across every
+    /// record we've seen for this key.
+    pub fn interval(&self) -> Option<std::time::Duration> {
+        if self.count < 2 {
+            return None;
+        }
+        let span = self.last_update.saturating_duration_since(self.first_seen);
+        Some(span / (self.count as u32 - 1))
+    }
 }
 
 /// One row in the device list.
@@ -144,6 +170,7 @@ impl AppState {
                         line,
                         last_update: now,
                         count: 1,
+                        first_seen: now,
                     },
                 );
             }

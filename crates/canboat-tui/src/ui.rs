@@ -637,9 +637,22 @@ fn format_entry_row(e: &Entry) -> Line<'static> {
         Span::styled(format!(" {:6} ", e.pgn), Style::default().fg(Color::Cyan)),
         Span::raw(format!("{:14.14}", sec)),
         Span::raw(format!(" {:30.30}", e.description)),
+        Span::raw(format!(" every {}", format_interval(e.interval()))),
         Span::raw(format!(" age {age:>4}s")),
         Span::raw(format!(" count {:>6}", e.count)),
     ])
+}
+
+/// Render a measured transmission interval as a fixed-width string
+/// for the PGN row. Sub-second cadences read as milliseconds (the
+/// usual canboat unit); slower ones as seconds. `None` (count < 2)
+/// prints `—` so the column stays right-aligned.
+fn format_interval(d: Option<std::time::Duration>) -> String {
+    match d {
+        None => format!("{:>7}", "—"),
+        Some(d) if d.as_millis() < 10_000 => format!("{:>5}ms", d.as_millis()),
+        Some(d) => format!("{:>6.1}s", d.as_secs_f32()),
+    }
 }
 
 fn draw_pgn_lists(f: &mut ratatui::Frame<'_>, area: Rect, lists: &crate::state::PgnLists) {

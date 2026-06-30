@@ -33,7 +33,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
 use crate::iso;
-use crate::overrides::{INTERVAL_DISABLE, Override, Overrides, default_path};
+use crate::overrides::{INTERVAL_OFF, Override, Overrides, default_path};
 use crate::state::{AppState, DeviceInfo, Entry};
 
 /// Per-PGN well-known transmit defaults, used purely as UI hints
@@ -107,14 +107,14 @@ impl App {
     pub fn replay_overrides(&self, writer: &crate::client::Writer) {
         for ov in &self.overrides.entries {
             let line = match (ov.manufacturer_code, ov.industry_code) {
-                (Some(mfr), Some(ind)) => iso::command_transmission_interval_proprietary(
+                (Some(mfr), Some(ind)) => iso::request_transmission_interval_proprietary(
                     ov.src,
                     ov.pgn,
                     mfr,
                     ind,
                     ov.interval_ms,
                 ),
-                _ => iso::command_transmission_interval(ov.src, ov.pgn, ov.interval_ms),
+                _ => iso::request_transmission_interval(ov.src, ov.pgn, ov.interval_ms),
             };
             let _ = writer.send(line);
         }
@@ -236,7 +236,7 @@ impl App {
                         return;
                     }
                 };
-                if interval_ms == INTERVAL_DISABLE
+                if interval_ms == INTERVAL_OFF
                     && !self.overrides.allows_disable(modal.src, modal.pgn)
                 {
                     self.toast = Some(format!(
@@ -249,14 +249,14 @@ impl App {
                     return;
                 }
                 let line = match (modal.manufacturer_code, modal.industry_code) {
-                    (Some(mfr), Some(ind)) => iso::command_transmission_interval_proprietary(
+                    (Some(mfr), Some(ind)) => iso::request_transmission_interval_proprietary(
                         modal.src,
                         modal.pgn,
                         mfr,
                         ind,
                         interval_ms,
                     ),
-                    _ => iso::command_transmission_interval(modal.src, modal.pgn, interval_ms),
+                    _ => iso::request_transmission_interval(modal.src, modal.pgn, interval_ms),
                 };
                 let sent = writer.send(line);
                 self.overrides.set(Override {
@@ -580,8 +580,7 @@ fn draw_modal(f: &mut ratatui::Frame<'_>, area: Rect, modal: &OverrideModal) {
         Line::from(""),
         Line::from("Enter to send (and persist) • Esc to cancel"),
         Line::from(format!(
-            "Disable sentinel: {} (rejected unless allow_disable in file)",
-            INTERVAL_DISABLE
+            "Off = interval {INTERVAL_OFF} (rejected unless allow_disable in file)"
         )),
     ];
     let p = Paragraph::new(text)

@@ -6,12 +6,25 @@
 //!   ask a device to (re-)emit a record (PGN 126464 PGN List, PGN
 //!   126996 Product Info, …).
 //!
-//! * **NMEA Group Function — Command (PGN 126208, function code 1)**
+//! * **NMEA Request group function (PGN 126208, function code 0)**
 //!   — variable-length payload used to ask a device to change the
-//!   transmission interval of one of its outgoing PGNs (the
-//!   `Transmission interval` parameter, units of 1 ms). The
-//!   proprietary form prepends Manufacturer Code + Industry Code so
-//!   the target only acts on it if the manufacturer matches.
+//!   transmission cadence of one of its outgoing PGNs.
+//!   `Transmission interval` is a dedicated 32‑bit DURATION field
+//!   inside the envelope (1 ms units; `0` = stop transmitting), so
+//!   no parameter pair is needed for the standard form. The
+//!   proprietary form appends two parameter pairs so the target
+//!   only reacts when the Manufacturer Code + Industry Code on its
+//!   own PGN schema match.
+//!
+//! The Command form (function code 1, parameter index 6 =
+//! "Transmission interval") is **not** what real targets implement
+//! for rate changes — the captured Furuno SCX‑20 setting tool
+//! traffic in `../canboat/samples/scx20-setting-tool-pgn-*.raw`
+//! uses Request exclusively. Schema authority for this layout is
+//! `../canboat/docs/canboat.json` PGN 126208 variant
+//! `nmeaRequestGroupFunction` (see comments below for the bit
+//! layout); the SCX‑20 sample lines double as byte‑exact tests at
+//! the bottom of this module.
 //!
 //! Output shape is the canboat PLAIN text line — `<ts>,<prio>,<pgn>,
 //! <src>,<dst>,<len>,<hex>,...` — exactly what canboat-pipeline
@@ -26,8 +39,11 @@ use canboat_core::format_iso_ms;
 /// outbound traffic and that suffices for the TUI.
 pub const TUI_SRC: u8 = 0;
 
-/// Format a canboat PLAIN line. `data` is the raw PGN payload (max
-/// 223 bytes for fast-packet).
+/// "Don't change" sentinel for the 16‑bit Transmission interval
+/// offset field. Real captures always send `0xFFFF` here.
+const OFFSET_DONT_CHANGE: u16 = 0xFFFF;
+
+/// Format a canboat PLAIN line. `data` is the raw PGN payload.
 pub fn format_plain(prio: u8, pgn: u32, src: u8, dst: u8, data: &[u8]) -> String {
     let ts = current_timestamp();
     let mut out = String::with_capacity(ts.len() + 16 + 4 + data.len() * 3);
@@ -60,62 +76,73 @@ pub fn iso_request(dst: u8, requested_pgn: u32) -> String {
     format_plain(6, 59904, TUI_SRC, dst, &payload)
 }
 
-/// PLAIN line for the standard (non-proprietary) form of PGN 126208
-/// Command — request a change to `Transmission interval` (1 ms units,
-/// 0xFFFFFFFF = restore default, 0xFFFFFFFE = turn off) on `commanded_pgn`
-/// at `dst`.
+/// PLAIN line for PGN 126208 **Request** (function code 0) addressed
+/// to `dst`, asking it to set the transmission interval of
+/// `commanded_pgn` to `interval_ms` (1 ms units; `0` means stop
+/// transmitting).
 ///
-/// Body layout per the NMEA 2000 Standardized Group Function spec:
+/// Body layout (matches `nmeaRequestGroupFunction` in
+/// `../canboat/docs/canboat.json`):
 ///
 /// ```text
-///   B0       : Function Code = 1 (Command)
-///   B1..B3   : Commanded PGN (LE)
-///   B4 hi:lo : Priority Setting (4) : Reserved (3) : 1 (1)
-///   B5       : Number of Parameter Pairs = 1
-///   B6       : Parameter index = 6 (Transmission interval)
-///   B7..B10  : New value (LE, 1 ms units)
+///   B0       : Function Code = 0 (Request)
+///   B1..B3   : Requested PGN (LE, 24 bits)
+///   B4..B7   : Transmission interval (LE, 32 bits, 1 ms units)
+///   B8..B9   : Transmission interval offset (LE, 16 bits)
+///   B10      : Number of Parameters = 0
 /// ```
 ///
-/// Only the "transmission interval" parameter is set; transmission
-/// interval offset is left untouched.
-pub fn command_transmission_interval(dst: u8, commanded_pgn: u32, interval_ms: u32) -> String {
+/// Use this overload for **standard** (non‑proprietary) PGNs.
+pub fn request_transmission_interval(dst: u8, commanded_pgn: u32, interval_ms: u32) -> String {
     let mut data = Vec::with_capacity(11);
-    data.push(0x01); // Function: Command
-    data.extend_from_slice(&commanded_pgn.to_le_bytes()[..3]);
-    // Priority Setting (4 bits) = 0x8 ("don't change"), Reserved (3
-    // bits) all-set per the spec, low bit = 1 ("don't change
-    // priority"). 0xF9 packs that cleanly.
-    data.push(0xf9);
-    data.push(0x01); // Number of Parameter Pairs
-    data.push(6); // Parameter index: Transmission interval
-    data.extend_from_slice(&interval_ms.to_le_bytes());
+    write_request_header(&mut data, commanded_pgn, interval_ms);
+    data.push(0); // Number of Parameters
     format_plain(3, 126208, TUI_SRC, dst, &data)
 }
 
-/// Same as [`command_transmission_interval`] but for the proprietary
-/// (group-function-code-1, manufacturer-scoped) variant. The body
-/// prepends Manufacturer Code (11 bits) + Reserved (2 bits, all-set)
-/// + Industry Code (3 bits) to the standard fields.
-pub fn command_transmission_interval_proprietary(
+/// PLAIN line for PGN 126208 **Request** scoping the rate change to
+/// the manufacturer + industry whose proprietary PGN this is —
+/// appends two parameter pairs at field indices 1 (Manufacturer
+/// Code, 11‑bit → 2 bytes) and 3 (Industry Code, 3‑bit → 1 byte).
+/// These are the field positions every proprietary PGN uses for
+/// those values (see e.g. `../canboat/docs/canboat.json` PGN 130842
+/// `furunoSixDegreesOfFreedomMovement`).
+///
+/// Captured Furuno SCX‑20 traffic in
+/// `../canboat/samples/scx20-setting-tool-pgn-130578to130846-on.raw`
+/// is byte‑identical to what this builder emits — see the test at
+/// the bottom of the module.
+pub fn request_transmission_interval_proprietary(
     dst: u8,
     commanded_pgn: u32,
     manufacturer_code: u16,
     industry_code: u8,
     interval_ms: u32,
 ) -> String {
-    let mut data = Vec::with_capacity(13);
-    data.push(0x01); // Function: Command
-    data.extend_from_slice(&commanded_pgn.to_le_bytes()[..3]);
-    data.push(0xf9); // Priority/Reserved/don't-change-prio
-    // Manufacturer (11) | Reserved (2 all-set) | Industry (3).
-    let mfr = manufacturer_code & 0x07ff;
-    let ind = (industry_code as u16) & 0x07;
-    let packed: u16 = mfr | (0b11 << 11) | (ind << 13);
-    data.extend_from_slice(&packed.to_le_bytes());
-    data.push(0x01); // Number of Parameter Pairs
-    data.push(6); // Parameter index: Transmission interval
-    data.extend_from_slice(&interval_ms.to_le_bytes());
+    let mut data = Vec::with_capacity(16);
+    write_request_header(&mut data, commanded_pgn, interval_ms);
+    data.push(2); // Number of Parameters = 2 (mfr + industry)
+    // Parameter pair 1: index = 1 (Manufacturer Code), value = 11‑bit
+    // field rounded up to 2 LE bytes. The top 5 bits of the value
+    // word stay 0 — only the 11‑bit Manufacturer Code is carried
+    // here, the adjacent Reserved + Industry Code bits live in their
+    // own field indices.
+    data.push(1);
+    data.extend_from_slice(&(manufacturer_code & 0x07FF).to_le_bytes());
+    // Parameter pair 2: index = 3 (Industry Code), value = 3‑bit
+    // field rounded up to 1 byte.
+    data.push(3);
+    data.push(industry_code & 0x07);
     format_plain(3, 126208, TUI_SRC, dst, &data)
+}
+
+/// Write B0..B9 of the PGN 126208 Request envelope (everything up to
+/// and not including the `Number of Parameters` byte).
+fn write_request_header(out: &mut Vec<u8>, commanded_pgn: u32, interval_ms: u32) {
+    out.push(0x00); // Function Code: Request
+    out.extend_from_slice(&commanded_pgn.to_le_bytes()[..3]);
+    out.extend_from_slice(&interval_ms.to_le_bytes());
+    out.extend_from_slice(&OFFSET_DONT_CHANGE.to_le_bytes());
 }
 
 fn current_timestamp() -> String {
@@ -130,6 +157,11 @@ fn current_timestamp() -> String {
 mod tests {
     use super::*;
 
+    /// Strip the leading ISO timestamp so the assertion is stable.
+    fn no_ts(line: &str) -> &str {
+        line.split_once(',').map(|(_, rest)| rest).unwrap_or(line)
+    }
+
     #[test]
     fn iso_request_payload_is_le_pgn() {
         // PGN 126464 little-endian = 0x00, 0xee, 0x01.
@@ -137,28 +169,79 @@ mod tests {
         assert!(line.ends_with(",6,59904,0,35,3,00,ee,01"));
     }
 
+    /// Reproduces the exact 11‑byte standard‑PGN Request line emitted
+    /// by the Furuno SCX‑20 setting tool when disabling PGN 130578:
+    ///
+    /// ```text
+    /// ,3,126208,0,52,11,00,12,fe,01,00,00,00,00,ff,ff,00
+    /// ```
+    ///
+    /// (See `../canboat/samples/scx20-setting-tool-pgn-130578to130846-off.raw`.)
     #[test]
-    fn command_transmission_interval_layout() {
-        // commanded_pgn 127251 = 0x01F113 -> LE 0x13, 0xf1, 0x01.
-        // interval_ms 250 -> LE 0xfa, 0x00, 0x00, 0x00.
-        let line = command_transmission_interval(17, 127251, 250);
-        assert!(
-            line.contains(",126208,0,17,11,01,13,f1,01,f9,01,06,fa,00,00,00"),
+    fn request_standard_pgn_disable_matches_scx20_sample() {
+        let line = request_transmission_interval(52, 130578, 0);
+        assert_eq!(
+            no_ts(&line),
+            "3,126208,0,52,11,00,12,fe,01,00,00,00,00,ff,ff,00",
             "got: {line}"
         );
     }
 
+    /// Same standard PGN with a 1000 ms interval — taken from the
+    /// `…-on.raw` companion sample.
     #[test]
-    fn command_transmission_interval_proprietary_packs_manufacturer_and_industry() {
-        // commanded_pgn 130824 = 0x01FF08 -> LE 0x08, 0xff, 0x01.
-        // Manufacturer = 381 (B&G), Industry = 4 (Marine).
-        // 381 = 0x017D. Packed = 0x017D | (0x03 << 11) | (0x04 << 13)
-        //               = 0x017D | 0x1800 | 0x8000 = 0x997D → LE 7d 99.
-        // interval_ms 1000 -> LE 0xe8, 0x03, 0x00, 0x00.
-        let line = command_transmission_interval_proprietary(17, 130824, 381, 4, 1000);
-        assert!(
-            line.contains(",126208,0,17,13,01,08,ff,01,f9,7d,99,01,06,e8,03,00,00"),
+    fn request_standard_pgn_enable_matches_scx20_sample() {
+        let line = request_transmission_interval(52, 130578, 1000);
+        assert_eq!(
+            no_ts(&line),
+            "3,126208,0,52,11,00,12,fe,01,e8,03,00,00,ff,ff,00",
             "got: {line}"
         );
+    }
+
+    /// Reproduces the 16‑byte proprietary Request line that disables
+    /// Furuno's PGN 130842:
+    ///
+    /// ```text
+    /// ,3,126208,0,52,16,00,1a,ff,01,00,00,00,00,ff,ff,02,01,3f,07,03,04
+    /// ```
+    ///
+    /// Furuno = manufacturer 1855 (0x73F), Marine industry = 4. The
+    /// two parameter pairs at the tail are `(idx=1, mfr 2B LE)` and
+    /// `(idx=3, industry 1B)` — the schema field positions for those
+    /// values on every proprietary PGN.
+    #[test]
+    fn request_proprietary_pgn_disable_matches_scx20_sample() {
+        let line = request_transmission_interval_proprietary(52, 130842, 1855, 4, 0);
+        assert_eq!(
+            no_ts(&line),
+            "3,126208,0,52,16,00,1a,ff,01,00,00,00,00,ff,ff,02,01,3f,07,03,04",
+            "got: {line}"
+        );
+    }
+
+    /// Companion to the disable test — same envelope but the four
+    /// interval bytes carry 200 ms (`c8,00,00,00`). Taken verbatim
+    /// from the `…-on.raw` sample line for PGN 130842.
+    #[test]
+    fn request_proprietary_pgn_enable_matches_scx20_sample() {
+        let line = request_transmission_interval_proprietary(52, 130842, 1855, 4, 200);
+        assert_eq!(
+            no_ts(&line),
+            "3,126208,0,52,16,00,1a,ff,01,c8,00,00,00,ff,ff,02,01,3f,07,03,04",
+            "got: {line}"
+        );
+    }
+
+    /// Manufacturer Code mask: a value with bits above the 11‑bit
+    /// limit set must still emit only the low 11 bits, so a careless
+    /// caller can't poison the wire format. The constants 0xF800 +
+    /// 1855 share the low 11 bits with plain 1855.
+    #[test]
+    fn proprietary_request_masks_manufacturer_to_11_bits() {
+        let careful = request_transmission_interval_proprietary(52, 130842, 1855, 4, 0);
+        let careless =
+            request_transmission_interval_proprietary(52, 130842, 0xF800 | 1855, 4 | 0xF0, 0);
+        assert_eq!(careful, careless);
     }
 }

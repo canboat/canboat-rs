@@ -8,8 +8,8 @@
 //!    made yesterday survives a target reboot.
 //!
 //! 2. **Authorisation gate for "turn off"** — the user is permitted
-//!    to set `interval_ms = 0xFFFFFFFE` ("disable transmission") only
-//!    when a matching entry already exists on disk with
+//!    to set `interval_ms = 0` ("stop transmitting") only when a
+//!    matching entry already exists on disk with
 //!    `allow_disable: true`. This file is the persistent record the
 //!    spec asks us to require before silencing a PGN.
 //!
@@ -22,22 +22,29 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
-/// Sentinel value for "disable transmission" in the NMEA 2000 group
-/// function `Transmission interval` parameter (1 ms units).
-pub const INTERVAL_DISABLE: u32 = 0xFFFF_FFFE;
+/// "Stop transmitting" value for the PGN 126208 Request envelope's
+/// 32-bit Transmission interval field (1 ms units). The captured
+/// Furuno SCX-20 setting-tool traffic in
+/// `../canboat/samples/scx20-setting-tool-pgn-130578to130846-off.raw`
+/// uses `0` here, not the `0xFFFFFFFE` sentinel I had originally
+/// written from the spec — that sentinel is a feature of the older
+/// Command form (function code 1), which real targets don't
+/// implement for rate changes.
+pub const INTERVAL_OFF: u32 = 0;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Override {
     pub src: u8,
     pub pgn: u32,
-    /// Desired interval in milliseconds, or one of the sentinels
-    /// above.
+    /// Desired interval in milliseconds. `0` means "stop
+    /// transmitting" (see [`INTERVAL_OFF`]); any positive value is
+    /// the new cadence in milliseconds.
     pub interval_ms: u32,
     /// Required to be `true` before the TUI is allowed to send an
-    /// override with `interval_ms == INTERVAL_DISABLE`. The TUI
-    /// itself never flips this — the user must edit the file by
-    /// hand, which serves as the explicit acknowledgement that a
-    /// PGN is being silenced.
+    /// override with `interval_ms == INTERVAL_OFF`. The TUI itself
+    /// never flips this — the user must edit the file by hand,
+    /// which serves as the explicit acknowledgement that a PGN is
+    /// being silenced.
     #[serde(default)]
     pub allow_disable: bool,
     /// Required for proprietary PGNs (range 0xFF00-0xFFFF / 0x1FF00-

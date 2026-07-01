@@ -130,6 +130,52 @@ pub struct App {
     /// and `e != last_acknowledged_error`, a fatal-error modal is
     /// drawn over everything until the user presses a key.
     pub last_acknowledged_error: Option<String>,
+    /// Active text-entry prompt for `/` (search) or `f` (PGN filter)
+    /// on the TimeView screen. When `Some`, keystrokes go into the
+    /// buffer; Enter applies, Esc cancels.
+    pub text_prompt: Option<TextPrompt>,
+    /// Active source-select modal for `s` on the TimeView screen —
+    /// a checkbox list of currently-known sources, Space to toggle,
+    /// Enter to apply.
+    pub src_select: Option<SrcSelect>,
+    /// Currently active substring search on TimeView (from `/`).
+    /// Case-insensitive match against a canonical row string
+    /// (`<timestamp> src <src> pgn <pgn> <description>`). `n` / `N`
+    /// step through matches; `/` with empty input clears.
+    pub search_query: Option<String>,
+    /// Currently active PGN allowlist (from `f`). `None` = show all;
+    /// `Some([])` behaves the same but is never produced (empty
+    /// input clears back to `None`).
+    pub filter_pgns: Option<Vec<u32>>,
+    /// Currently active source allowlist (from `s`). Same
+    /// conventions as `filter_pgns`.
+    pub filter_srcs: Option<Vec<u8>>,
+}
+
+/// One-line text prompt shown at the bottom of the screen when the
+/// user presses `/` or `f` on TimeView. `kind` picks what Enter
+/// does with the buffered text.
+pub struct TextPrompt {
+    pub kind: TextPromptKind,
+    pub buffer: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TextPromptKind {
+    /// `/` — substring search across formatted row text.
+    Search,
+    /// `f` — comma-separated PGN allowlist. Empty clears.
+    FilterPgns,
+}
+
+/// State for the interactive source-select modal (`s` on TimeView).
+/// The list is snapshot at open time from `AppState::device_list()`;
+/// cursor + selected set live here so the user can toggle multiple
+/// sources before hitting Enter.
+pub struct SrcSelect {
+    pub sources: Vec<(u8, String)>,
+    pub selected: std::collections::HashSet<u8>,
+    pub cursor: usize,
 }
 
 pub struct OverrideModal {
@@ -170,7 +216,38 @@ impl App {
             should_quit: false,
             connecting_dismissed: false,
             last_acknowledged_error: None,
+            text_prompt: None,
+            src_select: None,
+            search_query: None,
+            filter_pgns: None,
+            filter_srcs: None,
         }
+    }
+
+    /// Row visibility filter for TimeView. Returns the indices into
+    /// `state.history` of the records that pass the currently-active
+    /// PGN + source filters (both AND-combined; `None` = pass all).
+    /// Used both by the renderer (which rows to display) and by
+    /// search navigation (which rows are candidates for `n`/`N`).
+    pub fn visible_history_indices(&self, state: &AppState) -> Vec<usize> {
+        if self.filter_pgns.is_none() && self.filter_srcs.is_none() {
+            return (0..state.history.len()).collect();
+        }
+        state
+            .history
+            .iter()
+            .enumerate()
+            .filter(|(_, h)| {
+                self.filter_pgns
+                    .as_ref()
+                    .is_none_or(|list| list.contains(&h.pgn))
+                    && self
+                        .filter_srcs
+                        .as_ref()
+                        .is_none_or(|list| list.contains(&h.src))
+            })
+            .map(|(i, _)| i)
+            .collect()
     }
 
     /// Composed row list for the DeviceDetail screen: live cached
@@ -243,6 +320,16 @@ impl App {
             self.handle_modal_key(key, writer);
             return;
         }
+        // Text prompt (/ or f) trumps every other key on TimeView.
+        if self.text_prompt.is_some() {
+            self.handle_text_prompt_key(key, state);
+            return;
+        }
+        // Source-select modal (s) trumps everything else too.
+        if self.src_select.is_some() {
+            self.handle_src_select_key(key);
+            return;
+        }
         self.toast = None;
         self.alert = None;
         // Left/right on EntryDetail steps through past instances.
@@ -273,16 +360,81 @@ impl App {
             (_, KeyCode::Char('t')) => self.screen = Screen::TimeView,
             (Screen::TimeView, KeyCode::Char('d')) => self.screen = Screen::Devices,
             (Screen::TimeView, KeyCode::Down) | (Screen::TimeView, KeyCode::Char('j')) => {
-                navigate_list(&mut self.time_state, state.history.len(), 1);
+                let n = self.visible_history_indices(state).len();
+                navigate_list(&mut self.time_state, n, 1);
             }
             (Screen::TimeView, KeyCode::Up) | (Screen::TimeView, KeyCode::Char('k')) => {
-                navigate_list(&mut self.time_state, state.history.len(), -1);
+                let n = self.visible_history_indices(state).len();
+                navigate_list(&mut self.time_state, n, -1);
+            }
+            (Screen::TimeView, KeyCode::Char('/')) => {
+                self.text_prompt = Some(TextPrompt {
+                    kind: TextPromptKind::Search,
+                    buffer: self.search_query.clone().unwrap_or_default(),
+                });
+            }
+            (Screen::TimeView, KeyCode::Char('f')) => {
+                let buffer = self
+                    .filter_pgns
+                    .as_ref()
+                    .map(|list| {
+                        list.iter()
+                            .map(|p| p.to_string())
+                            .collect::<Vec<_>>()
+                            .join(",")
+                    })
+                    .unwrap_or_default();
+                self.text_prompt = Some(TextPrompt {
+                    kind: TextPromptKind::FilterPgns,
+                    buffer,
+                });
+            }
+            (Screen::TimeView, KeyCode::Char('s')) => {
+                let devs = state.device_list();
+                let sources: Vec<(u8, String)> = devs
+                    .iter()
+                    .map(|d| {
+                        let label = if d.manufacturer.is_empty() && d.model.is_empty() {
+                            format!("src {}", d.src)
+                        } else {
+                            format!(
+                                "src {:3}  {} {}",
+                                d.src,
+                                d.manufacturer.as_str(),
+                                d.model.as_str()
+                            )
+                        };
+                        (d.src, label)
+                    })
+                    .collect();
+                let selected = self
+                    .filter_srcs
+                    .as_ref()
+                    .cloned()
+                    .map(|v| v.into_iter().collect())
+                    .unwrap_or_else(|| sources.iter().map(|(s, _)| *s).collect());
+                self.src_select = Some(SrcSelect {
+                    sources,
+                    selected,
+                    cursor: 0,
+                });
+            }
+            (Screen::TimeView, KeyCode::Char('n')) => {
+                self.jump_search(state, 1);
+            }
+            (Screen::TimeView, KeyCode::Char('N')) => {
+                self.jump_search(state, -1);
             }
             (Screen::TimeView, KeyCode::Enter) => {
-                if let Some(row) = self
+                // Translate the visible-row cursor to an actual
+                // `state.history` index — the filter may hide most
+                // of the raw list.
+                let visible = self.visible_history_indices(state);
+                if let Some(target) = self
                     .time_state
                     .selected()
-                    .and_then(|i| state.history.get(i))
+                    .and_then(|i| visible.get(i).copied())
+                    && let Some(row) = state.history.get(target)
                 {
                     // Drilling in from TimeView opens EntryDetail for
                     // the record the cursor is on, positioned to
@@ -290,10 +442,6 @@ impl App {
                     // and left/right through nearby instances.
                     let key = (row.pgn, row.src, row.secondary.clone());
                     if let Some(entry) = state.entries.get(&key) {
-                        // Find our history_index inside the entry's
-                        // per-key list. Linear but each entry has at
-                        // most a few thousand indices in practice.
-                        let target = self.time_state.selected().unwrap_or(0);
                         let history_pos = entry
                             .history_indices
                             .iter()
@@ -438,6 +586,163 @@ impl App {
             }
             _ => {}
         }
+    }
+
+    /// Key routing when the `/` or `f` text prompt is active.
+    /// Digits + letters + hyphen + comma go into the buffer; Enter
+    /// commits (kind-specific interpretation), Esc cancels without
+    /// touching the filter/search state.
+    fn handle_text_prompt_key(&mut self, key: KeyEvent, state: &AppState) {
+        let Some(prompt) = self.text_prompt.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => {
+                self.text_prompt = None;
+            }
+            KeyCode::Backspace => {
+                prompt.buffer.pop();
+            }
+            KeyCode::Enter => {
+                let raw = prompt.buffer.trim().to_string();
+                let kind = prompt.kind;
+                self.text_prompt = None;
+                match kind {
+                    TextPromptKind::Search => {
+                        if raw.is_empty() {
+                            self.search_query = None;
+                        } else {
+                            self.search_query = Some(raw);
+                            self.jump_search(state, 0);
+                        }
+                    }
+                    TextPromptKind::FilterPgns => {
+                        if raw.is_empty() {
+                            self.filter_pgns = None;
+                        } else {
+                            let list: Vec<u32> = raw
+                                .split(|c: char| c == ',' || c.is_whitespace())
+                                .filter(|t| !t.is_empty())
+                                .filter_map(|t| t.parse().ok())
+                                .collect();
+                            self.filter_pgns = (!list.is_empty()).then_some(list);
+                            self.time_state.select(Some(0));
+                        }
+                    }
+                }
+            }
+            KeyCode::Char(c) => {
+                prompt.buffer.push(c);
+            }
+            _ => {}
+        }
+    }
+
+    /// Key routing for the source-select checkbox modal. `Space`
+    /// toggles the current cursor's source; `a` / `A` toggles all;
+    /// Enter commits; Esc cancels.
+    fn handle_src_select_key(&mut self, key: KeyEvent) {
+        let Some(sel) = self.src_select.as_mut() else {
+            return;
+        };
+        let len = sel.sources.len();
+        match key.code {
+            KeyCode::Esc => {
+                self.src_select = None;
+            }
+            KeyCode::Enter => {
+                let selected = sel.selected.clone();
+                let full = sel.sources.iter().all(|(s, _)| selected.contains(s));
+                self.src_select = None;
+                // "All sources selected" is the same as no filter —
+                // canonicalise so the status bar doesn't lie.
+                self.filter_srcs = if full || selected.is_empty() {
+                    None
+                } else {
+                    let mut v: Vec<u8> = selected.into_iter().collect();
+                    v.sort_unstable();
+                    Some(v)
+                };
+                self.time_state.select(Some(0));
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if len > 0 {
+                    sel.cursor = (sel.cursor + 1) % len;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                if len > 0 {
+                    sel.cursor = (sel.cursor + len - 1) % len;
+                }
+            }
+            KeyCode::Char(' ') => {
+                if let Some((src, _)) = sel.sources.get(sel.cursor)
+                    && !sel.selected.insert(*src)
+                {
+                    sel.selected.remove(src);
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                if sel.selected.len() == sel.sources.len() {
+                    sel.selected.clear();
+                } else {
+                    sel.selected = sel.sources.iter().map(|(s, _)| *s).collect();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Advance search cursor by `dir` (`+1` next, `-1` prev, `0`
+    /// stay-or-find-first). Search matches against the same
+    /// canonical row string [`format_time_row`] renders — case-
+    /// insensitive substring match. No-op when there's no query.
+    fn jump_search(&mut self, state: &AppState, dir: i32) {
+        let Some(q_lower) = self.search_query.as_ref().map(|s| s.to_lowercase()) else {
+            return;
+        };
+        let visible = self.visible_history_indices(state);
+        if visible.is_empty() {
+            return;
+        }
+        let cur = self.time_state.selected().unwrap_or(0);
+        let matches: Vec<usize> = visible
+            .iter()
+            .enumerate()
+            .filter(|(_, hi)| {
+                state
+                    .history
+                    .get(**hi)
+                    .is_some_and(|h| row_search_string(h).to_lowercase().contains(&q_lower))
+            })
+            .map(|(vpos, _)| vpos)
+            .collect();
+        if matches.is_empty() {
+            self.toast = Some(format!(
+                "no matches for \"{}\"",
+                self.search_query.as_deref().unwrap_or("")
+            ));
+            return;
+        }
+        let target = match dir.cmp(&0) {
+            std::cmp::Ordering::Equal => matches
+                .iter()
+                .copied()
+                .find(|m| *m >= cur)
+                .unwrap_or(matches[0]),
+            std::cmp::Ordering::Greater => matches
+                .iter()
+                .copied()
+                .find(|m| *m > cur)
+                .unwrap_or(matches[0]),
+            std::cmp::Ordering::Less => matches
+                .iter()
+                .copied()
+                .rev()
+                .find(|m| *m < cur)
+                .unwrap_or(*matches.last().unwrap()),
+        };
+        self.time_state.select(Some(target));
     }
 
     fn handle_modal_key(&mut self, key: KeyEvent, writer: &crate::client::Writer) {
@@ -631,12 +936,21 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
             }
             Screen::TimeView => draw_time_view(f, chunks[1], app, state),
         }
-        draw_hint_bar(f, chunks[2], app, state);
+        // The bottom line: text prompt when `/` or `f` is active,
+        // otherwise the per-screen keybinding hint.
+        if let Some(prompt) = &app.text_prompt {
+            draw_text_prompt(f, chunks[2], prompt);
+        } else {
+            draw_hint_bar(f, chunks[2], app, state);
+        }
         // Modal stack — last drawn wins. Override dialog is least
         // important, connecting overlay sits above it, fatal-error
         // modal trumps everything.
         if let Some(modal) = &app.modal {
             draw_modal(f, area, modal);
+        }
+        if let Some(sel) = &app.src_select {
+            draw_src_select_modal(f, area, sel);
         }
         if !app.connecting_dismissed {
             draw_connecting_modal(f, area, state);
@@ -763,7 +1077,9 @@ fn screen_hint(screen: &Screen, overrides_writable: bool, mode: Mode) -> &'stati
         (Screen::EntryDetail { .. }, _) => {
             "q quit | ↑↓ scroll 1 | ←→ prev/next instance | PgUp/PgDn scroll 10 | Esc back"
         }
-        (Screen::TimeView, _) => "q quit | ↑↓ move | Enter drill in | d device view | Esc back",
+        (Screen::TimeView, _) => {
+            "q quit | ↑↓ move | Enter drill in | / search | n/N next/prev | f filter pgns | s filter sources | d device view | Esc back"
+        }
     }
 }
 
@@ -1058,32 +1374,67 @@ fn draw_entry_detail(
 /// description. Enter drills into the corresponding EntryDetail
 /// screen, positioned to that specific observation.
 fn draw_time_view(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &AppState) {
-    if !state.history.is_empty() && app.time_state.selected().is_none() {
+    let visible = app.visible_history_indices(state);
+    // Clamp cursor to the (possibly reduced) filter subset.
+    if !visible.is_empty() && app.time_state.selected().is_none() {
         app.time_state.select(Some(0));
     }
-    // Live mode: jump to the newest record so the user doesn't have
-    // to press End every draw. Only when the current selection is
-    // the previous end-of-list, so manual scrolling isn't disturbed.
-    if state.status.mode == Mode::Live
-        && let Some(sel) = app.time_state.selected()
-        && sel + 1 < state.history.len()
-        && sel + 2 == state.history.len()
+    if let Some(sel) = app.time_state.selected()
+        && sel >= visible.len()
     {
-        app.time_state.select(Some(state.history.len() - 1));
+        app.time_state
+            .select(visible.len().checked_sub(1).or(Some(0)));
     }
-    let items: Vec<ListItem> = state
-        .history
+    let items: Vec<ListItem> = visible
         .iter()
-        .enumerate()
-        .map(|(i, h)| ListItem::new(format_time_row(i, h)))
+        .filter_map(|hi| state.history.get(*hi).map(|h| (hi, h)))
+        .map(|(hi, h)| ListItem::new(format_time_row(*hi, h)))
         .collect();
-    let title = format!("Timeline ({} records)", state.history.len());
-    let list = List::new(items)
+    let mut title_parts = vec![format!("Timeline ({}", visible.len())];
+    if state.history.len() != visible.len() {
+        title_parts.push(format!(" of {}", state.history.len()));
+    }
+    title_parts.push(")".to_string());
+    if let Some(list) = &app.filter_pgns {
+        title_parts.push(format!(
+            "  pgns: {}",
+            list.iter()
+                .map(|p| p.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if let Some(list) = &app.filter_srcs {
+        title_parts.push(format!(
+            "  srcs: {}",
+            list.iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
+    }
+    if let Some(q) = &app.search_query {
+        title_parts.push(format!("  /{q}"));
+    }
+    let title: String = title_parts.concat();
+    let list_widget = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
         .highlight_symbol(" ▶ ")
         .highlight_spacing(HighlightSpacing::Always);
-    f.render_stateful_widget(list, area, &mut app.time_state);
+    f.render_stateful_widget(list_widget, area, &mut app.time_state);
+}
+
+/// Canonical row string for search matching — a plain-text form of
+/// [`format_time_row`] without ANSI/ratatui styling. Kept in sync so
+/// searching for whatever the user sees on-screen finds the row.
+fn row_search_string(h: &crate::state::HistoryRecord) -> String {
+    let stamp = h.timestamp.as_deref().unwrap_or("");
+    let sec = h.secondary.as_deref().unwrap_or("");
+    format!(
+        "{stamp} src {} pgn {} {sec} {}",
+        h.src, h.pgn, h.description
+    )
 }
 
 /// One row on the `TimeView` screen — index, timestamp, src, pgn,
@@ -1275,4 +1626,81 @@ fn draw_error_modal(f: &mut ratatui::Frame<'_>, area: Rect, message: &str) {
         )
         .wrap(Wrap { trim: true });
     f.render_widget(p, rect);
+}
+
+/// One-line text-prompt bar — replaces the hint bar while `/` or
+/// `f` is active. Renders `<prefix> <buffer>_` with a fake cursor
+/// glyph at the end of the buffer.
+fn draw_text_prompt(f: &mut ratatui::Frame<'_>, area: Rect, prompt: &TextPrompt) {
+    let prefix = match prompt.kind {
+        TextPromptKind::Search => "/",
+        TextPromptKind::FilterPgns => "filter pgns: ",
+    };
+    let text = format!(" {prefix}{}_", prompt.buffer);
+    let p = Paragraph::new(text).style(
+        Style::default()
+            .fg(Color::Black)
+            .bg(Color::Yellow)
+            .add_modifier(Modifier::BOLD),
+    );
+    f.render_widget(p, area);
+}
+
+/// Source-select checkbox modal — shown while the `s` prompt is
+/// active on TimeView. Each row is `[x] <label>`; `Space` toggles
+/// the cursor's row, `a` toggles all, Enter applies, Esc cancels.
+fn draw_src_select_modal(f: &mut ratatui::Frame<'_>, area: Rect, sel: &SrcSelect) {
+    let w = 60.min(area.width.saturating_sub(2));
+    let h = (sel.sources.len() as u16 + 6)
+        .min(area.height.saturating_sub(2))
+        .max(6);
+    let rect = centered_rect(area, w, h);
+    f.render_widget(Clear, rect);
+    let items: Vec<ListItem> = sel
+        .sources
+        .iter()
+        .map(|(src, label)| {
+            let mark = if sel.selected.contains(src) {
+                "[x]"
+            } else {
+                "[ ]"
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!(" {mark}  "), Style::default().fg(Color::Green)),
+                Span::raw(label.clone()),
+            ]))
+        })
+        .collect();
+    let mut list_state = ListState::default();
+    list_state.select(Some(sel.cursor));
+    let title = format!(
+        " Filter sources ({}/{})",
+        sel.selected.len(),
+        sel.sources.len()
+    );
+    let list = List::new(items)
+        .block(
+            Block::default().borders(Borders::ALL).title(Span::styled(
+                title,
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            )),
+        )
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol(" ▶ ")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(list, rect, &mut list_state);
+    // Overlay a footer hint on the bottom-most row.
+    if rect.height >= 2 {
+        let hint_area = Rect {
+            x: rect.x + 1,
+            y: rect.y + rect.height - 1,
+            width: rect.width.saturating_sub(2),
+            height: 1,
+        };
+        let hint = Paragraph::new(" Space toggle | a toggle-all | Enter apply | Esc cancel ")
+            .style(Style::default().fg(Color::DarkGray));
+        f.render_widget(hint, hint_area);
+    }
 }

@@ -584,12 +584,17 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
             }
         }
     }
-    // Auto-dismiss the connecting modal once both connections are up
-    // and clean — successful startup shouldn't require a keystroke.
+    // Auto-dismiss the connecting modal.
+    //
+    // * Live mode: wait for both connections to come up clean.
+    // * Log mode: the modal talks about "connecting" — irrelevant
+    //   for a file. Dismiss immediately; the status bar already
+    //   shows `loading… / loaded` as the file is ingested.
     if !app.connecting_dismissed
-        && state.status.snapshot_loaded
-        && state.status.stream_connected
-        && state.status.last_error.is_none()
+        && (state.status.mode == Mode::Log
+            || (state.status.snapshot_loaded
+                && state.status.stream_connected
+                && state.status.last_error.is_none()))
     {
         app.connecting_dismissed = true;
     }

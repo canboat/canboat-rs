@@ -45,9 +45,11 @@ use crate::state::{AppState, Status};
 )]
 struct Args {
     /// Hostname or IP of the n2kd / canboat-pipeline endpoint.
-    /// Ignored when `--log` is set.
-    #[arg(long, default_value = "127.0.0.1")]
-    host: String,
+    /// Required unless `--log` is set (there is no default: pick a
+    /// live endpoint or a capture on purpose, don't blindly connect
+    /// to localhost).
+    #[arg(long, required_unless_present = "log", conflicts_with = "log")]
+    host: Option<String>,
     /// Snapshot port (default 2597 — canboat-pipeline `--snapshot-port`
     /// or n2kd JSON snapshot). Ignored when `--log` is set.
     #[arg(long, default_value_t = 2597)]
@@ -60,8 +62,9 @@ struct Args {
     /// Replay a captured log file instead of connecting to a live
     /// endpoint. Accepts any analyzer-readable format (PLAIN, FAST,
     /// Actisense, iKonvert, YDWG02 — auto-detected on the first
-    /// content line). The `o` (override) and `i` (ISO request) keys
-    /// are disabled in this mode since they need a live bus.
+    /// content line). Mutually exclusive with `--host`. The `o`
+    /// (override) and `i` (ISO request) keys are disabled in this
+    /// mode since they need a live bus.
     #[arg(long, value_name = "PATH")]
     log: Option<std::path::PathBuf>,
 }
@@ -75,9 +78,12 @@ async fn main() -> Result<()> {
         .try_init();
 
     let args = Args::parse();
-    let status = match &args.log {
-        Some(path) => Status::new_log(path.display().to_string()),
-        None => Status::new_live(args.host.clone(), args.snapshot_port, args.stream_port),
+    // Clap enforces `--host XOR --log` above — so exactly one of
+    // these branches matches.
+    let status = match (&args.log, &args.host) {
+        (Some(path), _) => Status::new_log(path.display().to_string()),
+        (None, Some(host)) => Status::new_live(host.clone(), args.snapshot_port, args.stream_port),
+        (None, None) => unreachable!("clap's required_unless_present guarantees one is Some"),
     };
     let state = Arc::new(Mutex::new(AppState::new(status)));
 
@@ -95,14 +101,11 @@ async fn main() -> Result<()> {
     } else {
         // Live mode: kick off both network tasks in the background;
         // the UI loop surfaces their progress / errors via the status
-        // bar.
-        client::spawn_snapshot_load(args.host.clone(), args.snapshot_port, state.clone());
-        client::spawn_stream_connection(
-            args.host.clone(),
-            args.stream_port,
-            state.clone(),
-            writer_rx,
-        );
+        // bar. `args.host` is guaranteed `Some` here by the CLI
+        // match above.
+        let host = args.host.clone().expect("--host required in live mode");
+        client::spawn_snapshot_load(host.clone(), args.snapshot_port, state.clone());
+        client::spawn_stream_connection(host, args.stream_port, state.clone(), writer_rx);
     }
 
     let mut app = ui::App::new();

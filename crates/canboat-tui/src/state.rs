@@ -40,9 +40,13 @@ pub const MAX_PENDING_ALERTS: usize = 20;
 pub type EntryKey = (u32, u8, Option<String>);
 
 /// One snapshot entry: a single decoded record indexed by its
-/// composite primary key. `line` is the analyzer-JSON object (parsed
-/// once into `serde_json::Value` so the UI can pull fields without
-/// re-parsing on every frame).
+/// composite primary key. `line` caches the latest observation so
+/// the UI can pull fields without indirecting through
+/// [`AppState::history`] on every frame; `history_indices` indexes
+/// every observation we've seen for this key in chronological order
+/// so the user can step through past instances with left / right
+/// (and the [`Screen::TimeView`] flattens them all into one
+/// timeline).
 #[derive(Debug, Clone)]
 pub struct Entry {
     pub pgn: u32,
@@ -66,6 +70,11 @@ pub struct Entry {
     /// interval average so the displayed cadence is `(last − first)
     /// / (count − 1)` and not perturbed by a single late frame.
     pub first_seen: Instant,
+    /// Indices into [`AppState::history`], one per observation of
+    /// this key, in chronological insertion order. The last index
+    /// names the same record that `line` caches. Empty on
+    /// synthetic silenced-override placeholder rows.
+    pub history_indices: Vec<usize>,
 }
 
 impl Entry {
@@ -164,12 +173,37 @@ impl Status {
     }
 }
 
+/// One observation of any PGN, in arrival order. The TUI keeps the
+/// full history in [`AppState::history`] so each `Entry` can index
+/// back into it for left/right navigation and the (forthcoming)
+/// `TimeView` can iterate all records chronologically without
+/// touching the per-key `Entry` map.
+#[derive(Debug, Clone)]
+pub struct HistoryRecord {
+    /// ISO timestamp string from the analyzer JSON line, if any.
+    pub timestamp: Option<String>,
+    /// Local-clock arrival time — used as the chronological sort
+    /// key when the wire `timestamp` is absent.
+    pub seen_at: Instant,
+    pub pgn: u32,
+    pub src: u8,
+    pub secondary: Option<String>,
+    pub description: String,
+    pub line: Value,
+}
+
 /// Shared state guarded by a [`tokio::sync::Mutex`] in the binary.
 pub struct AppState {
     /// Insertion-ordered to keep the UI stable across renders. Insertions
     /// happen on first sight of a `(pgn, src, secondary)`; updates keep
     /// the slot in place.
     pub entries: IndexMap<EntryKey, Entry>,
+    /// Every observation of every key, in chronological insertion
+    /// order. `Entry::history_indices` points back into this. Grows
+    /// unbounded; in `Mode::Log` it's capped by the file size, in
+    /// `Mode::Live` we'll add a cap once long-running sessions need
+    /// one.
+    pub history: Vec<HistoryRecord>,
     pub status: Status,
     /// Bus-side warnings queued by the stream reader (e.g. a device
     /// NAKed one of our PGN 126208 Requests with a non-zero error
@@ -184,6 +218,7 @@ impl AppState {
     pub fn new(status: Status) -> Self {
         Self {
             entries: IndexMap::new(),
+            history: Vec::new(),
             status,
             alerts: VecDeque::new(),
         }
@@ -210,12 +245,31 @@ impl AppState {
     ) {
         let key = (pgn, src, secondary.clone());
         let now = Instant::now();
+        let timestamp = line
+            .pointer("/timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+
+        // Append to the global chronological history first so the
+        // entry's freshly-pushed index points at the right row.
+        let history_idx = self.history.len();
+        self.history.push(HistoryRecord {
+            timestamp,
+            seen_at: now,
+            pgn,
+            src,
+            secondary: secondary.clone(),
+            description: description.clone(),
+            line: line.clone(),
+        });
+
         match self.entries.get_mut(&key) {
             Some(e) => {
                 e.line = line;
                 e.description = description;
                 e.last_update = now;
                 e.count += 1;
+                e.history_indices.push(history_idx);
             }
             None => {
                 self.entries.insert(
@@ -229,6 +283,7 @@ impl AppState {
                         last_update: now,
                         count: 1,
                         first_seen: now,
+                        history_indices: vec![history_idx],
                     },
                 );
             }

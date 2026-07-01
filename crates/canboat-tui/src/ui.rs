@@ -73,13 +73,29 @@ pub enum Screen {
         src: u8,
         pgn: u32,
         secondary: Option<String>,
+        /// Which observation in the entry's `history_indices` is
+        /// currently being displayed. Defaults to the latest on
+        /// drill-in; ← / → step backwards / forwards through past
+        /// records. Clamped at draw time so the buffer being mutated
+        /// underneath us (new records arriving in live mode) doesn't
+        /// produce a stale index.
+        history_pos: usize,
     },
+    /// Chronological list of every observed record. Toggled with
+    /// `t` (time) / `d` (devices). Most useful in log-replay mode
+    /// where the timeline is finite and the user wants to see the
+    /// exact sequence a device booted / claimed / negotiated in,
+    /// but it works in live mode too.
+    TimeView,
 }
 
 pub struct App {
     pub screen: Screen,
     pub devices_state: ListState,
     pub detail_state: ListState,
+    /// Selection state for the `TimeView` screen — one row per
+    /// observation in `AppState::history`.
+    pub time_state: ListState,
     /// Vertical scroll offset for the pretty-printed JSON in the
     /// `EntryDetail` screen. Reset to 0 when drilling in.
     pub entry_scroll: u16,
@@ -137,10 +153,13 @@ impl App {
         devices_state.select(Some(0));
         let mut detail_state = ListState::default();
         detail_state.select(Some(0));
+        let mut time_state = ListState::default();
+        time_state.select(Some(0));
         Self {
             screen: Screen::Devices,
             devices_state,
             detail_state,
+            time_state,
             entry_scroll: 0,
             overrides,
             overrides_path,
@@ -226,8 +245,71 @@ impl App {
         }
         self.toast = None;
         self.alert = None;
+        // Left/right on EntryDetail steps through past instances.
+        // Handled *before* the shared-borrow match so we can grab a
+        // `&mut history_pos` inside the Screen without conflicting
+        // with the `&self.screen` borrow the main match takes.
+        if let Screen::EntryDetail { history_pos, .. } = &mut self.screen {
+            match key.code {
+                KeyCode::Left | KeyCode::Char('H') => {
+                    *history_pos = history_pos.saturating_sub(1);
+                    self.entry_scroll = 0;
+                    return;
+                }
+                KeyCode::Right | KeyCode::Char('L') => {
+                    *history_pos = history_pos.saturating_add(1);
+                    self.entry_scroll = 0;
+                    return;
+                }
+                _ => {}
+            }
+        }
         match (&self.screen, key.code) {
             (_, KeyCode::Char('q')) => self.should_quit = true,
+            // Global view toggles — `t` opens TimeView; `d` returns
+            // to the device tree from anywhere. Both preserve the
+            // per-screen ListState so the user's position isn't lost
+            // when toggling back.
+            (_, KeyCode::Char('t')) => self.screen = Screen::TimeView,
+            (Screen::TimeView, KeyCode::Char('d')) => self.screen = Screen::Devices,
+            (Screen::TimeView, KeyCode::Down) | (Screen::TimeView, KeyCode::Char('j')) => {
+                navigate_list(&mut self.time_state, state.history.len(), 1);
+            }
+            (Screen::TimeView, KeyCode::Up) | (Screen::TimeView, KeyCode::Char('k')) => {
+                navigate_list(&mut self.time_state, state.history.len(), -1);
+            }
+            (Screen::TimeView, KeyCode::Enter) => {
+                if let Some(row) = self
+                    .time_state
+                    .selected()
+                    .and_then(|i| state.history.get(i))
+                {
+                    // Drilling in from TimeView opens EntryDetail for
+                    // the record the cursor is on, positioned to
+                    // exactly that observation — so you can Esc back
+                    // and left/right through nearby instances.
+                    let key = (row.pgn, row.src, row.secondary.clone());
+                    if let Some(entry) = state.entries.get(&key) {
+                        // Find our history_index inside the entry's
+                        // per-key list. Linear but each entry has at
+                        // most a few thousand indices in practice.
+                        let target = self.time_state.selected().unwrap_or(0);
+                        let history_pos = entry
+                            .history_indices
+                            .iter()
+                            .position(|i| *i == target)
+                            .unwrap_or(entry.history_indices.len().saturating_sub(1));
+                        self.entry_scroll = 0;
+                        self.screen = Screen::EntryDetail {
+                            src: row.src,
+                            pgn: row.pgn,
+                            secondary: row.secondary.clone(),
+                            history_pos,
+                        };
+                    }
+                }
+            }
+            (Screen::TimeView, KeyCode::Esc) => self.screen = Screen::Devices,
             (Screen::Devices, KeyCode::Down) | (Screen::Devices, KeyCode::Char('j')) => {
                 navigate_list(&mut self.devices_state, state.device_list().len(), 1);
             }
@@ -262,10 +344,15 @@ impl App {
                         return;
                     }
                     self.entry_scroll = 0;
+                    // Start at the most recent observation. Saturating
+                    // is fine — a live entry has count >= 1, and we
+                    // skipped count==0 rows above.
+                    let history_pos = row.history_indices.len().saturating_sub(1);
                     self.screen = Screen::EntryDetail {
                         src: *src,
                         pgn: row.pgn,
                         secondary: row.secondary.clone(),
+                        history_pos,
                     };
                 }
             }
@@ -466,19 +553,30 @@ fn navigate_list(state: &mut ListState, len: usize, delta: i32) {
 pub type Tty = Terminal<CrosstermBackend<Stdout>>;
 
 pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
-    // Clamp the entry-detail scroll offset to whatever the visible
-    // entry's content needs — `End`/`G` set it to `u16::MAX` so the
-    // user can jump to the bottom without knowing the line count.
+    // Clamp the entry-detail history cursor + scroll offset to
+    // whatever the visible entry currently holds. Both can race
+    // against ingest (live mode: new observations grow the
+    // history; log mode: it's frozen) so re-check every frame.
     if let Screen::EntryDetail {
         src,
         pgn,
         secondary,
-    } = &app.screen
+        history_pos,
+    } = &mut app.screen
     {
         let key = (*pgn, *src, secondary.clone());
         if let Some(entry) = state.entries.get(&key) {
-            let pretty = serde_json::to_string_pretty(&entry.line)
-                .unwrap_or_else(|_| entry.line.to_string());
+            let max_pos = entry.history_indices.len().saturating_sub(1);
+            if *history_pos > max_pos {
+                *history_pos = max_pos;
+            }
+            let line = entry
+                .history_indices
+                .get(*history_pos)
+                .and_then(|idx| state.history.get(*idx))
+                .map(|h| &h.line)
+                .unwrap_or(&entry.line);
+            let pretty = serde_json::to_string_pretty(line).unwrap_or_else(|_| line.to_string());
             let lines = pretty.lines().count() as u16;
             let max_scroll = lines.saturating_sub(1);
             if app.entry_scroll > max_scroll {
@@ -513,6 +611,7 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
                 src,
                 pgn,
                 secondary,
+                history_pos,
             } => {
                 draw_entry_detail(
                     f,
@@ -521,9 +620,11 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
                     *src,
                     *pgn,
                     secondary.as_deref(),
+                    *history_pos,
                     app.entry_scroll,
                 );
             }
+            Screen::TimeView => draw_time_view(f, chunks[1], app, state),
         }
         draw_hint_bar(f, chunks[2], app, state);
         // Modal stack — last drawn wins. Override dialog is least
@@ -655,8 +756,9 @@ fn screen_hint(screen: &Screen, overrides_writable: bool, mode: Mode) -> &'stati
             "q quit | ↑↓ move | Enter open entry | Esc back | i ISO 126464"
         }
         (Screen::EntryDetail { .. }, _) => {
-            "q quit | ↑↓ scroll 1 | PgUp/PgDn scroll 10 | g/G top/bottom | Esc back"
+            "q quit | ↑↓ scroll 1 | ←→ prev/next instance | PgUp/PgDn scroll 10 | Esc back"
         }
+        (Screen::TimeView, _) => "q quit | ↑↓ move | Enter drill in | d device view | Esc back",
     }
 }
 
@@ -804,6 +906,10 @@ fn synthesize_silenced_entry(ov: &Override) -> Entry {
         last_update: now,
         count: 0,
         first_seen: now,
+        // Silenced placeholders carry no observations — `count == 0`
+        // is the sentinel that tells the row renderer to draw OFF
+        // and the EntryDetail handler to skip drill-in.
+        history_indices: Vec::new(),
     }
 }
 
@@ -874,6 +980,7 @@ fn draw_pgn_lists(f: &mut ratatui::Frame<'_>, area: Rect, lists: &crate::state::
     f.render_widget(p, area);
 }
 
+#[allow(clippy::too_many_arguments)]
 fn draw_entry_detail(
     f: &mut ratatui::Frame<'_>,
     area: Rect,
@@ -881,6 +988,7 @@ fn draw_entry_detail(
     src: u8,
     pgn: u32,
     secondary: Option<&str>,
+    history_pos: usize,
     scroll: u16,
 ) {
     let key = (pgn, src, secondary.map(|s| s.to_string()));
@@ -893,10 +1001,22 @@ fn draw_entry_detail(
         f.render_widget(p, area);
         return;
     };
-    let pretty =
-        serde_json::to_string_pretty(&entry.line).unwrap_or_else(|_| entry.line.to_string());
+    // Render the observation indexed by `history_pos`; fall back to
+    // `entry.line` (the cached latest) if the index has slipped out
+    // of bounds — `draw` clamps but a synth row might still reach
+    // here with an empty history_indices.
+    let (line, timestamp) = entry
+        .history_indices
+        .get(history_pos)
+        .and_then(|idx| state.history.get(*idx))
+        .map(|h| (&h.line, h.timestamp.as_deref()))
+        .unwrap_or((&entry.line, None));
+    let pretty = serde_json::to_string_pretty(line).unwrap_or_else(|_| line.to_string());
+    let total = entry.history_indices.len().max(1);
+    let position = format!("[{}/{total}]", history_pos + 1);
+    let stamp = timestamp.map(|t| format!(" {t}")).unwrap_or_default();
     let title = format!(
-        "PGN {} src {} {}  count {}  age {}s",
+        "PGN {} src {} {}{}  {}  count {}  age {}s",
         entry.pgn,
         entry.src,
         entry
@@ -904,6 +1024,8 @@ fn draw_entry_detail(
             .as_deref()
             .map(|s| format!("[{s}] "))
             .unwrap_or_default(),
+        position,
+        stamp,
         entry.count,
         entry.last_update.elapsed().as_secs(),
     );
@@ -912,6 +1034,70 @@ fn draw_entry_detail(
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
     f.render_widget(p, area);
+}
+
+/// Chronological table view — one row per observation in
+/// `AppState::history`. Columns: index / timestamp / src / pgn /
+/// description. Enter drills into the corresponding EntryDetail
+/// screen, positioned to that specific observation.
+fn draw_time_view(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &AppState) {
+    if !state.history.is_empty() && app.time_state.selected().is_none() {
+        app.time_state.select(Some(0));
+    }
+    // Live mode: jump to the newest record so the user doesn't have
+    // to press End every draw. Only when the current selection is
+    // the previous end-of-list, so manual scrolling isn't disturbed.
+    if state.status.mode == Mode::Live
+        && let Some(sel) = app.time_state.selected()
+        && sel + 1 < state.history.len()
+        && sel + 2 == state.history.len()
+    {
+        app.time_state.select(Some(state.history.len() - 1));
+    }
+    let items: Vec<ListItem> = state
+        .history
+        .iter()
+        .enumerate()
+        .map(|(i, h)| ListItem::new(format_time_row(i, h)))
+        .collect();
+    let title = format!("Timeline ({} records)", state.history.len());
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol(" ▶ ")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(list, area, &mut app.time_state);
+}
+
+/// One row on the `TimeView` screen — index, timestamp, src, pgn,
+/// and description columns. Timestamp column is right-padded to a
+/// fixed width so `src`/`pgn` line up column-wise across rows.
+fn format_time_row(idx: usize, h: &crate::state::HistoryRecord) -> Line<'static> {
+    // Prefer the wire timestamp from the analyzer JSON; fall back
+    // to relative wall-clock age (`+<N>s`) computed from `seen_at`
+    // when the record didn't carry one.
+    let stamp: String = match h.timestamp.as_deref() {
+        Some(s) if !s.is_empty() => s.to_string(),
+        _ => format!("+{}s", h.seen_at.elapsed().as_secs()),
+    };
+    let sec = h
+        .secondary
+        .as_deref()
+        .map(|s| format!(":{s}"))
+        .unwrap_or_default();
+    Line::from(vec![
+        Span::styled(format!(" {idx:>6}  "), Style::default().fg(Color::DarkGray)),
+        Span::styled(format!("{stamp:<24}"), Style::default().fg(Color::White)),
+        Span::styled(
+            format!(" src {:3}", h.src),
+            Style::default().fg(Color::Yellow),
+        ),
+        Span::styled(
+            format!("  {:6}{sec:<10}", h.pgn),
+            Style::default().fg(Color::Cyan),
+        ),
+        Span::raw(format!("  {}", h.description)),
+    ])
 }
 
 /// Compute a centered rect of at most `max_w` × `max_h`, clamped to

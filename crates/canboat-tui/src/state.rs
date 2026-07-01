@@ -23,11 +23,13 @@
 //! apply each incoming line. No background derivation runs; views are
 //! computed on demand from the cached JSON values.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::time::Instant;
 
 use indexmap::IndexMap;
 use serde_json::Value;
+
+use crate::device_cache::{CachedInfo, NameKey};
 
 /// Cap on how many pending alerts (e.g. NAKed PGN 126208 ACKs) we
 /// keep before dropping the oldest. Twenty is more than the user
@@ -231,15 +233,29 @@ pub struct AppState {
     /// Bounded to [`MAX_PENDING_ALERTS`] entries — oldest dropped
     /// when the bus is shouting faster than the user can read.
     pub alerts: VecDeque<String>,
+    /// Persistent NAME → device-info cache, loaded at startup and
+    /// saved at exit. Enriches `device_list()` with fields the
+    /// current session hasn't observed (typical case: a log capture
+    /// that includes ISO Address Claim but not the request-only
+    /// Product Information PGN 126996).
+    pub device_cache: HashMap<NameKey, CachedInfo>,
+    /// Last-seen NAME per source address, populated from PGN 60928
+    /// as records arrive. Used to route PGN 126996 / 126998 updates
+    /// to the correct NAME in the cache (those PGNs don't carry a
+    /// NAME themselves — they arrive addressed to the same `src` as
+    /// the recent Address Claim).
+    pub src_to_name: HashMap<u8, NameKey>,
 }
 
 impl AppState {
-    pub fn new(status: Status) -> Self {
+    pub fn new(status: Status, device_cache: HashMap<NameKey, CachedInfo>) -> Self {
         Self {
             entries: IndexMap::new(),
             history: Vec::new(),
             status,
             alerts: VecDeque::new(),
+            device_cache,
+            src_to_name: HashMap::new(),
         }
     }
 
@@ -324,13 +340,87 @@ impl AppState {
                 );
             }
         }
+        // Every 60928 / 126996 / 126998 record enriches the
+        // persistent NAME → info cache. See
+        // `AppState::observe_for_cache` for the extraction logic.
+        self.observe_for_cache(pgn, src, self.history.last().map(|h| h.line.clone()));
         self.status.messages_seen = self.status.messages_seen.saturating_add(1);
+    }
+
+    /// Update the persistent [`AppState::device_cache`] from a
+    /// freshly-observed record. PGN 60928 (ISO Address Claim)
+    /// carries the NAME components; PGNs 126996 and 126998 carry
+    /// product / configuration info that we key off the NAME learned
+    /// from the last 60928 for the same source.
+    fn observe_for_cache(&mut self, pgn: u32, src: u8, line: Option<Value>) {
+        let Some(line) = line else { return };
+        let now_stamp = line
+            .pointer("/timestamp")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        match pgn {
+            60928 => {
+                if let Some(key) = name_key_from_claim(&line) {
+                    self.src_to_name.insert(src, key);
+                    let info = CachedInfo {
+                        manufacturer_name: manufacturer_name_from_claim(&line),
+                        device_function: field_number(&line, "Device Function").map(|v| v as u32),
+                        device_class: field_number(&line, "Device Class").map(|v| v as u32),
+                        industry_group: field_number(&line, "Industry Group").map(|v| v as u32),
+                        first_seen: now_stamp.clone(),
+                        last_seen: now_stamp,
+                        ..Default::default()
+                    };
+                    self.device_cache.entry(key).or_default().merge_from(info);
+                }
+            }
+            126996 => {
+                let Some(key) = self.src_to_name.get(&src).copied() else {
+                    return;
+                };
+                let info = CachedInfo {
+                    product_code: field_number(&line, "Product Code").map(|v| v as u32),
+                    model_id: field_text(&line, "Model ID"),
+                    software_version: field_text(&line, "Software Version Code"),
+                    model_version: field_text(&line, "Model Version"),
+                    model_serial_code: field_text(&line, "Model Serial Code"),
+                    nmea_db_version: field_number(&line, "NMEA 2000 Version").map(|v| v as u32),
+                    certification_level: field_number(&line, "NMEA 2000 Certification Level")
+                        .map(|v| v as u32),
+                    load_equivalency: field_number(&line, "Load Equivalency").map(|v| v as u32),
+                    last_seen: now_stamp,
+                    ..Default::default()
+                };
+                self.device_cache.entry(key).or_default().merge_from(info);
+            }
+            126998 => {
+                let Some(key) = self.src_to_name.get(&src).copied() else {
+                    return;
+                };
+                let info = CachedInfo {
+                    installation_description_1: field_text(&line, "Installation Description #1"),
+                    installation_description_2: field_text(&line, "Installation Description #2"),
+                    manufacturer_information: field_text(&line, "Manufacturer Information"),
+                    last_seen: now_stamp,
+                    ..Default::default()
+                };
+                self.device_cache.entry(key).or_default().merge_from(info);
+            }
+            _ => {}
+        }
     }
 
     /// Walk the cache and produce a stable, src-ordered device list,
     /// pulling identity fields out of the device-info PGNs. Cheap
     /// enough to run per frame (a typical bus has tens of devices and
     /// hundreds of entries).
+    ///
+    /// Anything not yet observed this session (typical case: a log
+    /// capture missing the request-only PGN 126996) is backfilled
+    /// from [`AppState::device_cache`] whenever we have a NAME for
+    /// this source, so the DeviceDetail screen shows the same
+    /// manufacturer / model / installation labels the user has seen
+    /// on this device before.
     pub fn device_list(&self) -> Vec<DeviceInfo> {
         let mut by_src: BTreeMap<u8, DeviceInfo> = BTreeMap::new();
         let mut pgns_per_src: BTreeMap<u8, std::collections::BTreeSet<u32>> = BTreeMap::new();
@@ -350,6 +440,39 @@ impl AppState {
         for (src, set) in pgns_per_src {
             if let Some(dev) = by_src.get_mut(&src) {
                 dev.pgn_count = set.len();
+            }
+        }
+        // Enrichment pass: anywhere a field is still empty, try the
+        // persistent cache. Cache lookups are anchored on the NAME
+        // we learned from this session's 60928 (if any) — a session
+        // with only cached info and no fresh ISO claim can't be
+        // enriched because we don't know which NAME owns which src.
+        for dev in by_src.values_mut() {
+            let Some(key) = self.src_to_name.get(&dev.src) else {
+                continue;
+            };
+            let Some(cached) = self.device_cache.get(key) else {
+                continue;
+            };
+            if dev.manufacturer.is_empty()
+                && let Some(m) = &cached.manufacturer_name
+            {
+                dev.manufacturer = m.clone();
+            }
+            if dev.model.is_empty()
+                && let Some(m) = &cached.model_id
+            {
+                dev.model = m.clone();
+            }
+            if dev.software.is_empty()
+                && let Some(s) = &cached.software_version
+            {
+                dev.software = s.clone();
+            }
+            if dev.installation.is_empty()
+                && let Some(i) = &cached.installation_description_1
+            {
+                dev.installation = i.clone();
             }
         }
         by_src.into_values().collect()
@@ -408,6 +531,36 @@ impl PgnLists {
     pub fn is_empty(&self) -> bool {
         self.tx.is_empty() && self.rx.is_empty()
     }
+}
+
+/// Extract a `NameKey` (`(manufacturer_code, unique_number)`) from
+/// an analyzer-JSON PGN 60928 record. Returns `None` when either
+/// field is absent — an incomplete Address Claim isn't useful as a
+/// cache key.
+fn name_key_from_claim(line: &Value) -> Option<NameKey> {
+    let mfr = field_number(line, "Manufacturer Code")?;
+    let uid = field_number(line, "Unique Number")?;
+    Some(NameKey {
+        manufacturer_code: u16::try_from(mfr).ok()?,
+        unique_number: u32::try_from(uid).ok()?,
+    })
+}
+
+/// Pull the `-nv` display name of the Manufacturer Code lookup out
+/// of a PGN 60928 record. Falls back to the bare-integer path so
+/// non-`-nv` producers still populate the cache with *something*.
+fn manufacturer_name_from_claim(line: &Value) -> Option<String> {
+    let v = line.pointer("/fields/Manufacturer Code")?;
+    v.pointer("/name")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+/// Pull an integer out of `line.fields.<name>` (handles both the
+/// bare-integer JSON shape and the `-nv` `{value, name}` object).
+fn field_number(line: &Value, name: &str) -> Option<i64> {
+    let v = line.pointer(&format!("/fields/{}", json_pointer_escape(name)))?;
+    field_as_int(v)
 }
 
 fn fill_from_claim(dev: &mut DeviceInfo, line: &Value) {

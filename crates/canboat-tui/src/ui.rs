@@ -64,6 +64,7 @@ fn default_interval_hint(pgn: u32) -> u32 {
     }
 }
 
+#[derive(Clone)]
 pub enum Screen {
     Devices,
     DeviceDetail {
@@ -80,6 +81,13 @@ pub enum Screen {
         /// underneath us (new records arriving in live mode) doesn't
         /// produce a stale index.
         history_pos: usize,
+        /// Where to return on Esc/Backspace/h. `Screen::DeviceDetail`
+        /// when the user drilled in from the per-device PGN list;
+        /// `Screen::TimeView` when they drilled in from a timeline
+        /// row. Preserving the origin means "back" behaves the way
+        /// the user expects instead of always dumping them on the
+        /// device tree.
+        return_to: Box<Screen>,
     },
     /// Chronological list of every observed record. Toggled with
     /// `t` (time) / `d` (devices). Most useful in log-replay mode
@@ -453,6 +461,7 @@ impl App {
                             pgn: row.pgn,
                             secondary: row.secondary.clone(),
                             history_pos,
+                            return_to: Box::new(Screen::TimeView),
                         };
                     }
                 }
@@ -496,11 +505,13 @@ impl App {
                     // is fine — a live entry has count >= 1, and we
                     // skipped count==0 rows above.
                     let history_pos = row.history_indices.len().saturating_sub(1);
+                    let return_src = *src;
                     self.screen = Screen::EntryDetail {
-                        src: *src,
+                        src: return_src,
                         pgn: row.pgn,
                         secondary: row.secondary.clone(),
                         history_pos,
+                        return_to: Box::new(Screen::DeviceDetail { src: return_src }),
                     };
                 }
             }
@@ -578,11 +589,15 @@ impl App {
             | (Screen::EntryDetail { .. }, KeyCode::Char('G')) => {
                 self.entry_scroll = u16::MAX;
             }
-            (Screen::EntryDetail { src, .. }, KeyCode::Esc)
-            | (Screen::EntryDetail { src, .. }, KeyCode::Backspace)
-            | (Screen::EntryDetail { src, .. }, KeyCode::Char('h')) => {
-                let src = *src;
-                self.screen = Screen::DeviceDetail { src };
+            (Screen::EntryDetail { return_to, .. }, KeyCode::Esc)
+            | (Screen::EntryDetail { return_to, .. }, KeyCode::Backspace)
+            | (Screen::EntryDetail { return_to, .. }, KeyCode::Char('h')) => {
+                // Restore whatever screen the user drilled in from —
+                // DeviceDetail when coming via the per-device PGN
+                // list, TimeView when coming via the timeline. The
+                // `return_to` is captured at drill-in time so
+                // subsequent state changes can't mislead us.
+                self.screen = (**return_to).clone();
             }
             _ => {}
         }
@@ -867,6 +882,7 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
         pgn,
         secondary,
         history_pos,
+        ..
     } = &mut app.screen
     {
         let key = (*pgn, *src, secondary.clone());
@@ -922,6 +938,7 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
                 pgn,
                 secondary,
                 history_pos,
+                ..
             } => {
                 draw_entry_detail(
                     f,

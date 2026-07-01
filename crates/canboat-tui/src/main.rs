@@ -31,6 +31,7 @@ use tokio::sync::Mutex;
 use tokio::time::interval;
 
 mod client;
+mod device_cache;
 mod iso;
 mod overrides;
 mod state;
@@ -85,7 +86,11 @@ async fn main() -> Result<()> {
         (None, Some(host)) => Status::new_live(host.clone(), args.snapshot_port, args.stream_port),
         (None, None) => unreachable!("clap's required_unless_present guarantees one is Some"),
     };
-    let state = Arc::new(Mutex::new(AppState::new(status)));
+    // Load the persistent NAME → info device cache. Enriches the
+    // device list with anything we've learned across past sessions.
+    let device_cache_path = device_cache::default_path();
+    let device_cache = device_cache::load_or_default(&device_cache_path);
+    let state = Arc::new(Mutex::new(AppState::new(status, device_cache)));
 
     // Writer channel is created up front in both modes — in log mode
     // nothing ever sends through it (the `o` / `i` handlers are gated
@@ -117,8 +122,18 @@ async fn main() -> Result<()> {
     }
 
     let mut tty = setup_tty()?;
-    let res = run_loop(&mut tty, &mut app, state, writer).await;
+    let res = run_loop(&mut tty, &mut app, state.clone(), writer).await;
     restore_tty(&mut tty)?;
+    // Persist the freshly-enriched NAME → info cache so a subsequent
+    // log-mode session sees whatever this run learned. Failures
+    // aren't fatal — a full disk shouldn't crash the exit path — but
+    // do surface on stderr so the user notices.
+    {
+        let s = state.lock().await;
+        if let Err(e) = device_cache::save(&s.device_cache, &device_cache_path) {
+            eprintln!("canboat-tui: failed to save device cache: {e:#}");
+        }
+    }
     res
 }
 

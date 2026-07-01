@@ -748,17 +748,17 @@ fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &AppS
 /// doesn't get advertised where it would do nothing.
 fn screen_hint(screen: &Screen, overrides_writable: bool, mode: Mode) -> &'static str {
     match (screen, mode) {
-        (Screen::Devices, _) => "q quit | ↑↓ move | Enter open device",
+        (Screen::Devices, _) => "q quit | ↑↓ move | Enter open device | t timeline",
         // Log mode: no live bus → no `i` / `o`.
         (Screen::DeviceDetail { .. }, Mode::Log) => {
-            "q quit | ↑↓ move | Enter open entry | Esc back"
+            "q quit | ↑↓ move | Enter open entry | Esc back | t timeline"
         }
         (Screen::DeviceDetail { .. }, Mode::Live) if overrides_writable => {
-            "q quit | ↑↓ move | Enter open entry | Esc back | i ISO 126464 | o override interval"
+            "q quit | ↑↓ move | Enter open entry | Esc back | t timeline | i ISO 126464 | o override interval"
         }
         // `o` omitted when the overrides file isn't writable.
         (Screen::DeviceDetail { .. }, Mode::Live) => {
-            "q quit | ↑↓ move | Enter open entry | Esc back | i ISO 126464"
+            "q quit | ↑↓ move | Enter open entry | Esc back | t timeline | i ISO 126464"
         }
         (Screen::EntryDetail { .. }, _) => {
             "q quit | ↑↓ scroll 1 | ←→ prev/next instance | PgUp/PgDn scroll 10 | Esc back"

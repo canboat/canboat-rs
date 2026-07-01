@@ -827,7 +827,7 @@ fn draw_device_detail(
     let rows = app.detail_rows(src, state);
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|e| ListItem::new(format_entry_row(e)))
+        .map(|e| ListItem::new(format_entry_row(e, state.status.mode)))
         .collect();
     let title = match state.device_list().iter().find(|d| d.src == src) {
         Some(d) => format!(
@@ -857,7 +857,7 @@ fn draw_device_detail(
     }
 }
 
-fn format_entry_row(e: &Entry) -> Line<'static> {
+fn format_entry_row(e: &Entry, mode: Mode) -> Line<'static> {
     // `count == 0` is the sentinel for a synthetic silenced-override
     // row — no live data, no measured interval, no meaningful age.
     // Render it as an OFF row in dim grey so the user can see at a
@@ -878,20 +878,26 @@ fn format_entry_row(e: &Entry) -> Line<'static> {
             Span::styled(format!(" {:>13}", "(silenced)"), dim),
         ]);
     }
-    let age = e.last_update.elapsed().as_secs();
     let sec = e
         .secondary
         .as_deref()
         .map(|s| format!(":{s}"))
         .unwrap_or_default();
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled(format!(" {:6} ", e.pgn), Style::default().fg(Color::Cyan)),
         Span::raw(format!("{:14.14}", sec)),
         Span::raw(format!(" {:30.30}", e.description)),
         Span::raw(format!(" every {}", format_interval(e.interval()))),
-        Span::raw(format!(" age {age:>4}s")),
-        Span::raw(format!(" count {:>6}", e.count)),
-    ])
+    ];
+    // "age" is wall-clock seconds since `last_update` — a real
+    // measurement in Live mode, but in Log mode it's just "how long
+    // since we ingested this line", which is meaningless. Skip it.
+    if mode == Mode::Live {
+        let age = e.last_update.elapsed().as_secs();
+        spans.push(Span::raw(format!(" age {age:>4}s")));
+    }
+    spans.push(Span::raw(format!(" count {:>6}", e.count)));
+    Line::from(spans)
 }
 
 /// Build a placeholder `Entry` for a silenced override so it can
@@ -911,6 +917,8 @@ fn synthesize_silenced_entry(ov: &Override) -> Entry {
         last_update: now,
         count: 0,
         first_seen: now,
+        first_stamp_ms: None,
+        last_stamp_ms: None,
         // Silenced placeholders carry no observations — `count == 0`
         // is the sentinel that tells the row renderer to draw OFF
         // and the EntryDetail handler to skip drill-in.
@@ -1020,8 +1028,13 @@ fn draw_entry_detail(
     let total = entry.history_indices.len().max(1);
     let position = format!("[{}/{total}]", history_pos + 1);
     let stamp = timestamp.map(|t| format!(" {t}")).unwrap_or_default();
+    let age_suffix = if state.status.mode == Mode::Live {
+        format!("  age {}s", entry.last_update.elapsed().as_secs())
+    } else {
+        String::new()
+    };
     let title = format!(
-        "PGN {} src {} {}{}  {}  count {}  age {}s",
+        "PGN {} src {} {}{}  {}  count {}{age_suffix}",
         entry.pgn,
         entry.src,
         entry
@@ -1032,7 +1045,6 @@ fn draw_entry_detail(
         position,
         stamp,
         entry.count,
-        entry.last_update.elapsed().as_secs(),
     );
     let p = Paragraph::new(pretty)
         .block(Block::default().borders(Borders::ALL).title(title))

@@ -70,6 +70,17 @@ pub struct Entry {
     /// interval average so the displayed cadence is `(last − first)
     /// / (count − 1)` and not perturbed by a single late frame.
     pub first_seen: Instant,
+    /// Wire timestamp from the *first* observation, parsed to Unix
+    /// milliseconds. `None` when the analyzer JSON line didn't
+    /// carry a `"timestamp"` field. When both this and
+    /// `last_stamp_ms` are present, [`Entry::interval`] uses them
+    /// instead of the wall-clock `first_seen` / `last_update`
+    /// pair — the whole point being that in log-replay mode the
+    /// `Instant` pair reflects ingest speed, not real bus cadence.
+    pub first_stamp_ms: Option<i64>,
+    /// Wire timestamp from the *latest* observation, same units as
+    /// [`Entry::first_stamp_ms`].
+    pub last_stamp_ms: Option<i64>,
     /// Indices into [`AppState::history`], one per observation of
     /// this key, in chronological insertion order. The last index
     /// names the same record that `line` caches. Empty on
@@ -80,15 +91,23 @@ pub struct Entry {
 impl Entry {
     /// Average measured transmission interval. Returns `None` until
     /// the second record arrives (one observation isn't enough to
-    /// measure a cadence). Computed as `(last_update − first_seen) /
-    /// (count − 1)`, i.e. the mean inter-arrival time across every
-    /// record we've seen for this key.
+    /// measure a cadence). Prefers wire timestamps
+    /// (`first_stamp_ms`/`last_stamp_ms`) when both are present so
+    /// the number reflects the real bus cadence even in log-replay
+    /// mode; falls back to the wall-clock `first_seen`/`last_update`
+    /// `Instant` pair when the analyzer JSON didn't carry a
+    /// `"timestamp"` field (some formats don't).
     pub fn interval(&self) -> Option<std::time::Duration> {
         if self.count < 2 {
             return None;
         }
+        let denom = self.count.saturating_sub(1) as u32;
+        if let (Some(first), Some(last)) = (self.first_stamp_ms, self.last_stamp_ms) {
+            let span_ms = (last - first).max(0) as u64;
+            return Some(std::time::Duration::from_millis(span_ms) / denom);
+        }
         let span = self.last_update.saturating_duration_since(self.first_seen);
-        Some(span / (self.count as u32 - 1))
+        Some(span / denom)
     }
 }
 
@@ -249,6 +268,11 @@ impl AppState {
             .pointer("/timestamp")
             .and_then(Value::as_str)
             .map(str::to_string);
+        // Parse the wire timestamp to Unix ms so `Entry::interval`
+        // can compute real bus cadence in log mode (where the
+        // `Instant`-based diff is meaningless — it just measures
+        // how fast we ingested lines).
+        let stamp_ms = timestamp.as_deref().and_then(canboat_core::parse_iso_ms);
 
         // Append to the global chronological history first so the
         // entry's freshly-pushed index points at the right row.
@@ -270,6 +294,16 @@ impl AppState {
                 e.last_update = now;
                 e.count += 1;
                 e.history_indices.push(history_idx);
+                // Only overwrite `last_stamp_ms` when this record
+                // carried a valid timestamp; a single record with
+                // no `timestamp` field shouldn't null out the
+                // interval for a whole burst.
+                if let Some(ms) = stamp_ms {
+                    e.last_stamp_ms = Some(ms);
+                    if e.first_stamp_ms.is_none() {
+                        e.first_stamp_ms = Some(ms);
+                    }
+                }
             }
             None => {
                 self.entries.insert(
@@ -283,6 +317,8 @@ impl AppState {
                         last_update: now,
                         count: 1,
                         first_seen: now,
+                        first_stamp_ms: stamp_ms,
+                        last_stamp_ms: stamp_ms,
                         history_indices: vec![history_idx],
                     },
                 );

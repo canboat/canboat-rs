@@ -73,6 +73,67 @@ pub fn format_iso_ms(ms: u64) -> String {
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
 }
 
+/// Parse an ISO-8601 timestamp of the shape emitted by
+/// [`format_iso_ms`] (`YYYY-MM-DDTHH:MM:SS[.mmm][Z]`) into Unix
+/// milliseconds. Accepts a `T` or space between date and time,
+/// makes the fractional seconds and trailing `Z` optional, and
+/// rejects anything else — this isn't a full RFC-3339 parser, just
+/// the specific shape canboat analyzer / n2kd / EBL reader emit.
+///
+/// Returns `None` on parse failure so callers can fall back to a
+/// local monotonic clock (canboat-tui's `Entry::interval` does this
+/// when the analyzer JSON line didn't carry a `timestamp` field).
+pub fn parse_iso_ms(s: &str) -> Option<i64> {
+    let s = s.trim_end_matches('Z');
+    let (date, time) = s.split_once('T').or_else(|| s.split_once(' '))?;
+    // YYYY-MM-DD
+    let mut date_parts = date.split('-');
+    let y: i32 = date_parts.next()?.parse().ok()?;
+    let mo: u32 = date_parts.next()?.parse().ok()?;
+    let d: u32 = date_parts.next()?.parse().ok()?;
+    if date_parts.next().is_some() {
+        return None;
+    }
+    // HH:MM:SS[.mmm]. Left-pad or truncate the fractional part to
+    // exactly 3 digits — `.5` → 500 ms, `.123456` → 123 ms.
+    let (hms, millis) = match time.split_once('.') {
+        Some((hms, frac)) => {
+            let mut ms = 0u32;
+            for (i, ch) in frac.chars().take(3).enumerate() {
+                let d = ch.to_digit(10)?;
+                ms += d * 10u32.pow(2 - i as u32);
+            }
+            (hms, ms as i64)
+        }
+        None => (time, 0),
+    };
+    let mut hms_parts = hms.split(':');
+    let h: i64 = hms_parts.next()?.parse().ok()?;
+    let mi: i64 = hms_parts.next()?.parse().ok()?;
+    let s: i64 = hms_parts.next()?.parse().ok()?;
+    if hms_parts.next().is_some() {
+        return None;
+    }
+    let days = ymd_to_days(y, mo, d)?;
+    Some((days * 86_400 + h * 3600 + mi * 60 + s) * 1000 + millis)
+}
+
+/// Inverse of [`days_to_ymd`]: days since 1970-01-01 for
+/// `(year, month, day)`. Returns `None` when the arguments are out
+/// of range (month 1..=12, day 1..=31).
+fn ymd_to_days(y: i32, m: u32, d: u32) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = i64::from(y) - i64::from(m <= 2);
+    let era = if y >= 0 { y } else { y - 399 }.div_euclid(400);
+    let yoe = y - era * 400;
+    let m_shifted = i64::from(if m > 2 { m - 3 } else { m + 9 });
+    let doy = (153 * m_shifted + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
 fn days_to_ymd(days: i64) -> (i32, u32, u32) {
     let z = days + 719_468;
     let era = z.div_euclid(146_097);
@@ -89,6 +150,55 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn parse_iso_ms_round_trips_format_iso_ms() {
+        for ms in [
+            0i64,
+            1,
+            1_000,
+            1_500,
+            86_400_000,
+            1_735_689_600_000, // 2025-01-01T00:00:00Z
+            1_782_115_200_000, // 2026-06-30T12:00:00Z
+        ] {
+            let s = format_iso_ms(ms as u64);
+            assert_eq!(parse_iso_ms(&s), Some(ms), "roundtrip failed for ms={ms}");
+        }
+    }
+
+    #[test]
+    fn parse_iso_ms_accepts_optional_zulu_and_fractional() {
+        // With/without Z, with/without fractional seconds.
+        assert_eq!(
+            parse_iso_ms("2026-01-01T00:00:00.500Z"),
+            Some(1_767_225_600_500)
+        );
+        assert_eq!(
+            parse_iso_ms("2026-01-01T00:00:00.500"),
+            Some(1_767_225_600_500)
+        );
+        assert_eq!(parse_iso_ms("2026-01-01T00:00:00"), Some(1_767_225_600_000));
+        // Space separator (some analyzer producers).
+        assert_eq!(
+            parse_iso_ms("2026-01-01 00:00:00.500Z"),
+            Some(1_767_225_600_500)
+        );
+        // Short fractional (millisecond precision recovered).
+        assert_eq!(
+            parse_iso_ms("2026-01-01T00:00:00.5"),
+            Some(1_767_225_600_500)
+        );
+    }
+
+    #[test]
+    fn parse_iso_ms_rejects_malformed_input() {
+        assert_eq!(parse_iso_ms(""), None);
+        assert_eq!(parse_iso_ms("not-a-time"), None);
+        assert_eq!(parse_iso_ms("2026-13-01T00:00:00Z"), None); // month 13
+        assert_eq!(parse_iso_ms("2026-01-32T00:00:00Z"), None); // day 32
+        assert_eq!(parse_iso_ms("2026-01-01T00:00:00:00Z"), None); // extra part
+    }
 
     #[test]
     fn encodes_version_and_strings() {

@@ -23,7 +23,7 @@ pub use db::{FieldHandle, PgnDatabase};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use frame::{FASTPACKET_MAX_SIZE, RawFrame};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
-pub use startup::{CANBOAT_BEM, format_iso_ms, startup_record};
+pub use startup::{CANBOAT_BEM, format_iso_ms, parse_iso_ms, startup_record};
 pub use types::{
     BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable, IndirectLookupValue,
     LookupTable, LookupValue, PacketType, PgnInfo,

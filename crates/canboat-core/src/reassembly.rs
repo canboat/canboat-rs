@@ -27,6 +27,59 @@ const BUCKET_0_OFFSET: usize = 2;
 const BUCKET_N_OFFSET: usize = 1;
 const FASTPACKET_MAX_INDEX: u32 = 0x1f;
 
+/// ISO Transport Protocol carries messages that don't fit in a
+/// single CAN frame OR in fast-packet framing (223-byte ceiling).
+/// Newer devices (Neon GPS is the trigger for this code) wrap PGN
+/// 129540 (Satellites in View) in ISO TP when the sat list is
+/// large enough to exceed fast-packet's 223 bytes.
+///
+/// Two PGNs are involved:
+///
+/// * **PGN 60416 (`0xEC00`) — TP.CM (Connection Management).** One
+///   frame that announces the transfer. The Group Function Code in
+///   byte 0 says what kind:
+///     * `32` (0x20) BAM — Broadcast Announce, no ACK expected.
+///     * `16` (0x10) RTS — Request To Send, addressed, with CTS
+///       handshake.
+///     * `17` / `19` / `255` — CTS / EOM / Abort, only meaningful
+///       to the peers of an RTS session.
+///
+///   Layout of a BAM / RTS CM frame:
+///
+///   ```text
+///     B0        control (32 or 16)
+///     B1..B2    total message size, little-endian
+///     B3        packet count
+///     B4        reserved / max-packets — we don't send CTS so it's
+///               ignored on the receive side
+///     B5..B7    target PGN, little-endian (24 bits)
+///   ```
+///
+/// * **PGN 60160 (`0xEB00`) — TP.DT (Data Transfer).** The actual
+///   payload, split into 7-byte chunks with a 1-based sequence
+///   number:
+///
+///   ```text
+///     B0        sequence (1-based)
+///     B1..B7    payload chunk (7 bytes; last frame padded)
+///   ```
+///
+/// Both PGN wire frames are single-frame PGNs on the bus, but for
+/// a monitoring tool they're plumbing, not data — so the
+/// reassembler swallows them and emits a synthesized [`RawFrame`]
+/// for the target PGN once all `TP.DT` sequence numbers are in.
+const PGN_ISO_TP_CM: u32 = 60416;
+const PGN_ISO_TP_DT: u32 = 60160;
+const TP_CM_BAM: u8 = 32;
+const TP_CM_RTS: u8 = 16;
+const TP_CM_ABORT: u8 = 255;
+/// Max slots for in-flight ISO TP sessions — one per source, so 16
+/// covers a very active bus.
+const ISO_TP_SLOTS: usize = 16;
+/// Absolute upper bound on a TP payload — 255 packets × 7 bytes.
+/// Real-world PGN 129540 with many sats is well under 500 bytes.
+const ISO_TP_MAX_SIZE: usize = 255 * BUCKET_N_SIZE;
+
 /// What the reassembler emitted in response to a `push` call.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Reassembled {
@@ -146,10 +199,39 @@ fn describe_expectation(all_frames: u32, size: usize, frames: u32) -> String {
     }
 }
 
-/// Fast-packet reassembler.
+/// One in-flight ISO TP session (BAM or RTS). Keyed on source
+/// address — the spec allows one transfer per source at a time.
+#[derive(Debug, Clone, Default)]
+struct TpSlot {
+    used: bool,
+    src: u8,
+    dst: u8,
+    prio: u8,
+    target_pgn: u32,
+    /// Bytes declared by the CM frame; final payload is truncated to
+    /// this when we emit the reassembled `RawFrame`.
+    total_size: usize,
+    /// Packet count declared by the CM frame.
+    packets: u8,
+    /// Bitmask of received sequence numbers, bit `n` = seq `n+1`.
+    received: [u64; 4],
+    /// ISO timestamp of the CM frame — reused on the synthesized
+    /// reassembled frame so downstream ordering is stable.
+    timestamp: Option<String>,
+    /// Payload buffer sized to the spec's ceiling. Vec so a stalled
+    /// session doesn't cost 1.7 kB per unused slot.
+    data: Vec<u8>,
+    /// Monotonic age for oldest-out eviction, same convention as
+    /// the fast-packet slots.
+    age: u64,
+}
+
+/// Fast-packet + ISO Transport Protocol reassembler.
 pub struct Reassembler {
     slots: Vec<Slot>,
+    tp_slots: Vec<TpSlot>,
     next_age: u64,
+    tp_next_age: u64,
 }
 
 impl Default for Reassembler {
@@ -162,7 +244,9 @@ impl Reassembler {
     pub fn new() -> Self {
         Self {
             slots: vec![Slot::default(); REASSEMBLY_BUFFER_SIZE],
+            tp_slots: vec![TpSlot::default(); ISO_TP_SLOTS],
             next_age: 0,
+            tp_next_age: 0,
         }
     }
 
@@ -172,6 +256,18 @@ impl Reassembler {
     /// PGNs pass `FramePacketType::Other` — the frame will pass through
     /// untouched.
     pub fn push(&mut self, frame: RawFrame, packet_type: FramePacketType) -> Reassembled {
+        // ISO Transport Protocol frames are single-frame PGNs on the
+        // wire but they're plumbing for a larger virtual payload.
+        // Swallow them: hand back `Partial` while accumulating, and
+        // `Complete` with a synthesized target-PGN frame on the
+        // last TP.DT of a session.
+        if frame.pgn == PGN_ISO_TP_CM {
+            return self.handle_tp_cm(frame);
+        }
+        if frame.pgn == PGN_ISO_TP_DT {
+            return self.handle_tp_dt(frame);
+        }
+
         // Coalesced payloads (len > 8) and non-fast-packet PGNs are
         // returned verbatim. This matches the C analyzer's gate.
         if frame.data.len() > 8 || packet_type != FramePacketType::Fast {
@@ -295,6 +391,188 @@ impl Reassembler {
         }
 
         Reassembled::Partial
+    }
+
+    /// Handle a PGN 60416 TP.CM frame. `BAM` and `RTS` open a fresh
+    /// TP session for this source; `Abort` closes one down; the
+    /// other control bytes (CTS / EOM) are peer responses to an
+    /// RTS session we, as a monitor, don't participate in and are
+    /// swallowed too.
+    ///
+    /// Never emits `PassThrough` — a CM frame is plumbing, never
+    /// user-facing.
+    fn handle_tp_cm(&mut self, frame: RawFrame) -> Reassembled {
+        if frame.data.is_empty() {
+            return Reassembled::Error(ReassemblyError::EmptyData);
+        }
+        let control = frame.data[0];
+        match control {
+            TP_CM_BAM | TP_CM_RTS => {}
+            TP_CM_ABORT => {
+                // Drop any in-flight session for this source.
+                if let Some(i) = self.find_tp_slot(frame.src) {
+                    self.tp_slots[i].used = false;
+                }
+                return Reassembled::Partial;
+            }
+            _ => return Reassembled::Partial,
+        }
+        // Need 8 CM bytes to decode. A short frame is malformed; log
+        // and swallow rather than surface an error variant — the
+        // reassembler's `Error` is reserved for out-of-slot / empty.
+        if frame.data.len() < 8 {
+            log::warn!(
+                "ISO TP CM frame from src={} has {} bytes (need 8); dropping",
+                frame.src,
+                frame.data.len()
+            );
+            return Reassembled::Partial;
+        }
+        let total_size = u16::from_le_bytes([frame.data[1], frame.data[2]]) as usize;
+        let packets = frame.data[3];
+        let target_pgn =
+            (frame.data[5] as u32) | ((frame.data[6] as u32) << 8) | ((frame.data[7] as u32) << 16);
+        if packets == 0 || total_size == 0 || total_size > ISO_TP_MAX_SIZE {
+            log::warn!(
+                "ISO TP CM from src={} declares implausible size={} packets={}; dropping",
+                frame.src,
+                total_size,
+                packets
+            );
+            return Reassembled::Partial;
+        }
+        let slot_idx = match self.claim_tp_slot(frame.src) {
+            Some(i) => i,
+            None => {
+                return Reassembled::Error(ReassemblyError::OutOfSlots {
+                    pgn: target_pgn,
+                    src: frame.src,
+                });
+            }
+        };
+        let slot = &mut self.tp_slots[slot_idx];
+        slot.dst = frame.dst;
+        slot.prio = frame.prio;
+        slot.target_pgn = target_pgn;
+        slot.total_size = total_size;
+        slot.packets = packets;
+        slot.received = [0; 4];
+        slot.timestamp = frame.timestamp;
+        slot.data.clear();
+        slot.data.resize(total_size, 0xff);
+        Reassembled::Partial
+    }
+
+    /// Handle a PGN 60160 TP.DT frame. Copies the 7-byte chunk into
+    /// the matching session's buffer at offset `(seq - 1) * 7`;
+    /// emits `Complete` with a synthesized target-PGN frame the
+    /// moment every declared sequence has been seen.
+    ///
+    /// A DT frame with no matching open session is silently swallowed
+    /// (we may have missed the CM) — better than surfacing a
+    /// misleading pass-through for a frame the user never wants to
+    /// see anyway.
+    fn handle_tp_dt(&mut self, frame: RawFrame) -> Reassembled {
+        if frame.data.is_empty() {
+            return Reassembled::Error(ReassemblyError::EmptyData);
+        }
+        let Some(slot_idx) = self.find_tp_slot(frame.src) else {
+            log::debug!(
+                "ISO TP DT from src={} with no open session; dropping",
+                frame.src
+            );
+            return Reassembled::Partial;
+        };
+        let slot = &mut self.tp_slots[slot_idx];
+        let sequence = frame.data[0];
+        if sequence == 0 || sequence > slot.packets {
+            log::warn!(
+                "ISO TP DT src={} seq={} out of range 1..={}; dropping",
+                frame.src,
+                sequence,
+                slot.packets
+            );
+            return Reassembled::Partial;
+        }
+        // 1-based sequence → 0-based bit position → chunk offset.
+        let seq_zero_based = (sequence - 1) as usize;
+        let bit_word = seq_zero_based / 64;
+        let bit_slot = seq_zero_based % 64;
+        slot.received[bit_word] |= 1u64 << bit_slot;
+        let offset = seq_zero_based * BUCKET_N_SIZE;
+        let end = (offset + BUCKET_N_SIZE).min(slot.total_size);
+        let copy_len = end.saturating_sub(offset);
+        let avail = frame.data.len().saturating_sub(1);
+        let n = copy_len.min(avail);
+        if n > 0 {
+            slot.data[offset..offset + n].copy_from_slice(&frame.data[1..1 + n]);
+        }
+
+        // Complete iff every declared sequence has arrived.
+        let packets = slot.packets as usize;
+        let full_words = packets / 64;
+        let partial_bits = packets % 64;
+        let all_full = slot.received[..full_words].iter().all(|w| *w == u64::MAX);
+        let last_ok = if partial_bits == 0 {
+            true
+        } else {
+            let mask = (1u64 << partial_bits) - 1;
+            slot.received[full_words] & mask == mask
+        };
+        if !(all_full && last_ok) {
+            return Reassembled::Partial;
+        }
+
+        let mut data: smallvec::SmallVec<[u8; 8]> =
+            smallvec::SmallVec::with_capacity(slot.total_size);
+        data.extend_from_slice(&slot.data[..slot.total_size]);
+        let reassembled = RawFrame {
+            timestamp: slot.timestamp.take(),
+            prio: slot.prio,
+            pgn: slot.target_pgn,
+            src: frame.src,
+            dst: slot.dst,
+            data,
+        };
+        slot.used = false;
+        Reassembled::Complete(reassembled)
+    }
+
+    fn find_tp_slot(&self, src: u8) -> Option<usize> {
+        self.tp_slots.iter().position(|s| s.used && s.src == src)
+    }
+
+    /// Reuse or reset a slot for `src`. Prefers an existing slot for
+    /// this source (matching the "one session per src" invariant);
+    /// otherwise picks a free slot, else evicts the oldest.
+    fn claim_tp_slot(&mut self, src: u8) -> Option<usize> {
+        if let Some(existing) = self.find_tp_slot(src) {
+            self.tp_next_age = self.tp_next_age.wrapping_add(1);
+            let age = self.tp_next_age;
+            self.tp_slots[existing].src = src;
+            self.tp_slots[existing].age = age;
+            self.tp_slots[existing].used = true;
+            return Some(existing);
+        }
+        let free = self.tp_slots.iter().position(|s| !s.used);
+        let idx = match free {
+            Some(i) => i,
+            None => self
+                .tp_slots
+                .iter()
+                .enumerate()
+                .min_by_key(|(_, s)| s.age)
+                .map(|(i, _)| i)?,
+        };
+        self.tp_next_age = self.tp_next_age.wrapping_add(1);
+        let age = self.tp_next_age;
+        self.tp_slots[idx] = TpSlot {
+            used: true,
+            src,
+            age,
+            ..TpSlot::default()
+        };
+        Some(idx)
     }
 
     fn find_slot(&self, pgn: u32, src: u8, seq: u8) -> Option<usize> {
@@ -455,6 +733,146 @@ mod tests {
         };
         assert_eq!(&a.data[..], &[0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6]);
         assert_eq!(&b.data[..], &[0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6]);
+    }
+
+    /// Parse one PLAIN-format line `<ts>,<prio>,<pgn>,<src>,<dst>,
+    /// <len>,<hex>,...` into a `RawFrame`. Convenience for exercising
+    /// the reassembler with real captures.
+    fn parse_plain(line: &str) -> RawFrame {
+        let parts: Vec<&str> = line.split(',').collect();
+        let prio: u8 = parts[1].parse().unwrap();
+        let pgn: u32 = parts[2].parse().unwrap();
+        let src: u8 = parts[3].parse().unwrap();
+        let dst: u8 = parts[4].parse().unwrap();
+        let len: usize = parts[5].parse().unwrap();
+        let data: smallvec::SmallVec<[u8; 8]> = parts[6..6 + len]
+            .iter()
+            .map(|b| u8::from_str_radix(b, 16).unwrap())
+            .collect();
+        RawFrame {
+            timestamp: Some(parts[0].to_string()),
+            prio,
+            pgn,
+            src,
+            dst,
+            data,
+        }
+    }
+
+    /// A real 32-packet BAM sequence captured off a Navico NAC-3
+    /// broadcasting PGN 129540 — `~/src/rev/navico/nac3_nav_mode.raw`
+    /// (larger payload than fast-packet's 223-byte ceiling, so the
+    /// device falls back to ISO Transport Protocol).
+    const NAC3_TP_CM: &str = "2026-06-30T23:30:33.151Z,6,60416,23,255,8,20,db,00,20,ff,04,fa,01";
+    const NAC3_TP_DT: &[&str] = &[
+        "2026-06-30T23:30:33.216Z,6,60160,23,255,8,01,aa,ff,12,08,39,0a,7e",
+        "2026-06-30T23:30:33.291Z,6,60160,23,255,8,02,61,1c,0c,00,00,00,00",
+        "2026-06-30T23:30:33.369Z,6,60160,23,255,8,03,02,09,dc,17,5a,79,1c",
+        "2026-06-30T23:30:33.450Z,6,60160,23,255,8,04,0c,00,00,00,00,02,0e",
+        "2026-06-30T23:30:33.514Z,6,60160,23,255,8,05,22,15,08,a7,f0,0a,00",
+        "2026-06-30T23:30:33.601Z,6,60160,23,255,8,06,00,00,00,00,42,73,23",
+        "2026-06-30T23:30:33.667Z,6,60160,23,255,8,07,72,7d,fc,08,00,00,00",
+        "2026-06-30T23:30:33.744Z,6,60160,23,255,8,08,00,10,01,e8,19,7f,25",
+        "2026-06-30T23:30:33.815Z,6,60160,23,255,8,09,98,08,00,00,00,00,00",
+        "2026-06-30T23:30:33.890Z,6,60160,23,255,8,0a,02,5c,10,e7,37,98,08",
+        "2026-06-30T23:30:33.968Z,6,60160,23,255,8,0b,00,00,00,00,00,13,f4",
+        "2026-06-30T23:30:34.044Z,6,60160,23,255,8,0c,0c,87,db,98,08,00,00",
+        "2026-06-30T23:30:34.114Z,6,60160,23,255,8,0d,00,00,00,16,d1,15,65",
+        "2026-06-30T23:30:34.198Z,6,60160,23,255,8,0e,b7,34,08,00,00,00,00",
+        "2026-06-30T23:30:34.271Z,6,60160,23,255,8,0f,00,11,22,24,e4,dc,d0",
+        "2026-06-30T23:30:34.344Z,6,60160,23,255,8,10,07,00,00,00,00,00,04",
+        "2026-06-30T23:30:34.416Z,6,60160,23,255,8,11,73,23,ac,5a,d0,07,00",
+        "2026-06-30T23:30:34.495Z,6,60160,23,255,8,12,00,00,00,02,4e,2e,08",
+        "2026-06-30T23:30:34.569Z,6,60160,23,255,8,13,65,a8,d0,07,00,00,00",
+        "2026-06-30T23:30:34.661Z,6,60160,23,255,8,14,00,10,03,16,22,45,0c",
+        "2026-06-30T23:30:34.721Z,6,60160,23,255,8,15,6c,07,00,00,00,00,02",
+        "2026-06-30T23:30:34.791Z,6,60160,23,255,8,16,06,7f,07,2a,cb,08,07",
+        "2026-06-30T23:30:34.868Z,6,60160,23,255,8,17,00,00,00,00,00,41,ad",
+        "2026-06-30T23:30:34.941Z,6,60160,23,255,8,18,2d,73,23,40,06,00,00",
+        "2026-06-30T23:30:35.022Z,6,60160,23,255,8,19,00,00,10,58,5c,1f,dc",
+        "2026-06-30T23:30:35.090Z,6,60160,23,255,8,1a,08,40,06,00,00,00,00",
+        "2026-06-30T23:30:35.170Z,6,60160,23,255,8,1b,10,48,e8,0a,16,13,00",
+        "2026-06-30T23:30:35.252Z,6,60160,23,255,8,1c,00,00,00,00,00,10,4f",
+        "2026-06-30T23:30:35.316Z,6,60160,23,255,8,1d,74,05,1f,c9,00,00,00",
+        "2026-06-30T23:30:35.391Z,6,60160,23,255,8,1e,00,00,00,10,51,dc,08",
+        "2026-06-30T23:30:35.464Z,6,60160,23,255,8,1f,87,db,00,00,00,00,00",
+        "2026-06-30T23:30:35.539Z,6,60160,23,255,8,20,00,10,ff,ff,ff,ff,ff",
+    ];
+
+    #[test]
+    fn iso_tp_bam_reassembles_nac3_pgn_129540() {
+        let mut r = Reassembler::new();
+        // CM frame is single-frame PGN 60416; packet_type is
+        // `Single` from the schema perspective, but the reassembler
+        // intercepts it before the pass-through gate.
+        let cm = parse_plain(NAC3_TP_CM);
+        assert_eq!(
+            r.push(cm, FramePacketType::Single),
+            Reassembled::Partial,
+            "CM frame must never emit pass-through — it's plumbing"
+        );
+
+        // 31 partial DTs, then Complete on the 32nd.
+        for (i, line) in NAC3_TP_DT.iter().enumerate() {
+            let dt = parse_plain(line);
+            let got = r.push(dt, FramePacketType::Single);
+            if i + 1 < NAC3_TP_DT.len() {
+                assert_eq!(
+                    got,
+                    Reassembled::Partial,
+                    "DT seq {} expected Partial",
+                    i + 1
+                );
+            } else {
+                match got {
+                    Reassembled::Complete(frame) => {
+                        assert_eq!(frame.pgn, 129540, "target PGN");
+                        assert_eq!(frame.src, 23);
+                        assert_eq!(frame.dst, 255);
+                        assert_eq!(frame.data.len(), 0xdb, "declared 219 bytes");
+                        // First byte of the assembled payload is
+                        // seq-1's B1 (offset 0). Sanity check.
+                        assert_eq!(frame.data[0], 0xaa);
+                        // Last valid byte is at offset 218; frame's
+                        // final chunk is `00,10,ff,ff,ff,ff,ff` so
+                        // offset 217 = 0x00, 218 = 0x10.
+                        assert_eq!(frame.data[218], 0x10);
+                    }
+                    other => panic!("last DT expected Complete, got {other:?}"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn iso_tp_abort_cm_frees_slot() {
+        let mut r = Reassembler::new();
+        let cm = parse_plain(NAC3_TP_CM);
+        assert_eq!(r.push(cm, FramePacketType::Single), Reassembled::Partial);
+        // A subsequent CM with control=255 (Abort) drops the slot.
+        // Force one by hand.
+        let abort = RawFrame {
+            timestamp: Some("2026-06-30T23:30:33.500Z".to_string()),
+            prio: 6,
+            pgn: 60416,
+            src: 23,
+            dst: 255,
+            data: smallvec![255, 0, 0, 0, 0, 0, 0, 0],
+        };
+        assert_eq!(r.push(abort, FramePacketType::Single), Reassembled::Partial);
+        // A DT arriving after the abort must not resurrect the slot
+        // (we no longer have an open session for src 23).
+        let dt = parse_plain(NAC3_TP_DT[0]);
+        assert_eq!(r.push(dt, FramePacketType::Single), Reassembled::Partial);
+    }
+
+    #[test]
+    fn iso_tp_dt_without_open_session_is_swallowed() {
+        let mut r = Reassembler::new();
+        // No prior CM — DT with no matching session must not blow
+        // up and must not surface as PassThrough.
+        let dt = parse_plain(NAC3_TP_DT[0]);
+        assert_eq!(r.push(dt, FramePacketType::Single), Reassembled::Partial);
     }
 
     #[test]

@@ -4,4 +4,4 @@ Cargo.lock.bak
 .DS_Store
 .idea/
 .vscode/
-Makefile
+Makefile.local

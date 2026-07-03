@@ -72,11 +72,25 @@ struct Args {
 
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() -> Result<()> {
-    // Mirror canboat-cli's env_logger plumbing so the user can turn
-    // on RUST_LOG=debug when something looks off.
-    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
-        .target(env_logger::Target::Stderr)
-        .try_init();
+    // The TUI takes over the terminal via crossterm's alt-screen, so
+    // any log line emitted on stderr paints garbage over the UI. Route
+    // logs to a file instead, and quiet the default filter (WARN) so a
+    // capture with a handful of decode warnings doesn't produce a
+    // multi-MB session log. Users who need verbose diagnostics can
+    // still opt in via `RUST_LOG=debug` — the file grows accordingly.
+    if let Ok(log_path) = std::env::var("CANBOAT_TUI_LOG").or_else(|_| {
+        std::env::var("TMPDIR")
+            .map(|d| format!("{d}/canboat-tui.log"))
+            .or_else(|_| Ok::<_, std::env::VarError>("/tmp/canboat-tui.log".to_string()))
+    }) && let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+            .target(env_logger::Target::Pipe(Box::new(file)))
+            .try_init();
+    }
 
     let args = Args::parse();
     // Clap enforces `--host XOR --log` above — so exactly one of

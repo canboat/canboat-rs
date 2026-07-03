@@ -13,7 +13,7 @@ use std::fmt;
 
 use smallvec::SmallVec;
 
-use crate::frame::{FASTPACKET_MAX_SIZE, RawFrame};
+use crate::frame::{RAWFRAME_MAX_SIZE, RawFrame};
 
 /// Byte → hex nibble lookup. `0xff` sentinel for non-hex bytes.
 /// Used by the PLAIN/FAST payload decoder to skip the cost of
@@ -52,7 +52,7 @@ pub enum ParseError {
         /// ydwg02, etc. — use `str::Split` and don't bother).
         offset: Option<usize>,
     },
-    #[error("declared length {len} exceeds max {max}", max = FASTPACKET_MAX_SIZE)]
+    #[error("declared length {len} exceeds max {max}", max = RAWFRAME_MAX_SIZE)]
     LengthTooLarge { len: usize },
     #[error("expected {expected} hex bytes, found {found}")]
     BadPayloadCount { expected: usize, found: usize },
@@ -113,7 +113,7 @@ pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let dst = take_uint_until_comma::<u8>(rest_bytes, &mut cursor, rest_base, "dst")?;
     let len = take_uint_until_comma::<usize>(rest_bytes, &mut cursor, rest_base, "len")?;
 
-    if len > FASTPACKET_MAX_SIZE {
+    if len > RAWFRAME_MAX_SIZE {
         return Err(ParseError::LengthTooLarge { len });
     }
 

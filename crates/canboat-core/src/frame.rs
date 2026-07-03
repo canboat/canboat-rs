@@ -1,10 +1,13 @@
 //! `RawFrame` — a CAN/N2K frame that has been read off a wire or line.
 //!
-//! A `RawFrame` may represent either a single 8-byte CAN frame, or an
-//! already-coalesced fast-packet payload of up to 223 bytes. The `data`
-//! field's length distinguishes the two. The reassembly state machine
-//! in [`crate::reassembly`] turns a stream of single-frame `RawFrame`s
-//! into coalesced `RawFrame`s for fast-packet PGNs.
+//! A `RawFrame` may represent either a single 8-byte CAN frame, an
+//! already-coalesced fast-packet payload (≤ 223 bytes), or an
+//! already-coalesced ISO Transport Protocol payload (≤ 1785 bytes,
+//! typically PGN 129540 with a full satellite list from a Neon-style
+//! GPS). The `data` field's length distinguishes them. The
+//! reassembly state machine in [`crate::reassembly`] turns a stream
+//! of single-frame `RawFrame`s into coalesced ones for fast-packet
+//! and ISO TP PGNs.
 
 use smallvec::SmallVec;
 
@@ -14,10 +17,19 @@ use smallvec::SmallVec;
 /// `6 + 31 * 7 = 223`.
 pub const FASTPACKET_MAX_SIZE: usize = 223;
 
+/// Maximum payload size a `RawFrame` will accept — the ISO 11783
+/// Transport Protocol ceiling (`255 * 7 = 1785`). Fast-packet payloads
+/// stay at `FASTPACKET_MAX_SIZE`; TP-carried payloads (and any input
+/// format that ships an upstream-coalesced TP record) can go up to
+/// this limit before we truncate. Named so the constant announces
+/// its scope (any coalesced payload, not just fast-packet).
+pub const RAWFRAME_MAX_SIZE: usize = 255 * 7;
+
 /// A CAN/N2K frame.
 ///
 /// Single-frame: `data.len() <= 8`. Coalesced fast-packet:
-/// `data.len() <= FASTPACKET_MAX_SIZE`.
+/// `data.len() <= FASTPACKET_MAX_SIZE`. Coalesced ISO TP:
+/// `data.len() <= RAWFRAME_MAX_SIZE`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawFrame {
     /// Free-form timestamp string as captured on the input line (or `None`
@@ -33,7 +45,11 @@ pub struct RawFrame {
 
 impl RawFrame {
     /// Construct a frame with the given header and payload. Does no
-    /// validation beyond capping `data` at `FASTPACKET_MAX_SIZE`.
+    /// validation beyond capping `data` at [`RAWFRAME_MAX_SIZE`] —
+    /// which is the ISO TP ceiling, not fast-packet's, so an
+    /// upstream-coalesced TP record (e.g. a > 223-byte PGN 129540
+    /// line captured from a gateway that did its own reassembly)
+    /// passes through untruncated.
     pub fn new(
         timestamp: Option<String>,
         prio: u8,
@@ -43,8 +59,8 @@ impl RawFrame {
         data: impl IntoIterator<Item = u8>,
     ) -> Self {
         let mut payload: SmallVec<[u8; 8]> = data.into_iter().collect();
-        if payload.len() > FASTPACKET_MAX_SIZE {
-            payload.truncate(FASTPACKET_MAX_SIZE);
+        if payload.len() > RAWFRAME_MAX_SIZE {
+            payload.truncate(RAWFRAME_MAX_SIZE);
         }
         Self {
             timestamp,

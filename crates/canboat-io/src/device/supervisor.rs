@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Reconnect supervisor for [`super::DeviceHandle`].
 //!
 //! A bare `DeviceHandle` lasts exactly one device session: when the

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Garmin CSV capture format — two flavours.
 //!
 //! **CSV1** (relative-timestamp header):

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Shared snapshot cache for the canboat C-compatible base-port output.
 //!
 //! Both the standalone `n2kd` binary and the combined `canboat-pipeline`

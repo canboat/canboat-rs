@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Actisense N2K ASCII line format.
 //!
 //! Example line:

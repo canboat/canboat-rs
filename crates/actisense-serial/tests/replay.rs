@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! End-to-end integration: write a synthetic NGT-1 binary capture,
 //! run the actisense-serial binary against it, and verify the emitted
 //! PLAIN line matches what canboat expects for the same N2K frame.

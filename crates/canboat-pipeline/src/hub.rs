@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Lazy broadcast hub for the read-only TCP outputs.
 //!
 //! `canboat-pipeline` exposes three read streams a TCP client can

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Outgoing PGN payload builders.
 //!
 //! The TUI sends two kinds of frames upstream:

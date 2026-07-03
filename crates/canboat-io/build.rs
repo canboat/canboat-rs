@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Generate the fast-packet lookup table for the "mixed" PGN range
 //! (0x1F000..0x1FFFF) at build time from the canboat PGN database, so
 //! the single/fast decision always tracks the spec. PGNs outside that

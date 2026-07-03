@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! n2kd library — exposes the conversion modules used by the
 //! `n2kd` binary and any in-process pipeline experiments.
 //!

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Actisense NGT-1 binary protocol — sans-I/O byte framer.
 //!
 //! Frames on the wire look like:

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Airmar single-line capture format.
 //!
 //! Layout (one whole frame per line, separator is the first run of

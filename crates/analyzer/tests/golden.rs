@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Golden tests against canboat's `analyzer/tests/*.in` / `*.out`
 //! files. Each case feeds an `.in` through the Rust `analyzer` binary
 //! with the same flags canboat passes, then byte-diffs against the

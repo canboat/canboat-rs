@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `maretron-ipg`: bridge a Maretron IPG100/200 over TCP to a canboat
 //! PLAIN/FAST byte stream on stdout.
 //!
@@ -57,7 +59,8 @@ const CANBOAT_FORMAT_FAST_HEADER: &str = "# format=FAST\n";
 #[command(
     name = "maretron-ipg",
     about = "Bridge a Maretron IPG100/200 (TCP) to canboat PLAIN/FAST",
-    version
+    version,
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Cli {
     /// IPG URL: `tcp://<host>[:<port>]`. Default port 6543 (bus 0);
@@ -127,6 +130,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+    log::info!("{}", canboat_cli::COPYRIGHT_ID);
 
     let device = cli
         .device

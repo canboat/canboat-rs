@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `candump2analyzer`: convert can-utils / candump output into the
 //! canboat analyzer's `RAWFORMAT_PLAIN` lines.
 //!
@@ -36,7 +38,8 @@ use canboat_core::format::ydwg02::iso11783_decompose;
 #[command(
     name = "candump2analyzer",
     about = "Convert can-utils candump lines to canboat PLAIN format",
-    version
+    version,
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Cli {
     /// Optional input file (defaults to stdin).
@@ -95,6 +98,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+    log::info!("{}", canboat_cli::COPYRIGHT_ID);
 
     let reader: Box<dyn BufRead> = match &cli.input {
         Some(path) => Box::new(BufReader::new(

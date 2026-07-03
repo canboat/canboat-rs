@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 use std::process::Command;
 

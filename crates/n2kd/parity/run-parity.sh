@@ -1,4 +1,5 @@
 #!/bin/bash
+# (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 #
 # Manual parity check: drive canboat C n2kd and canboat-rs n2kd from
 # the same analyzer-JSON input, then capture each of the five TCP

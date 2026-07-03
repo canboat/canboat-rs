@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Wire/line-format parsers (sans-I/O).
 //!
 //! Each submodule handles one canboat-recognised input format. The

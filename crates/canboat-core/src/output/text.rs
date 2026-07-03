@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Text format — matches the canboat C analyzer's default text output.
 //!
 //! Layout, replicated from `analyzer/analyzer.c:1205` and `print.c`:

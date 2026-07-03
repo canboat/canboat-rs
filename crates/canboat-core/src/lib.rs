@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! canboat-core: sans-I/O NMEA 2000 (canboat) PGN database, parsers,
 //! decoder, and output formatters.
 //!
@@ -23,6 +25,7 @@ pub use db::{FieldHandle, PgnDatabase};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use frame::{FASTPACKET_MAX_SIZE, RAWFRAME_MAX_SIZE, RawFrame};
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
+pub use schema_data::COPYRIGHT_ID;
 pub use startup::{CANBOAT_BEM, format_iso_ms, parse_iso_ms, startup_record};
 pub use types::{
     BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable, IndirectLookupValue,

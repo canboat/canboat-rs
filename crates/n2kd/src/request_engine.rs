@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Periodic ISO Address Claim (PGN 60928) / Product Information
 //! (PGN 126996) / Configuration Information (PGN 126998) auto-request
 //! engine.

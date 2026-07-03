@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Linux SocketCAN device adapter — a full NMEA 2000 bus participant.
 //!
 //! Wraps a raw `CAN_RAW` socket on a Linux SocketCAN interface and runs

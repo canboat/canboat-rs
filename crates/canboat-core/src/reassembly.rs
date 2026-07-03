@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Fast-packet reassembly state machine (sans-I/O).
 //!
 //! NMEA 2000 fast-packet PGNs are split across up to 32 CAN frames.

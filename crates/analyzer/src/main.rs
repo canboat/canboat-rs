@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `analyzer`: read canboat PLAIN/FAST lines from stdin (or a file),
 //! decode each PGN against the canboat database, and emit text or
 //! JSON on stdout.
@@ -27,7 +29,8 @@ use analyzer::replay::{self, Config};
 #[command(
     name = "analyzer",
     about = "Decode canboat PLAIN/FAST lines from stdin into text or JSON",
-    version
+    version,
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Cli {
     /// Read input from this file instead of stdin.

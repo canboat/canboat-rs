@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Maretron IPG100 binary frame codec (sans-I/O).
 //!
 //! The IPG100 ships NMEA 2000 frames over TCP after a brief text-mode

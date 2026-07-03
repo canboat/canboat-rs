@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Sync `std::io` adapters for `canboat-core`.
 //!
 //! These types are thin wrappers around `BufRead` / `Read` /

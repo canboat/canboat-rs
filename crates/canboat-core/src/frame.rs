@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `RawFrame` — a CAN/N2K frame that has been read off a wire or line.
 //!
 //! A `RawFrame` may represent either a single 8-byte CAN frame, an

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Bit-level extraction primitives shared by the field decoder.
 //!
 //! NMEA 2000 packs fields LSB-first within each byte, advancing byte by

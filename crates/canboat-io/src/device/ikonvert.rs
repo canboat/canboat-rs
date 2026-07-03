@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Digital Yacht iKonvert codec adapter for [`super::run`].
 //!
 //! Wraps [`canboat_core::format::ikonvert`]. iKonvert is line-based

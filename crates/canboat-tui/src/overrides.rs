@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Persistent PGN-rate overrides.
 //!
 //! Each entry is one "the user wants device X's PGN Y to transmit at

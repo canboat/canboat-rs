@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! "Canboat Raw CSV" (PLAIN/FAST) codec — talks to another
 //! `canboat-pipeline` instance over its bidirectional CSV TCP port
 //! (default 2603).

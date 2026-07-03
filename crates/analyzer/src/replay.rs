@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Library form of the analyzer's input → decode pipeline.
 
 use std::fs::File;

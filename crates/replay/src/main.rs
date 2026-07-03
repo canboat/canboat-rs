@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `replay`: pace a captured canboat PLAIN/FAST stream so each line
 //! is emitted at its original wall-clock rhythm.
 //!
@@ -27,7 +29,8 @@ use clap::Parser;
 #[command(
     name = "replay",
     about = "Pace canboat PLAIN/FAST stdin so it replays at real-time speed",
-    version
+    version,
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Cli {
     /// Verbose / debug logging — alias of `-d`. Matches canboat's C tool.
@@ -68,6 +71,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+    log::info!("{}", canboat_cli::COPYRIGHT_ID);
 
     let stdin = io::stdin();
     let stdout = io::stdout();

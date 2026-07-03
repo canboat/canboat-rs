@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Yacht Devices YDWG-02 / YDEN line format.
 //!
 //! Example line (from YDWG02 docs):

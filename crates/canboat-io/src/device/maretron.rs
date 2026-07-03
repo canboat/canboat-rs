@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Maretron IPG100/200 codec adapter for [`super::run`].
 //!
 //! Wraps [`canboat_core::format::maretron_ipg`]. Unlike NGT-1 or

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Convert analyzer JSON lines to NMEA 0183 sentences.
 //!
 //! Mirrors `canboat/n2kd/nmea0183.c` + the GPS sentences in

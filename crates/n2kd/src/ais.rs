@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Convert NMEA 2000 AIS PGNs to NMEA 0183 AIVDM/AIVDO sentences.
 //!
 //! Mirrors `canboat/n2kd/gps_ais.c`. The payload is a packed bit

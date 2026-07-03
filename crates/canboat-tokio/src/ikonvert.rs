@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `IkonvertStream` — async adapter for the Digital Yacht iKonvert
 //! line-based protocol. iKonvert sends control sentences (`$PDGY,...`)
 //! and frame lines (`!PDGY,...,<base64>`) over a serial port.

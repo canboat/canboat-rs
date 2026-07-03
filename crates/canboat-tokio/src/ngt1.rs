@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `Ngt1Stream` — async adapter feeding NGT-1 binary bytes into the
 //! sans-I/O `Ngt1Decoder`, then into the same reassembly + decode
 //! pipeline the standalone binaries use.

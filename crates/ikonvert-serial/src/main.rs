@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `ikonvert-serial`: bidirectional bridge between a Digital Yacht
 //! iKonvert and a canboat PLAIN/FAST byte stream.
 //!
@@ -45,7 +47,8 @@ const CANBOAT_FORMAT_FAST_HEADER: &str = "# format=FAST\n";
 #[command(
     name = "ikonvert-serial",
     about = "Bridge a Digital Yacht iKonvert to canboat PLAIN/FAST format",
-    version
+    version,
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Cli {
     /// Path to the serial device (e.g. /dev/ttyUSB0). Use `-` to read
@@ -123,6 +126,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+    log::info!("{}", canboat_cli::COPYRIGHT_ID);
 
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());

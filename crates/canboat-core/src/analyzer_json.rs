@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Minimal JSON-value extraction by substring scan over analyzer-shape
 //! JSON. Matches the pragmatic style canboat's C `getJSONValue` uses
 //! — we never need a real parser because the analyzer's output is

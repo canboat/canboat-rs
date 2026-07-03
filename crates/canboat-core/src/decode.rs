@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Decode a `RawFrame` into a structured `DecodedPgn`.
 //!
 //! The decoder looks the frame's PGN up in the database, picks the

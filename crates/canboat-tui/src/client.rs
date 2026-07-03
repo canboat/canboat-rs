@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! TCP client to either `n2kd` or `canboat-pipeline`.
 //!
 //! On startup the client opens the snapshot port (default 2597),

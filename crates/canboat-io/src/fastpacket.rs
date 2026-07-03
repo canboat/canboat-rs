@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Fast-packet vs single-frame classification for outbound PGN encoding
 //! and inbound reassembly.
 //!

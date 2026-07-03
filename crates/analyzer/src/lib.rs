@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! In-process entry points to the canboat-rs analyzer pipeline.
 //!
 //! [`replay::decode_stream`] (and the [`replay::decode_file`]

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Struct-passing converters that take `&DecodedPgn` directly
 //! instead of re-parsing a JSON string. Lets `n2kd-inproc` skip the
 //! analyzer JSON → n2kd JSON-parse round trip when the two stages

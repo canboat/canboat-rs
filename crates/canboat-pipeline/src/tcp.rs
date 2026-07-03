@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! TCP listeners attached to the pipeline.
 //!
 //! Five endpoints:

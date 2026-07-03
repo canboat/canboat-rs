@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! The synthetic "CANboat: Startup" record (PGN 0x40200 / 262656).
 //!
 //! The canboat device-reader tools (actisense-serial, ikonvert-serial,

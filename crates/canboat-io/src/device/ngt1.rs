@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Actisense NGT-1 codec adapter for [`super::run`].
 //!
 //! Wraps [`canboat_core::format::ngt1`]: the device reader pushes

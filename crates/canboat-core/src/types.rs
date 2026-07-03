@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Canboat PGN database types.
 //!
 //! These are defined in [`canboat_schema`]; this module re-exports them

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! In-memory model of the bus, fed from the snapshot + live stream.
 //!
 //! Two structures matter:

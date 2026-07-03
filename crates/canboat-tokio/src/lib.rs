@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Async tokio adapters for [`canboat_core`].
 //!
 //! Each adapter wraps an `AsyncRead` byte source (typically a

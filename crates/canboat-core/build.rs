@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Build script: read `data/canboat.json` (+ `data/synthetic-pgns.json`)
 //! and emit a Rust source file with the full schema as `&'static`
 //! tables. The output is `include!`d from `src/schema_data.rs` and
@@ -40,6 +42,7 @@ fn de_loose_string<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Stri
 struct CanboatJson {
     schema_version: String,
     version: String,
+    copyright: String,
     #[serde(rename = "PGNs")]
     pgns: Vec<RawPgn>,
     #[serde(default)]
@@ -870,6 +873,22 @@ fn main() {
         out,
         "pub const VERSION: &str = {};",
         quote(&canboat.version)
+    )
+    .unwrap();
+
+    // The Copyright field is a multi-line banner (version, (C) line,
+    // Apache license boilerplate). The (C) line is the one the C
+    // tools print in their usage/verbose output — extract just that.
+    let copyright_line = canboat
+        .copyright
+        .lines()
+        .map(str::trim)
+        .find(|l| l.starts_with("(C)"))
+        .expect("no \"(C) ...\" line in canboat.json Copyright field");
+    writeln!(
+        out,
+        "pub const COPYRIGHT_ID: &str = {};",
+        quote(copyright_line)
     )
     .unwrap();
 

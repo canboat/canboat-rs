@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `canboat-tui` — interactive terminal UI for an NMEA 2000 bus.
 //!
 //! Connects to either `canboat-pipeline` or `n2kd`. On startup the
@@ -42,7 +44,8 @@ use crate::state::{AppState, Status};
 #[derive(Parser, Debug)]
 #[command(
     name = "canboat-tui",
-    about = "Interactive terminal UI for an NMEA 2000 bus, fed by n2kd or canboat-pipeline."
+    about = "Interactive terminal UI for an NMEA 2000 bus, fed by n2kd or canboat-pipeline.",
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Args {
     /// Hostname or IP of the n2kd / canboat-pipeline endpoint.
@@ -90,6 +93,7 @@ async fn main() -> Result<()> {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
             .target(env_logger::Target::Pipe(Box::new(file)))
             .try_init();
+        log::info!("{}", canboat_cli::COPYRIGHT_ID);
     }
 
     let args = Args::parse();

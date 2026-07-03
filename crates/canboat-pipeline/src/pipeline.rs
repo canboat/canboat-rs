@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Drives the analyzer → n2kd conversion stage.
 //!
 //! Consumes `RawFrame`s off an `mpsc::Receiver`, runs them through

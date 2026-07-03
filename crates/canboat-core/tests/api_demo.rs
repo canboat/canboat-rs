@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! API surface walkthrough — a single decoded PGN, then the consumer
 //! patterns that touch every accessor on `DecodedField` / `DecodedPgn` /
 //! `FieldValue` we expose today.

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! End-to-end integration: write a synthetic iKonvert ASCII capture
 //! and verify the binary's stdout matches the expected PLAIN line.
 

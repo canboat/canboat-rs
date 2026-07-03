@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Pipeline-side snapshot adapter.
 //!
 //! The cache, TTL policy, and nested-JSON emitter all live in

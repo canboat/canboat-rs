@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Chetco N2K-USB line format.
 //!
 //! Layout (one NMEA-style sentence per line):

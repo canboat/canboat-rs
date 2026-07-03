@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Canboat PGN database — const-friendly type definitions.
 //!
 //! This crate carries no data of its own. The full database is emitted

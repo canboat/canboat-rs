@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Digital Yacht iKonvert serial protocol — line-based, ASCII control
 //! sentences interleaved with binary frames carrying Base64 payload.
 //!

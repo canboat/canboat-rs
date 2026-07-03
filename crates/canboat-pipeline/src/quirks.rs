@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Device-specific firmware-quirk workarounds.
 //!
 //! Each variant of [`QuirkKind`] is a known piece of misbehaviour we

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Device-level read/write abstraction shared by the standalone
 //! reader binaries (actisense-serial, ikonvert-serial, maretron-ipg)
 //! and the integrated `n2kd-pipeline` binary.

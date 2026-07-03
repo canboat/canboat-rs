@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Output formatters for `DecodedPgn`.
 //!
 //! Both formatters write to a `&mut dyn fmt::Write` — no I/O. The

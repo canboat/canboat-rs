@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `socketcan-serial`: bridge a Linux SocketCAN interface to/from
 //! canboat FAST format, behaving as much like `actisense-serial` and
 //! `ikonvert-serial` as possible.
@@ -34,7 +36,8 @@ use clap::Parser;
 #[command(
     name = "socketcan-serial",
     about = "Bridge a Linux SocketCAN interface to/from canboat FAST format",
-    version
+    version,
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Cli {
     /// SocketCAN interface name, e.g. can0 or nmea2000.
@@ -120,6 +123,7 @@ fn main() -> ExitCode {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+    log::info!("{}", canboat_cli::COPYRIGHT_ID);
 
     if let Err(e) = run(cli) {
         eprintln!("socketcan-serial: {e:#}");

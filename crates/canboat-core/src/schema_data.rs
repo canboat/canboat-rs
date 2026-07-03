@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Static schema tables, generated at build time from
 //! `data/canboat.json` plus `data/synthetic-pgns.json` by
 //! `canboat-core/build.rs`.
@@ -10,5 +12,7 @@
 //!   [`FIELD_TYPE_LOOKUPS`] — sorted alphabetically by name for
 //!   binary-search lookup.
 //! - [`SCHEMA_VERSION`], [`VERSION`] — strings from canboat.json.
+//! - [`COPYRIGHT_ID`] — the `(C) ...` line from canboat.json's
+//!   Copyright banner, for help text and verbose logging.
 
 include!(concat!(env!("OUT_DIR"), "/schema_generated.rs"));

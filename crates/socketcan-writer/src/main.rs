@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `socketcan-writer`: read canboat PLAIN/FAST lines from stdin and
 //! emit them as 29-bit CAN frames on a Linux SocketCAN interface
 //! (or to stdout for testing). Mirrors
@@ -35,7 +37,8 @@ const CANBOAT_PGN_START: u32 = 0x40000;
 #[command(
     name = "socketcan-writer",
     about = "Forward canboat PLAIN/FAST stdin to a Linux SocketCAN device",
-    version
+    version,
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Cli {
     /// Target device. Use `-` or `stdout` to write the raw 16-byte
@@ -81,6 +84,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
+    log::info!("{}", canboat_cli::COPYRIGHT_ID);
 
     let mut sink: Box<dyn FrameSink> = if cli.device == "-" || cli.device == "stdout" {
         Box::new(StdoutSink::new())

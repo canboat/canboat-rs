@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Integration tests that prove the same sans-I/O core drives cleanly
 //! through tokio. Each test fabricates a byte stream in memory, hands
 //! it to a `Stream`, and verifies the emitted `DecodedPgn` events.

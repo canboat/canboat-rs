@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Read N2K traffic off a Digital Yacht iKonvert over a serial port
 //! and consume `DecodedPgn` events directly (no JSON middleman). This
 //! mirrors how merrimac-rs is expected to embed the canboat stack.

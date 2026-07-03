@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Persistent NAME → product-info cache.
 //!
 //! On the wire, every N2K device advertises a globally-unique 64-bit

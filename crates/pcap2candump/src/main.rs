@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! `pcap2candump`: convert a libpcap capture of SocketCAN frames into
 //! `candump -l` log format (canboat's `FMT_3`). Mirrors
 //! `canboat/pcap2candump/pcap2candump.py`.
@@ -35,7 +37,8 @@ const PCAP_MAGIC_US: u32 = 0xa1b2c3d4;
 #[command(
     name = "pcap2candump",
     about = "Convert libpcap CAN captures to candump -l log lines",
-    version
+    version,
+    after_help = canboat_cli::COPYRIGHT_ID
 )]
 struct Cli {
     /// One or more pcap files. Output is to stdout.

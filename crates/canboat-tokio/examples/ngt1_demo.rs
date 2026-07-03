@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Read N2K traffic off an Actisense NGT-1 over a serial port and
 //! print one line per decoded PGN as canboat-style text. The
 //! interesting part is what isn't here: zero protocol code lives in

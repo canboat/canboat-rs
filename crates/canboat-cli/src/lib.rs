@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Shared CLI plumbing for the canboat-rs binaries.
 //!
 //! At the moment the only thing here is [`canboat_argv`], an argv
@@ -10,6 +12,12 @@
 
 use std::env;
 use std::ffi::OsString;
+
+/// The canboat copyright line, extracted from `data/canboat.json` at
+/// build time by `canboat-core/build.rs`. Every binary shows it in
+/// `--help` (via clap `after_help`) and logs it at startup when
+/// verbose logging is on.
+pub use canboat_core::COPYRIGHT_ID;
 
 /// Read the process argv and translate any single-dash long options
 /// to double-dash form. This lets users invoke a canboat-rs tool the

@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! Struct-path equivalent of [`crate::ais`] — converts AIS PGNs to
 //! NMEA 0183 `!AIVDM` sentences by reading fields directly from a
 //! `DecodedPgn` instead of round-tripping through analyzer JSON.

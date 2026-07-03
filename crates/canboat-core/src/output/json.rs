@@ -1,3 +1,5 @@
+// (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
 //! JSON format — matches the canboat C analyzer's `-json` output.
 //!
 //! Output shape:

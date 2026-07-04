@@ -173,6 +173,12 @@ pub struct Hubs {
 ///   `RAWFORMAT_PLAIN_OR_FAST` → `FAST` lock-in). Once true it
 ///   stays true. The stdin pump also flips it when it sees a
 ///   `# format=<NAME>` header declaring a coalesced format.
+/// * `nmea0183_rate_limit` gates the 1 Hz per-`(src, quantity)` NMEA
+///   0183 limiter (see [`n2kd::nmea0183::RateLimiter`]). `true` (the
+///   deployed default) drops repeat sentences within 1 s so several
+///   devices reporting the same measurement don't flood downstream
+///   0183 consumers; AIS is emitted on a separate path and never
+///   limited. `false` emits every converted sentence unthrottled.
 /// * `json_opts` configures the analyzer JSON / snapshot serializer
 ///   — `camel_case` selects field-key + PGN-description style
 ///   (`Off` / `Lower` matches canboat C `-camel`, `Upper` matches
@@ -185,6 +191,7 @@ pub fn run(
     emit_nmea_stdout: bool,
     pre_coalesced: Arc<AtomicBool>,
     json_opts: JsonOptions,
+    nmea0183_rate_limit: bool,
 ) {
     // LineWriter (rather than BufWriter) so each NMEA 0183 sentence
     // is flushed as soon as its trailing newline arrives. Long-
@@ -197,7 +204,7 @@ pub fn run(
     let mut nmea_buf = String::with_capacity(256);
     let mut raw_line = String::with_capacity(256);
     let mut json_line = String::with_capacity(1024);
-    let mut rl = n2kd::nmea0183::RateLimiter::new(false);
+    let mut rl = n2kd::nmea0183::RateLimiter::new(nmea0183_rate_limit);
     let mut ais_seq: u8 = 0;
     let handles = n2kd::decoded::Handles::new(db);
 

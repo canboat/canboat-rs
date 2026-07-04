@@ -240,6 +240,16 @@ struct Cli {
     #[arg(long)]
     nmea0183_stdout: bool,
 
+    /// Disable the 1 Hz NMEA 0183 rate limit. By default each
+    /// `(source, quantity)` is limited to one sentence per second on
+    /// the NMEA 0183 outputs (matching canboat C `n2kd`), so a bus
+    /// with several devices reporting the same measurement doesn't
+    /// flood downstream 0183 consumers. AIS (`!AI…`) is never rate-
+    /// limited. Pass this to emit every converted sentence unthrottled
+    /// (e.g. for byte-for-byte parity captures).
+    #[arg(long = "no-nmea0183-rate-limit")]
+    no_nmea0183_rate_limit: bool,
+
     /// Emit field keys + PGN descriptions as camelCase
     /// identifiers (`"uniqueNumber"` instead of `"Unique Number"`)
     /// on the analyzer JSON / snapshot TCP ports. Matches canboat
@@ -459,6 +469,7 @@ fn run(cli: Cli) -> Result<()> {
         cli.nmea0183_stdout,
         pre_coalesced,
         json_opts,
+        !cli.no_nmea0183_rate_limit,
     );
 
     // After the pipeline drains, signal the supervisor to stop

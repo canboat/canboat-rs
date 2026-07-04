@@ -297,23 +297,73 @@ impl Reassembler {
             },
         };
 
-        // Detect duplicate frame index within this sequence — same
-        // (pgn, src, seq) saw this frame index before, so the previous
-        // assembly was incomplete. Log the incident (canboat emits an
-        // ERROR line on stderr here) but still place this frame as the
-        // start of a *fresh* attempt: zero the bitmask, keep `size` /
-        // `all_frames` from frame 0 so the in-flight non-zero indices
-        // can still complete a payload. Matches analyzer.c:811-815.
-        if self.slots[slot_idx].frames & (1u32 << frame_index) != 0 {
+        // Two situations mean the assembly in the slot belongs to an
+        // earlier message and must be restarted with this frame:
+        //
+        // * **A duplicate frame index.** The wrapped sequence counter
+        //   reused this (pgn, src, seq) after the previous burst lost
+        //   frames (analyzer.c:811-815 logs and resets the bitmask the
+        //   same way). Keeping `size` / `all_frames` is harmless:
+        //   completion requires frame 0's bit, and frame 0 always
+        //   refreshes them (below) before setting it.
+        //
+        // * **Frame 0 that would complete instantly off held bits.**
+        //   Frame 0 with earlier indices already in the slot is
+        //   ambiguous: an out-of-order retransmission (YDWG delivers
+        //   frames reordered; canboat's recombine-frames fixture
+        //   requires those to survive) looks exactly like the body of
+        //   a previous burst whose frame 0 was lost. The tell is
+        //   completion: a genuinely reordered burst still has frames
+        //   in flight, so it completes on a later index, while stale
+        //   leftovers satisfy the mask the moment frame 0 lands —
+        //   emitting a payload gluing this frame 0 onto the previous
+        //   message's body, and (when the sizes differ) wedging the
+        //   slot with `frames ⊋ all_frames` so nothing ever completes
+        //   again. So: if the held bits plus frame 0 would satisfy the
+        //   mask this frame declares, discard them as stale; otherwise
+        //   keep them. (`all_frames == 1` is exempt — a ≤6-byte
+        //   payload legitimately completes on frame 0 alone, and uses
+        //   no held data.)
+        let stale = self.slots[slot_idx].frames;
+        let duplicate = stale & (1u32 << frame_index) != 0;
+
+        // Frame 0 carries the total payload size in data[1]; compute
+        // the mask of frame indices it declares as required.
+        let new_all_frames = (frame_index == 0).then(|| {
+            let declared = frame.data.get(1).copied().unwrap_or(0) as usize;
+            let size = declared.min(FASTPACKET_MAX_SIZE);
+            // canboat: number of frames needed = 1 + size/7 (integer
+            // division). Frame 0 holds 6 bytes; each later frame holds
+            // 7. The integer-truncated formula gives the right count
+            // because frame 0's extra byte effectively borrows from the
+            // first chunk of 7.
+            let needed = (1 + size / BUCKET_N_SIZE).min((FASTPACKET_MAX_INDEX as usize) + 1);
+            let all_frames = match needed {
+                0 => 0,
+                n if n >= 32 => u32::MAX,
+                n => (1u32 << n) - 1,
+            };
+            (size, all_frames)
+        });
+        let completes_instantly = new_all_frames.is_some_and(|(_, mask)| {
+            !duplicate && stale != 0 && mask != 1 && (stale | 1) & mask == mask
+        });
+
+        if duplicate || completes_instantly {
             let slot = &self.slots[slot_idx];
             log::warn!(
                 "Incomplete fast packet pgn={} src={} seq=0x{:02x}: \
-                 frame index {} arrived again before the sequence completed. \
+                 frame index {} {} before the sequence completed. \
                  Already received frame{} {{{}}}{}. Restarting assembly with this frame.",
                 frame.pgn,
                 frame.src,
                 seq,
                 frame_index,
+                if duplicate {
+                    "arrived again"
+                } else {
+                    "started a new message"
+                },
                 if slot.frames.count_ones() == 1 {
                     ""
                 } else {
@@ -325,22 +375,9 @@ impl Reassembler {
             self.slots[slot_idx].frames = 0;
         }
 
-        // Frame 0 carries the total payload size in data[1].
-        if frame_index == 0 {
-            let declared = frame.data.get(1).copied().unwrap_or(0) as usize;
-            let size = declared.min(FASTPACKET_MAX_SIZE);
+        if let Some((size, all_frames)) = new_all_frames {
             self.slots[slot_idx].size = size;
-            // canboat: number of frames needed = 1 + size/7 (integer
-            // division). Frame 0 holds 6 bytes; each later frame holds
-            // 7. The integer-truncated formula gives the right count
-            // because frame 0's extra byte effectively borrows from the
-            // first chunk of 7.
-            let needed = (1 + size / BUCKET_N_SIZE).min((FASTPACKET_MAX_INDEX as usize) + 1);
-            self.slots[slot_idx].all_frames = match needed {
-                0 => 0,
-                n if n >= 32 => u32::MAX,
-                n => (1u32 << n) - 1,
-            };
+            self.slots[slot_idx].all_frames = all_frames;
         }
 
         // Copy this frame's payload into the assembled buffer at the
@@ -735,6 +772,143 @@ mod tests {
         };
         assert_eq!(&a.data[..], &[0xa0, 0xa1, 0xa2, 0xa3, 0xa4, 0xa5, 0xa6]);
         assert_eq!(&b.data[..], &[0xb0, 0xb1, 0xb2, 0xb3, 0xb4, 0xb5, 0xb6]);
+    }
+
+    /// Build the CAN frames of one fast-packet burst: `seq` in the
+    /// top three bits, declared payload size `size`, every payload
+    /// byte set to `fill` so tests can tell bursts apart.
+    fn burst(pgn: u32, src: u8, seq: u8, size: usize, fill: u8) -> Vec<RawFrame> {
+        let n = 1 + size / BUCKET_N_SIZE;
+        (0..n)
+            .map(|i| {
+                let mut d = vec![seq | i as u8];
+                if i == 0 {
+                    d.push(size as u8);
+                    d.extend(std::iter::repeat_n(fill, 6));
+                } else {
+                    d.extend(std::iter::repeat_n(fill, 7));
+                }
+                frame(pgn, src, d)
+            })
+            .collect()
+    }
+
+    /// Push all frames, asserting none of them completes a message.
+    fn push_partial(r: &mut Reassembler, frames: &[RawFrame]) {
+        for f in frames {
+            assert_eq!(
+                r.push(f.clone(), FramePacketType::Fast),
+                Reassembled::Partial,
+                "unexpected result for frame {:02x}",
+                f.data[0],
+            );
+        }
+    }
+
+    /// The SCX-20 wedge: a burst whose frame 0 was lost leaves stale
+    /// index bits in the slot; when the wrapped sequence counter
+    /// reuses the slot, the next message must still come out intact.
+    /// (Previously the stale bits made `frames` a strict superset of
+    /// `all_frames`, so nothing ever completed and every following
+    /// frame logged an "Incomplete fast packet" warning.)
+    #[test]
+    fn recovers_when_previous_burst_lost_frame_zero() {
+        let mut r = Reassembler::new();
+        // Burst A: 115 bytes → 17 frames, but frame 0 never arrives.
+        let a = burst(130845, 52, 0xe0, 115, 0xaa);
+        push_partial(&mut r, &a[1..]);
+        // Burst B: 103 bytes → 15 frames, same (pgn, src, seq), complete.
+        let b = burst(130845, 52, 0xe0, 103, 0xbb);
+        push_partial(&mut r, &b[..14]);
+        match r.push(b[14].clone(), FramePacketType::Fast) {
+            Reassembled::Complete(g) => {
+                assert_eq!(g.data.len(), 103);
+                assert!(g.data.iter().all(|&x| x == 0xbb), "payload mixes bursts");
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    /// A lost tail frame must cost exactly one message: the next
+    /// frame 0 on the same (pgn, src, seq) restarts the slot.
+    #[test]
+    fn recovers_when_previous_burst_lost_tail_frame() {
+        let mut r = Reassembler::new();
+        // Burst A: 17 frames, last one lost.
+        let a = burst(130845, 52, 0xe0, 115, 0xaa);
+        push_partial(&mut r, &a[..16]);
+        // Burst B: complete 15-frame message.
+        let b = burst(130845, 52, 0xe0, 103, 0xbb);
+        push_partial(&mut r, &b[..14]);
+        match r.push(b[14].clone(), FramePacketType::Fast) {
+            Reassembled::Complete(g) => {
+                assert_eq!(g.data.len(), 103);
+                assert!(g.data.iter().all(|&x| x == 0xbb), "payload mixes bursts");
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    /// Frame 0 always starts a fresh message — it must never combine
+    /// with buckets left over from an earlier burst. (Previously,
+    /// when burst B lost its frame 0, burst C's frame 0 completed
+    /// immediately against B's buckets and emitted a payload mixing
+    /// the two.)
+    #[test]
+    fn never_emits_payload_mixing_two_bursts() {
+        let mut r = Reassembler::new();
+        // Burst A: 15 frames, tail frame lost.
+        let a = burst(130845, 52, 0xe0, 103, 0xaa);
+        push_partial(&mut r, &a[..14]);
+        // Burst B: same shape, frame 0 lost.
+        let b = burst(130845, 52, 0xe0, 103, 0xbb);
+        push_partial(&mut r, &b[1..]);
+        // Burst C: complete. Its frame 0 lands on a slot holding B's
+        // buckets 1..=14 — completing here would emit C's first six
+        // bytes glued to B's ninety-seven.
+        let c = burst(130845, 52, 0xe0, 103, 0xcc);
+        push_partial(&mut r, &c[..14]);
+        match r.push(c[14].clone(), FramePacketType::Fast) {
+            Reassembled::Complete(g) => {
+                assert_eq!(g.data.len(), 103);
+                assert!(g.data.iter().all(|&x| x == 0xcc), "payload mixes bursts");
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
+    }
+
+    /// Mirror of canboat's `recombine-frames.in` fourth group: an
+    /// out-of-order burst missing one frame, followed by a full
+    /// out-of-order retransmission whose frame 0 arrives *after* one
+    /// of its body frames. The held pre-frame-0 frame must survive
+    /// the frame 0 restart logic so the retransmission completes.
+    #[test]
+    fn keeps_reordered_frames_that_precede_frame_zero() {
+        let mut r = Reassembler::new();
+        let b = burst(129029, 0, 0x00, 43, 0xbb); // 7 frames
+        // First transmission, out of order, frame 1 never arrives.
+        for i in [0usize, 2, 6, 3, 4, 5] {
+            assert_eq!(
+                r.push(b[i].clone(), FramePacketType::Fast),
+                Reassembled::Partial
+            );
+        }
+        // Retransmission, out of order: frame 2 lands before frame 0
+        // (frame 2 is a duplicate → restart; frame 0 must then keep it).
+        for i in [2usize, 0, 6, 3, 4, 5] {
+            assert_eq!(
+                r.push(b[i].clone(), FramePacketType::Fast),
+                Reassembled::Partial,
+                "frame {i} should not complete yet"
+            );
+        }
+        match r.push(b[1].clone(), FramePacketType::Fast) {
+            Reassembled::Complete(g) => {
+                assert_eq!(g.data.len(), 43);
+                assert!(g.data.iter().all(|&x| x == 0xbb));
+            }
+            other => panic!("expected complete, got {other:?}"),
+        }
     }
 
     /// Parse one PLAIN-format line `<ts>,<prio>,<pgn>,<src>,<dst>,

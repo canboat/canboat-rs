@@ -116,6 +116,21 @@
         {"Order": 2, "Id": "source",  "Name": "Source",  "BitLength": 256, "BitOffset": 16,  "FieldType": "STRING_FIX"},
         {"Order": 3, "Id": "device",  "Name": "Device",  "BitLength": 256, "BitOffset": 272, "FieldType": "STRING_FIX"}
       ]
+    },
+    {
+      "PGN": 262657,
+      "Id": "canboatNmea0183Filter",
+      "Description": "CANboat: NMEA 0183 filter",
+      "Type": "Single",
+      "Complete": true,
+      "FieldCount": 4,
+      "Length": 8,
+      "Fields": [
+        {"Order": 1, "Id": "function",  "Name": "Function",  "BitLength": 8,  "BitOffset": 0,  "FieldType": "NUMBER", "Resolution": 1, "Description": "0=Report (pipeline->tui), 1=Set (tui->pipeline)"},
+        {"Order": 2, "Id": "source",    "Name": "Source",    "BitLength": 8,  "BitOffset": 8,  "FieldType": "NUMBER", "Resolution": 1, "Description": "N2K source address this record refers to"},
+        {"Order": 3, "Id": "sentence",  "Name": "Sentence",  "BitLength": 24, "BitOffset": 16, "FieldType": "STRING_FIX", "Description": "3-letter NMEA 0183 formatter, or 'ALL' for the whole source"},
+        {"Order": 4, "Id": "muted",     "Name": "Muted",     "BitLength": 8,  "BitOffset": 40, "FieldType": "NUMBER", "Resolution": 1, "Description": "0=active (emitting), 1=muted"}
+      ]
     }
   ]
 }

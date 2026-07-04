@@ -380,6 +380,13 @@ fn forward_plain_line(line: &str, inject: &InjectPoint) -> bool {
     }
     match parse_plain(trimmed) {
         Ok(mut frame) => {
+            // The NMEA 0183 filter control PGN is a pipeline-local
+            // message, never a bus frame: loop it into the pipeline
+            // (which owns the filter state) but do not transmit it on
+            // the N2K bus or rewrite its source.
+            if frame.pgn == crate::pipeline::PGN_NMEA0183_FILTER {
+                return inject.loopback.send(frame).is_ok();
+            }
             // Rewrite a default / broadcast `src` to our gateway's
             // live claim address on BOTH paths. The device adapter
             // does the same rewrite internally for the bus side, but

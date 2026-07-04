@@ -33,6 +33,7 @@
 //! walks the `DecodedPgn` struct — and they each build a
 //! [`SnapshotInput`] from it before calling [`SnapshotStore::store`].
 
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -400,8 +401,28 @@ pub struct SnapshotInput {
     pub line: String,
 }
 
+/// The analyzer-JSON value stored per cache key. Either a string that
+/// was already serialized by the caller (the n2kd path, which reads
+/// JSON lines off stdin), or a closure that serializes on demand (the
+/// pipeline path, which holds a `DecodedPgn` and defers `write_json`
+/// until a snapshot client actually connects — so a busy bus with no
+/// snapshot consumer never pays the serialization tax).
+enum LinePayload {
+    Ready(String),
+    Lazy(Box<dyn Fn() -> String + Send>),
+}
+
+impl LinePayload {
+    fn render(&self) -> Cow<'_, str> {
+        match self {
+            LinePayload::Ready(s) => Cow::Borrowed(s),
+            LinePayload::Lazy(f) => Cow::Owned(f()),
+        }
+    }
+}
+
 struct CacheEntry {
-    line: String,
+    payload: LinePayload,
     /// `pgn_description` truncated at the first `:`.
     pgn_short_description: String,
     /// `None` means "never expires" — set for PGNs in
@@ -444,14 +465,59 @@ impl SnapshotStore {
         }
     }
 
-    /// Stash one classified record. Overwrites any prior entry with
-    /// the same `(pgn, src, secondary)` key in place — the entry's
-    /// insertion order is preserved. Status fields (`count`,
-    /// `interval_ms`) accumulate across stores for the same key.
+    /// Stash one classified record whose analyzer-JSON line is already
+    /// serialized (the n2kd path). Overwrites any prior entry with the
+    /// same `(pgn, src, secondary)` key in place — insertion order is
+    /// preserved. Status fields (`count`, `interval_ms`) accumulate
+    /// across stores for the same key.
     pub fn store(&self, input: SnapshotInput) {
+        self.store_entry(
+            input.pgn,
+            input.src,
+            input.secondary,
+            input.is_ais,
+            &input.pgn_description,
+            LinePayload::Ready(input.line),
+        );
+    }
+
+    /// Stash one record whose analyzer-JSON line is produced lazily by
+    /// `render` — called only when a snapshot client actually reads the
+    /// cache. The pipeline uses this to keep the cache current without
+    /// serializing every decoded record on a busy bus. Same keying and
+    /// status accounting as [`Self::store`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_lazy(
+        &self,
+        pgn: u32,
+        src: u8,
+        secondary: Option<String>,
+        is_ais: bool,
+        pgn_description: &str,
+        render: Box<dyn Fn() -> String + Send>,
+    ) {
+        self.store_entry(
+            pgn,
+            src,
+            secondary,
+            is_ais,
+            pgn_description,
+            LinePayload::Lazy(render),
+        );
+    }
+
+    fn store_entry(
+        &self,
+        pgn: u32,
+        src: u8,
+        secondary: Option<String>,
+        is_ais: bool,
+        pgn_description: &str,
+        payload: LinePayload,
+    ) {
         let now = Instant::now();
-        let expires_at = ttl_for_pgn(input.pgn, input.is_ais).map(|ttl| now + ttl);
-        let key = (input.pgn, input.src, input.secondary);
+        let expires_at = ttl_for_pgn(pgn, is_ais).map(|ttl| now + ttl);
+        let key = (pgn, src, secondary);
         let mut guard = self.cache.lock().expect("snapshot cache poisoned");
 
         // Carry count + previous_store_at forward across overwrites
@@ -474,8 +540,8 @@ impl SnapshotStore {
             .unwrap_or(0);
 
         let entry = CacheEntry {
-            line: input.line,
-            pgn_short_description: short_description(&input.pgn_description),
+            payload,
+            pgn_short_description: short_description(pgn_description),
             expires_at,
             last_timestamp: Some(format_iso_ms(wall_ms)),
             count: prev_count + 1,
@@ -561,7 +627,7 @@ impl SnapshotStore {
                     out.push_str(s);
                 }
                 out.push_str("\":");
-                out.push_str(&entry.line);
+                out.push_str(&entry.payload.render());
             }
             out.push_str("\n  }");
         }

@@ -12,7 +12,7 @@ use std::sync::Arc;
 
 use canboat_core::output::{JsonOptions, write_json};
 use canboat_core::snapshot::{
-    SnapshotInput, composite_secondary, is_ais_pgn, per_iteration_secondary, repeating_pk_set,
+    composite_secondary, is_ais_pgn, per_iteration_secondary, repeating_pk_set,
 };
 use canboat_core::{DecodedField, DecodedPgn, FieldValue, PgnDatabase};
 
@@ -40,25 +40,22 @@ impl SnapshotStore {
         }
     }
 
-    /// Stash the analyzer JSON `line` (no trailing newline) for this
-    /// decoded record.
+    /// Stash this decoded record in the snapshot cache. The analyzer
+    /// JSON is **not** produced here — the store holds the decoded
+    /// record and serializes lazily, only when a snapshot client reads
+    /// the cache. On a busy bus with no snapshot consumer connected,
+    /// that means the pipeline never serializes JSON for the snapshot
+    /// at all; the expensive `write_json` walk is deferred to connect
+    /// time (rare).
     ///
     /// When the PGN's primary key lives inside a repeating set
-    /// ([`repeating_pk_set`]), `line` is ignored: this method
-    /// re-serializes the decoded record once per iteration via the
-    /// stored [`JsonOptions`] so each cache entry carries only its
-    /// own iteration's fields.
-    pub fn store(&self, decoded: &DecodedPgn, line: String) {
+    /// ([`repeating_pk_set`]) the record is split into one cache entry
+    /// per iteration, each lazily re-serializing only its own
+    /// iteration's fields.
+    pub fn store(&self, decoded: &DecodedPgn) {
         let is_ais = is_ais_pgn(decoded.pgn);
         let Some(info) = PgnDatabase::embedded().first_pgn(decoded.pgn) else {
-            self.inner.store(SnapshotInput {
-                pgn: decoded.pgn,
-                src: decoded.src,
-                secondary: None,
-                is_ais,
-                pgn_description: decoded.description.to_string(),
-                line,
-            });
+            self.store_whole(decoded, None, is_ais);
             return;
         };
 
@@ -68,22 +65,34 @@ impl SnapshotStore {
         }
 
         let secondary = composite_secondary(info, |f| top_field_text(decoded, f));
-        self.inner.store(SnapshotInput {
-            pgn: decoded.pgn,
-            src: decoded.src,
+        self.store_whole(decoded, secondary, is_ais);
+    }
+
+    /// Store the whole record under one key, deferring serialization.
+    fn store_whole(&self, decoded: &DecodedPgn, secondary: Option<String>, is_ais: bool) {
+        let d = Arc::new(decoded.clone());
+        let opts = self.json_opts.clone();
+        self.inner.store_lazy(
+            decoded.pgn,
+            decoded.src,
             secondary,
             is_ais,
-            pgn_description: decoded.description.to_string(),
-            line,
-        });
+            decoded.description,
+            Box::new(move || {
+                let mut s = String::with_capacity(256);
+                let _ = write_json(&mut s, &d, &opts);
+                s
+            }),
+        );
     }
 
     /// Per-iteration storage path for PGNs whose PK lives in
     /// `repeat_set`. One cache entry is written per iteration; each
-    /// entry's `line` is a re-serialized JSON document containing
-    /// only that iteration's repeating-set fields plus all top-level
-    /// fields. Updates from a subsequent record refresh exactly the
-    /// iteration whose PK matches and leave the rest in place.
+    /// entry lazily re-serializes a JSON document containing only that
+    /// iteration's repeating-set fields plus all top-level fields, so a
+    /// subsequent record refreshes exactly the iteration whose PK
+    /// matches and leaves the rest in place. The decoded record is
+    /// cloned once and shared (Arc) across the per-iteration closures.
     fn store_per_iteration(
         &self,
         decoded: &DecodedPgn,
@@ -92,7 +101,11 @@ impl SnapshotStore {
         is_ais: bool,
     ) {
         let iters: Vec<u32> = collect_iter_indexes(decoded, rs);
-        for &iter in &iters {
+        if iters.is_empty() {
+            return;
+        }
+        let shared = Arc::new(decoded.clone());
+        for iter in iters {
             let secondary = per_iteration_secondary(
                 info,
                 rs,
@@ -100,15 +113,16 @@ impl SnapshotStore {
                 |f| top_field_text(decoded, f),
                 |f, ii| iter_field_text(decoded, rs, ii, f),
             );
-            let iter_line = synthesize_iter_line(decoded, rs, iter, &self.json_opts);
-            self.inner.store(SnapshotInput {
-                pgn: decoded.pgn,
-                src: decoded.src,
+            let d = shared.clone();
+            let opts = self.json_opts.clone();
+            self.inner.store_lazy(
+                decoded.pgn,
+                decoded.src,
                 secondary,
                 is_ais,
-                pgn_description: decoded.description.to_string(),
-                line: iter_line,
-            });
+                decoded.description,
+                Box::new(move || synthesize_iter_line(&d, rs, iter, &opts)),
+            );
         }
     }
 

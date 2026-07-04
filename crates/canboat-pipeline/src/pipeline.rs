@@ -486,22 +486,24 @@ pub fn run(
             f.note_address_claim(decoded.src, name);
         }
 
+        // Snapshot cache: hand the store the decoded record and let it
+        // serialize lazily, only when a snapshot client reads. So the
+        // snapshot no longer forces per-record JSON — that cost is now
+        // paid solely for the analyzer port's live subscribers.
+        if let Some(snap) = hubs.snapshot.as_ref() {
+            snap.store(&decoded);
+        }
+
         // Lazy analyzer JSON — serialized at most ONCE per decoded
-        // record and shared by all three consumers: the snapshot
-        // cache, the analyzer port broadcast, and the NMEA 0183
-        // fallback converter below. The serializer walks every
-        // decoded field, so skipping it when no one needs the line
+        // record and shared by the analyzer port broadcast and the
+        // NMEA 0183 fallback converter below. The serializer walks
+        // every decoded field, so skipping it when no one is subscribed
         // actually buys something on a high-rate input stream.
-        let want_json = analyzer_batch.has_subscribers() || hubs.snapshot.is_some();
+        let want_json = analyzer_batch.has_subscribers();
         let mut json_ok = false;
         if want_json {
             json_line.clear();
             json_ok = write_json(&mut json_line, &decoded, &json_opts).is_ok();
-            // Snapshot wants the bare JSON (it embeds the line as a
-            // value inside its own nested wrapper).
-            if json_ok && let Some(snap) = hubs.snapshot.as_ref() {
-                snap.store(&decoded, json_line.clone());
-            }
         }
 
         // NMEA 0183 conversion only runs when someone will see the

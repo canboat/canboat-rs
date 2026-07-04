@@ -49,7 +49,7 @@ use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
 use n2kd::request_engine::{self, RequestEngine};
 
-use crate::hub::Hub;
+use crate::hub::{BinHub, Hub};
 use crate::pipeline::Hubs;
 use crate::snapshot::SnapshotStore;
 
@@ -234,6 +234,18 @@ struct Cli {
     #[arg(long, default_value_t = 2601)]
     ais_port: u16,
 
+    /// Port for the read-only binary analyzer stream: each decoded PGN
+    /// as a length-prefixed postcard `WirePgn` (see the canboat-wire
+    /// crate), preceded by a one-shot `Hello` handshake carrying the
+    /// schema hash. Far cheaper for a Rust consumer than parsing the
+    /// analyzer JSON — no field re-serialization here, no JSON parse
+    /// there — but the client MUST link an identical schema. Lazy:
+    /// nothing is encoded when no client is subscribed. `0` disables
+    /// (the default). Suggested value: 2602 (first free port after the
+    /// text ports).
+    #[arg(long, default_value_t = 0)]
+    analyzer_binary_port: u16,
+
     /// Also write NMEA 0183 sentences (including AIVDM) to stdout —
     /// mirrors canboat C `n2kd`'s `--nmea0183` flag. Off by default,
     /// matching n2kd's TCP-multiplex behaviour; subscribers should
@@ -363,6 +375,7 @@ fn run(cli: Cli) -> Result<()> {
         raw: Arc::new(Hub::new()),
         nmea: Arc::new(Hub::new()),
         analyzer: Arc::new(Hub::new()),
+        bin: Arc::new(BinHub::new()),
         snapshot: snapshot.clone(),
         engine: Arc::clone(&engine),
         quirks: quirks::Quirks::new(quirks_kinds),
@@ -469,6 +482,15 @@ fn run(cli: Cli) -> Result<()> {
                 cli.ais_port,
             );
         }
+    }
+    if cli.analyzer_binary_port != 0 {
+        // Read-only binary analyzer stream. Shares the decode with the
+        // JSON/NMEA outputs; only the (lazy) WirePgn encode is extra.
+        tcp_joins.push(tcp::spawn_binary_stream(
+            cli.bind,
+            cli.analyzer_binary_port,
+            hubs.bin.clone(),
+        )?);
     }
 
     let _ = inject; // No further use in this function

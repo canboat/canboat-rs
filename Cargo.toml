@@ -16,6 +16,7 @@ members = [
     "crates/socketcan-writer",
     "crates/socketcan-serial",
     "crates/n2kd",
+    "crates/canboat-wire",
     "crates/canboat-pipeline",
     "crates/canboat-tui",
 ]
@@ -33,6 +34,7 @@ canboat-schema = { path = "crates/canboat-schema", version = "0.3.0" } # x-relea
 canboat-core   = { path = "crates/canboat-core",   version = "0.3.0" } # x-release-please-version
 canboat-io     = { path = "crates/canboat-io",     version = "0.3.0" } # x-release-please-version
 canboat-cli    = { path = "crates/canboat-cli",    version = "0.3.0" } # x-release-please-version
+canboat-wire   = { path = "crates/canboat-wire",   version = "0.3.0" } # x-release-please-version
 
 serde      = { version = "1", features = ["derive"] }
 serde_json = "1"

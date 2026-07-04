@@ -52,6 +52,11 @@ pub(crate) fn djb2_hash_str(s: &str) -> u64 {
 pub struct PgnDatabase {
     pub schema_version: &'static str,
     pub version: &'static str,
+    /// FNV-1a/64 content hash of the schema source (canboat.json +
+    /// synthetic-pgns.json), emitted by `build.rs`. Two processes that
+    /// exchange field indices on the wire must share this exact value —
+    /// see canboat-wire's handshake.
+    pub schema_hash: u64,
 
     pgns: &'static [PgnInfo],
     /// `(pgn_number, indices_into_pgns)`, sorted by `pgn_number` for
@@ -68,6 +73,7 @@ pub struct PgnDatabase {
 static EMBEDDED: PgnDatabase = PgnDatabase {
     schema_version: schema_data::SCHEMA_VERSION,
     version: schema_data::VERSION,
+    schema_hash: schema_data::SCHEMA_HASH,
     pgns: schema_data::PGNS,
     pgn_index: schema_data::PGN_INDEX,
     lookups: schema_data::LOOKUPS,

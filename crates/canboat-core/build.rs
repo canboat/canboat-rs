@@ -874,6 +874,24 @@ fn main() {
     )
     .unwrap();
 
+    // Content hash over the raw schema source bytes (canboat.json then
+    // synthetic-pgns.json). This is the schema identity two processes
+    // exchange to prove they were built from byte-identical schema data
+    // before trusting each other's field indices on the wire (see
+    // canboat-wire). Any edit to either file — versioned or not —
+    // changes this, so a mismatch fails the handshake loudly instead of
+    // silently mis-decoding fields. FNV-1a/64: dependency-free, stable,
+    // and drift-detection is all it needs to be (not security).
+    let schema_hash: u64 = {
+        let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+        for &b in canboat_bytes.iter().chain(synthetic_bytes.iter()) {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
+    };
+    writeln!(out, "pub const SCHEMA_HASH: u64 = {};", schema_hash).unwrap();
+
     // The Copyright field is a multi-line banner (version, (C) line,
     // Apache license boilerplate). The (C) line is the one the C
     // tools print in their usage/verbose output — extract just that.

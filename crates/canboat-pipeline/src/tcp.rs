@@ -70,17 +70,15 @@ pub const CANBOAT_FORMAT_FAST_HEADER: &[u8] = b"# format=FAST\n";
 use crate::hub::Hub;
 use crate::snapshot::SnapshotStore;
 
-/// Disable Nagle's algorithm on a freshly-accepted client socket.
-/// Without this, the kernel batches small writes for up to ~40 ms
-/// looking for more data to coalesce — fine for bulk transfers,
-/// terrible for the per-sentence streams this binary produces.
-/// Logged at debug level if setsockopt fails so the failure is
-/// noticed but doesn't take the client connection down.
-fn set_nodelay(stream: &TcpStream, name: &str) {
-    if let Err(e) = stream.set_nodelay(true) {
-        log::debug!("{name}: set_nodelay failed: {e}");
-    }
-}
+// Nagle's algorithm is deliberately left ENABLED on every client
+// socket (no `set_nodelay`). These are telemetry streams, not
+// request/response protocols: at bus rates (hundreds of lines/s)
+// the kernel coalescing consecutive small writes into full segments
+// is pure win — fewer packets, fewer syscall-sized wakeups on the
+// receiver — and the added latency is bounded by the ACK round-trip
+// (sub-millisecond on loopback / LAN). The write loops below batch
+// at the application level too; Nagle mops up whatever still goes
+// out small.
 
 /// Bind the snapshot server. Each accepted client gets one dump of
 /// every live `(pgn, src, secondary)` cache entry then the connection
@@ -118,7 +116,6 @@ fn snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
 }
 
 fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
-    set_nodelay(&stream, "snapshot");
     // Snapshot is a strictly read-only one-shot: FIN the read
     // direction immediately so any client writes during the brief
     // window before the dump completes get ECONNRESET / EPIPE
@@ -176,7 +173,6 @@ fn ais_snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
 }
 
 fn run_ais_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
-    set_nodelay(&stream, "ais");
     if let Err(e) = stream.shutdown(Shutdown::Read) {
         log::debug!("ais: shutdown(read) failed: {e}");
     }
@@ -266,8 +262,6 @@ fn run_stream_client(
     direction: Direction,
     header: Option<&'static [u8]>,
 ) {
-    set_nodelay(&stream, name);
-
     let read_handle = match direction {
         // Strictly read-only: FIN the read direction so any client
         // write attempts get ECONNRESET / EPIPE instead of silently
@@ -304,8 +298,26 @@ fn run_stream_client(
     {
         return;
     }
+    // Batch: block for the first line, then greedily drain whatever
+    // is already queued and push it all out with a single write.
+    // A burst (one fast-packet flurry decoding into many lines, or a
+    // slow client catching up) collapses into one syscall; a quiet
+    // stream still sends each line immediately — `try_recv` comes
+    // back `Empty` and the single-line batch goes straight out. The
+    // cap only bounds memory; a burst larger than it simply takes
+    // more than one write.
+    const MAX_BATCH: usize = 64 * 1024;
+    let mut batch: Vec<u8> = Vec::with_capacity(4096);
     while let Ok(line) = rx.recv() {
-        if stream.write_all(line.as_bytes()).is_err() {
+        batch.clear();
+        batch.extend_from_slice(line.as_bytes());
+        while batch.len() < MAX_BATCH {
+            match rx.try_recv() {
+                Ok(line) => batch.extend_from_slice(line.as_bytes()),
+                Err(_) => break,
+            }
+        }
+        if stream.write_all(&batch).is_err() {
             break;
         }
     }

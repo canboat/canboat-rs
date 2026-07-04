@@ -27,6 +27,7 @@ use std::io::{self, LineWriter, Write};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
+use std::time::{Duration, Instant};
 
 use canboat_core::format::write_plain;
 use canboat_core::output::{JsonOptions, write_json};
@@ -40,6 +41,74 @@ use crate::snapshot::SnapshotStore;
 
 thread_local! {
     static JSON_BUF: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+/// Source-side output batcher for one broadcast hub.
+///
+/// Broadcasting per line costs a channel send, a futex wake, and a
+/// `write` syscall *per subscriber per line* — at bus rates that
+/// dwarfs the formatting work. Instead, lines accumulate here and go
+/// out as one multi-line chunk when the batch is old enough or big
+/// enough. Subscribers are line-oriented streams, so a chunk of
+/// whole lines is indistinguishable from the same lines sent singly.
+///
+/// Flushing is driven by the pipeline's own frame loop (one
+/// [`OutputBatcher::flush_due`] call per received frame), which at
+/// bus rates checks far more often than `MAX_AGE` — and a quiet bus
+/// has nothing pending to flush, so no timer thread is needed.
+struct OutputBatcher {
+    hub: Arc<Hub>,
+    pending: String,
+    oldest: Instant,
+}
+
+/// Flush when the oldest pending line has waited this long…
+const BATCH_MAX_AGE: Duration = Duration::from_millis(25);
+/// …or when this much output has accumulated, whichever comes first.
+const BATCH_MAX_BYTES: usize = 16 * 1024;
+
+impl OutputBatcher {
+    fn new(hub: Arc<Hub>) -> Self {
+        Self {
+            hub,
+            pending: String::with_capacity(2048),
+            oldest: Instant::now(),
+        }
+    }
+
+    #[inline]
+    fn has_subscribers(&self) -> bool {
+        self.hub.has_subscribers()
+    }
+
+    /// Queue one line (trailing `\n` included by the caller).
+    fn push(&mut self, line: &str, now: Instant) {
+        if self.pending.is_empty() {
+            self.oldest = now;
+        }
+        self.pending.push_str(line);
+        if self.pending.len() >= BATCH_MAX_BYTES {
+            self.flush();
+        }
+    }
+
+    #[inline]
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// Flush if the oldest pending line has exceeded [`BATCH_MAX_AGE`].
+    #[inline]
+    fn flush_due(&mut self, now: Instant) {
+        if !self.pending.is_empty() && now.duration_since(self.oldest) >= BATCH_MAX_AGE {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        self.hub.broadcast(&self.pending);
+        self.pending.clear();
+    }
 }
 
 fn is_ais_pgn(pgn: u32) -> bool {
@@ -140,15 +209,37 @@ pub fn run(
     // so there's no risk of an infinite synthesis loop.
     let mut pending_synth: VecDeque<RawFrame> = VecDeque::new();
 
+    let mut raw_batch = OutputBatcher::new(hubs.raw.clone());
+    let mut nmea_batch = OutputBatcher::new(hubs.nmea.clone());
+    let mut analyzer_batch = OutputBatcher::new(hubs.analyzer.clone());
+
     loop {
+        let any_pending =
+            raw_batch.has_pending() || nmea_batch.has_pending() || analyzer_batch.has_pending();
         let frame = if let Some(synth) = pending_synth.pop_front() {
             synth
+        } else if any_pending {
+            // Output is waiting on a batch deadline: don't block
+            // indefinitely on a quiet bus. On timeout, flush what's
+            // pending and go back to waiting.
+            match frames_rx.recv_timeout(BATCH_MAX_AGE) {
+                Ok(f) => f,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    let now = Instant::now();
+                    raw_batch.flush_due(now);
+                    nmea_batch.flush_due(now);
+                    analyzer_batch.flush_due(now);
+                    continue;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+            }
         } else {
             match frames_rx.recv() {
                 Ok(f) => f,
                 Err(_) => break,
             }
         };
+        let now = Instant::now();
 
         // Quirk shim: inspect the inbound bus frame, maybe synthesise.
         // Each synthetic is written to the bus (so external consumers
@@ -165,11 +256,11 @@ pub fn run(
 
         // Lazy raw broadcast — one `# format=FAST` PLAIN line
         // per coalesced `RawFrame`.
-        if hubs.raw.has_subscribers() {
+        if raw_batch.has_subscribers() {
             raw_line.clear();
             if write_plain(&mut raw_line, &frame).is_ok() {
                 raw_line.push('\n');
-                hubs.raw.broadcast(&raw_line);
+                raw_batch.push(&raw_line, now);
             }
         }
 
@@ -217,36 +308,40 @@ pub fn run(
         // Updates "last received" stamps for PGN 60928 and 126996.
         hubs.engine.note_device_seen(decoded.pgn, decoded.src);
 
-        // Lazy analyzer JSON broadcast / snapshot stash — one JSON
-        // line per decoded record. Serialization runs when either
-        // the analyzer hub has subscribers OR the snapshot store is
-        // configured. The JSON serializer walks every decoded field,
-        // so skipping when no one needs the line actually buys
-        // something on a high-rate input stream.
-        let want_json = hubs.analyzer.has_subscribers() || hubs.snapshot.is_some();
+        // Lazy analyzer JSON — serialized at most ONCE per decoded
+        // record and shared by all three consumers: the snapshot
+        // cache, the analyzer port broadcast, and the NMEA 0183
+        // fallback converter below. The serializer walks every
+        // decoded field, so skipping it when no one needs the line
+        // actually buys something on a high-rate input stream.
+        let want_json = analyzer_batch.has_subscribers() || hubs.snapshot.is_some();
+        let mut json_ok = false;
         if want_json {
             json_line.clear();
-            if write_json(&mut json_line, &decoded, &json_opts).is_ok() {
-                // Snapshot wants the bare JSON (it embeds the line as
-                // a value inside its own nested wrapper). The
-                // analyzer port wants one-record-per-line, so we tack
-                // the newline on for that path only.
-                if let Some(snap) = hubs.snapshot.as_ref() {
-                    snap.store(&decoded, json_line.clone());
-                }
-                if hubs.analyzer.has_subscribers() {
-                    json_line.push('\n');
-                    hubs.analyzer.broadcast(&json_line);
-                }
+            json_ok = write_json(&mut json_line, &decoded, &json_opts).is_ok();
+            // Snapshot wants the bare JSON (it embeds the line as a
+            // value inside its own nested wrapper).
+            if json_ok && let Some(snap) = hubs.snapshot.as_ref() {
+                snap.store(&decoded, json_line.clone());
             }
         }
 
+        // NMEA 0183 conversion only runs when someone will see the
+        // result — a connected TCP subscriber or `--nmea0183-stdout`.
+        // With neither, the per-record cost is two atomic loads.
         nmea_buf.clear();
         let pgn = decoded.pgn;
-        let n_emitted = if n2kd::decoded::Handles::supports(pgn) {
+        let n_emitted = if !emit_nmea_stdout && !nmea_batch.has_subscribers() {
+            0
+        } else if n2kd::decoded::Handles::supports(pgn) {
             n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles)
         } else if is_ais_pgn(pgn) {
             n2kd::ais_decoded::convert(&mut nmea_buf, &decoded, &mut ais_seq)
+        } else if json_ok {
+            // The analyzer JSON for this record is already in
+            // `json_line` — feed the converter from there instead of
+            // serializing the same record a second time.
+            n2kd::nmea0183::convert(&mut nmea_buf, &json_line, &mut rl)
         } else {
             JSON_BUF.with(|c| {
                 let mut buf = c.borrow_mut();
@@ -259,10 +354,26 @@ pub fn run(
             if emit_nmea_stdout {
                 let _ = out.write_all(nmea_buf.as_bytes());
             }
-            if hubs.nmea.has_subscribers() {
-                hubs.nmea.broadcast(&nmea_buf);
+            if nmea_batch.has_subscribers() {
+                nmea_batch.push(&nmea_buf, now);
             }
         }
+
+        // Analyzer port broadcast last, so the newline appended for
+        // its one-record-per-line framing doesn't leak into the
+        // shared bare-JSON uses above.
+        if json_ok && analyzer_batch.has_subscribers() {
+            json_line.push('\n');
+            analyzer_batch.push(&json_line, now);
+        }
+
+        raw_batch.flush_due(now);
+        nmea_batch.flush_due(now);
+        analyzer_batch.flush_due(now);
     }
+    // Shutdown: push out whatever the batchers still hold.
+    raw_batch.flush();
+    nmea_batch.flush();
+    analyzer_batch.flush();
     out.flush().ok();
 }

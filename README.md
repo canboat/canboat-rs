@@ -1,49 +1,90 @@
 # canboat-rs
 
-A Rust implementation of (most of) the [canboat](https://github.com/canboat/canboat)
-NMEA 2000 tooling. Sister project to canboat — same PGN database, same wire
-formats, but built as a sans-I/O library with thin sync and async adapters
-above it.
+Advanced tooling for NMEA 2000. Sister project to
+[canboat](https://github.com/canboat/canboat) — same PGN database, same wire
+formats.
 
-## Architecture
+The project serves two purposes. First, a more composable way of working with
+the CANboat database, built with modern tools: the PGN database is compiled
+into a sans-I/O core library, with thin sync and async adapters above it, so
+you can embed NMEA 2000 decoding in your own application instead of parsing
+another program's output. Second, more polished end-to-end solutions —
+`canboat-pipeline` runs the whole device-to-services chain in one process,
+and `canboat-tui` puts an interactive monitor on top of it.
 
-- **`canboat-core`** — sans-I/O library. PGN database, format parsers,
-  reassembly, decoder, encoder, output formatters. No `std::io`, no
-  `tokio`, no threads.
-- **`canboat-io`** — sync `std::io` adapters (stdin, `serialport`,
-  `std::net`). Used by the standalone binaries.
-- **`canboat-tokio`** — async tokio adapters. Used to embed the canboat
-  decode pipeline in a tokio application (e.g. merrimac-rs).
-- **`canboat-cli`** — shared CLI plumbing for the standalone binaries.
-- **Binaries** — each links `canboat-core` + `canboat-io` +
-  `canboat-cli`. Sync, small.
+## The library side
 
-## Binary status
+- **`canboat-core`** — sans-I/O. PGN database, format parsers, reassembly,
+  decoder, encoder, output formatters. No `std::io`, no `tokio`, no threads.
+  The schema (`canboat.json`) is compiled in at build time; there is nothing
+  to load or distribute at runtime.
+- **`canboat-io`** — sync `std::io` adapters (stdin, serial, `std::net`).
+  Used by the standalone binaries.
+- **`canboat-tokio`** — async tokio adapters, for embedding the decode
+  pipeline in a tokio application.
+- **`canboat-cli`**, **`canboat-schema`** — shared CLI plumbing and schema
+  types.
 
-The following binaries are working against real hardware / real
-captures and pass the byte-for-byte golden-test suite where one
-exists:
+Note: as this is not hitting crates.io yet, we may decide that a different
+crate structure is better. This is still v0.x, so expect breakage!
 
-| Binary             | What it does                                                                  | Hardware-tested      |
-|--------------------|-------------------------------------------------------------------------------|----------------------|
-| `analyzer`         | Decode PLAIN/FAST (and other formats) into canboat text or JSON. Drop-in for canboat C's analyzer; `--si`, `--camel` / `--upper-camel`, `-empty`, `-nv`, `-debug`, `-geo` flags. | yes (replay)         |
-| `ikonvert-serial`  | Digital Yacht iKonvert ↔ canboat PLAIN/FAST. ACK-driven init handshake, mid-stream device-reset recovery. | yes (live device)    |
-| `n2kd`             | Analyzer-JSON → NMEA 0183 / AIVDM multiplexer, drop-in for canboat C `n2kd`.   | yes (replay)         |
-| `canboat-pipeline` | Single-process device-reader → analyzer → n2kd. Snapshot / NMEA 0183 / analyzer-JSON / CSV-R/W / write-only TCP servers, supervisor-based device reconnect, lazy formatting. | yes (live iKonvert)  |
-| `socketcan-serial` | Linux SocketCAN ↔ canboat FAST. Software fast-packet reassembly, `SO_TIMESTAMP`. Full ISO node: address claim (PGN 60928, scan-then-claim, back-off), Product Information (126996), PGN List (126464), NAK of unsupported addressed requests (59392), Heartbeat (126993, default 60 s) configurable via Request Group Function (126208). Drop-in for canboat C's socketcan-serial. | yes (live, mcp2515) |
+## The tool side
 
-Other binaries (`actisense-serial`, `maretron-ipg`, `replay`,
-`candump2analyzer`, `pcap2candump`, `socketcan-writer`) build and
-have unit tests but haven't been exercised end-to-end against
-hardware in this repo yet.
+`canboat-pipeline` is the flagship: a single process that reads a device
+(iKonvert, Actisense, SocketCAN, Maretron IPG, or a log file), decodes, and
+serves snapshot / analyzer-JSON / NMEA 0183 / CSV over TCP, with
+supervisor-based device reconnect.
 
-See [PGN data](data/VERSION) for the upstream canboat release this repo
-tracks.
+`canboat-tui` is a text user interface à la `top` that allows you to view
+messages either live or from a log file, in various ways. It will improve
+over time to become the go-to way of reading log files, monitoring
+interesting situations on a live bus, and configuring devices.
+
+The rest are canboat-compatible building blocks: `analyzer` (drop-in for the
+C analyzer, PLAIN/FAST/Actisense/YDWG02/iKonvert input, text or JSON out),
+`n2kd`, the device bridges (`actisense-serial`, `ikonvert-serial`,
+`maretron-ipg`, `socketcan-serial`, `socketcan-writer`), and the small
+utilities (`replay`, `candump2analyzer`, `pcap2candump`).
+
+`analyzer`, `ikonvert-serial`, `n2kd`, `canboat-pipeline`, and
+`socketcan-serial` are exercised against real hardware and pass a
+byte-for-byte golden-test suite against canboat C's output.
+
+## Installation
+
+Each [release](https://github.com/canboat/canboat-rs/releases) ships all the
+binaries as one archive per platform: static musl Linux builds for x86_64,
+aarch64, and armv7 (Raspberry Pi class), a macOS universal binary, and
+Windows x86_64.
+
+Or build from source (Rust 1.88+):
+
+```
+git clone https://github.com/canboat/canboat-rs
+cd canboat-rs
+cargo build --release
+```
+
+## The PGN database
+
+The vendored schema lives in `crates/canboat-core/data/canboat.json`;
+`CANBOAT_REF` next to it records the upstream canboat commit it was copied
+from. CI checks the two stay in lockstep: the vendored file must be
+byte-identical to `docs/canboat.json` at that ref, and the golden tests run
+against that same ref's fixtures. To move to a newer canboat release:
+
+```
+make sync-canboat REF=v7.2.0
+```
+
+then commit both files together — the test suite tells you whether the
+decoder needs work for the new schema. Every binary reports the embedded
+schema version in `--help` and in its startup log line.
 
 ## Performance
 
 Same decode work — `-json -nv` over 1.26 M PGN frames (canboat's
-`dirona-actisense-serial.raw` × 50) on an M1 Pro, release build:
+`dirona-actisense-serial.raw` × 50) on an M4 Pro, release build:
 
 | Implementation         | Wall time | vs canboat-rs |
 |------------------------|----------:|--------------:|
@@ -51,11 +92,9 @@ Same decode work — `-json -nv` over 1.26 M PGN frames (canboat's
 | canboat C              |   9.1 s   |   **2.6 ×**   |
 | canboat-rs `analyzer`  |   3.4 s   |       1.0 ×   |
 
-The Rust analyzer is ~8 × faster than canboatjs and ~2.6 × faster
-than the canboat C analyzer on the same input. canboat-rs also
-goes one step further — `canboat-pipeline` collapses the
-`analyzer | n2kd` pipeline into a single process with no JSON
-text serialisation between stages:
+`canboat-pipeline` goes one step further and collapses the
+`analyzer | n2kd` pipeline into a single process with no JSON text
+serialisation between stages:
 
 | Pipeline                                | Wall time | Throughput            |
 |-----------------------------------------|----------:|-----------------------|
@@ -63,41 +102,19 @@ text serialisation between stages:
 | `analyzer \| n2kd` (piped, two procs)   |   6.5 s   | 194 k sentences / s   |
 | `canboat-pipeline` (single proc)        |   3.5 s   | 360 k sentences / s   |
 
-`canboat-pipeline` is **46 % faster wall-time** than the equivalent
-piped `analyzer | n2kd` setup, while doing strictly more work
-(it's a long-running service with TCP fan-out). On CPU time the
-ratio is closer to **3.4 ×** (3.42 s user vs. 10.7 s combined for
-the piped pipeline). The savings come from a few design choices:
+That's 46 % less wall time than the piped setup while doing strictly more
+work (it's a long-running service with TCP fan-out); on CPU time the ratio
+is closer to 3.4 ×.
 
-- **Structs between stages.** `RawFrame` and `DecodedPgn` move
-  across mpsc channels between the device reader, the analyzer,
-  and the NMEA 0183 converter. No JSON text round-trip for any
-  PGN the struct path covers (currently all non-fallback PGNs +
-  all 11 AIS encoders). The fallback JSON path is the only
-  remaining string serialisation in the hot loop.
-- **Lazy formatting on every output port.** Each TCP server hub
-  checks `has_subscribers()` (one relaxed atomic load) before
-  spending cycles to format. With no clients connected, the only
-  active per-frame cost on the analyzer-JSON, NMEA-0183, and CSV
-  ports is that atomic. Numbers above are with all ports idle.
-- **O(1) field lookups.** `DecodedPgn::field(handle)` is one
-  array-indexed load through a pre-resolved `FieldHandle` — no
-  field-name string compares in the hot path.
-- **TCP_NODELAY on every accepted client socket** so per-sentence
-  writes don't sit in Nagle's 40 ms coalescing window.
-- **`LineWriter` on stdout** (when `--nmea0183-stdout` is on) so
-  each sentence flushes on its newline rather than batching into
-  64 KB chunks.
+## Contributing
 
-Enabling the canboat-C-compatible snapshot port (`--snapshot-port
-N`, default 2597) forces JSON to be serialised for every decoded
-record so the cache stays warm, costing about **50 %** more wall
-time (3.5 s → 4.5 s on the same corpus). Disable with
-`--snapshot-port 0` to get back to the lazy hot path.
-
-End-to-end on real iKonvert hardware (Pi 4, ~50 frames / s of
-real bus traffic) the binary holds steady at <2 % CPU.
+`make precommit` runs what CI checks (fmt, clippy, tests). PR titles follow
+[Conventional Commits](https://www.conventionalcommits.org/) — releases and
+the changelog are derived from them. The golden tests need a canboat
+checkout: a sibling `../canboat`, or point `CANBOAT_DIR` at one.
 
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+(C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.

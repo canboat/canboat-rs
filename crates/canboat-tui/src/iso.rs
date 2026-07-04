@@ -78,6 +78,28 @@ pub fn iso_request(dst: u8, requested_pgn: u32) -> String {
     format_plain(6, 59904, TUI_SRC, dst, &payload)
 }
 
+/// PLAIN line for the pipeline's NMEA 0183 filter control PGN (262657),
+/// **Set** form (Function 1): mute or unmute `sentence` — a 3-letter
+/// formatter (e.g. `"VHW"`) or `"ALL"` for the whole source — on the
+/// device currently at source address `source`. The pipeline
+/// intercepts this before bus injection; it never reaches the wire.
+///
+/// Payload: `[Function=1, Source, s0, s1, s2, Muted, 0xff, 0xff]`.
+pub fn nmea0183_filter_set(source: u8, sentence: &str, muted: bool) -> String {
+    let s = sentence.as_bytes();
+    let data = [
+        1u8, // Function: Set
+        source,
+        *s.first().unwrap_or(&b' '),
+        *s.get(1).unwrap_or(&b' '),
+        *s.get(2).unwrap_or(&b' '),
+        u8::from(muted),
+        0xff,
+        0xff,
+    ];
+    format_plain(7, 262657, TUI_SRC, 255, &data)
+}
+
 /// PLAIN line for PGN 126208 **Request** (function code 0) addressed
 /// to `dst`, asking it to set the transmission interval of
 /// `commanded_pgn` to `interval_ms` (1 ms units; `0` means stop
@@ -162,6 +184,20 @@ mod tests {
     /// Strip the leading ISO timestamp so the assertion is stable.
     fn no_ts(line: &str) -> &str {
         line.split_once(',').map(|(_, rest)| rest).unwrap_or(line)
+    }
+
+    #[test]
+    fn nmea0183_filter_set_whole_source() {
+        // Function=1, source=33 (0x21), "ALL" = 41,4c,4c, muted=1.
+        let line = nmea0183_filter_set(33, "ALL", true);
+        assert_eq!(no_ts(&line), "7,262657,0,255,8,01,21,41,4c,4c,01,ff,ff");
+    }
+
+    #[test]
+    fn nmea0183_filter_set_one_sentence_unmute() {
+        // source=35 (0x23), "VLW" = 56,4c,57, muted=0.
+        let line = nmea0183_filter_set(35, "VLW", false);
+        assert_eq!(no_ts(&line), "7,262657,0,255,8,01,23,56,4c,57,00,ff,ff");
     }
 
     #[test]

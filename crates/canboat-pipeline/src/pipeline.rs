@@ -443,7 +443,12 @@ pub fn run(
         nmea_buf.clear();
         let pgn = decoded.pgn;
         let mut ais_branch = false;
-        let converted = if !emit_nmea_stdout && !nmea_batch.has_subscribers() {
+        // Convert when someone will see the 0183, OR when the filter is
+        // active: the filter learns each device's producible sentences
+        // by observing conversions, and the TUI needs that inventory
+        // (via the 262657 Report) even with no 0183 client attached.
+        let want_nmea = emit_nmea_stdout || nmea_batch.has_subscribers() || nmea_filter.is_some();
+        let converted = if !want_nmea {
             false
         } else if n2kd::decoded::Handles::supports(pgn) {
             n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles) > 0

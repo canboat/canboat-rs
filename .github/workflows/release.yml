@@ -1,0 +1,162 @@
+name: Release
+
+# Build release binaries for every supported platform when a release
+# tag lands and attach them to the GitHub release. release-please
+# creates the tag + release (with changelog notes) when the release PR
+# is merged; this workflow only adds the binary assets, so it passes no
+# body to action-gh-release (that would clobber the notes).
+#
+# NOTE: a tag created by release-please running with the fallback
+# GITHUB_TOKEN does NOT trigger this workflow — GitHub suppresses
+# workflow triggers for events caused by GITHUB_TOKEN. Set
+# RELEASE_PLEASE_TOKEN (preferred), or run this manually via
+# workflow_dispatch with the tag selected as the ref.
+#
+# Targets mirror where canboat runs in practice: static musl Linux
+# builds for x86_64 / aarch64 / armv7 (Raspberry Pi and other boat
+# computers — same coverage as canboat C's armv7l-musl release), a
+# macOS universal binary, and Windows x86_64.
+
+on:
+  push:
+    tags: ["v[0-9]+.[0-9]+.[0-9]+"]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  BINS: >-
+    analyzer actisense-serial ikonvert-serial maretron-ipg replay
+    candump2analyzer pcap2candump socketcan-serial socketcan-writer
+    n2kd canboat-pipeline canboat-tui
+
+jobs:
+  build-linux:
+    name: Build ${{ matrix.target }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+          - armv7-unknown-linux-musleabihf
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Install cross
+        run: cargo install cross
+
+      - name: Build
+        run: cross build --release --workspace --locked --target ${{ matrix.target }}
+
+      - name: Package
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf "$GITHUB_WORKSPACE/canboat-rs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" ${BINS}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: canboat-rs-${{ matrix.target }}
+          path: canboat-rs-*.tar.gz
+
+  build-macos:
+    name: Build macOS universal
+    runs-on: macos-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Build ARM64
+        run: cargo build --release --workspace --locked --target aarch64-apple-darwin
+
+      - name: Build x86_64
+        run: cargo build --release --workspace --locked --target x86_64-apple-darwin
+
+      - name: Create universal binaries
+        run: |
+          mkdir -p universal
+          for b in ${BINS}; do
+            lipo -create \
+              "target/aarch64-apple-darwin/release/$b" \
+              "target/x86_64-apple-darwin/release/$b" \
+              -output "universal/$b"
+          done
+          file universal/analyzer
+
+      - name: Package
+        run: |
+          cd universal
+          tar -czf "$GITHUB_WORKSPACE/canboat-rs-${{ github.ref_name }}-universal-apple-darwin.tar.gz" ${BINS}
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: canboat-rs-macos
+          path: canboat-rs-*.tar.gz
+
+  build-windows:
+    name: Build Windows
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - uses: swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --workspace --locked
+
+      - name: Package
+        run: |
+          $paths = $env:BINS -split '\s+' | ForEach-Object { "target/release/$_.exe" }
+          Compress-Archive -Path $paths -DestinationPath "canboat-rs-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: canboat-rs-windows
+          path: canboat-rs-*.zip
+
+  upload:
+    name: Attach assets to release
+    needs: [build-linux, build-macos, build-windows]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+
+      - name: List artifacts
+        run: find artifacts -type f
+
+      # No `body`: the release already exists with release-please's
+      # changelog notes; this only attaches the binary archives.
+      - name: Attach to release
+        uses: softprops/action-gh-release@v3
+        with:
+          tag_name: ${{ github.ref_name }}
+          files: |
+            artifacts/**/*.tar.gz
+            artifacts/**/*.zip

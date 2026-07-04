@@ -45,11 +45,11 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Checkout canboat golden fixtures
         if: runner.os != 'Windows'
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
         with:
           repository: canboat/canboat
           ref: ${{ env.CANBOAT_FIXTURES_REF }}
@@ -60,13 +60,6 @@ jobs:
 
       - name: Cache cargo & target
         uses: Swatinem/rust-cache@v2
-
-      - name: Install system dependencies
-        # serialport (transitively used by the workspace) needs libudev on Linux.
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config
 
       - name: Build
         run: cargo build --workspace --locked
@@ -87,7 +80,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust 1.88
         uses: dtolnay/rust-toolchain@master
@@ -97,11 +90,6 @@ jobs:
       - name: Cache cargo & target
         uses: Swatinem/rust-cache@v2
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config
-
       - name: Check
         run: cargo check --workspace --locked
 
@@ -110,7 +98,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -120,11 +108,6 @@ jobs:
       - name: Cache cargo & target
         uses: Swatinem/rust-cache@v2
 
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libudev-dev pkg-config
-
       - name: Clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
@@ -133,7 +116,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Install Rust stable with rustfmt
         uses: dtolnay/rust-toolchain@stable

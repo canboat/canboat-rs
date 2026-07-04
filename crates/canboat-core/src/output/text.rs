@@ -249,6 +249,22 @@ fn write_latlon<W: fmt::Write>(w: &mut W, dd: f64, name: &str, geo: GeoFormat) -
     }
 }
 
+/// Append the unit for a numeric field, ` <unit>` style.
+///
+/// canboat C stores a Match field's expected value as its internal
+/// unit string (`"=15"`), and the plain-number print path appends it
+/// like any other unit — so a NUMBER match field renders as
+/// `Report Type = 15 =15`. canboat.json exports that as `Match` with
+/// no `Unit`, so synthesize the pseudo-unit here for parity.
+fn write_unit<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result {
+    if let Some(unit) = &f.unit() {
+        write!(w, " {}", unit)?;
+    } else if let Some(m) = f.info.match_value {
+        write!(w, " ={}", m)?;
+    }
+    Ok(())
+}
+
 fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat) -> fmt::Result {
     match &f.value {
         FieldValue::Number(v) => {
@@ -263,16 +279,12 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
             }
             let p = effective_precision(f.precision(), f.resolution());
             write!(w, "{:.*}", p, v)?;
-            if let Some(unit) = &f.unit() {
-                write!(w, " {}", unit)?;
-            }
+            write_unit(w, f)?;
             Ok(())
         }
         FieldValue::Integer(v) => {
             write!(w, "{}", v)?;
-            if let Some(unit) = &f.unit() {
-                write!(w, " {}", unit)?;
-            }
+            write_unit(w, f)?;
             Ok(())
         }
         FieldValue::Float(v) => {

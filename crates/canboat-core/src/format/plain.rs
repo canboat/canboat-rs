@@ -312,10 +312,21 @@ mod tests {
 
     #[test]
     fn rejects_oversized_len() {
-        let line = "ts,3,129029,36,255,250";
+        // RAWFRAME_MAX_SIZE is 255 * 7 = 1785 (ISO-TP maximum).
+        let line = "ts,3,129029,36,255,1786";
         assert!(matches!(
             parse_line(line),
             Err(ParseError::LengthTooLarge { .. })
+        ));
+        // 250 declared bytes is in range since ISO-TP support; with no
+        // payload supplied it now fails on the byte count instead.
+        let line = "ts,3,129029,36,255,250";
+        assert!(matches!(
+            parse_line(line),
+            Err(ParseError::BadPayloadCount {
+                expected: 250,
+                found: 0
+            })
         ));
     }
 

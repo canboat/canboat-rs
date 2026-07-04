@@ -9,6 +9,11 @@
 #             golden fixtures for now: the runner's git checks fixtures
 #             out with CRLF line endings, which breaks the byte-exact
 #             diffs.
+#   - schema-pin: the vendored crates/canboat-core/data/canboat.json must
+#             be byte-identical to docs/canboat.json at the canboat ref
+#             recorded in crates/canboat-core/data/CANBOAT_REF. That ref
+#             is also where the golden fixtures are checked out, so the
+#             schema and the fixtures can never drift apart.
 #   - msrv:   `cargo check` with the workspace's declared rust-version.
 #   - clippy: -D warnings, all targets.
 #   - fmt:    rustfmt check.
@@ -26,15 +31,6 @@ concurrency:
   group: ci-${{ github.head_ref || github.ref_name }}
   cancel-in-progress: ${{ github.ref_name != 'main' }}
 
-env:
-  # canboat C ref whose analyzer/tests fixtures decode identically to
-  # the vendored data/canboat.json. These two move in lockstep: when
-  # data/canboat.json is updated to a newer canboat state, bump this
-  # ref in the same PR (and vice versa) so the golden tests stay green.
-  # 244abdf = master state matching the currently vendored schema
-  # (v7.1.0 + PK annotations + navico PGNs through #731).
-  CANBOAT_FIXTURES_REF: 244abdfdcbe9aa7b8c432448f6dfd47742c4d552
-
 jobs:
   test:
     name: Build & Test (${{ matrix.os }})
@@ -47,12 +43,21 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
 
+      - name: Read canboat schema pin
+        id: pin
+        shell: bash
+        run: echo "ref=$(cat crates/canboat-core/data/CANBOAT_REF)" >> "$GITHUB_OUTPUT"
+
+      # The fixtures come from the same canboat commit the vendored
+      # schema was copied from (see the schema-pin job), so golden
+      # output and schema always agree. `make sync-canboat REF=...`
+      # updates both the json and the pin together.
       - name: Checkout canboat golden fixtures
         if: runner.os != 'Windows'
         uses: actions/checkout@v6
         with:
           repository: canboat/canboat
-          ref: ${{ env.CANBOAT_FIXTURES_REF }}
+          ref: ${{ steps.pin.outputs.ref }}
           path: canboat-fixtures
 
       - name: Install Rust stable
@@ -74,6 +79,31 @@ jobs:
       - name: Test
         if: runner.os == 'Windows'
         run: cargo test --workspace --locked
+
+  schema-pin:
+    name: Schema matches pinned canboat ref
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Read canboat schema pin
+        id: pin
+        run: echo "ref=$(cat crates/canboat-core/data/CANBOAT_REF)" >> "$GITHUB_OUTPUT"
+
+      - name: Checkout pinned canboat
+        uses: actions/checkout@v6
+        with:
+          repository: canboat/canboat
+          ref: ${{ steps.pin.outputs.ref }}
+          path: canboat-pinned
+
+      - name: Vendored canboat.json must be byte-identical to the pin
+        run: |
+          if ! cmp crates/canboat-core/data/canboat.json canboat-pinned/docs/canboat.json; then
+            echo "::error::crates/canboat-core/data/canboat.json differs from docs/canboat.json at the ref in CANBOAT_REF. Run 'make sync-canboat REF=<ref>' and commit both files."
+            exit 1
+          fi
 
   msrv:
     name: MSRV (1.88)

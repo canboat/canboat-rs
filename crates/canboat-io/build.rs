@@ -24,7 +24,7 @@ const PROPRIETARY_START: u32 = 0x1FF00;
 
 fn main() {
     let manifest = env::var("CARGO_MANIFEST_DIR").unwrap();
-    let json_path = Path::new(&manifest).join("../../data/canboat.json");
+    let json_path = Path::new(&manifest).join("../canboat-core/data/canboat.json");
     println!("cargo:rerun-if-changed={}", json_path.display());
     println!("cargo:rerun-if-changed=build.rs");
 

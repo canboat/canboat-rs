@@ -57,7 +57,7 @@ use crate::snapshot::SnapshotStore;
     name = "canboat-pipeline",
     about = "Single-process device-reader \u{2192} analyzer \u{2192} n2kd pipeline",
     version,
-    after_help = canboat_cli::COPYRIGHT_ID
+    after_help = canboat_cli::help_footer()
 )]
 struct Cli {
     /// Read frames from an Actisense NGT-1 / W2K-1 on this serial
@@ -286,7 +286,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
-    log::info!("{}", canboat_cli::COPYRIGHT_ID);
+    canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     // The schema is compiled into the binary; no JSON loading, no
     // path discovery, no synthetic-PGN merge — `canboat-core/build.rs`

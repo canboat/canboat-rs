@@ -3,7 +3,7 @@
 //! Canboat PGN database — const-friendly type definitions.
 //!
 //! This crate carries no data of its own. The full database is emitted
-//! by `canboat-core`'s build script from `data/canboat.json` (plus the
+//! by `canboat-core`'s build script from `crates/canboat-core/data/canboat.json` (plus the
 //! synthetic-PGNs blob) into `&'static` tables that use these types.
 //!
 //! Everything here is `Copy` or a slice of `Copy`/struct types, so the

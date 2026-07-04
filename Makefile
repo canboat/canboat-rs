@@ -24,7 +24,7 @@
 
 CARGO ?= cargo
 
-.PHONY: all build debug check test fmt fmt-check clippy precommit \
+.PHONY: all build debug check test fmt fmt-check clippy precommit sync-canboat \
         analyzer pipeline tui n2kd \
         clean help
 
@@ -64,6 +64,12 @@ clippy:
 # Everything you'd want green before opening a PR.
 precommit: fmt clippy test
 
+# Sync the vendored canboat schema (crates/canboat-core/data/) to an
+# upstream canboat ref and record the pin CI verifies against:
+#   make sync-canboat REF=v7.2.0
+sync-canboat:
+	./scripts/sync-canboat.sh $(REF)
+
 # Per-binary release shortcuts. `cargo build --release -p <crate>` under
 # the hood — handy when you only need one specific tool.
 analyzer:
@@ -94,6 +100,7 @@ help:
 	@echo "  make fmt-check      cargo fmt --all --check (CI shape)"
 	@echo "  make clippy         Workspace clippy at -D warnings (CI shape)"
 	@echo "  make precommit      fmt + clippy + test"
+	@echo "  make sync-canboat   REF=<ref> — vendor canboat.json from upstream"
 	@echo ""
 	@echo "  make analyzer       Release build of just analyzer"
 	@echo "  make pipeline       Release build of just canboat-pipeline"

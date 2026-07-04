@@ -1,6 +1,6 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
-//! Build script: read `data/canboat.json` (+ `data/synthetic-pgns.json`)
+//! Build script: read this crate's `data/canboat.json` (+ `data/synthetic-pgns.json`)
 //! and emit a Rust source file with the full schema as `&'static`
 //! tables. The output is `include!`d from `src/schema_data.rs` and
 //! published as a `static PgnDatabase` (see `src/db.rs`).
@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::env;
 use std::fmt::Write as _;
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 // ---------------------------------------------------------------------
 // Build-script deserialization types.
@@ -774,12 +774,10 @@ fn emit_ft_lookup(out: &mut String, t: &RawFieldTypeLookup, computed: &[Computed
 
 fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
-    let workspace = manifest
-        .parent()
-        .and_then(Path::parent)
-        .expect("workspace root");
-    let canboat_path = workspace.join("data").join("canboat.json");
-    let synthetic_path = workspace.join("data").join("synthetic-pgns.json");
+    // The schema lives inside this crate so the package stays
+    // self-contained (publishable / buildable without the workspace).
+    let canboat_path = manifest.join("data").join("canboat.json");
+    let synthetic_path = manifest.join("data").join("synthetic-pgns.json");
 
     println!("cargo:rerun-if-changed={}", canboat_path.display());
     println!("cargo:rerun-if-changed={}", synthetic_path.display());

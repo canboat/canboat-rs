@@ -22,7 +22,7 @@
 //! | `>= 0x40000` (BEM)   | Fast (synthetic CANboat PGNs, never on the wire)         |
 //!
 //! The mixed-range table is generated at build time from
-//! `data/canboat.json` (see `build.rs`).
+//! `crates/canboat-core/data/canboat.json` (see `build.rs`).
 
 use canboat_core::FramePacketType;
 
@@ -58,7 +58,7 @@ mod tests {
     use super::*;
 
     /// PGN 127508 (Battery Status) sits in the mixed range and per
-    /// `data/canboat.json` is **single-frame**, not fast — the table
+    /// `crates/canboat-core/data/canboat.json` is **single-frame**, not fast — the table
     /// must reflect that, otherwise our encoder wraps an 8-byte
     /// payload in a fast-packet shell and the receiver decodes
     /// garbage. This is the regression test for the original bug.
@@ -68,7 +68,7 @@ mod tests {
     }
 
     /// PGN 127506 (DC Detailed Status) is fast-packet per the spec
-    /// and per `data/canboat.json`. Sanity check the table the other
+    /// and per `crates/canboat-core/data/canboat.json`. Sanity check the table the other
     /// way too.
     #[test]
     fn pgn_127506_dc_detailed_is_fast() {

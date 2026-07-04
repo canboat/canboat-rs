@@ -215,7 +215,7 @@ fn encode_addressed_safety(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
     if bits > 156 {
         bits = 156;
     }
-    if bits % 8 != 0 {
+    if !bits.is_multiple_of(8) {
         bits += 8 - bits % 8;
     }
     bv.add_string(text, bits);
@@ -231,7 +231,7 @@ fn encode_broadcast_safety(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
     if bits > 161 {
         bits = 161;
     }
-    if bits % 8 != 0 {
+    if !bits.is_multiple_of(8) {
         bits += 8 - bits % 8;
     }
     bv.add_string(text, bits);
@@ -480,11 +480,11 @@ fn comm_state(d: &DecodedPgn) -> i64 {
     if let Some(n) = f.value.as_i64() {
         return n & ((1 << 19) - 1);
     }
-    if let FieldValue::Binary(bytes) = &f.value {
-        if bytes.len() >= 3 {
-            let v = (bytes[0] as i64) | ((bytes[1] as i64) << 8) | ((bytes[2] as i64) << 16);
-            return v & ((1 << 19) - 1);
-        }
+    if let FieldValue::Binary(bytes) = &f.value
+        && bytes.len() >= 3
+    {
+        let v = (bytes[0] as i64) | ((bytes[1] as i64) << 8) | ((bytes[2] as i64) << 16);
+        return v & ((1 << 19) - 1);
     }
     if let Some(s) = f.value.as_str() {
         let trimmed = s.trim_matches([' ', '"']);
@@ -574,19 +574,19 @@ fn ais_eta(d: &DecodedPgn) -> i64 {
         }
     }
     let (mut hour, mut minute) = (24u32, 60u32);
-    if let Some(f) = d.field_by_name("ETA Time") {
-        if let FieldValue::Time { seconds, .. } = f.value {
-            if seconds.is_finite() && seconds >= 0.0 {
-                let whole = seconds.trunc() as u64;
-                hour = (whole / 3600) as u32;
-                minute = ((whole / 60) % 60) as u32;
-                if hour > 24 {
-                    hour = 24;
-                }
-                if minute > 60 {
-                    minute = 60;
-                }
-            }
+    if let Some(f) = d.field_by_name("ETA Time")
+        && let FieldValue::Time { seconds, .. } = f.value
+        && seconds.is_finite()
+        && seconds >= 0.0
+    {
+        let whole = seconds.trunc() as u64;
+        hour = (whole / 3600) as u32;
+        minute = ((whole / 60) % 60) as u32;
+        if hour > 24 {
+            hour = 24;
+        }
+        if minute > 60 {
+            minute = 60;
         }
     }
     ((month as i64) << 16) | ((day as i64) << 11) | ((hour as i64) << 6) | minute as i64

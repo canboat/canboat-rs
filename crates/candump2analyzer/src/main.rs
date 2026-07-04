@@ -194,12 +194,12 @@ fn sniff(line: &str) -> Option<Format> {
     {
         let mut toks = line.split_whitespace();
         let first = toks.next().unwrap_or("");
-        if let Some(num) = first.strip_suffix(')') {
-            if num.parse::<u32>().is_ok() {
-                let _offset = toks.next();
-                if matches!(toks.next(), Some("Rx" | "Tx" | "rx" | "tx")) {
-                    return Some(Format::PcanView);
-                }
+        if let Some(num) = first.strip_suffix(')')
+            && num.parse::<u32>().is_ok()
+        {
+            let _offset = toks.next();
+            if matches!(toks.next(), Some("Rx" | "Tx" | "rx" | "tx")) {
+                return Some(Format::PcanView);
             }
         }
     }

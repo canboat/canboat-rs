@@ -8,7 +8,8 @@
 //! Test data is read straight from the sibling canboat checkout at
 //! `../canboat/analyzer/tests/`. If that directory isn't present the
 //! tests skip gracefully — they're not blockers for users building
-//! canboat-rs in isolation.
+//! canboat-rs in isolation. Set `CANBOAT_GOLDEN=required` (CI does)
+//! to turn a missing fixture directory into a hard failure instead.
 //!
 //! New cases are added by name. v0 covers the ones our decoder can
 //! already render; the rest will be added (with documentation of
@@ -82,6 +83,12 @@ fn run_case(in_name: &str, expected_name: &str, args: &[&str]) {
 /// the declared payload) we deliberately don't replicate.
 fn run_case_skipping(in_name: &str, expected_name: &str, args: &[&str], skip_lines: &[usize]) {
     let Some(dir) = canboat_tests_dir() else {
+        if std::env::var_os("CANBOAT_GOLDEN").is_some_and(|v| v == "required") {
+            panic!(
+                "CANBOAT_GOLDEN=required but no canboat fixture directory found \
+                 (set CANBOAT_DIR or provide a ../canboat checkout)"
+            );
+        }
         eprintln!("skipping: canboat test directory not available");
         return;
     };
@@ -328,6 +335,12 @@ fn switch_multi_text_debug() {
 #[test]
 fn dms_format_text() {
     let Some(dir) = canboat_tests_dir() else {
+        if std::env::var_os("CANBOAT_GOLDEN").is_some_and(|v| v == "required") {
+            panic!(
+                "CANBOAT_GOLDEN=required but no canboat fixture directory found \
+                 (set CANBOAT_DIR or provide a ../canboat checkout)"
+            );
+        }
         eprintln!("skipping: canboat test directory not available");
         return;
     };

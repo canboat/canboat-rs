@@ -1,6 +1,17 @@
 # CI for the canboat-rs Cargo workspace.
-# Workspace MSRV is rust-version = "1.74" (see Cargo.toml); these jobs run on
-# stable, which satisfies that floor.
+#
+# Jobs:
+#   - test:   build + full test suite on Linux / macOS / Windows. On the
+#             Unix runners the canboat C repo is checked out at a pinned
+#             ref so the analyzer golden tests run against real fixtures
+#             (CANBOAT_GOLDEN=required turns a missing fixture dir into a
+#             hard failure instead of a silent skip). Windows skips the
+#             golden fixtures for now: the runner's git checks fixtures
+#             out with CRLF line endings, which breaks the byte-exact
+#             diffs.
+#   - msrv:   `cargo check` with the workspace's declared rust-version.
+#   - clippy: -D warnings, all targets.
+#   - fmt:    rustfmt check.
 name: CI
 
 on:
@@ -9,13 +20,40 @@ on:
   pull_request:
     branches: [main]
 
+# Cancel superseded runs when a newer commit arrives on the same PR /
+# branch; main is excluded so its runs always complete.
+concurrency:
+  group: ci-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: ${{ github.ref_name != 'main' }}
+
+env:
+  # canboat C ref whose analyzer/tests fixtures decode identically to
+  # the vendored data/canboat.json. These two move in lockstep: when
+  # data/canboat.json is updated to a newer canboat state, bump this
+  # ref in the same PR (and vice versa) so the golden tests stay green.
+  # 244abdf = master state matching the currently vendored schema
+  # (v7.1.0 + PK annotations + navico PGNs through #731).
+  CANBOAT_FIXTURES_REF: 244abdfdcbe9aa7b8c432448f6dfd47742c4d552
+
 jobs:
   test:
-    name: Build & Test
-    runs-on: ubuntu-latest
+    name: Build & Test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - name: Checkout
         uses: actions/checkout@v4
+
+      - name: Checkout canboat golden fixtures
+        if: runner.os != 'Windows'
+        uses: actions/checkout@v4
+        with:
+          repository: canboat/canboat
+          ref: ${{ env.CANBOAT_FIXTURES_REF }}
+          path: canboat-fixtures
 
       - name: Install Rust stable
         uses: dtolnay/rust-toolchain@stable
@@ -25,6 +63,7 @@ jobs:
 
       - name: Install system dependencies
         # serialport (transitively used by the workspace) needs libudev on Linux.
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libudev-dev pkg-config
@@ -32,8 +71,39 @@ jobs:
       - name: Build
         run: cargo build --workspace --locked
 
-      - name: Test
+      - name: Test (golden fixtures required)
+        if: runner.os != 'Windows'
         run: cargo test --workspace --locked
+        env:
+          CANBOAT_DIR: ${{ github.workspace }}/canboat-fixtures
+          CANBOAT_GOLDEN: required
+
+      - name: Test
+        if: runner.os == 'Windows'
+        run: cargo test --workspace --locked
+
+  msrv:
+    name: MSRV (1.88)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.88
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.88"
+
+      - name: Cache cargo & target
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libudev-dev pkg-config
+
+      - name: Check
+        run: cargo check --workspace --locked
 
   clippy:
     name: Clippy

@@ -186,21 +186,21 @@ pub fn spawn(engine: Arc<RequestEngine>, emit: impl Fn(u8, u32) + Send + 'static
             loop {
                 thread::sleep(Duration::from_millis(500));
                 let now = Instant::now();
-                if now.duration_since(last_claim_emit) >= DEVICE_REQUEST_SPACING {
-                    if let Some(dst) = engine.next_due(&mut next_claim, RequestKind::Claim) {
-                        emit(dst, PGN_CLAIM);
-                        last_claim_emit = now;
-                    }
+                if now.duration_since(last_claim_emit) >= DEVICE_REQUEST_SPACING
+                    && let Some(dst) = engine.next_due(&mut next_claim, RequestKind::Claim)
+                {
+                    emit(dst, PGN_CLAIM);
+                    last_claim_emit = now;
                 }
-                if now.duration_since(last_prod_emit) >= DEVICE_REQUEST_SPACING {
-                    if let Some(dst) = engine.next_due(&mut next_prod, RequestKind::ProductInfo) {
-                        // canboat asks for both 126996 (Product Info)
-                        // and 126998 (Configuration Info) under the
-                        // same scheduling slot.
-                        emit(dst, PGN_PROD_INFO);
-                        emit(dst, PGN_CONFIG_INFO);
-                        last_prod_emit = now;
-                    }
+                if now.duration_since(last_prod_emit) >= DEVICE_REQUEST_SPACING
+                    && let Some(dst) = engine.next_due(&mut next_prod, RequestKind::ProductInfo)
+                {
+                    // canboat asks for both 126996 (Product Info)
+                    // and 126998 (Configuration Info) under the
+                    // same scheduling slot.
+                    emit(dst, PGN_PROD_INFO);
+                    emit(dst, PGN_CONFIG_INFO);
+                    last_prod_emit = now;
                 }
             }
         })

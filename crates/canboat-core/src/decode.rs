@@ -115,10 +115,10 @@ impl DecodedField {
     /// resolution; otherwise from [`FieldInfo::unit`].
     #[inline]
     pub fn unit(&self) -> Option<&'static str> {
-        if let Some(o) = self.overrides.as_deref() {
-            if o.unit.is_some() {
-                return o.unit;
-            }
+        if let Some(o) = self.overrides.as_deref()
+            && o.unit.is_some()
+        {
+            return o.unit;
         }
         self.info.unit
     }
@@ -126,10 +126,10 @@ impl DecodedField {
     /// Display resolution.
     #[inline]
     pub fn resolution(&self) -> Option<f64> {
-        if let Some(o) = self.overrides.as_deref() {
-            if o.resolution.is_some() {
-                return o.resolution;
-            }
+        if let Some(o) = self.overrides.as_deref()
+            && o.resolution.is_some()
+        {
+            return o.resolution;
         }
         self.info.resolution
     }
@@ -137,10 +137,10 @@ impl DecodedField {
     /// Decimal precision override (`0` = derive from resolution).
     #[inline]
     pub fn precision(&self) -> u8 {
-        if let Some(o) = self.overrides.as_deref() {
-            if o.precision > 0 {
-                return o.precision;
-            }
+        if let Some(o) = self.overrides.as_deref()
+            && o.precision > 0
+        {
+            return o.precision;
         }
         self.info.precision
     }
@@ -539,55 +539,55 @@ fn decode_fields(
         // Repeating set 1 starts here? `count_field1` can be absent
         // (e.g. PGN 126464 PGN List) — in that case canboat repeats
         // until the payload runs out.
-        if let (Some(start), Some(size)) = (start1, size1) {
-            if (f.order as u32) == start {
-                // Only mark as "entered" if the start field is
-                // actually within the payload — canboat C's main
-                // loop stops once `startBit >> 3 >= length`, so a
-                // truncated PGN payload never reaches the start
-                // field and never emits the list opener.
-                let bit_offset = f.bit_offset.unwrap_or(cursor_bits);
-                if (bit_offset as usize) < data.len() * 8 {
-                    entered[0] = true;
-                }
-                cursor_bits = decode_repeating(
-                    info,
-                    data,
-                    db,
-                    &mut out,
-                    &mut ctx,
-                    i,
-                    size as usize,
-                    count_field1,
-                    cursor_bits,
-                    1,
-                );
-                i += size as usize;
-                continue;
+        if let (Some(start), Some(size)) = (start1, size1)
+            && (f.order as u32) == start
+        {
+            // Only mark as "entered" if the start field is
+            // actually within the payload — canboat C's main
+            // loop stops once `startBit >> 3 >= length`, so a
+            // truncated PGN payload never reaches the start
+            // field and never emits the list opener.
+            let bit_offset = f.bit_offset.unwrap_or(cursor_bits);
+            if (bit_offset as usize) < data.len() * 8 {
+                entered[0] = true;
             }
+            cursor_bits = decode_repeating(
+                info,
+                data,
+                db,
+                &mut out,
+                &mut ctx,
+                i,
+                size as usize,
+                count_field1,
+                cursor_bits,
+                1,
+            );
+            i += size as usize;
+            continue;
         }
         // Repeating set 2?
-        if let (Some(start), Some(size)) = (start2, size2) {
-            if (f.order as u32) == start {
-                let bit_offset = f.bit_offset.unwrap_or(cursor_bits);
-                if (bit_offset as usize) < data.len() * 8 {
-                    entered[1] = true;
-                }
-                cursor_bits = decode_repeating(
-                    info,
-                    data,
-                    db,
-                    &mut out,
-                    &mut ctx,
-                    i,
-                    size as usize,
-                    count_field2,
-                    cursor_bits,
-                    2,
-                );
-                i += size as usize;
-                continue;
+        if let (Some(start), Some(size)) = (start2, size2)
+            && (f.order as u32) == start
+        {
+            let bit_offset = f.bit_offset.unwrap_or(cursor_bits);
+            if (bit_offset as usize) < data.len() * 8 {
+                entered[1] = true;
             }
+            cursor_bits = decode_repeating(
+                info,
+                data,
+                db,
+                &mut out,
+                &mut ctx,
+                i,
+                size as usize,
+                count_field2,
+                cursor_bits,
+                2,
+            );
+            i += size as usize;
+            continue;
         }
 
         if f.condition.is_some() {
@@ -623,10 +623,11 @@ fn build_index_by_order(fields: &[DecodedField]) -> [i8; 32] {
         if f.repeat_set != 0 {
             continue;
         }
-        if let Some(slot) = (f.order() as usize).checked_sub(1) {
-            if slot < idx.len() && pos < i8::MAX as usize {
-                idx[slot] = pos as i8;
-            }
+        if let Some(slot) = (f.order() as usize).checked_sub(1)
+            && slot < idx.len()
+            && pos < i8::MAX as usize
+        {
+            idx[slot] = pos as i8;
         }
     }
     idx

@@ -566,10 +566,10 @@ fn field_number(line: &Value, name: &str) -> Option<i64> {
 }
 
 fn fill_from_claim(dev: &mut DeviceInfo, line: &Value) {
-    if dev.manufacturer.is_empty() {
-        if let Some(name) = field_text(line, "Manufacturer Code") {
-            dev.manufacturer = name;
-        }
+    if dev.manufacturer.is_empty()
+        && let Some(name) = field_text(line, "Manufacturer Code")
+    {
+        dev.manufacturer = name;
     }
 }
 
@@ -582,10 +582,10 @@ fn fill_from_product_info(dev: &mut DeviceInfo, line: &Value) {
     }
     // Product Info also carries the manufacturer code as text; only
     // backfill when the ISO Address Claim hasn't filled it in yet.
-    if dev.manufacturer.is_empty() {
-        if let Some(s) = field_text(line, "Manufacturer") {
-            dev.manufacturer = s;
-        }
+    if dev.manufacturer.is_empty()
+        && let Some(s) = field_text(line, "Manufacturer")
+    {
+        dev.manufacturer = s;
     }
 }
 
@@ -621,10 +621,10 @@ fn field_as_int(v: &Value) -> Option<i64> {
     if let Some(n) = v.as_i64() {
         return Some(n);
     }
-    if let Some(obj) = v.as_object() {
-        if let Some(n) = obj.get("value").and_then(Value::as_i64) {
-            return Some(n);
-        }
+    if let Some(obj) = v.as_object()
+        && let Some(n) = obj.get("value").and_then(Value::as_i64)
+    {
+        return Some(n);
     }
     if let Some(s) = v.as_str() {
         return s.parse().ok();

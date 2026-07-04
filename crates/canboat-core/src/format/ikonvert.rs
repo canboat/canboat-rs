@@ -287,7 +287,7 @@ fn b64_decode(s: &str) -> Option<Vec<u8>> {
     }
     let bytes = s.as_bytes();
     // Padding lengths must yield a 4-byte-aligned group count.
-    if bytes.len() % 4 != 0 {
+    if !bytes.len().is_multiple_of(4) {
         return None;
     }
     let mut out = Vec::with_capacity(bytes.len() / 4 * 3);

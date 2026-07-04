@@ -123,10 +123,10 @@ impl RateLimiter {
         }
         let now = Instant::now();
         let slot = &mut self.last_passed[src as usize][rate as usize];
-        if let Some(prev) = *slot {
-            if now.duration_since(prev) < Duration::from_secs(1) {
-                return true;
-            }
+        if let Some(prev) = *slot
+            && now.duration_since(prev) < Duration::from_secs(1)
+        {
+            return true;
         }
         *slot = Some(now);
         false
@@ -178,10 +178,10 @@ pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> u
     };
     let src = json::int(msg, "src").unwrap_or(0) as u8;
     let rate = pgn_to_rate(pgn);
-    if let Some(rt) = rate {
-        if rate_limiter.should_drop(src, rt) {
-            return 0;
-        }
+    if let Some(rt) = rate
+        && rate_limiter.should_drop(src, rt)
+    {
+        return 0;
     }
     let before = out.len();
     match pgn {
@@ -254,23 +254,23 @@ fn vessel_heading(out: &mut String, src: u8, msg: &str) {
     let reference = ref_value(msg, "Reference", HEADING_REF_NAMES);
     let dev = json::number(msg, "Deviation");
     let var = json::number(msg, "Variation");
-    if let (Some(d), Some(v)) = (dev, var) {
-        if reference == 1 {
-            // HDG: heading,dev,dir,var,dir
-            create(
-                out,
-                src,
-                &format!(
-                    "HDG,{:.1},{:.1},{},{:.1},{}",
-                    heading,
-                    d.abs(),
-                    if d < 0.0 { 'W' } else { 'E' },
-                    v.abs(),
-                    if v < 0.0 { 'W' } else { 'E' },
-                ),
-            );
-            return;
-        }
+    if let (Some(d), Some(v)) = (dev, var)
+        && reference == 1
+    {
+        // HDG: heading,dev,dir,var,dir
+        create(
+            out,
+            src,
+            &format!(
+                "HDG,{:.1},{:.1},{},{:.1},{}",
+                heading,
+                d.abs(),
+                if d < 0.0 { 'W' } else { 'E' },
+                v.abs(),
+                if v < 0.0 { 'W' } else { 'E' },
+            ),
+        );
+        return;
     }
     if reference == 0 {
         create(out, src, &format!("HDT,{:.1},T", heading));

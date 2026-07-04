@@ -974,10 +974,10 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
         if !app.connecting_dismissed {
             draw_connecting_modal(f, area, state);
         }
-        if has_unacknowledged_error(app, state) {
-            if let Some(err) = state.status.last_error.as_deref() {
-                draw_error_modal(f, area, err);
-            }
+        if has_unacknowledged_error(app, state)
+            && let Some(err) = state.status.last_error.as_deref()
+        {
+            draw_error_modal(f, area, err);
         }
     })?;
     Ok(())

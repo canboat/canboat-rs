@@ -299,10 +299,10 @@ fn run_stream_client(
     // Main: drain the subscription and write to the socket.
     let rx = hub.subscribe();
     let mut stream = stream;
-    if let Some(bytes) = header {
-        if stream.write_all(bytes).is_err() {
-            return;
-        }
+    if let Some(bytes) = header
+        && stream.write_all(bytes).is_err()
+    {
+        return;
     }
     while let Ok(line) = rx.recv() {
         if stream.write_all(line.as_bytes()).is_err() {
@@ -377,12 +377,12 @@ fn forward_plain_line(line: &str, inject: &InjectPoint) -> bool {
             // even though the on-wire frame has the gateway's src.
             // `CLAIM_UNCLAIMED` (254) means we haven't claimed yet —
             // leave src as-is rather than guess.
-            if matches!(frame.src, 0 | 255) {
-                if let Some(claim) = inject.claim_addr.as_deref() {
-                    let live = claim.load(Ordering::Relaxed);
-                    if live != canboat_io::device::socketcan::CLAIM_UNCLAIMED {
-                        frame.src = live;
-                    }
+            if matches!(frame.src, 0 | 255)
+                && let Some(claim) = inject.claim_addr.as_deref()
+            {
+                let live = claim.load(Ordering::Relaxed);
+                if live != canboat_io::device::socketcan::CLAIM_UNCLAIMED {
+                    frame.src = live;
                 }
             }
             if inject.device.send_frame(frame.clone()).is_err() {

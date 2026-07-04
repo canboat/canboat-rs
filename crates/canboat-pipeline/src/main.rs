@@ -372,12 +372,12 @@ fn run(cli: Cli) -> Result<()> {
     // put the requests on the bus; in stdin-only mode there is no
     // sink, so we skip the engine entirely. `--no-request-claims`
     // disables it explicitly (matches n2kd's flag).
-    if !cli.no_request_claims {
-        if let Some(sender) = device_sender.clone() {
-            request_engine::spawn(Arc::clone(&engine), move |dst, pgn| {
-                let _ = sender.send_frame(request_engine::iso_request_frame(0, dst, pgn));
-            });
-        }
+    if !cli.no_request_claims
+        && let Some(sender) = device_sender.clone()
+    {
+        request_engine::spawn(Arc::clone(&engine), move |dst, pgn| {
+            let _ = sender.send_frame(request_engine::iso_request_frame(0, dst, pgn));
+        });
     }
 
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();

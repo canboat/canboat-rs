@@ -250,10 +250,10 @@ fn compute_field(f: &mut RawField) -> Computed {
     };
 
     // canboat hard-codes 7-decimal display precision for lat/lon.
-    if let Some(pq) = f.physical_quantity.as_deref() {
-        if pq == "GEOGRAPHICAL_LATITUDE" || pq == "GEOGRAPHICAL_LONGITUDE" {
-            c.precision = 7;
-        }
+    if let Some(pq) = f.physical_quantity.as_deref()
+        && (pq == "GEOGRAPHICAL_LATITUDE" || pq == "GEOGRAPHICAL_LONGITUDE")
+    {
+        c.precision = 7;
     }
 
     let Some(unit) = f.unit.clone() else {

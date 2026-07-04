@@ -256,7 +256,7 @@ impl Decoder {
         let mut state = self.init_state.lock().expect("ikonvert state poisoned");
         // ACK only advances at odd states *other* than the OFFLINE
         // wait — that one needs TEXT.
-        if *state == STATE_DONE || *state == STATE_WAIT_OFFLINE_ACK || *state % 2 == 0 {
+        if *state == STATE_DONE || *state == STATE_WAIT_OFFLINE_ACK || (*state).is_multiple_of(2) {
             return;
         }
         *state -= 1;

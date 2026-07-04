@@ -172,10 +172,10 @@ fn write_json_inner<W: fmt::Write>(
         // `-debug` (e.g. PGN 126998's third STRING_LAU when only two
         // descriptions fit in the wire). Same gate the text formatter
         // already applies.
-        if let Some(bo) = f.bit_offset {
-            if bo >= payload_bits {
-                continue;
-            }
+        if let Some(bo) = f.bit_offset
+            && bo >= payload_bits
+        {
+            continue;
         }
         // Under `-debug` we keep unavailable fields so the byte/bit
         // diagnostic is preserved; otherwise honour the canboat
@@ -188,10 +188,10 @@ fn write_json_inner<W: fmt::Write>(
         // non-zero — the comment there calls a non-zero SPARE "an
         // incorrect PGN definition". The field will then be emitted
         // by the value writer's `Spare { bytes, .. }` arm.
-        if let FieldValue::Spare { value, .. } = &f.value {
-            if *value == 0 {
-                continue;
-            }
+        if let FieldValue::Spare { value, .. } = &f.value
+            && *value == 0
+        {
+            continue;
         }
         // Reserved fields whose raw value is all-ones (the "unused"
         // default) are skipped entirely — even under -debug, matching
@@ -214,12 +214,12 @@ fn write_json_inner<W: fmt::Write>(
         // canboat doesn't emit them either. The text formatter, by
         // contrast, prints "None" for these (see write_field_value
         // in output/text.rs).
-        if !opts.include_empty && !opts.debug {
-            if let FieldValue::BitField { bits, .. } = &f.value {
-                if bits.is_empty() {
-                    continue;
-                }
-            }
+        if !opts.include_empty
+            && !opts.debug
+            && let FieldValue::BitField { bits, .. } = &f.value
+            && bits.is_empty()
+        {
+            continue;
         }
 
         // Determine "where is this field going":
@@ -287,10 +287,10 @@ fn write_json_inner<W: fmt::Write>(
     // pushes NotAvailable fields onto the decoded set but the JSON
     // emits none of them.
     let renderable = |f: &DecodedField| {
-        if let FieldValue::Spare { value, .. } = &f.value {
-            if *value == 0 {
-                return false;
-            }
+        if let FieldValue::Spare { value, .. } = &f.value
+            && *value == 0
+        {
+            return false;
         }
         if matches!(f.value, FieldValue::NotAvailable) && !opts.include_empty && !opts.debug {
             return false;

@@ -250,18 +250,18 @@ fn field_in_any_repeat_set(pgn: &crate::PgnInfo, field: &crate::FieldInfo) -> Op
     if let (Some(start), Some(size)) = (
         pgn.repeating_field_set1_start_field,
         pgn.repeating_field_set1_size,
-    ) {
-        if order >= start && order < start + size {
-            return Some(1);
-        }
+    ) && order >= start
+        && order < start + size
+    {
+        return Some(1);
     }
     if let (Some(start), Some(size)) = (
         pgn.repeating_field_set2_start_field,
         pgn.repeating_field_set2_size,
-    ) {
-        if order >= start && order < start + size {
-            return Some(2);
-        }
+    ) && order >= start
+        && order < start + size
+    {
+        return Some(2);
     }
     None
 }

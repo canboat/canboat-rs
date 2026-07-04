@@ -320,7 +320,7 @@ fn encode_addressed_safety(bv: &mut BitVector, msgid: i64, msg: &str) {
     if bits > 156 {
         bits = 156;
     }
-    if bits % 8 != 0 {
+    if !bits.is_multiple_of(8) {
         bits += 8 - bits % 8;
     }
     bv.add_string(text, bits);
@@ -336,7 +336,7 @@ fn encode_broadcast_safety(bv: &mut BitVector, msgid: i64, msg: &str) {
     if bits > 161 {
         bits = 161;
     }
-    if bits % 8 != 0 {
+    if !bits.is_multiple_of(8) {
         bits += 8 - bits % 8;
     }
     bv.add_string(text, bits);
@@ -482,10 +482,10 @@ fn unescape_json(s: &str) -> String {
             Some('t') => out.push('\t'),
             Some('u') => {
                 let hex: String = chars.by_ref().take(4).collect();
-                if let Ok(code) = u32::from_str_radix(&hex, 16) {
-                    if let Some(ch) = char::from_u32(code) {
-                        out.push(ch);
-                    }
+                if let Ok(code) = u32::from_str_radix(&hex, 16)
+                    && let Some(ch) = char::from_u32(code)
+                {
+                    out.push(ch);
                 }
             }
             Some(other) => {
@@ -506,10 +506,10 @@ fn repeat_indicator(msg: &str) -> i64 {
 /// quoted strings (`"User ID":"244180106"`). We try the lookup-int
 /// path first (`-nv` numeric form) and then the bare string form.
 fn user_id(msg: &str, field: &str, default: i64) -> i64 {
-    if let Some(s) = json::value(msg, field) {
-        if let Ok(n) = s.trim().parse() {
-            return n;
-        }
+    if let Some(s) = json::value(msg, field)
+        && let Ok(n) = s.trim().parse()
+    {
+        return n;
     }
     json::int(msg, field).unwrap_or(default)
 }

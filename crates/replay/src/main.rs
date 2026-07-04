@@ -135,10 +135,11 @@ fn parse_timestamp_ms(line: &str) -> Option<i64> {
     }
     let s: u32 = take(17..19)?.parse().ok()?;
     let mut ms: i64 = 0;
-    if bytes.len() >= 23 && (bytes[19] == b'.' || bytes[19] == b',') {
-        if let Some(v) = take(20..23).and_then(|s| s.parse::<i64>().ok()) {
-            ms = v;
-        }
+    if bytes.len() >= 23
+        && (bytes[19] == b'.' || bytes[19] == b',')
+        && let Some(v) = take(20..23).and_then(|s| s.parse::<i64>().ok())
+    {
+        ms = v;
     }
     let days = days_since_epoch(y, mo as i64, d as i64)?;
     let secs = days * 86_400 + (h as i64) * 3600 + (m as i64) * 60 + s as i64;

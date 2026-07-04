@@ -396,11 +396,11 @@ fn run_read_loop<R: Read>(
                 }
             }
             Err(e) if e.kind() == io::ErrorKind::TimedOut => {
-                if let Some(t) = timeout {
-                    if last_rx.elapsed() > t {
-                        log::warn!("no message received for {} s; exiting", t.as_secs());
-                        return Ok(());
-                    }
+                if let Some(t) = timeout
+                    && last_rx.elapsed() > t
+                {
+                    log::warn!("no message received for {} s; exiting", t.as_secs());
+                    return Ok(());
                 }
                 continue;
             }

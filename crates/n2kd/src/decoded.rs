@@ -135,10 +135,10 @@ pub fn convert_nmea0183(
     let src = decoded.src;
     let pgn = decoded.pgn;
     let rate = pgn_to_rate(pgn);
-    if let Some(rt) = rate {
-        if rl.should_drop_fast(src, rt) {
-            return 0;
-        }
+    if let Some(rt) = rate
+        && rl.should_drop_fast(src, rt)
+    {
+        return 0;
     }
     let before = out.len();
     match pgn {
@@ -216,10 +216,10 @@ impl RateLimiter {
         }
         let slot = self.last_passed_slot(src as usize, rate_index(rate));
         let now = Instant::now();
-        if let Some(prev) = *slot {
-            if now.duration_since(prev) < std::time::Duration::from_secs(1) {
-                return true;
-            }
+        if let Some(prev) = *slot
+            && now.duration_since(prev) < std::time::Duration::from_secs(1)
+        {
+            return true;
         }
         *slot = Some(now);
         false
@@ -245,22 +245,22 @@ fn vessel_heading(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) 
     let var = decoded
         .field(&h.vh_variation)
         .and_then(|f| f.value.as_f64());
-    if let (Some(d), Some(v)) = (dev, var) {
-        if reference == 1 {
-            create(
-                out,
-                src,
-                &format!(
-                    "HDG,{:.1},{:.1},{},{:.1},{}",
-                    heading,
-                    d.abs(),
-                    if d < 0.0 { 'W' } else { 'E' },
-                    v.abs(),
-                    if v < 0.0 { 'W' } else { 'E' },
-                ),
-            );
-            return;
-        }
+    if let (Some(d), Some(v)) = (dev, var)
+        && reference == 1
+    {
+        create(
+            out,
+            src,
+            &format!(
+                "HDG,{:.1},{:.1},{},{:.1},{}",
+                heading,
+                d.abs(),
+                if d < 0.0 { 'W' } else { 'E' },
+                v.abs(),
+                if v < 0.0 { 'W' } else { 'E' },
+            ),
+        );
+        return;
     }
     if reference == 0 {
         create(out, src, &format!("HDT,{:.1},T", heading));

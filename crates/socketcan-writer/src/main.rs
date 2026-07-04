@@ -120,21 +120,21 @@ fn run(cli: Cli) -> Result<()> {
             log::debug!("skipping synthetic PGN {}", frame.pgn);
             continue;
         }
-        if cli.pace {
-            if let Some(now_ms) = frame.timestamp.as_deref().and_then(parse_iso_timestamp_ms) {
-                if let (Some(prev_ms), Some(prev_inst)) = (prev_wire_ms, prev_ts) {
-                    let delta = now_ms - prev_ms;
-                    if (0..10_000).contains(&delta) {
-                        let elapsed = prev_inst.elapsed();
-                        let want = Duration::from_millis(delta as u64);
-                        if want > elapsed {
-                            std::thread::sleep(want - elapsed);
-                        }
+        if cli.pace
+            && let Some(now_ms) = frame.timestamp.as_deref().and_then(parse_iso_timestamp_ms)
+        {
+            if let (Some(prev_ms), Some(prev_inst)) = (prev_wire_ms, prev_ts) {
+                let delta = now_ms - prev_ms;
+                if (0..10_000).contains(&delta) {
+                    let elapsed = prev_inst.elapsed();
+                    let want = Duration::from_millis(delta as u64);
+                    if want > elapsed {
+                        std::thread::sleep(want - elapsed);
                     }
                 }
-                prev_wire_ms = Some(now_ms);
-                prev_ts = Some(Instant::now());
             }
+            prev_wire_ms = Some(now_ms);
+            prev_ts = Some(Instant::now());
         }
         send_pgn(sink.as_mut(), &frame)?;
     }
@@ -277,10 +277,11 @@ fn parse_iso_timestamp_ms(s: &str) -> Option<i64> {
     let m: u32 = take(14..16)?.parse().ok()?;
     let sec: u32 = take(17..19)?.parse().ok()?;
     let mut ms: i64 = 0;
-    if bytes.len() >= 23 && (bytes[19] == b'.' || bytes[19] == b',') {
-        if let Some(v) = take(20..23).and_then(|s| s.parse::<i64>().ok()) {
-            ms = v;
-        }
+    if bytes.len() >= 23
+        && (bytes[19] == b'.' || bytes[19] == b',')
+        && let Some(v) = take(20..23).and_then(|s| s.parse::<i64>().ok())
+    {
+        ms = v;
     }
     let days = days_since_epoch(y, mo as i64, d as i64)?;
     let secs = days * 86_400 + (h as i64) * 3600 + (m as i64) * 60 + sec as i64;

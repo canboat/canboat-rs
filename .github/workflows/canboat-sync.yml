@@ -1,0 +1,79 @@
+name: canboat sync
+
+# Weekly check for a new upstream canboat release. If the latest
+# release's docs/canboat.json differs from the vendored copy, run
+# scripts/sync-canboat.sh and open a PR bumping canboat.json +
+# CANBOAT_REF together. CI on that PR (golden tests against the
+# pinned fixtures + the schema-pin equality gate) then shows exactly
+# what the schema update breaks, if anything.
+#
+# The PR is opened with a `chore(schema):` title; retitle it to
+# `feat(schema):` / `fix(schema):` before merging if the content
+# warrants a version bump — release-please derives semver from the
+# squash-merge subject.
+#
+# workflow_dispatch accepts any canboat ref (tag, branch, SHA) for
+# syncing to something other than the latest release, e.g. master.
+
+on:
+  schedule:
+    - cron: "17 5 * * 1" # Mondays 05:17 UTC
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "canboat ref to sync to (default: latest release tag)"
+        required: false
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          # PAT so the pushed branch's PR gets CI checks.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Determine target canboat ref
+        id: target
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          REF="${{ inputs.ref }}"
+          if [ -z "$REF" ]; then
+            REF="$(gh api repos/canboat/canboat/releases/latest --jq .tag_name)"
+          fi
+          echo "ref=$REF" >> "$GITHUB_OUTPUT"
+          echo "Target canboat ref: $REF"
+
+      - name: Sync schema
+        run: ./scripts/sync-canboat.sh "${{ steps.target.outputs.ref }}"
+
+      - name: Open PR if the schema changed
+        env:
+          GH_TOKEN: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          REF: ${{ steps.target.outputs.ref }}
+        run: |
+          if git diff --quiet -- crates/canboat-core/data; then
+            echo "Vendored schema already matches canboat $REF — nothing to do."
+            exit 0
+          fi
+          BRANCH="chore/canboat-sync-$REF"
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git switch -C "$BRANCH"
+          git commit -am "chore(schema): sync canboat.json to $REF"
+          git push -f --set-upstream origin "$BRANCH"
+          if gh pr list --head "$BRANCH" --state open --json number --jq length | grep -qv '^0$'; then
+            echo "PR for $BRANCH already open — branch updated."
+            exit 0
+          fi
+          gh pr create \
+            --base main \
+            --head "$BRANCH" \
+            --title "chore(schema): sync canboat.json to $REF" \
+            --body "$(printf 'Automated sync of the vendored canboat schema to upstream canboat `%s` (see `crates/canboat-core/data/CANBOAT_REF`).\n\nThe golden tests and the schema-pin gate on this PR tell you whether the decoder keeps full parity with this schema version. If they fail, decoder work is needed before merging.\n\nRetitle to `feat(schema):`/`fix(schema):` before merging if the content warrants a release bump.\n\n🤖 Generated with [Claude Code](https://claude.com/claude-code)' "$REF")"

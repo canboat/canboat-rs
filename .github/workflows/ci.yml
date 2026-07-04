@@ -106,7 +106,7 @@ jobs:
           fi
 
   msrv:
-    name: MSRV (1.88)
+    name: MSRV
     runs-on: ubuntu-latest
     steps:
       - name: Checkout

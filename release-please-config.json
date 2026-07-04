@@ -1,0 +1,15 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "packages": {
+    ".": {
+      "release-type": "simple",
+      "package-name": "canboat-rs",
+      "include-component-in-tag": false,
+      "extra-files": [
+        "Cargo.toml",
+        "crates/canboat-pipeline/Cargo.toml",
+        "crates/canboat-tui/Cargo.toml"
+      ]
+    }
+  }
+}

@@ -1,0 +1,72 @@
+name: release-please
+
+# Maintains a rolling release PR from Conventional Commit history: it
+# bumps the workspace version (the `x-release-please-version` annotated
+# lines in Cargo.toml and the two crate manifests with pinned internal
+# versions), updates CHANGELOG.md + version.txt, and on merge tags the
+# release (plain `vX.Y.Z` tags).
+#
+# The root Cargo.toml is a virtual workspace manifest, which
+# release-please's `rust` release type refuses to update — hence the
+# `simple` release type plus generic-updater annotations.
+#
+# A PAT (RELEASE_PLEASE_TOKEN) is preferred so pushes to the release PR
+# re-trigger CI on it; with the default GITHUB_TOKEN the required checks
+# do not re-run automatically. Falls back to GITHUB_TOKEN.
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    outputs:
+      pr: ${{ steps.rp.outputs.pr }}
+      prs_created: ${{ steps.rp.outputs.prs_created }}
+      releases_created: ${{ steps.rp.outputs.releases_created }}
+      tag_name: ${{ steps.rp.outputs.tag_name }}
+    steps:
+      - uses: googleapis/release-please-action@v4
+        id: rp
+        with:
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
+
+  # Cargo.lock records every workspace crate's version, so the version
+  # bump in the release PR makes it stale — and CI builds with
+  # `--locked`. Regenerate the lockfile on the release PR branch so the
+  # PR passes CI without manual intervention. (Same pattern as
+  # canboat/canboat's `regenerate` job for its versioned docs.)
+  sync-lockfile:
+    needs: release-please
+    if: ${{ needs.release-please.outputs.prs_created == 'true' }}
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJson(needs.release-please.outputs.pr).headBranchName }}
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      # `cargo update --workspace` only rewrites the lockfile entries
+      # for workspace members; it neither compiles nor touches
+      # third-party pins.
+      - name: Sync Cargo.lock with the version bump
+        run: cargo update --workspace
+
+      - name: Commit & push if Cargo.lock changed
+        run: |
+          if ! git diff --exit-code Cargo.lock; then
+            git config user.name "github-actions[bot]"
+            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+            git commit -am "chore: sync Cargo.lock for release"
+            git push
+          fi

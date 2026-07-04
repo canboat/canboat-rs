@@ -128,6 +128,52 @@ fn is_ais_pgn(pgn: u32) -> bool {
     )
 }
 
+/// Synthetic BEM PGN carrying the per-device NMEA 0183 filter control
+/// channel (see `crate::nmea_filter` and `data/synthetic-pgns.json`).
+/// Never appears on the N2K bus.
+pub const PGN_NMEA0183_FILTER: u32 = 262657;
+/// PGN 262657 `Function` values.
+const FILTER_FN_REPORT: u8 = 0; // pipeline → tui (current state)
+const FILTER_FN_SET: u8 = 1; // tui → pipeline (apply a change)
+/// How often the pipeline re-broadcasts the full filter state, so a
+/// TUI connecting mid-stream learns it without asking.
+const FILTER_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// Decode a PGN 262657 Set payload (`[function, source, s0, s1, s2,
+/// muted, …]`) and apply it to the filter.
+fn apply_filter_control(f: &mut crate::nmea_filter::NmeaFilter, data: &[u8]) {
+    if data.len() < 6 {
+        return;
+    }
+    let src = data[1];
+    let sentence = std::str::from_utf8(&data[2..5])
+        .unwrap_or("")
+        .trim_matches(|c| c == '\0' || c == ' ');
+    if sentence.is_empty() {
+        return;
+    }
+    f.set(src, sentence, data[5] != 0);
+}
+
+/// Queue one PGN 262657 Report frame per filter row so they flow out
+/// the analyzer / raw ports as normal decoded records the TUI reads.
+fn queue_filter_report(f: &crate::nmea_filter::NmeaFilter, out: &mut VecDeque<RawFrame>) {
+    for row in f.report() {
+        let b = row.sentence.as_bytes();
+        let data = [
+            FILTER_FN_REPORT,
+            row.src,
+            *b.first().unwrap_or(&b' '),
+            *b.get(1).unwrap_or(&b' '),
+            *b.get(2).unwrap_or(&b' '),
+            u8::from(row.muted),
+            0xff,
+            0xff,
+        ];
+        out.push_back(RawFrame::new(None, 7, PGN_NMEA0183_FILTER, 0, 255, data));
+    }
+}
+
 /// Bundle of broadcast hubs the pipeline writes into.
 pub struct Hubs {
     /// Raw N2K input/output: every coalesced frame goes out as a
@@ -158,6 +204,18 @@ pub struct Hubs {
     pub device_sender: Option<FrameSender>,
 }
 
+/// NMEA 0183 output options for [`run`], bundled to keep the entry
+/// point's signature small.
+pub struct Nmea0183Options {
+    /// Mirrors canboat C `n2kd`'s `--nmea0183` flag: also write
+    /// sentences to stdout, not just the TCP port.
+    pub emit_stdout: bool,
+    /// Enable the 1 Hz per-`(src, quantity)` rate limit.
+    pub rate_limit: bool,
+    /// Per-device NAME filter; `None` disables it.
+    pub filter: Option<crate::nmea_filter::NmeaFilter>,
+}
+
 /// Pipeline entry point. Returns when `frames_rx` is closed.
 ///
 /// * `emit_nmea_stdout` mirrors canboat C `n2kd`'s `--nmea0183` flag.
@@ -179,6 +237,11 @@ pub struct Hubs {
 ///   devices reporting the same measurement don't flood downstream
 ///   0183 consumers; AIS is emitted on a separate path and never
 ///   limited. `false` emits every converted sentence unthrottled.
+/// * `nmea_filter`, when `Some`, mutes NMEA 0183 sentences per device
+///   NAME (see [`crate::nmea_filter`]): it learns `src → NAME` from
+///   PGN 60928 and drops a converted sentence block when the source is
+///   unknown or muted. `None` disables it (every converted sentence is
+///   emitted). AIS is never routed through it.
 /// * `json_opts` configures the analyzer JSON / snapshot serializer
 ///   — `camel_case` selects field-key + PGN-description style
 ///   (`Off` / `Lower` matches canboat C `-camel`, `Upper` matches
@@ -188,11 +251,15 @@ pub fn run(
     db: &'static PgnDatabase,
     frames_rx: Receiver<RawFrame>,
     mut hubs: Hubs,
-    emit_nmea_stdout: bool,
     pre_coalesced: Arc<AtomicBool>,
     json_opts: JsonOptions,
-    nmea0183_rate_limit: bool,
+    nmea: Nmea0183Options,
 ) {
+    let Nmea0183Options {
+        emit_stdout: emit_nmea_stdout,
+        rate_limit: nmea0183_rate_limit,
+        filter: mut nmea_filter,
+    } = nmea;
     // LineWriter (rather than BufWriter) so each NMEA 0183 sentence
     // is flushed as soon as its trailing newline arrives. Long-
     // running deployments observe stdout for the latest state, not
@@ -207,6 +274,7 @@ pub fn run(
     let mut rl = n2kd::nmea0183::RateLimiter::new(nmea0183_rate_limit);
     let mut ais_seq: u8 = 0;
     let handles = n2kd::decoded::Handles::new(db);
+    let mut last_filter_report = Instant::now();
 
     // Quirk synthesisers can produce extra `RawFrame`s in response to
     // an inbound bus frame. We re-feed them through this same loop so
@@ -247,6 +315,29 @@ pub fn run(
             }
         };
         let now = Instant::now();
+
+        // NMEA 0183 filter control channel (PGN 262657). A client Set
+        // (Function == 1, arriving via the inbound loopback) mutates the
+        // filter here and is consumed — never rebroadcast, never on the
+        // bus. Report frames (Function == 0), including the ones this
+        // loop synthesises below, fall through to normal broadcast so a
+        // subscribed TUI reads current state as analyzer JSON.
+        if frame.pgn == PGN_NMEA0183_FILTER && frame.data.first() == Some(&FILTER_FN_SET) {
+            if let Some(f) = nmea_filter.as_mut() {
+                apply_filter_control(f, &frame.data);
+                queue_filter_report(f, &mut pending_synth);
+            }
+            continue;
+        }
+        // Periodically re-advertise the full filter state while a
+        // reader is attached, so a late-connecting TUI catches up.
+        if let Some(f) = nmea_filter.as_ref()
+            && now.duration_since(last_filter_report) >= FILTER_REPORT_INTERVAL
+            && (analyzer_batch.has_subscribers() || raw_batch.has_subscribers())
+        {
+            queue_filter_report(f, &mut pending_synth);
+            last_filter_report = now;
+        }
 
         // Quirk shim: inspect the inbound bus frame, maybe synthesise.
         // Each synthetic is written to the bus (so external consumers
@@ -315,6 +406,19 @@ pub fn run(
         // Updates "last received" stamps for PGN 60928 and 126996.
         hubs.engine.note_device_seen(decoded.pgn, decoded.src);
 
+        // Learn `src → NAME` for the per-device 0183 filter. The NAME
+        // is the full 64-bit ISO Address Claim payload (little-endian),
+        // so even a device with an "unavailable" manufacturer code is
+        // uniquely identified. A source that never claims stays
+        // unmapped and produces no 0183 — the "no NAME, no output" rule.
+        if decoded.pgn == 60928
+            && assembled.data.len() >= 8
+            && let Some(f) = nmea_filter.as_mut()
+        {
+            let name = u64::from_le_bytes(assembled.data[..8].try_into().expect("8 bytes"));
+            f.note_address_claim(decoded.src, name);
+        }
+
         // Lazy analyzer JSON — serialized at most ONCE per decoded
         // record and shared by all three consumers: the snapshot
         // cache, the analyzer port broadcast, and the NMEA 0183
@@ -338,26 +442,41 @@ pub fn run(
         // With neither, the per-record cost is two atomic loads.
         nmea_buf.clear();
         let pgn = decoded.pgn;
-        let n_emitted = if !emit_nmea_stdout && !nmea_batch.has_subscribers() {
-            0
+        let mut ais_branch = false;
+        // Convert when someone will see the 0183, OR when the filter is
+        // active: the filter learns each device's producible sentences
+        // by observing conversions, and the TUI needs that inventory
+        // (via the 262657 Report) even with no 0183 client attached.
+        let want_nmea = emit_nmea_stdout || nmea_batch.has_subscribers() || nmea_filter.is_some();
+        let converted = if !want_nmea {
+            false
         } else if n2kd::decoded::Handles::supports(pgn) {
-            n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles)
+            n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles) > 0
         } else if is_ais_pgn(pgn) {
-            n2kd::ais_decoded::convert(&mut nmea_buf, &decoded, &mut ais_seq)
+            ais_branch = true;
+            n2kd::ais_decoded::convert(&mut nmea_buf, &decoded, &mut ais_seq) > 0
         } else if json_ok {
             // The analyzer JSON for this record is already in
             // `json_line` — feed the converter from there instead of
             // serializing the same record a second time.
-            n2kd::nmea0183::convert(&mut nmea_buf, &json_line, &mut rl)
+            n2kd::nmea0183::convert(&mut nmea_buf, &json_line, &mut rl) > 0
         } else {
             JSON_BUF.with(|c| {
                 let mut buf = c.borrow_mut();
                 buf.clear();
                 let _ = write_json(&mut *buf, &decoded, &json_opts);
                 n2kd::nmea0183::convert(&mut nmea_buf, &buf, &mut rl)
-            })
+            }) > 0
         };
-        if n_emitted > 0 {
+        // Per-device NMEA 0183 filter mutes redundant devices' `$`
+        // sentences; AIS (`!AI…`) is exempt and passes straight through.
+        if converted
+            && !ais_branch
+            && let Some(f) = nmea_filter.as_mut()
+        {
+            f.apply(decoded.src, &mut nmea_buf);
+        }
+        if !nmea_buf.is_empty() {
             if emit_nmea_stdout {
                 let _ = out.write_all(nmea_buf.as_bytes());
             }

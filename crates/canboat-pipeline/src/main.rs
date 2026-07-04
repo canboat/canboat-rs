@@ -24,6 +24,7 @@
 //! Output: NMEA 0183 sentences on stdout.
 
 mod hub;
+mod nmea_filter;
 mod pipeline;
 mod quirks;
 mod snapshot;
@@ -250,6 +251,16 @@ struct Cli {
     #[arg(long = "no-nmea0183-rate-limit")]
     no_nmea0183_rate_limit: bool,
 
+    /// Enable the per-device NMEA 0183 filter, reading mute rules from
+    /// this JSON file (a missing file starts with no mutes). When set,
+    /// the 0183 outputs only carry sentences from devices whose NAME
+    /// (PGN 60928) the pipeline has learned and that aren't muted — so
+    /// several devices reporting one measurement no longer each reach
+    /// downstream 0183 consumers. Off when unset: every converted
+    /// sentence is emitted, as before. The N2K bus is never affected.
+    #[arg(long = "nmea0183-filter", value_name = "PATH")]
+    nmea0183_filter: Option<std::path::PathBuf>,
+
     /// Emit field keys + PGN descriptions as camelCase
     /// identifiers (`"uniqueNumber"` instead of `"Unique Number"`)
     /// on the analyzer JSON / snapshot TCP ports. Matches canboat
@@ -462,14 +473,29 @@ fn run(cli: Cli) -> Result<()> {
 
     let _ = inject; // No further use in this function
 
+    let nmea_filter = match cli.nmea0183_filter.as_deref() {
+        Some(path) => {
+            let f = nmea_filter::NmeaFilter::load(path)?;
+            log::info!(
+                "NMEA 0183 per-device filter enabled from {}",
+                path.display()
+            );
+            Some(f)
+        }
+        None => None,
+    };
+
     pipeline::run(
         db,
         frames_rx,
         hubs,
-        cli.nmea0183_stdout,
         pre_coalesced,
         json_opts,
-        !cli.no_nmea0183_rate_limit,
+        pipeline::Nmea0183Options {
+            emit_stdout: cli.nmea0183_stdout,
+            rate_limit: !cli.no_nmea0183_rate_limit,
+            filter: nmea_filter,
+        },
     );
 
     // After the pipeline drains, signal the supervisor to stop

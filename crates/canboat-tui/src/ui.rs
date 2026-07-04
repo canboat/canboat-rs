@@ -97,12 +97,19 @@ pub enum Screen {
     /// exact sequence a device booted / claimed / negotiated in,
     /// but it works in live mode too.
     TimeView,
+    /// Per-device NMEA 0183 output filter (live mode + pipeline only).
+    /// Lists every source producing 0183 with the sentences it emits;
+    /// Space toggles a whole source or an individual sentence, sending
+    /// a PGN 262657 Set to the pipeline. Fed by its Report frames.
+    Nmea0183,
 }
 
 pub struct App {
     pub screen: Screen,
     pub devices_state: ListState,
     pub detail_state: ListState,
+    /// Selection state for the `Nmea0183` filter screen.
+    pub nmea0183_state: ListState,
     /// Selection state for the `TimeView` screen — one row per
     /// observation in `AppState::history`.
     pub time_state: ListState,
@@ -211,10 +218,13 @@ impl App {
         detail_state.select(Some(0));
         let mut time_state = ListState::default();
         time_state.select(Some(0));
+        let mut nmea0183_state = ListState::default();
+        nmea0183_state.select(Some(0));
         Self {
             screen: Screen::Devices,
             devices_state,
             detail_state,
+            nmea0183_state,
             time_state,
             entry_scroll: 0,
             overrides,
@@ -481,6 +491,44 @@ impl App {
                     self.screen = Screen::DeviceDetail { src: d.src };
                     self.detail_state.select(Some(0));
                 }
+            }
+            // NMEA 0183 filter view — live pipeline only (needs the
+            // 262657 control channel to be answered).
+            (Screen::Devices, KeyCode::Char('n')) if state.status.mode == Mode::Live => {
+                self.nmea0183_state.select(Some(0));
+                self.screen = Screen::Nmea0183;
+            }
+            (Screen::Nmea0183, KeyCode::Down) | (Screen::Nmea0183, KeyCode::Char('j')) => {
+                navigate_list(&mut self.nmea0183_state, state.nmea0183_rows().len(), 1);
+            }
+            (Screen::Nmea0183, KeyCode::Up) | (Screen::Nmea0183, KeyCode::Char('k')) => {
+                navigate_list(&mut self.nmea0183_state, state.nmea0183_rows().len(), -1);
+            }
+            (Screen::Nmea0183, KeyCode::Char(' ')) | (Screen::Nmea0183, KeyCode::Enter) => {
+                let rows = state.nmea0183_rows();
+                if let Some(row) = self.nmea0183_state.selected().and_then(|i| rows.get(i)) {
+                    let sentence = row
+                        .sentence
+                        .as_deref()
+                        .unwrap_or(crate::state::NMEA0183_ALL);
+                    let line = iso::nmea0183_filter_set(row.src, sentence, !row.muted);
+                    if writer.send(line) {
+                        let what = row.sentence.clone().unwrap_or_else(|| "all".into());
+                        self.toast = Some(format!(
+                            "{} {what} on src {}",
+                            if row.muted { "Unmuted" } else { "Muted" },
+                            row.src
+                        ));
+                    } else {
+                        self.toast = Some("Writer channel closed".into());
+                    }
+                }
+            }
+            (Screen::Nmea0183, KeyCode::Esc)
+            | (Screen::Nmea0183, KeyCode::Backspace)
+            | (Screen::Nmea0183, KeyCode::Char('h'))
+            | (Screen::Nmea0183, KeyCode::Char('d')) => {
+                self.screen = Screen::Devices;
             }
             (Screen::DeviceDetail { src }, KeyCode::Down)
             | (Screen::DeviceDetail { src }, KeyCode::Char('j')) => {
@@ -954,6 +1002,7 @@ pub fn draw(tty: &mut Tty, app: &mut App, state: &AppState) -> Result<()> {
                 );
             }
             Screen::TimeView => draw_time_view(f, chunks[1], app, state),
+            Screen::Nmea0183 => draw_nmea0183(f, chunks[1], app, state),
         }
         // The bottom line: text prompt when `/` or `f` is active,
         // otherwise the per-screen keybinding hint.
@@ -1081,7 +1130,13 @@ fn draw_hint_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &AppS
 /// doesn't get advertised where it would do nothing.
 fn screen_hint(screen: &Screen, overrides_writable: bool, mode: Mode) -> &'static str {
     match (screen, mode) {
+        (Screen::Devices, Mode::Live) => {
+            "q quit | ↑↓ move | Enter open device | n NMEA0183 filter | t timeline"
+        }
         (Screen::Devices, _) => "q quit | ↑↓ move | Enter open device | t timeline",
+        (Screen::Nmea0183, _) => {
+            "q quit | ↑↓ move | Space toggle mute | d/Esc back | (row = whole source or one sentence)"
+        }
         // Log mode: no live bus → no `i` / `o`.
         (Screen::DeviceDetail { .. }, Mode::Log) => {
             "q quit | ↑↓ move | Enter open entry | Esc back | t timeline"
@@ -1143,6 +1198,76 @@ fn format_device_row(d: &DeviceInfo) -> Line<'static> {
         Span::raw(format!(" pgns {:3}", d.pgn_count)),
         Span::raw(format!("  {}", d.installation)),
     ])
+}
+
+fn draw_nmea0183(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &AppState) {
+    let rows = state.nmea0183_rows();
+    // Friendly per-source labels from the device list.
+    let labels: std::collections::HashMap<u8, String> = state
+        .device_list()
+        .into_iter()
+        .map(|d| {
+            let mfr = if d.manufacturer.is_empty() {
+                "(unknown)".to_string()
+            } else {
+                d.manufacturer
+            };
+            let model = if d.model.is_empty() {
+                String::new()
+            } else {
+                format!(" {}", d.model)
+            };
+            (d.src, format!("{mfr}{model}"))
+        })
+        .collect();
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|r| {
+            let (tag, color) = if r.muted {
+                ("muted", Color::Red)
+            } else {
+                (" on  ", Color::Green)
+            };
+            let line = match &r.sentence {
+                None => Line::from(vec![
+                    Span::styled(
+                        format!(" src {:3} ", r.src),
+                        Style::default()
+                            .fg(Color::Yellow)
+                            .add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        format!("[{tag}] "),
+                        Style::default().fg(color).add_modifier(Modifier::BOLD),
+                    ),
+                    Span::styled(
+                        labels.get(&r.src).cloned().unwrap_or_default(),
+                        Style::default().add_modifier(Modifier::BOLD),
+                    ),
+                ]),
+                Some(s) => Line::from(vec![
+                    Span::raw("          "),
+                    Span::raw(format!("{s:<5}")),
+                    Span::styled(format!("[{tag}]"), Style::default().fg(color)),
+                ]),
+            };
+            ListItem::new(line)
+        })
+        .collect();
+    if !rows.is_empty() && app.nmea0183_state.selected().is_none() {
+        app.nmea0183_state.select(Some(0));
+    }
+    let title = if rows.is_empty() {
+        "NMEA 0183 filter (waiting for pipeline report…)".to_string()
+    } else {
+        format!("NMEA 0183 filter — {} sources", state.nmea0183.len())
+    };
+    let list = List::new(items)
+        .block(Block::default().borders(Borders::ALL).title(title))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED))
+        .highlight_symbol(" ▶ ")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(list, area, &mut app.nmea0183_state);
 }
 
 fn draw_device_detail(

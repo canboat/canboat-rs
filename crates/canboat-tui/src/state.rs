@@ -135,6 +135,29 @@ pub struct DeviceInfo {
     pub pgn_count: usize,
 }
 
+/// Per-source NMEA 0183 filter state, learned from the pipeline's PGN
+/// 262657 Report frames. `muted` is the whole-source state; `sentences`
+/// maps each 3-letter formatter the device can produce to its current
+/// (effective) mute state. See [`AppState::apply_nmea0183_report`].
+#[derive(Debug, Clone, Default)]
+pub struct Nmea0183Device {
+    pub muted: bool,
+    pub sentences: BTreeMap<String, bool>,
+}
+
+/// One navigable row in the NMEA 0183 filter screen: either a
+/// whole-source header (`sentence == None`) or one of its sentences.
+#[derive(Debug, Clone)]
+pub struct Nmea0183Row {
+    pub src: u8,
+    pub sentence: Option<String>,
+    pub muted: bool,
+}
+
+/// The `ALL` sentence token in PGN 262657 (whole-source mute). Mirrors
+/// `canboat_pipeline::nmea_filter::ALL_SENTENCES`.
+pub const NMEA0183_ALL: &str = "ALL";
+
 /// What's feeding the cache — a live bus / pipeline endpoint or a
 /// captured log file. Drives several UI affordances:
 ///
@@ -247,6 +270,9 @@ pub struct AppState {
     /// NAME themselves — they arrive addressed to the same `src` as
     /// the recent Address Claim).
     pub src_to_name: HashMap<u8, NameKey>,
+    /// Per-source NMEA 0183 filter state, fed by the pipeline's PGN
+    /// 262657 Report frames. Drives the `Screen::Nmea0183` view.
+    pub nmea0183: BTreeMap<u8, Nmea0183Device>,
 }
 
 impl AppState {
@@ -258,6 +284,7 @@ impl AppState {
             alerts: VecDeque::new(),
             device_cache,
             src_to_name: HashMap::new(),
+            nmea0183: BTreeMap::new(),
         }
     }
 
@@ -280,6 +307,14 @@ impl AppState {
         description: String,
         line: Value,
     ) {
+        // PGN 262657 is the pipeline's NMEA 0183 filter control channel,
+        // not a bus record — route its Report frames into the filter
+        // view instead of the entry/device model.
+        if pgn == 262657 {
+            self.apply_nmea0183_report(&line);
+            self.status.messages_seen = self.status.messages_seen.saturating_add(1);
+            return;
+        }
         let key = (pgn, src, secondary.clone());
         let now = Instant::now();
         let timestamp = line
@@ -480,6 +515,50 @@ impl AppState {
         by_src.into_values().collect()
     }
 
+    /// Fold one PGN 262657 Report frame into [`AppState::nmea0183`].
+    /// Only Report frames (Function 0) carry state; a stray Set
+    /// (Function 1) echoed back is ignored.
+    fn apply_nmea0183_report(&mut self, line: &Value) {
+        if field_number(line, "Function") != Some(0) {
+            return;
+        }
+        let Some(src) = field_number(line, "Source") else {
+            return;
+        };
+        let Some(sentence) = field_text(line, "Sentence") else {
+            return;
+        };
+        let muted = field_number(line, "Muted").unwrap_or(0) != 0;
+        let dev = self.nmea0183.entry(src as u8).or_default();
+        if sentence == NMEA0183_ALL {
+            dev.muted = muted;
+        } else {
+            dev.sentences.insert(sentence, muted);
+        }
+    }
+
+    /// Flatten [`AppState::nmea0183`] into navigable rows: one
+    /// whole-source header per device followed by its sentences,
+    /// source-ordered.
+    pub fn nmea0183_rows(&self) -> Vec<Nmea0183Row> {
+        let mut rows = Vec::new();
+        for (src, dev) in &self.nmea0183 {
+            rows.push(Nmea0183Row {
+                src: *src,
+                sentence: None,
+                muted: dev.muted,
+            });
+            for (sentence, muted) in &dev.sentences {
+                rows.push(Nmea0183Row {
+                    src: *src,
+                    sentence: Some(sentence.clone()),
+                    muted: *muted,
+                });
+            }
+        }
+        rows
+    }
+
     /// All entries for `src`, sorted by PGN then secondary so the UI
     /// shows a stable list.
     pub fn entries_for_src(&self, src: u8) -> Vec<&Entry> {
@@ -650,4 +729,50 @@ fn collect_pgn_list(line: &Value) -> Vec<u32> {
 /// unchanged; do this anyway so we never silently miss a field.
 fn json_pointer_escape(s: &str) -> String {
     s.replace('~', "~0").replace('/', "~1")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn state() -> AppState {
+        AppState::new(Status::new_live("t".into(), 0, 0), HashMap::new())
+    }
+
+    fn report(src: u8, sentence: &str, muted: u8) -> Value {
+        json!({
+            "pgn": 262657,
+            "fields": {"Function": 0, "Source": src, "Sentence": sentence, "Muted": muted}
+        })
+    }
+
+    #[test]
+    fn nmea0183_report_builds_rows_and_stays_out_of_entries() {
+        let mut s = state();
+        s.upsert(262657, 0, None, String::new(), report(35, NMEA0183_ALL, 0));
+        s.upsert(262657, 0, None, String::new(), report(35, "VHW", 0));
+        s.upsert(262657, 0, None, String::new(), report(35, "VLW", 1));
+        // Control frames don't pollute the bus/device model.
+        assert!(s.entries.is_empty());
+        assert!(s.device_list().is_empty());
+        let rows = s.nmea0183_rows();
+        // header (ALL) + VHW + VLW
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].src, 35);
+        assert!(rows[0].sentence.is_none() && !rows[0].muted);
+        assert_eq!(rows[1].sentence.as_deref(), Some("VHW"));
+        assert!(!rows[1].muted);
+        assert_eq!(rows[2].sentence.as_deref(), Some("VLW"));
+        assert!(rows[2].muted);
+    }
+
+    #[test]
+    fn whole_source_mute_updates_header() {
+        let mut s = state();
+        s.upsert(262657, 0, None, String::new(), report(53, "MWV", 0));
+        s.upsert(262657, 0, None, String::new(), report(53, NMEA0183_ALL, 1));
+        let rows = s.nmea0183_rows();
+        assert!(rows[0].sentence.is_none() && rows[0].muted);
+    }
 }

@@ -171,6 +171,8 @@ dependencies = [
  "env_logger",
  "log",
  "n2kd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

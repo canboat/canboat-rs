@@ -182,54 +182,89 @@ fn run_ais_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
     let _ = stream.shutdown(Shutdown::Both);
 }
 
-/// Direction policy for [`spawn_stream_server`]. Mode `ReadOnly`
-/// shuts down the TCP read direction on every accept; `ReadWrite`
-/// spawns an inbound reader subthread that parses PLAIN/FAST lines
-/// and forwards `RawFrame`s through `inject` if one is configured
-/// (silently drops them when `None`, e.g. stdin-mode pipeline with
-/// no device behind it).
-pub enum Direction {
-    ReadOnly,
-    ReadWrite { inject: Option<InjectPoint> },
-}
-
-/// Bind a TCP server that streams `hub` broadcast lines out to every
-/// connected client and — depending on [`Direction`] — optionally
-/// accepts PLAIN/FAST lines back from those clients.
+/// Bind a read-only TCP server that streams `hub` broadcast lines out
+/// to every connected client. The read direction is FIN'd on accept —
+/// all injection goes through the dedicated write-only input port
+/// ([`spawn_input_server`]), so no broadcast stream is bidirectional.
 ///
 /// `header` is optional bytes written to the client immediately on
-/// connect, before the first broadcast line. Used by the CSV port
-/// to emit canboat's `# format=FAST\n` so downstream PLAIN/FAST
+/// connect, before the first broadcast line. Used by the raw output
+/// port to emit canboat's `# format=FAST\n` so downstream PLAIN/FAST
 /// parsers know the stream is pre-coalesced.
 pub fn spawn_stream_server(
     name: &'static str,
     bind: Ipv4Addr,
     port: u16,
     hub: Arc<Hub>,
-    direction: Direction,
     header: Option<&'static [u8]>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding {name} TCP port {}:{}", bind, port))?;
-    let mode = match (&direction, header.is_some()) {
-        (Direction::ReadWrite { inject: Some(_) }, true) => "R/W + header",
-        (Direction::ReadWrite { inject: Some(_) }, false) => "R/W",
-        (Direction::ReadWrite { inject: None }, true) => "R/W (writes dropped) + header",
-        (Direction::ReadWrite { inject: None }, false) => "R/W (writes dropped)",
-        (Direction::ReadOnly, _) => "RO",
+    log::info!("{name} server listening on {}:{} (RO)", bind, port);
+    Ok(thread::Builder::new()
+        .name(format!("{name}-accept"))
+        .spawn(move || stream_accept(name, listener, hub, header))
+        .expect("spawn stream accept"))
+}
+
+/// Bind a **write-only** TCP input server: clients connect and write
+/// PLAIN/FAST lines that are parsed and injected onto the bus via
+/// `inject`. Nothing is streamed back — this is the canonical
+/// `SERVER_INPUT_STREAM` slot (canboat C n2kd `port+3`). Unlike the
+/// broadcast ports it never subscribes to a hub, so it adds no
+/// serialization pressure; that's what makes it the cheap write path
+/// for a consumer that reads its data elsewhere (e.g. the binary
+/// port). `inject: None` (stdin mode, no device) still accepts and
+/// drains client writes, logging them at debug.
+pub fn spawn_input_server(
+    name: &'static str,
+    bind: Ipv4Addr,
+    port: u16,
+    inject: Option<InjectPoint>,
+) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding {name} TCP port {}:{}", bind, port))?;
+    let mode = if inject.is_some() {
+        "write-only"
+    } else {
+        "write-only (writes dropped)"
     };
     log::info!("{name} server listening on {}:{} ({mode})", bind, port);
     Ok(thread::Builder::new()
         .name(format!("{name}-accept"))
-        .spawn(move || stream_accept(name, listener, hub, direction, header))
-        .expect("spawn stream accept"))
+        .spawn(move || input_accept(name, listener, inject))
+        .expect("spawn input accept"))
+}
+
+fn input_accept(name: &'static str, listener: TcpListener, inject: Option<InjectPoint>) {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("{name} accept failed: {e}");
+                return;
+            }
+        };
+        log::info!("{name} client connected: {peer}");
+        let inj = inject.clone();
+        thread::Builder::new()
+            .name(format!("{name}-client"))
+            .spawn(move || {
+                // We never broadcast to this client; FIN our write
+                // direction so a client that tries to read sees EOF.
+                if let Err(e) = stream.shutdown(Shutdown::Write) {
+                    log::debug!("{name}: shutdown(write) failed: {e}");
+                }
+                run_inbound_reader(name, stream, inj);
+            })
+            .ok();
+    }
 }
 
 fn stream_accept(
     name: &'static str,
     listener: TcpListener,
     hub: Arc<Hub>,
-    direction: Direction,
     header: Option<&'static [u8]>,
 ) {
     loop {
@@ -242,53 +277,20 @@ fn stream_accept(
         };
         log::info!("{name} client connected: {peer}");
         let h = hub.clone();
-        let d = match &direction {
-            Direction::ReadOnly => Direction::ReadOnly,
-            Direction::ReadWrite { inject } => Direction::ReadWrite {
-                inject: inject.clone(),
-            },
-        };
         thread::Builder::new()
             .name(format!("{name}-client"))
-            .spawn(move || run_stream_client(name, stream, h, d, header))
+            .spawn(move || run_stream_client(name, stream, h, header))
             .ok();
     }
 }
 
-fn run_stream_client(
-    name: &'static str,
-    stream: TcpStream,
-    hub: Arc<Hub>,
-    direction: Direction,
-    header: Option<&'static [u8]>,
-) {
-    let read_handle = match direction {
-        // Strictly read-only: FIN the read direction so any client
-        // write attempts get ECONNRESET / EPIPE instead of silently
-        // piling up in the kernel's receive buffer.
-        Direction::ReadOnly => {
-            if let Err(e) = stream.shutdown(Shutdown::Read) {
-                log::debug!("{name}: shutdown(read) failed: {e}");
-            }
-            None
-        }
-        // R/W: spawn a reader subthread on its own socket clone.
-        // When no inject point is configured (stdin mode) the reader
-        // silently drops inbound lines — we still accept the writes
-        // (no FIN), we just have nowhere to forward them.
-        Direction::ReadWrite { inject } => match stream.try_clone() {
-            Ok(read_stream) => Some(
-                thread::Builder::new()
-                    .name(format!("{name}-client-read"))
-                    .spawn(move || run_inbound_reader(name, read_stream, inject))
-                    .expect("spawn inbound reader"),
-            ),
-            Err(e) => {
-                log::warn!("{name}: cannot clone client stream: {e}");
-                None
-            }
-        },
-    };
+fn run_stream_client(name: &'static str, stream: TcpStream, hub: Arc<Hub>, header: Option<&'static [u8]>) {
+    // FIN the read direction so any client write attempts get
+    // ECONNRESET / EPIPE instead of silently piling up in the kernel's
+    // receive buffer — these broadcast ports are strictly read-only.
+    if let Err(e) = stream.shutdown(Shutdown::Read) {
+        log::debug!("{name}: shutdown(read) failed: {e}");
+    }
 
     // Main: drain the subscription and write to the socket.
     let rx = hub.subscribe();
@@ -321,12 +323,8 @@ fn run_stream_client(
             break;
         }
     }
-    // Closing the write side drops the fd; the inbound reader (if
-    // any) exits on its next read.
+    // Closing the write side drops the fd and ends the client.
     drop(stream);
-    if let Some(j) = read_handle {
-        let _ = j.join();
-    }
 }
 
 fn run_inbound_reader(name: &'static str, stream: TcpStream, inject: Option<InjectPoint>) {

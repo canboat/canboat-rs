@@ -23,7 +23,7 @@
 //!
 //! Which PGNs are fast-packet for stdout reassembly is decided by range,
 //! except for the mixed 0x1F000..0x1FFFF range, for which a table
-//! generated from `data/canboat.json` at build time (see `build.rs`) is
+//! generated from `crates/canboat-core/data/canboat.json` at build time (see `build.rs`) is
 //! consulted.
 //!
 //! Mirrors `canboat/socketcan-serial/socketcan-serial.c`.
@@ -37,7 +37,7 @@ use clap::Parser;
     name = "socketcan-serial",
     about = "Bridge a Linux SocketCAN interface to/from canboat FAST format",
     version,
-    after_help = canboat_cli::COPYRIGHT_ID
+    after_help = canboat_cli::help_footer()
 )]
 struct Cli {
     /// SocketCAN interface name, e.g. can0 or nmea2000.
@@ -123,7 +123,7 @@ fn main() -> ExitCode {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
-    log::info!("{}", canboat_cli::COPYRIGHT_ID);
+    canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     if let Err(e) = run(cli) {
         eprintln!("socketcan-serial: {e:#}");

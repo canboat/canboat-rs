@@ -38,7 +38,7 @@ const CANBOAT_PGN_START: u32 = 0x40000;
     name = "socketcan-writer",
     about = "Forward canboat PLAIN/FAST stdin to a Linux SocketCAN device",
     version,
-    after_help = canboat_cli::COPYRIGHT_ID
+    after_help = canboat_cli::help_footer()
 )]
 struct Cli {
     /// Target device. Use `-` or `stdout` to write the raw 16-byte
@@ -84,7 +84,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
-    log::info!("{}", canboat_cli::COPYRIGHT_ID);
+    canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     let mut sink: Box<dyn FrameSink> = if cli.device == "-" || cli.device == "stdout" {
         Box::new(StdoutSink::new())

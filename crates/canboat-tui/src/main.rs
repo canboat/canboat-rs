@@ -45,7 +45,7 @@ use crate::state::{AppState, Status};
 #[command(
     name = "canboat-tui",
     about = "Interactive terminal UI for an NMEA 2000 bus, fed by n2kd or canboat-pipeline.",
-    after_help = canboat_cli::COPYRIGHT_ID
+    after_help = canboat_cli::help_footer()
 )]
 struct Args {
     /// Hostname or IP of the n2kd / canboat-pipeline endpoint.
@@ -93,7 +93,7 @@ async fn main() -> Result<()> {
         let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
             .target(env_logger::Target::Pipe(Box::new(file)))
             .try_init();
-        log::info!("{}", canboat_cli::COPYRIGHT_ID);
+        canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     }
 
     let args = Args::parse();

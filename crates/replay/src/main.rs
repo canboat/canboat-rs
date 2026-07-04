@@ -30,7 +30,7 @@ use clap::Parser;
     name = "replay",
     about = "Pace canboat PLAIN/FAST stdin so it replays at real-time speed",
     version,
-    after_help = canboat_cli::COPYRIGHT_ID
+    after_help = canboat_cli::help_footer()
 )]
 struct Cli {
     /// Verbose / debug logging — alias of `-d`. Matches canboat's C tool.
@@ -71,7 +71,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
-    log::info!("{}", canboat_cli::COPYRIGHT_ID);
+    canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     let stdin = io::stdin();
     let stdout = io::stdout();

@@ -30,7 +30,7 @@ use analyzer::replay::{self, Config};
     name = "analyzer",
     about = "Decode canboat PLAIN/FAST lines from stdin into text or JSON",
     version,
-    after_help = canboat_cli::COPYRIGHT_ID
+    after_help = canboat_cli::help_footer()
 )]
 struct Cli {
     /// Read input from this file instead of stdin.

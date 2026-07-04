@@ -38,7 +38,7 @@ const PCAP_MAGIC_US: u32 = 0xa1b2c3d4;
     name = "pcap2candump",
     about = "Convert libpcap CAN captures to candump -l log lines",
     version,
-    after_help = canboat_cli::COPYRIGHT_ID
+    after_help = canboat_cli::help_footer()
 )]
 struct Cli {
     /// One or more pcap files. Output is to stdout.

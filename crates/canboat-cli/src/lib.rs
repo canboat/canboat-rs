@@ -13,11 +13,26 @@
 use std::env;
 use std::ffi::OsString;
 
-/// The canboat copyright line, extracted from `data/canboat.json` at
-/// build time by `canboat-core/build.rs`. Every binary shows it in
-/// `--help` (via clap `after_help`) and logs it at startup when
-/// verbose logging is on.
-pub use canboat_core::COPYRIGHT_ID;
+/// The canboat copyright line and schema version, extracted from
+/// `crates/canboat-core/data/canboat.json` at build time by
+/// `canboat-core/build.rs`. Every binary shows them in `--help` (via
+/// clap `after_help`) and logs them at startup when verbose logging
+/// is on.
+pub use canboat_core::{CANBOAT_JSON_VERSION, COPYRIGHT_ID};
+
+/// `--help` footer shared by all binaries: embedded schema version +
+/// the canboat copyright line.
+pub fn help_footer() -> String {
+    format!("canboat.json v{CANBOAT_JSON_VERSION}\n{COPYRIGHT_ID}")
+}
+
+/// Log the standard startup banner at info level: binary name and
+/// version, embedded canboat.json version, copyright. Callers pass
+/// `env!("CARGO_PKG_NAME")` / `env!("CARGO_PKG_VERSION")` so the
+/// values come from the binary crate, not from canboat-cli.
+pub fn log_startup(name: &str, version: &str) {
+    log::info!("{name} v{version} (canboat.json v{CANBOAT_JSON_VERSION}) {COPYRIGHT_ID}");
+}
 
 /// Read the process argv and translate any single-dash long options
 /// to double-dash form. This lets users invoke a canboat-rs tool the

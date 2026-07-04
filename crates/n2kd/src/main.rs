@@ -55,7 +55,7 @@ const AIS_PGNS: &[u32] = &[
     name = "n2kd",
     about = "Multiplex analyzer JSON stdin to TCP clients",
     version,
-    after_help = canboat_cli::COPYRIGHT_ID
+    after_help = canboat_cli::help_footer()
 )]
 struct Cli {
     /// Base TCP port. `+1`=stream, `+2`=nmea0183, `+3`=raw input, `+4`=ais, `+5`=status. Matches canboat C n2kd.
@@ -153,7 +153,7 @@ fn run(cli: Cli) -> Result<()> {
         "info"
     };
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
-    log::info!("{}", canboat_cli::COPYRIGHT_ID);
+    canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
 
     let src_filter = parse_src_filter(cli.src_filter.as_deref())?;
     let bind_addr: Ipv4Addr = if cli.public {

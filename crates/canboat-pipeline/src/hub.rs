@@ -14,12 +14,12 @@
 //! (PLAIN/FAST, NMEA 0183, JSON). When no one is connected, the
 //! steady-state cost per frame is a single relaxed atomic load.
 
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
 
 pub struct Hub {
-    subscribers: Mutex<Vec<Sender<String>>>,
+    subscribers: Mutex<Vec<Sender<Arc<str>>>>,
     count: AtomicUsize,
 }
 
@@ -36,8 +36,8 @@ impl Hub {
         self.count.load(Ordering::Relaxed) > 0
     }
 
-    pub fn subscribe(&self) -> mpsc::Receiver<String> {
-        let (tx, rx) = mpsc::channel::<String>();
+    pub fn subscribe(&self) -> mpsc::Receiver<Arc<str>> {
+        let (tx, rx) = mpsc::channel::<Arc<str>>();
         let mut subs = self.subscribers.lock().expect("hub poisoned");
         subs.push(tx);
         self.count.store(subs.len(), Ordering::Relaxed);
@@ -45,10 +45,13 @@ impl Hub {
     }
 
     /// Broadcast `line` (caller's responsibility to include trailing
-    /// `\n` if expected). Dead subscribers are pruned in place.
+    /// `\n` if expected). The line is allocated once and shared by
+    /// every subscriber — each send is a refcount bump, not a copy.
+    /// Dead subscribers are pruned in place.
     pub fn broadcast(&self, line: &str) {
+        let shared: Arc<str> = Arc::from(line);
         let mut subs = self.subscribers.lock().expect("hub poisoned");
-        subs.retain(|tx| tx.send(line.to_string()).is_ok());
+        subs.retain(|tx| tx.send(shared.clone()).is_ok());
         self.count.store(subs.len(), Ordering::Relaxed);
     }
 }

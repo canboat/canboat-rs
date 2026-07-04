@@ -109,7 +109,7 @@ pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions
         } else {
             write!(w, "{name} = ", name = f.name())?;
         }
-        write_field_value(w, f, opts.geo)?;
+        write_field_value(w, f, opts.geo, opts.debug, &pgn.data)?;
         if opts.debug {
             write_text_debug_suffix(w, f, &pgn.data)?;
         }
@@ -265,7 +265,13 @@ fn write_unit<W: fmt::Write>(w: &mut W, f: &DecodedField) -> fmt::Result {
     Ok(())
 }
 
-fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat) -> fmt::Result {
+fn write_field_value<W: fmt::Write>(
+    w: &mut W,
+    f: &DecodedField,
+    geo: GeoFormat,
+    debug: bool,
+    payload: &[u8],
+) -> fmt::Result {
     match &f.value {
         FieldValue::Number(v) => {
             // Lat/lon are width 10, precision 7, and intentionally
@@ -344,8 +350,19 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
         FieldValue::Reserved { .. } | FieldValue::Spare { .. } => Ok(()),
         FieldValue::IsoName { value, subfields } => {
             // canboat text format: 0x<hex> name = [<sub1>;<sub2>;...]
+            // Under -debug each subfield carries its own
+            // `(bytes = ..., bits = ...)` relative to the 8-byte NAME
+            // payload; the whole-NAME bytes suffix is appended by the
+            // top-level walker as usual.
             write!(w, "0x{:x}", value)?;
             if !subfields.is_empty() {
+                let name_payload: &[u8] = match f.bit_offset {
+                    Some(bo) if bo % 8 == 0 && (bo / 8) as usize + 8 <= payload.len() => {
+                        let s = (bo / 8) as usize;
+                        &payload[s..s + 8]
+                    }
+                    _ => &[],
+                };
                 w.write_str(" name = [")?;
                 let mut sep = "";
                 for sf in subfields {
@@ -359,7 +376,10 @@ fn write_field_value<W: fmt::Write>(w: &mut W, f: &DecodedField, geo: GeoFormat)
                     }
                     w.write_str(sep)?;
                     write!(w, " {name} = ", name = sf.name())?;
-                    write_field_value(w, sf, geo)?;
+                    write_field_value(w, sf, geo, debug, name_payload)?;
+                    if debug {
+                        write_text_debug_suffix(w, sf, name_payload)?;
+                    }
                     sep = ";";
                 }
                 w.write_str("]")?;

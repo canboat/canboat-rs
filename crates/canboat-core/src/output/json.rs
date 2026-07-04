@@ -542,10 +542,39 @@ fn write_field_value_debug<W: fmt::Write>(
                 }
             }
         }
-        FieldValue::IsoName { value, .. } => {
-            // -debug doesn't expand the nested subfields here — it just
-            // shows the raw 64-bit identifier. (canboat does the same.)
+        FieldValue::IsoName { value, subfields } => {
             write!(w, "{}", value)?;
+            if opts.name_value {
+                // -nv + -debug expands the embedded PGN 60928 field
+                // set like the non-debug path, but each subfield
+                // carries bytes/bits relative to the 8-byte NAME
+                // payload; the outer wrapper still gets the whole
+                // NAME's `bytes` suffix after the match.
+                let name_payload: &[u8] = match f.bit_offset {
+                    Some(bo) if bo % 8 == 0 && (bo / 8) as usize + 8 <= payload.len() => {
+                        let s = (bo / 8) as usize;
+                        &payload[s..s + 8]
+                    }
+                    _ => &[],
+                };
+                w.write_str(",\"name\":{")?;
+                let mut sep = "";
+                for sf in subfields {
+                    // Same filtering as the non-debug IsoName arm.
+                    if !opts.include_empty && matches!(sf.value, FieldValue::NotAvailable) {
+                        continue;
+                    }
+                    if matches!(sf.value, FieldValue::Spare { .. }) {
+                        continue;
+                    }
+                    w.write_str(sep)?;
+                    write_json_string(w, field_display_name(sf, opts.camel_case).as_ref())?;
+                    w.write_char(':')?;
+                    write_field_value_debug(w, sf, opts, name_payload)?;
+                    sep = ",";
+                }
+                w.write_char('}')?;
+            }
         }
         FieldValue::Reserved { bytes, .. } => {
             // Same shape as canboat's Binary: uppercase hex, space-

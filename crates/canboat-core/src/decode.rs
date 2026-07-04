@@ -1653,6 +1653,11 @@ fn decode_dynamic_field_value(
                 FieldValue::Date(ex.value as u16)
             }
         }
+        // The 130822 source-setting entries (Depth/Speed Source N,
+        // Port/Stbd Boat Speed Source, …) carry a device's 8-byte
+        // NMEA 2000 NAME; canboat C's fieldPrintKeyValue routes this
+        // through the same printer as PGN 60928.
+        Some("ISO_NAME") => decode_iso_name(data, bit_offset, bits, db),
         _ => decode_binary(data, bit_offset, bits),
     };
     (val, bits)

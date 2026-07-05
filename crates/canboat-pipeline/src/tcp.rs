@@ -284,7 +284,12 @@ fn stream_accept(
     }
 }
 
-fn run_stream_client(name: &'static str, stream: TcpStream, hub: Arc<Hub>, header: Option<&'static [u8]>) {
+fn run_stream_client(
+    name: &'static str,
+    stream: TcpStream,
+    hub: Arc<Hub>,
+    header: Option<&'static [u8]>,
+) {
     // FIN the read direction so any client write attempts get
     // ECONNRESET / EPIPE instead of silently piling up in the kernel's
     // receive buffer — these broadcast ports are strictly read-only.

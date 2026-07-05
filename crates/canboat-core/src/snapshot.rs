@@ -560,9 +560,10 @@ impl SnapshotStore {
         // construction-time wall/monotonic epoch + this record's `now`,
         // avoiding a per-record `SystemTime::now()` syscall. Formatting
         // to ISO is deferred to the (rare) status read.
-        let wall_ms = self
-            .epoch_wall_ms
-            .saturating_add(now.saturating_duration_since(self.epoch_instant).as_millis() as u64);
+        let wall_ms = self.epoch_wall_ms.saturating_add(
+            now.saturating_duration_since(self.epoch_instant)
+                .as_millis() as u64,
+        );
 
         let entry = CacheEntry {
             payload,

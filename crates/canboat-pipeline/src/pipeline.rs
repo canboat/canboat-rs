@@ -572,7 +572,8 @@ pub fn run(
         // the encode is skipped entirely when the port has no clients.
         if bin_batch.has_subscribers() {
             wire_frame.clear();
-            if canboat_wire::append_frame(&mut wire_frame, &WirePgn::from(decoded.as_ref())).is_ok() {
+            if canboat_wire::append_frame(&mut wire_frame, &WirePgn::from(decoded.as_ref())).is_ok()
+            {
                 bin_batch.push(&wire_frame, now);
             }
         }

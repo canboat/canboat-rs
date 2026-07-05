@@ -132,7 +132,10 @@ impl std::fmt::Display for HelloError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             HelloError::BadMagic(m) => {
-                write!(f, "not a canboat-wire stream (magic {m:?}, expected {MAGIC:?})")
+                write!(
+                    f,
+                    "not a canboat-wire stream (magic {m:?}, expected {MAGIC:?})"
+                )
             }
             HelloError::WireVersion { theirs, ours } => write!(
                 f,
@@ -210,13 +213,27 @@ pub enum WireValue {
     BitField(u64),
     String(String),
     Date(u16),
-    Time { raw: i64, seconds: f64 },
+    Time {
+        raw: i64,
+        seconds: f64,
+    },
     Mmsi(u32),
     /// Target PGN number; description re-resolved by receiver.
     Pgn(u32),
-    IsoName { value: u64, subfields: Vec<WireField> },
-    Reserved { value: u64, bytes: Vec<u8>, bit_length: u32 },
-    Spare { value: u64, bytes: Vec<u8>, bit_length: u32 },
+    IsoName {
+        value: u64,
+        subfields: Vec<WireField>,
+    },
+    Reserved {
+        value: u64,
+        bytes: Vec<u8>,
+        bit_length: u32,
+    },
+    Spare {
+        value: u64,
+        bytes: Vec<u8>,
+        bit_length: u32,
+    },
     NotAvailable,
     OutOfRange(u64),
     ReservedValue(u64),
@@ -674,8 +691,11 @@ mod tests {
 
         // merrimac's access path — field-by-name — works on the result.
         assert_eq!(
-            rehy.field_by_name("Reference").and_then(|f| f.value.as_str()),
-            decoded.field_by_name("Reference").and_then(|f| f.value.as_str()),
+            rehy.field_by_name("Reference")
+                .and_then(|f| f.value.as_str()),
+            decoded
+                .field_by_name("Reference")
+                .and_then(|f| f.value.as_str()),
         );
     }
 
@@ -742,9 +762,23 @@ mod tests {
                 [0x00, 0xb8, 0x22, 0xff, 0x7f, 0xff, 0x7f, 0xfd],
             ),
             // 128267 Water Depth — plain numbers, no timestamp.
-            RawFrame::new(None, 3, 128267, 35, 255, [0x00, 0x10, 0x27, 0x00, 0x00, 0xff, 0xff, 0xff]),
+            RawFrame::new(
+                None,
+                3,
+                128267,
+                35,
+                255,
+                [0x00, 0x10, 0x27, 0x00, 0x00, 0xff, 0xff, 0xff],
+            ),
             // 127245 Rudder — instance + signed angle.
-            RawFrame::new(None, 2, 127245, 22, 255, [0x00, 0xf8, 0xff, 0xff, 0x00, 0x20, 0xff, 0xff]),
+            RawFrame::new(
+                None,
+                2,
+                127245,
+                22,
+                255,
+                [0x00, 0xf8, 0xff, 0xff, 0x00, 0x20, 0xff, 0xff],
+            ),
         ];
 
         for frame in frames {

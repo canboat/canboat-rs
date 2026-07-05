@@ -1,5 +1,34 @@
 # Changelog
 
+## [0.4.0](https://github.com/canboat/canboat-rs/compare/v0.3.0...v0.4.0) (2026-07-05)
+
+
+### Features
+
+* **canboat-core:** decode ISO_NAME dynamic field values ([43cc23b](https://github.com/canboat/canboat-rs/commit/43cc23bf034a7b7c07d0302bec790b828b744ad4))
+* **canboat-core:** vendor schema inside the crate, pin + gate upstream sync ([76865fb](https://github.com/canboat/canboat-rs/commit/76865fbdb9f08afa5fe6ad209cb63ac67b202570))
+* **canboat-pipeline:** binary WirePgn transport, canonical pipeline ports, performance ([465a138](https://github.com/canboat/canboat-rs/commit/465a138e6a75a9dad5243775dd97a3f2d56f6093))
+* **canboat-pipeline:** live control channel for the NMEA0183 filter ([f13dbd5](https://github.com/canboat/canboat-rs/commit/f13dbd56d92716cb368c3bedb10468c86151be44))
+* **canboat-pipeline:** per-device NMEA0183 filter keyed by NAME ([c2b1a73](https://github.com/canboat/canboat-rs/commit/c2b1a733671438523246c0dd7d1f95bc5d22bf11))
+* **canboat-pipeline:** per-device NMEA0183 filter with live control channel and TUI ([37500ab](https://github.com/canboat/canboat-rs/commit/37500ab1e1a35ab1c75e192295433bf7b595aac1))
+* **canboat-pipeline:** rate-limit NMEA0183 output to 1 Hz ([cf5a171](https://github.com/canboat/canboat-rs/commit/cf5a17132105142673426d76a38955dda52f6398))
+* **canboat-pipeline:** rate-limit NMEA0183 output to 1 Hz ([5259eb6](https://github.com/canboat/canboat-rs/commit/5259eb69dfe57a616731baab9f447a2270661542))
+* **canboat-tui:** NMEA0183 filter mode ([d124ea4](https://github.com/canboat/canboat-rs/commit/d124ea4d787c19ffa472e34eefdd4792b270e541))
+* **canboat-wire:** binary WirePgn transport for pipeline consumers ([dd2dbe9](https://github.com/canboat/canboat-rs/commit/dd2dbe956f2abfd02f622c0466e6664857a4ff48))
+* startup banner with binary version and canboat.json version ([40cf05a](https://github.com/canboat/canboat-rs/commit/40cf05abf51f9deef09adabcb48b158483b6661b))
+
+
+### Bug Fixes
+
+* **canboat-core:** don't let frame 0 complete a fast packet off stale bits ([3544487](https://github.com/canboat/canboat-rs/commit/35444879a3c361f0546920eee6e04e316c01922a))
+* **canboat-core:** don't let frame 0 complete a fast packet off stale bits ([1d04646](https://github.com/canboat/canboat-rs/commit/1d046467eedb27a7466e9b42f2ea7f866730a793))
+
+
+### Performance Improvements
+
+* **canboat-pipeline:** batch TCP output, serialize JSON once per record ([8f37772](https://github.com/canboat/canboat-rs/commit/8f377727fd3c49737097d5528fd6d72922ea80b3))
+* **canboat-pipeline:** batch TCP output, serialize JSON once per record ([4956f9b](https://github.com/canboat/canboat-rs/commit/4956f9b262b9d4287d49a2b2c9f7e5a880bbb160))
+
 ## [0.3.0](https://github.com/canboat/canboat-rs/compare/v0.2.0...v0.3.0) (2026-07-04)
 
 

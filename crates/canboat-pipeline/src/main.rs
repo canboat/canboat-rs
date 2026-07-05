@@ -18,10 +18,28 @@
 //!   to exist with `n2kd-inproc`.
 //! * **device**: a [`canboat_io::device`] reader stage opens the
 //!   chosen serial port / TCP socket and emits `RawFrame`s
-//!   directly. In this mode, the raw TCP port (write-N2K) and
-//!   the lazy CSV TCP server are also wired up.
+//!   directly. In this mode, the write-only input port and the lazy
+//!   output TCP servers are also wired up.
 //!
 //! Output: NMEA 0183 sentences on stdout.
+//!
+//! ## TCP port layout
+//!
+//! Base-relative offsets match canboat C `n2kd` (and the `n2kd`
+//! crate) one-for-one, so no port number ever means two different
+//! things across the three implementations. Every output stream is
+//! read-only; the single write path is the input port.
+//!
+//! | Port | Flag | Dir | Purpose |
+//! |------|------|-----|---------|
+//! | 2597 | `--snapshot-port`       | out | JSON snapshot per `(pgn, src)`, then close |
+//! | 2598 | `--analyzer-port`       | out | analyzer JSON stream (read-only) |
+//! | 2599 | `--nmea0183-port`       | out | NMEA 0183 stream |
+//! | 2600 | `--input-port`          | in  | **write-only** raw PLAIN/FAST → bus |
+//! | 2601 | `--ais-port`            | out | AIS snapshot, then close |
+//! | 2602 | *(reserved)*            | —   | future status stream (n2kd `port+5`) |
+//! | 2603 | `--raw-port`            | out | raw frame output stream |
+//! | 2604 | `--analyzer-binary-port`| out | binary `WirePgn` stream |
 
 mod hub;
 mod nmea_filter;
@@ -49,7 +67,7 @@ use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
 use n2kd::request_engine::{self, RequestEngine};
 
-use crate::hub::Hub;
+use crate::hub::{BinHub, Hub};
 use crate::pipeline::Hubs;
 use crate::snapshot::SnapshotStore;
 
@@ -196,16 +214,12 @@ struct Cli {
     #[arg(long, default_value_t = 2597)]
     snapshot_port: u16,
 
-    /// Port for the analyzer JSON server — one decoded PGN per
-    /// line. Matches canboat C `n2kd`'s `port+1` stream port for
-    /// the broadcast direction, but bidirectional: clients may also
-    /// send PLAIN/FAST lines back to inject onto the bus over the
-    /// same socket they're subscribed on. (canboat C n2kd has no
-    /// analyzer stage to inject into; this is a pipeline-only
-    /// convenience.) Use `--raw-port` instead if you want
-    /// injection without subscribing to the JSON broadcast. Lazy:
-    /// formatting is skipped when no client is subscribed. `0`
-    /// disables.
+    /// Port for the analyzer JSON server — one decoded PGN per line.
+    /// Matches canboat C `n2kd`'s `port+1` stream port: read-only.
+    /// Injection goes through `--input-port` instead; this port is
+    /// kept free for a future "analyzed write" feature that would
+    /// accept JSON here. Lazy: formatting is skipped when no client is
+    /// subscribed. `0` disables.
     #[arg(long, default_value_t = 2598)]
     analyzer_port: u16,
 
@@ -215,16 +229,25 @@ struct Cli {
     #[arg(long, default_value_t = 2599)]
     nmea0183_port: u16,
 
-    /// Port for the bidirectional raw N2K input/output server.
-    /// Clients receive every frame as a `# format=FAST` PLAIN line
-    /// (i.e. already-coalesced fast-packet payloads — never the
-    /// per-CAN-frame PLAIN format) and can send PLAIN/FAST lines
-    /// back to inject into the bus. Matches canboat C `n2kd`'s
-    /// `port+3` input slot. Reading is lazy (skipped with no client);
-    /// injection only takes effect in device mode. `0` disables.
-    /// (Previously named `--csv-port` then `--raw-input-port`; the
-    /// short name `--raw-port` is the supported spelling.)
+    /// Write-only raw input port — the canonical `SERVER_INPUT_STREAM`
+    /// slot (canboat C `n2kd` `port+3`). Clients connect and write
+    /// canboat PLAIN/FAST lines that are injected onto the bus
+    /// (device mode only); nothing is streamed back, so it never
+    /// forces JSON/CSV serialization. This is the cheap write path for
+    /// a consumer that reads its data on another port (e.g. the
+    /// analyzer-binary stream). `0` disables.
     #[arg(long, default_value_t = 2600)]
+    input_port: u16,
+
+    /// Read-only raw N2K output stream. Clients receive every frame as
+    /// a `# format=FAST` PLAIN line (already-coalesced fast-packet
+    /// payloads — never the per-CAN-frame PLAIN format). Reading is
+    /// lazy (skipped with no client). Injection is NOT accepted here —
+    /// use `--input-port`. `0` disables. (Previously this port was
+    /// bidirectional at 2600 under `--csv-port` / `--raw-input-port`;
+    /// the write side moved to `--input-port` and the read side moved
+    /// here to keep the input slot write-only.)
+    #[arg(long, default_value_t = 2603)]
     raw_port: u16,
 
     /// Port for the AIS snapshot server — on connect, dumps the
@@ -233,6 +256,18 @@ struct Cli {
     /// `n2kd`'s `port+4` AIS port. `0` disables.
     #[arg(long, default_value_t = 2601)]
     ais_port: u16,
+
+    /// Port for the read-only binary analyzer stream: each decoded PGN
+    /// as a length-prefixed postcard `WirePgn` (see the canboat-wire
+    /// crate), preceded by a one-shot `Hello` handshake carrying the
+    /// schema hash. Far cheaper for a Rust consumer than parsing the
+    /// analyzer JSON — no field re-serialization here, no JSON parse
+    /// there — but the client MUST link an identical schema. Lazy:
+    /// nothing is encoded when no client is subscribed, so it's cheap
+    /// to leave on. Canonical slot 2604 (after the reserved status
+    /// slot at 2602 and the raw output stream at 2603). `0` disables.
+    #[arg(long, default_value_t = 2604)]
+    analyzer_binary_port: u16,
 
     /// Also write NMEA 0183 sentences (including AIVDM) to stdout —
     /// mirrors canboat C `n2kd`'s `--nmea0183` flag. Off by default,
@@ -363,6 +398,7 @@ fn run(cli: Cli) -> Result<()> {
         raw: Arc::new(Hub::new()),
         nmea: Arc::new(Hub::new()),
         analyzer: Arc::new(Hub::new()),
+        bin: Arc::new(BinHub::new()),
         snapshot: snapshot.clone(),
         engine: Arc::clone(&engine),
         quirks: quirks::Quirks::new(quirks_kinds),
@@ -409,23 +445,30 @@ fn run(cli: Cli) -> Result<()> {
             store.clone(),
         )?);
     }
-    // Raw-input port: bidirectional FAST-format raw N2K stream.
-    // Clients see every coalesced frame as a PLAIN line under a
+    // Write-only input port (canboat C `n2kd` `port+3`
+    // `SERVER_INPUT_STREAM`): clients write PLAIN/FAST lines that we
+    // encode and forward onto the bus. Unlike canboat C n2kd's passive
+    // input, injection actually reaches the device; unlike the old
+    // bidirectional raw port, nothing is streamed back, so it adds no
+    // serialization cost — the cheap write path.
+    if cli.input_port != 0 {
+        tcp_joins.push(tcp::spawn_input_server(
+            "input",
+            cli.bind,
+            cli.input_port,
+            inject.clone(),
+        )?);
+    }
+    // Raw output stream: every coalesced frame as a PLAIN line under a
     // `# format=FAST` header so downstream tools (canboat C analyzer,
-    // canboatjs) know the stream is pre-coalesced; clients can send
-    // PLAIN/FAST lines back to inject onto the bus. Matches canboat
-    // C `n2kd`'s `port+3` input slot (with the added live broadcast
-    // and the actual encode-and-forward injection — canboat C n2kd's
-    // input is passive).
+    // canboatjs) know the stream is pre-coalesced. Read-only — writes
+    // go to `--input-port`.
     if cli.raw_port != 0 {
         tcp_joins.push(tcp::spawn_stream_server(
             "raw",
             cli.bind,
             cli.raw_port,
             hubs.raw.clone(),
-            tcp::Direction::ReadWrite {
-                inject: inject.clone(),
-            },
             Some(tcp::CANBOAT_FORMAT_FAST_HEADER),
         )?);
     }
@@ -437,22 +480,19 @@ fn run(cli: Cli) -> Result<()> {
             cli.bind,
             cli.nmea0183_port,
             hubs.nmea.clone(),
-            tcp::Direction::ReadOnly,
             None,
         )?);
     }
     if cli.analyzer_port != 0 {
         // Analyzer-JSON stream is read-only, matching canboat C
         // n2kd's `port+1` stream port. Injection lives on the
-        // raw port instead.
+        // input port instead. (Kept free for a future "analyzed
+        // write" feature that would accept JSON here.)
         tcp_joins.push(tcp::spawn_stream_server(
             "analyzer",
             cli.bind,
             cli.analyzer_port,
             hubs.analyzer.clone(),
-            tcp::Direction::ReadWrite {
-                inject: inject.clone(),
-            },
             None,
         )?);
     }
@@ -469,6 +509,15 @@ fn run(cli: Cli) -> Result<()> {
                 cli.ais_port,
             );
         }
+    }
+    if cli.analyzer_binary_port != 0 {
+        // Read-only binary analyzer stream. Shares the decode with the
+        // JSON/NMEA outputs; only the (lazy) WirePgn encode is extra.
+        tcp_joins.push(tcp::spawn_binary_stream(
+            cli.bind,
+            cli.analyzer_binary_port,
+            hubs.bin.clone(),
+        )?);
     }
 
     let _ = inject; // No further use in this function

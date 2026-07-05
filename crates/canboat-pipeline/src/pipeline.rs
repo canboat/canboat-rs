@@ -35,7 +35,9 @@ use canboat_core::{FramePacketType, PgnDatabase, RawFrame, Reassembled, Reassemb
 use canboat_io::device::FrameSender;
 use n2kd::request_engine::RequestEngine;
 
-use crate::hub::Hub;
+use canboat_wire::WirePgn;
+
+use crate::hub::{BinHub, Hub};
 use crate::quirks::Quirks;
 use crate::snapshot::SnapshotStore;
 
@@ -98,6 +100,60 @@ impl OutputBatcher {
     }
 
     /// Flush if the oldest pending line has exceeded [`BATCH_MAX_AGE`].
+    #[inline]
+    fn flush_due(&mut self, now: Instant) {
+        if !self.pending.is_empty() && now.duration_since(self.oldest) >= BATCH_MAX_AGE {
+            self.flush();
+        }
+    }
+
+    fn flush(&mut self) {
+        self.hub.broadcast(&self.pending);
+        self.pending.clear();
+    }
+}
+
+/// Byte-oriented twin of [`OutputBatcher`] for the [`BinHub`] stream.
+/// Accumulates whole length-prefixed frames and flushes them as one
+/// chunk on the same age/size cadence, so a fast-packet flurry becomes
+/// one `broadcast` (one channel send + write per subscriber) instead of
+/// one per record.
+struct BinBatcher {
+    hub: Arc<BinHub>,
+    pending: Vec<u8>,
+    oldest: Instant,
+}
+
+impl BinBatcher {
+    fn new(hub: Arc<BinHub>) -> Self {
+        Self {
+            hub,
+            pending: Vec::with_capacity(4096),
+            oldest: Instant::now(),
+        }
+    }
+
+    #[inline]
+    fn has_subscribers(&self) -> bool {
+        self.hub.has_subscribers()
+    }
+
+    /// Append one already-framed record (its `u32` length prefix + body).
+    fn push(&mut self, frame: &[u8], now: Instant) {
+        if self.pending.is_empty() {
+            self.oldest = now;
+        }
+        self.pending.extend_from_slice(frame);
+        if self.pending.len() >= BATCH_MAX_BYTES {
+            self.flush();
+        }
+    }
+
+    #[inline]
+    fn has_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
     #[inline]
     fn flush_due(&mut self, now: Instant) {
         if !self.pending.is_empty() && now.duration_since(self.oldest) >= BATCH_MAX_AGE {
@@ -182,6 +238,10 @@ pub struct Hubs {
     pub raw: Arc<Hub>,
     pub nmea: Arc<Hub>,
     pub analyzer: Arc<Hub>,
+    /// Binary analyzer stream: each decoded record as a length-prefixed
+    /// postcard [`WirePgn`]. Lazy like the others — the encode only runs
+    /// when a client is subscribed (see `--analyzer-binary-port`).
+    pub bin: Arc<BinHub>,
     /// Optional cache for the snapshot port. When `Some`, every
     /// decoded record's analyzer JSON line lands in the cache; the
     /// snapshot TCP listener dumps the live entries on each connect.
@@ -287,10 +347,16 @@ pub fn run(
     let mut raw_batch = OutputBatcher::new(hubs.raw.clone());
     let mut nmea_batch = OutputBatcher::new(hubs.nmea.clone());
     let mut analyzer_batch = OutputBatcher::new(hubs.analyzer.clone());
+    let mut bin_batch = BinBatcher::new(hubs.bin.clone());
+    // Reused encode buffer for the binary stream: one framed WirePgn is
+    // built here then appended to `bin_batch`'s pending chunk.
+    let mut wire_frame: Vec<u8> = Vec::with_capacity(1024);
 
     loop {
-        let any_pending =
-            raw_batch.has_pending() || nmea_batch.has_pending() || analyzer_batch.has_pending();
+        let any_pending = raw_batch.has_pending()
+            || nmea_batch.has_pending()
+            || analyzer_batch.has_pending()
+            || bin_batch.has_pending();
         let frame = if let Some(synth) = pending_synth.pop_front() {
             synth
         } else if any_pending {
@@ -304,6 +370,7 @@ pub fn run(
                     raw_batch.flush_due(now);
                     nmea_batch.flush_due(now);
                     analyzer_batch.flush_due(now);
+                    bin_batch.flush_due(now);
                     continue;
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
@@ -401,6 +468,10 @@ pub fn run(
         let Ok(decoded) = db.decode(&assembled) else {
             continue;
         };
+        // Share one decoded record across every consumer (snapshot,
+        // JSON, NMEA, binary) via `Arc`. The snapshot's lazy cache can
+        // then hold a refcount bump instead of a deep clone.
+        let decoded = Arc::new(decoded);
 
         // Feed the periodic claim/product-info request engine.
         // Updates "last received" stamps for PGN 60928 and 126996.
@@ -419,22 +490,24 @@ pub fn run(
             f.note_address_claim(decoded.src, name);
         }
 
+        // Snapshot cache: hand the store the decoded record and let it
+        // serialize lazily, only when a snapshot client reads. So the
+        // snapshot no longer forces per-record JSON — that cost is now
+        // paid solely for the analyzer port's live subscribers.
+        if let Some(snap) = hubs.snapshot.as_ref() {
+            snap.store(&decoded, now);
+        }
+
         // Lazy analyzer JSON — serialized at most ONCE per decoded
-        // record and shared by all three consumers: the snapshot
-        // cache, the analyzer port broadcast, and the NMEA 0183
-        // fallback converter below. The serializer walks every
-        // decoded field, so skipping it when no one needs the line
+        // record and shared by the analyzer port broadcast and the
+        // NMEA 0183 fallback converter below. The serializer walks
+        // every decoded field, so skipping it when no one is subscribed
         // actually buys something on a high-rate input stream.
-        let want_json = analyzer_batch.has_subscribers() || hubs.snapshot.is_some();
+        let want_json = analyzer_batch.has_subscribers();
         let mut json_ok = false;
         if want_json {
             json_line.clear();
             json_ok = write_json(&mut json_line, &decoded, &json_opts).is_ok();
-            // Snapshot wants the bare JSON (it embeds the line as a
-            // value inside its own nested wrapper).
-            if json_ok && let Some(snap) = hubs.snapshot.as_ref() {
-                snap.store(&decoded, json_line.clone());
-            }
         }
 
         // NMEA 0183 conversion only runs when someone will see the
@@ -493,13 +566,27 @@ pub fn run(
             analyzer_batch.push(&json_line, now);
         }
 
+        // Binary analyzer stream — the reference-stripped `WirePgn`
+        // built straight from `decoded` (no JSON involved) and appended
+        // as one length-prefixed postcard frame. Gated on subscribers so
+        // the encode is skipped entirely when the port has no clients.
+        if bin_batch.has_subscribers() {
+            wire_frame.clear();
+            if canboat_wire::append_frame(&mut wire_frame, &WirePgn::from(decoded.as_ref())).is_ok()
+            {
+                bin_batch.push(&wire_frame, now);
+            }
+        }
+
         raw_batch.flush_due(now);
         nmea_batch.flush_due(now);
         analyzer_batch.flush_due(now);
+        bin_batch.flush_due(now);
     }
     // Shutdown: push out whatever the batchers still hold.
     raw_batch.flush();
     nmea_batch.flush();
     analyzer_batch.flush();
+    bin_batch.flush();
     out.flush().ok();
 }

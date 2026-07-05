@@ -52,6 +52,11 @@ pub(crate) fn djb2_hash_str(s: &str) -> u64 {
 pub struct PgnDatabase {
     pub schema_version: &'static str,
     pub version: &'static str,
+    /// FNV-1a/64 content hash of the schema source (canboat.json +
+    /// synthetic-pgns.json), emitted by `build.rs`. Two processes that
+    /// exchange field indices on the wire must share this exact value —
+    /// see canboat-wire's handshake.
+    pub schema_hash: u64,
 
     pgns: &'static [PgnInfo],
     /// `(pgn_number, indices_into_pgns)`, sorted by `pgn_number` for
@@ -68,6 +73,7 @@ pub struct PgnDatabase {
 static EMBEDDED: PgnDatabase = PgnDatabase {
     schema_version: schema_data::SCHEMA_VERSION,
     version: schema_data::VERSION,
+    schema_hash: schema_data::SCHEMA_HASH,
     pgns: schema_data::PGNS,
     pgn_index: schema_data::PGN_INDEX,
     lookups: schema_data::LOOKUPS,
@@ -180,6 +186,27 @@ impl PgnDatabase {
             Err(_) => return None,
         };
         table.get(key)
+    }
+
+    /// Reverse of [`Self::field_type_lookup`]: resolve a DYNAMIC_FIELD_KEY
+    /// *label* (e.g. "Polar Performance") to its entry. Lets a config layer
+    /// pre-resolve a human key name to its stable numeric `value` once, then
+    /// match records by that number at runtime — robust against decode/wire
+    /// name-resolution gaps that a name match would silently miss. Linear
+    /// over the (small) table; intended for load-time use, not the hot path.
+    pub fn field_type_lookup_by_name(
+        &self,
+        name: &str,
+        value_name: &str,
+    ) -> Option<&'static LookupFieldTypeValue> {
+        let table = match self
+            .field_type_lookups
+            .binary_search_by(|t| t.name.cmp(name))
+        {
+            Ok(i) => &self.field_type_lookups[i],
+            Err(_) => return None,
+        };
+        table.values.iter().find(|v| v.name == value_name)
     }
 }
 

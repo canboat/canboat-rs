@@ -10,9 +10,13 @@
 //! | `port`     (2597) | **JSON snapshot** — on connect, send the latest line per `(pgn, src)`, close. |
 //! | `port+1`   (2598) | **JSON stream** — each connected client receives every line as it arrives.    |
 //! | `port+2`   (2599) | **NMEA 0183 stream** — converted sentences (HDG / MWV / DPT / RSA / VTG / …). |
-//! | `port+3`   (2600) | **AIS-only stream** — the AIS-related PGNs in JSON, unconverted.              |
-//! | `port+4`   (2601) | **Status stream** — periodic `{"clients":N,"pgns":[…]}` snapshots.            |
-//! | `port+5`   (2602) | **Raw input** — clients write canboat PLAIN/FAST; we forward to stdout.       |
+//! | `port+3`   (2600) | **Raw input** (write-only) — clients write canboat PLAIN/FAST; we forward to stdout. |
+//! | `port+4`   (2601) | **AIS-only stream** — the AIS-related PGNs in JSON, unconverted.              |
+//! | `port+5`   (2602) | **Status stream** — periodic `{"clients":N,"pgns":[…]}` snapshots.            |
+//!
+//! These offsets match `canboat/n2kd/main.c` (`SERVER_JSON`,
+//! `SERVER_JSON_STREAM`, `SERVER_NMEA0183_STREAM`, `SERVER_INPUT_STREAM`,
+//! `SERVER_AIS`, `SERVER_STATUS`) one-for-one.
 //!
 //! Plus an optional UDP NMEA 0183 broadcast (`--udp183 <host:port>`)
 //! and a periodic device-claim / product-info auto-request engine

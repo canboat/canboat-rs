@@ -33,6 +33,7 @@
 //! walks the `DecodedPgn` struct — and they each build a
 //! [`SnapshotInput`] from it before calling [`SnapshotStore::store`].
 
+use std::borrow::Cow;
 use std::fmt::Write;
 use std::sync::Mutex;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -400,8 +401,28 @@ pub struct SnapshotInput {
     pub line: String,
 }
 
+/// The analyzer-JSON value stored per cache key. Either a string that
+/// was already serialized by the caller (the n2kd path, which reads
+/// JSON lines off stdin), or a closure that serializes on demand (the
+/// pipeline path, which holds a `DecodedPgn` and defers `write_json`
+/// until a snapshot client actually connects — so a busy bus with no
+/// snapshot consumer never pays the serialization tax).
+enum LinePayload {
+    Ready(String),
+    Lazy(Box<dyn Fn() -> String + Send>),
+}
+
+impl LinePayload {
+    fn render(&self) -> Cow<'_, str> {
+        match self {
+            LinePayload::Ready(s) => Cow::Borrowed(s),
+            LinePayload::Lazy(f) => Cow::Owned(f()),
+        }
+    }
+}
+
 struct CacheEntry {
-    line: String,
+    payload: LinePayload,
     /// `pgn_description` truncated at the first `:`.
     pgn_short_description: String,
     /// `None` means "never expires" — set for PGNs in
@@ -409,7 +430,9 @@ struct CacheEntry {
     expires_at: Option<Instant>,
     /// Most recent record's `"timestamp":` field — emitted verbatim
     /// as `"last":` in the status port output.
-    last_timestamp: Option<String>,
+    /// Wall-clock millis of the most recent store under this key,
+    /// formatted to ISO only when the status port actually reads.
+    last_timestamp: Option<u64>,
     /// Number of records stashed under this key so far.
     count: u64,
     /// Monotonic `Instant` of the previous [`SnapshotStore::store`]
@@ -435,23 +458,91 @@ type CacheKey = (u32, u8, Option<String>);
 /// subsequent records under that key update the value in place.
 pub struct SnapshotStore {
     cache: Mutex<IndexMap<CacheKey, CacheEntry>>,
+    /// Wall-clock reference captured once at construction. Per-record
+    /// `last_timestamp` is derived as `epoch_wall_ms + (now -
+    /// epoch_instant)` from the caller-supplied monotonic `now`, so the
+    /// hot `store` path never issues its own `SystemTime::now()` syscall
+    /// (a real trap under musl). A few ms of drift vs. wall clock over a
+    /// session is immaterial for a "last seen" display value.
+    epoch_instant: Instant,
+    epoch_wall_ms: u64,
 }
 
 impl SnapshotStore {
     pub fn new() -> Self {
+        let epoch_wall_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_millis() as u64)
+            .unwrap_or(0);
         Self {
             cache: Mutex::new(IndexMap::new()),
+            epoch_instant: Instant::now(),
+            epoch_wall_ms,
         }
     }
 
-    /// Stash one classified record. Overwrites any prior entry with
-    /// the same `(pgn, src, secondary)` key in place — the entry's
-    /// insertion order is preserved. Status fields (`count`,
-    /// `interval_ms`) accumulate across stores for the same key.
+    /// Stash one classified record whose analyzer-JSON line is already
+    /// serialized (the n2kd path). Overwrites any prior entry with the
+    /// same `(pgn, src, secondary)` key in place — insertion order is
+    /// preserved. Status fields (`count`, `interval_ms`) accumulate
+    /// across stores for the same key.
     pub fn store(&self, input: SnapshotInput) {
-        let now = Instant::now();
-        let expires_at = ttl_for_pgn(input.pgn, input.is_ais).map(|ttl| now + ttl);
-        let key = (input.pgn, input.src, input.secondary);
+        // n2kd path (low rate, one JSON line per store): capture `now`
+        // here. The hot pipeline path uses [`Self::store_lazy`], which
+        // takes a `now` threaded from its record loop instead.
+        self.store_entry(
+            input.pgn,
+            input.src,
+            input.secondary,
+            input.is_ais,
+            &input.pgn_description,
+            LinePayload::Ready(input.line),
+            Instant::now(),
+        );
+    }
+
+    /// Stash one record whose analyzer-JSON line is produced lazily by
+    /// `render` — called only when a snapshot client actually reads the
+    /// cache. The pipeline uses this to keep the cache current without
+    /// serializing every decoded record on a busy bus. `now` is the
+    /// monotonic timestamp the caller already computed for this record,
+    /// reused here so the store issues no clock syscall of its own. Same
+    /// keying and status accounting as [`Self::store`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn store_lazy(
+        &self,
+        pgn: u32,
+        src: u8,
+        secondary: Option<String>,
+        is_ais: bool,
+        pgn_description: &str,
+        render: Box<dyn Fn() -> String + Send>,
+        now: Instant,
+    ) {
+        self.store_entry(
+            pgn,
+            src,
+            secondary,
+            is_ais,
+            pgn_description,
+            LinePayload::Lazy(render),
+            now,
+        );
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn store_entry(
+        &self,
+        pgn: u32,
+        src: u8,
+        secondary: Option<String>,
+        is_ais: bool,
+        pgn_description: &str,
+        payload: LinePayload,
+        now: Instant,
+    ) {
+        let expires_at = ttl_for_pgn(pgn, is_ais).map(|ttl| now + ttl);
+        let key = (pgn, src, secondary);
         let mut guard = self.cache.lock().expect("snapshot cache poisoned");
 
         // Carry count + previous_store_at forward across overwrites
@@ -465,19 +556,20 @@ impl SnapshotStore {
         };
 
         // canboat C uses the wall-clock time of store as the status
-        // port's `"last":` field (`m->m_last = now`), not the
-        // record's analyzer-JSON timestamp. Mirror that so the status
-        // emitter stays byte-comparable with canboat C.
-        let wall_ms = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
+        // port's `"last":` field (`m->m_last = now`). Derive it from the
+        // construction-time wall/monotonic epoch + this record's `now`,
+        // avoiding a per-record `SystemTime::now()` syscall. Formatting
+        // to ISO is deferred to the (rare) status read.
+        let wall_ms = self.epoch_wall_ms.saturating_add(
+            now.saturating_duration_since(self.epoch_instant)
+                .as_millis() as u64,
+        );
 
         let entry = CacheEntry {
-            line: input.line,
-            pgn_short_description: short_description(&input.pgn_description),
+            payload,
+            pgn_short_description: short_description(pgn_description),
             expires_at,
-            last_timestamp: Some(format_iso_ms(wall_ms)),
+            last_timestamp: Some(wall_ms),
             count: prev_count + 1,
             previous_store_at: Some(now),
             interval_ms,
@@ -561,7 +653,7 @@ impl SnapshotStore {
                     out.push_str(s);
                 }
                 out.push_str("\":");
-                out.push_str(&entry.line);
+                out.push_str(&entry.payload.render());
             }
             out.push_str("\n  }");
         }
@@ -617,8 +709,11 @@ impl SnapshotStore {
                 // canboat C always emits "last" as a quoted string,
                 // even when the source line had no timestamp — it
                 // falls back to "" in that case (a stored record
-                // would always have one in practice).
-                write_json_string(&mut out, entry.last_timestamp.as_deref().unwrap_or(""));
+                // would always have one in practice). The wall-clock
+                // millis are formatted to ISO here, on read, rather
+                // than per-record at store time.
+                let last = entry.last_timestamp.map(format_iso_ms).unwrap_or_default();
+                write_json_string(&mut out, &last);
                 let _ = write!(
                     out,
                     ",\"interval\":{},\"count\":{}}}",

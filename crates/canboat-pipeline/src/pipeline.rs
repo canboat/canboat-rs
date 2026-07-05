@@ -468,6 +468,10 @@ pub fn run(
         let Ok(decoded) = db.decode(&assembled) else {
             continue;
         };
+        // Share one decoded record across every consumer (snapshot,
+        // JSON, NMEA, binary) via `Arc`. The snapshot's lazy cache can
+        // then hold a refcount bump instead of a deep clone.
+        let decoded = Arc::new(decoded);
 
         // Feed the periodic claim/product-info request engine.
         // Updates "last received" stamps for PGN 60928 and 126996.
@@ -491,7 +495,7 @@ pub fn run(
         // snapshot no longer forces per-record JSON — that cost is now
         // paid solely for the analyzer port's live subscribers.
         if let Some(snap) = hubs.snapshot.as_ref() {
-            snap.store(&decoded);
+            snap.store(&decoded, now);
         }
 
         // Lazy analyzer JSON — serialized at most ONCE per decoded
@@ -568,7 +572,7 @@ pub fn run(
         // the encode is skipped entirely when the port has no clients.
         if bin_batch.has_subscribers() {
             wire_frame.clear();
-            if canboat_wire::append_frame(&mut wire_frame, &WirePgn::from(&decoded)).is_ok() {
+            if canboat_wire::append_frame(&mut wire_frame, &WirePgn::from(decoded.as_ref())).is_ok() {
                 bin_batch.push(&wire_frame, now);
             }
         }

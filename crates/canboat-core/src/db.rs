@@ -187,6 +187,27 @@ impl PgnDatabase {
         };
         table.get(key)
     }
+
+    /// Reverse of [`Self::field_type_lookup`]: resolve a DYNAMIC_FIELD_KEY
+    /// *label* (e.g. "Polar Performance") to its entry. Lets a config layer
+    /// pre-resolve a human key name to its stable numeric `value` once, then
+    /// match records by that number at runtime — robust against decode/wire
+    /// name-resolution gaps that a name match would silently miss. Linear
+    /// over the (small) table; intended for load-time use, not the hot path.
+    pub fn field_type_lookup_by_name(
+        &self,
+        name: &str,
+        value_name: &str,
+    ) -> Option<&'static LookupFieldTypeValue> {
+        let table = match self
+            .field_type_lookups
+            .binary_search_by(|t| t.name.cmp(name))
+        {
+            Ok(i) => &self.field_type_lookups[i],
+            Err(_) => return None,
+        };
+        table.values.iter().find(|v| v.name == value_name)
+    }
 }
 
 /// Iterator returned by [`PgnDatabase::pgn_variants`]. Walks the

@@ -443,7 +443,18 @@ fn rehydrate_value(
                 .lookup_enumeration
                 .and_then(|t| db.lookup(t))
                 .and_then(|t| t.get(*value))
-                .map(|lv| lv.name);
+                .map(|lv| lv.name)
+                // DYNAMIC_FIELD_KEY fields (e.g. B&G PGN 130824 "Key")
+                // carry their label in the field-type enumeration, not the
+                // plain lookup table. Mirror decode_dynamic_field_key so the
+                // rehydrated key keeps its name — receivers that match on it
+                // (the 130824 key-value handler) otherwise see a nameless
+                // number and silently drop the record.
+                .or_else(|| {
+                    info.lookup_field_type_enumeration
+                        .and_then(|n| db.field_type_lookup(n, *value))
+                        .map(|e| e.name)
+                });
             FieldValue::Lookup {
                 value: *value,
                 name,
@@ -666,6 +677,39 @@ mod tests {
             rehy.field_by_name("Reference").and_then(|f| f.value.as_str()),
             decoded.field_by_name("Reference").and_then(|f| f.value.as_str()),
         );
+    }
+
+    /// Regression: a DYNAMIC_FIELD_KEY (B&G PGN 130824 "Key") carries its
+    /// label in a `LookupFieldTypeEnumeration`, not the plain lookup table.
+    /// The receiver must re-resolve it — otherwise the key comes back a
+    /// nameless number and merrimac's key-value handler (which matches on
+    /// the key name, e.g. "Polar Performance" = 124) silently drops it.
+    #[test]
+    fn dynamic_field_key_lookup_reresolves_name() {
+        use canboat_core::FieldValue as FV;
+
+        let db = PgnDatabase::embedded();
+        let info = db.first_pgn(130824).expect("PGN 130824 in schema");
+        let key = info
+            .fields
+            .iter()
+            .find(|f| f.lookup_field_type_enumeration.is_some())
+            .expect("130824 declares a DYNAMIC_FIELD_KEY field");
+
+        let wf = WireField {
+            order: key.order,
+            repeat_index: Some(0),
+            repeat_set: 1,
+            value: WireValue::Lookup(124),
+            overrides: None,
+        };
+        let rehy = wf.rehydrate(info, db);
+        assert!(
+            matches!(&rehy.value, FV::Lookup { name: Some(n), value: 124 } if *n == "Polar Performance"),
+            "fieldtype-key 124 must re-resolve to \"Polar Performance\", got {:?}",
+            rehy.value
+        );
+        assert_eq!(rehy.value.as_str(), Some("Polar Performance"));
     }
 
     // The load-bearing guarantee for merrimac's "C-mode" shim: the JSON

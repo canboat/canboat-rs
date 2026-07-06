@@ -166,7 +166,7 @@ fn forward_plain_line(line: &str, inject: &InjectPoint) -> bool {
             // message, never a bus frame: loop it into the pipeline
             // (which owns the filter state) but do not transmit it on
             // the N2K bus or rewrite its source.
-            if frame.pgn == crate::server::pipeline::PGN_NMEA0183_FILTER {
+            if frame.pgn == n2kd::nmea_filter::PGN_NMEA0183_FILTER {
                 return inject.loopback.send(frame).is_ok();
             }
             // Rewrite a default / broadcast `src` to our gateway's

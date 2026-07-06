@@ -32,9 +32,29 @@
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
+use canboat_core::RawFrame;
 use serde::{Deserialize, Serialize};
+
+/// Synthetic BEM PGN carrying the per-device NMEA 0183 filter control
+/// channel — never a real bus frame. Both daemons speak it: a client
+/// (the TUI) writes a `Set` frame to change a rule; the daemon emits
+/// `Report` frames advertising the current state.
+pub const PGN_NMEA0183_FILTER: u32 = 262657;
+/// PGN 262657 `Function`: daemon → client, current state.
+pub const FILTER_FN_REPORT: u8 = 0;
+/// PGN 262657 `Function`: client → daemon, apply a change.
+pub const FILTER_FN_SET: u8 = 1;
+/// How often a daemon re-advertises the full filter state so a client
+/// connecting mid-stream learns it without asking.
+pub const FILTER_REPORT_INTERVAL: Duration = Duration::from_secs(2);
+
+/// `true` when `frame` is a filter `Set` control message.
+pub fn is_set_frame(frame: &RawFrame) -> bool {
+    frame.pgn == PGN_NMEA0183_FILTER && frame.data.first() == Some(&FILTER_FN_SET)
+}
 
 /// Formatter token used in PGN 262657 / [`FilterReportRow`] to mean
 /// "the whole source", as opposed to a specific 3-letter sentence.
@@ -299,6 +319,46 @@ impl NmeaFilter {
             }
         }
         rows
+    }
+
+    /// Apply a PGN 262657 `Set` payload (`[function, src, s0, s1, s2,
+    /// muted, …]`) to the filter. Malformed / empty-sentence payloads
+    /// are ignored.
+    pub fn apply_set_frame(&mut self, data: &[u8]) {
+        if data.len() < 6 {
+            return;
+        }
+        let src = data[1];
+        let sentence = std::str::from_utf8(&data[2..5])
+            .unwrap_or("")
+            .trim_matches(|c| c == '\0' || c == ' ');
+        if sentence.is_empty() {
+            return;
+        }
+        self.set(src, sentence, data[5] != 0);
+    }
+
+    /// One PGN 262657 `Report` frame per [`Self::report`] row, for a
+    /// daemon to emit onto its output streams so a client renders the
+    /// current device/sentence mute matrix.
+    pub fn report_frames(&self) -> Vec<RawFrame> {
+        self.report()
+            .into_iter()
+            .map(|row| {
+                let b = row.sentence.as_bytes();
+                let data = [
+                    FILTER_FN_REPORT,
+                    row.src,
+                    *b.first().unwrap_or(&b' '),
+                    *b.get(1).unwrap_or(&b' '),
+                    *b.get(2).unwrap_or(&b' '),
+                    u8::from(row.muted),
+                    0xff,
+                    0xff,
+                ];
+                RawFrame::new(None, 7, PGN_NMEA0183_FILTER, 0, 255, data)
+            })
+            .collect()
     }
 }
 

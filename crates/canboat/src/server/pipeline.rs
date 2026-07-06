@@ -184,52 +184,6 @@ fn is_ais_pgn(pgn: u32) -> bool {
     )
 }
 
-/// Synthetic BEM PGN carrying the per-device NMEA 0183 filter control
-/// channel (see `n2kd::nmea_filter` and `data/synthetic-pgns.json`).
-/// Never appears on the N2K bus.
-pub const PGN_NMEA0183_FILTER: u32 = 262657;
-/// PGN 262657 `Function` values.
-const FILTER_FN_REPORT: u8 = 0; // pipeline → tui (current state)
-const FILTER_FN_SET: u8 = 1; // tui → pipeline (apply a change)
-/// How often the pipeline re-broadcasts the full filter state, so a
-/// TUI connecting mid-stream learns it without asking.
-const FILTER_REPORT_INTERVAL: Duration = Duration::from_secs(2);
-
-/// Decode a PGN 262657 Set payload (`[function, source, s0, s1, s2,
-/// muted, …]`) and apply it to the filter.
-fn apply_filter_control(f: &mut n2kd::nmea_filter::NmeaFilter, data: &[u8]) {
-    if data.len() < 6 {
-        return;
-    }
-    let src = data[1];
-    let sentence = std::str::from_utf8(&data[2..5])
-        .unwrap_or("")
-        .trim_matches(|c| c == '\0' || c == ' ');
-    if sentence.is_empty() {
-        return;
-    }
-    f.set(src, sentence, data[5] != 0);
-}
-
-/// Queue one PGN 262657 Report frame per filter row so they flow out
-/// the analyzer / raw ports as normal decoded records the TUI reads.
-fn queue_filter_report(f: &n2kd::nmea_filter::NmeaFilter, out: &mut VecDeque<RawFrame>) {
-    for row in f.report() {
-        let b = row.sentence.as_bytes();
-        let data = [
-            FILTER_FN_REPORT,
-            row.src,
-            *b.first().unwrap_or(&b' '),
-            *b.get(1).unwrap_or(&b' '),
-            *b.get(2).unwrap_or(&b' '),
-            u8::from(row.muted),
-            0xff,
-            0xff,
-        ];
-        out.push_back(RawFrame::new(None, 7, PGN_NMEA0183_FILTER, 0, 255, data));
-    }
-}
-
 /// Bundle of broadcast hubs the pipeline writes into.
 pub struct Hubs {
     /// Raw N2K input/output: every coalesced frame goes out as a
@@ -389,20 +343,20 @@ pub fn run(
         // bus. Report frames (Function == 0), including the ones this
         // loop synthesises below, fall through to normal broadcast so a
         // subscribed TUI reads current state as analyzer JSON.
-        if frame.pgn == PGN_NMEA0183_FILTER && frame.data.first() == Some(&FILTER_FN_SET) {
+        if n2kd::nmea_filter::is_set_frame(&frame) {
             if let Some(f) = nmea_filter.as_mut() {
-                apply_filter_control(f, &frame.data);
-                queue_filter_report(f, &mut pending_synth);
+                f.apply_set_frame(&frame.data);
+                pending_synth.extend(f.report_frames());
             }
             continue;
         }
         // Periodically re-advertise the full filter state while a
         // reader is attached, so a late-connecting TUI catches up.
         if let Some(f) = nmea_filter.as_ref()
-            && now.duration_since(last_filter_report) >= FILTER_REPORT_INTERVAL
+            && now.duration_since(last_filter_report) >= n2kd::nmea_filter::FILTER_REPORT_INTERVAL
             && (analyzer_batch.has_subscribers() || raw_batch.has_subscribers())
         {
-            queue_filter_report(f, &mut pending_synth);
+            pending_synth.extend(f.report_frames());
             last_filter_report = now;
         }
 

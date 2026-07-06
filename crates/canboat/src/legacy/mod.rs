@@ -36,6 +36,7 @@ pub const LEGACY_NAMES: &[&str] = &[
     "canboat-pipeline",
     "canboat-tui",
     "replay",
+    "n2kd",
     // alias-module
     "analyzer",
 ];
@@ -78,6 +79,7 @@ fn prefix_subcommand(prog: &str) -> Option<&'static [&'static str]> {
         "canboat-pipeline" => &["server"],
         "canboat-tui" => &["tui"],
         "replay" => &["replay"],
+        "n2kd" => &["n2kd"],
         _ => return None,
     })
 }

@@ -48,15 +48,17 @@ be a fistful of separate tools:
   Maretron IPG) to and from stdout.
 - `canboat replay` — pace a captured PLAIN/FAST stream at its original
   wall-clock rhythm.
+- `canboat n2kd` — multiplex an analyzer-JSON stdin stream to TCP clients
+  (snapshot / stream / NMEA 0183 / AIS / status ports).
 
 The retired standalone names still work: `canboat` inspects `argv[0]`, so a
 symlink named `analyzer`, `actisense-serial`, `ikonvert-serial`,
-`socketcan-serial`, `maretron-ipg`, `replay`, `canboat-pipeline`, or
+`socketcan-serial`, `maretron-ipg`, `replay`, `n2kd`, `canboat-pipeline`, or
 `canboat-tui` dispatches into the right subcommand. `canboat install-shims`
 creates them. (`socketcan-writer` is gone too: its stdin-PLAIN → CAN-bus job
 is `canboat interface --kind socketcan -w`.)
 
-Still standalone for now: `n2kd` (the analyzer-JSON → TCP multiplexer).
+Everything is now one binary — `canboat` — plus those compatibility shims.
 
 The decode path, the device bridges, `n2kd`, and the `server` pipeline are
 exercised against real hardware and pass a byte-for-byte golden-test suite

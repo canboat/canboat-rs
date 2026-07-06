@@ -10,6 +10,7 @@
 
 pub mod ais;
 pub mod ais_decoded;
+pub mod app;
 pub mod decoded;
 pub mod json;
 pub mod nmea0183;

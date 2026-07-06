@@ -14,7 +14,11 @@
 # Inputs (override via env):
 #   C_N2KD    path to canboat C n2kd binary
 #             default: ../../../canboat/rel/darwin-arm64/n2kd
-#   RS_N2KD   path to canboat-rs n2kd binary
+#   RS_N2KD   path to canboat-rs n2kd — now the `n2kd` argv[0] shim
+#             into the unified `canboat` binary. Create it with
+#             `./target/release/canboat install-shims` (which drops a
+#             `target/release/n2kd -> canboat` symlink), or point this
+#             at `canboat` renamed/symlinked to `n2kd`.
 #             default: ../../../target/release/n2kd
 #   INPUT     path to analyzer-JSON file (canboat C needs `-json -nv`
 #             input — the first line must contain both `"version":`
@@ -22,13 +26,13 @@
 #             default: /tmp/live-analyzed-nv.json
 #
 # To capture a fresh INPUT from a live canboat-pipeline (e.g. on the
-# Pi), run:
+# Pi), tap its analyzer-JSON stream port directly (already -nv) and
+# prepend the version banner canboat C wants:
 #
-#   (timeout 30 nc <pipeline-host> 2603) > /tmp/live-plain.txt
-#   ./target/release/analyzer -json -nv \
-#       < /tmp/live-plain.txt > /tmp/live-analyzed-nv.json
+#   { echo '{"version":"7.1.0","units":"std","showLookupValues":true}'; \
+#     timeout 60 nc <pipeline-host> 2598; } > /tmp/live-analyzed-nv.json
 #
-# Then `./run-parity.sh`.
+# Then `canboat install-shims` (once) and `./run-parity.sh`.
 
 set -u
 

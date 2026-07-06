@@ -10,6 +10,8 @@
 //!   Maretron IPG) to/from stdout.
 //! - `server` — the device → analyzer → n2kd pipeline daemon.
 //! - `tui` — the terminal browser.
+//! - `replay` — pace a captured stream at its original wall-clock rhythm.
+//! - `n2kd` — multiplex an analyzer-JSON stdin stream to TCP clients.
 //!
 //! Retired tool names keep working via argv[0] multiplexing — see
 //! [`legacy`]. `canboat install-shims` creates the symlinks.
@@ -55,6 +57,9 @@ enum Command {
     /// Pace a captured PLAIN/FAST stream at its original wall-clock rhythm.
     Replay(replay::Args),
 
+    /// Multiplex an analyzer-JSON stdin stream to TCP clients (the n2kd daemon).
+    N2kd(Box<n2kd::app::Args>),
+
     /// Install symlinks for the retired tool names (analyzer, *-serial, …).
     InstallShims {
         /// Directory to create the symlinks in. Defaults to the
@@ -78,6 +83,7 @@ fn main() -> ExitCode {
         Command::Server(args) => server::run(*args),
         Command::Tui(args) => run_tui(args),
         Command::Replay(args) => replay::run(args),
+        Command::N2kd(args) => n2kd::app::run(*args),
         Command::InstallShims { dir } => install_shims(dir),
     };
     finish(result)

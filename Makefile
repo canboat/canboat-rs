@@ -14,7 +14,6 @@
 #   make precommit     - fmt + clippy + test — run this before pushing
 #   make pipeline      - Release build of just `canboat-pipeline`
 #   make tui           - Release build of just `canboat-tui`
-#   make n2kd          - Release build of just `n2kd`
 #   make clean         - `cargo clean`
 #
 # Per-developer targets (SSH deploys to your own boxes, scratch experiments,
@@ -24,7 +23,7 @@
 CARGO ?= cargo
 
 .PHONY: all build debug check test fmt fmt-check clippy precommit sync-canboat \
-        pipeline tui n2kd \
+        pipeline tui \
         clean help
 
 all: build
@@ -77,9 +76,6 @@ pipeline:
 tui:
 	$(CARGO) build --release -p canboat-tui
 
-n2kd:
-	$(CARGO) build --release -p n2kd
-
 clean:
 	$(CARGO) clean
 
@@ -100,7 +96,6 @@ help:
 	@echo ""
 	@echo "  make pipeline       Release build of just canboat-pipeline"
 	@echo "  make tui            Release build of just canboat-tui"
-	@echo "  make n2kd           Release build of just n2kd"
 	@echo ""
 	@echo "  make clean          cargo clean"
 	@echo ""

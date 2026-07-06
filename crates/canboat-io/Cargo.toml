@@ -12,6 +12,11 @@ description = "Sync std::io adapters for canboat-core (stdin, serial, TCP)."
 canboat-core = { workspace = true }
 log          = { workspace = true }
 serialport   = { workspace = true }
+# Container captures: `.nif` is gzip(tar); `.pcap.gz` / inner captures
+# are gzip(pcap). flate2's default miniz_oxide backend stays pure-Rust
+# for the static musl release builds.
+flate2       = { workspace = true }
+tar          = { workspace = true }
 
 [build-dependencies]
 serde_json = { workspace = true }

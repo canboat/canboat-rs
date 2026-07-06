@@ -33,7 +33,9 @@ use analyzer::replay::{self, Config};
     after_help = canboat_cli::help_footer()
 )]
 struct Cli {
-    /// Read input from this file instead of stdin.
+    /// Read input from this file instead of stdin. Besides the ASCII
+    /// line formats, a `.pcap` / `.pcap.gz` SocketCAN capture or a
+    /// Navico `.nif` export is unwrapped automatically.
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
 

@@ -10,6 +10,7 @@
 //! No tokio. No async. No threads. The sans-I/O decoder in
 //! `canboat-core` is driven directly from these synchronous reads.
 
+pub mod container;
 pub mod device;
 pub mod fastpacket;
 

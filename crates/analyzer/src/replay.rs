@@ -45,6 +45,14 @@ pub struct Config {
 /// `log` crate (matching the analyzer binary's behaviour) and the
 /// stream continues; only a hard read error stops the loop.
 pub fn decode_file<F: FnMut(&DecodedPgn)>(path: &Path, cfg: &Config, sink: F) -> Result<()> {
+    // Binary capture containers (`.pcap`, `.pcap.gz`, `.nif`) are
+    // unwrapped into PLAIN text on the fly, then fed through the same
+    // line pipeline as any other input.
+    if canboat_io::container::is_container(path) {
+        let reader = canboat_io::container::plain_reader(path, Default::default())
+            .with_context(|| format!("opening {}", path.display()))?;
+        return decode_stream(LineReader::new(reader), cfg, sink);
+    }
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
     decode_stream(LineReader::new(BufReader::new(file)), cfg, sink)
 }

@@ -35,6 +35,7 @@ pub const LEGACY_NAMES: &[&str] = &[
     // prefix-translate → other subcommands
     "canboat-pipeline",
     "canboat-tui",
+    "replay",
     // alias-module
     "analyzer",
 ];
@@ -76,6 +77,7 @@ fn prefix_subcommand(prog: &str) -> Option<&'static [&'static str]> {
         "maretron-ipg" => &["interface", "--kind", "maretron"],
         "canboat-pipeline" => &["server"],
         "canboat-tui" => &["tui"],
+        "replay" => &["replay"],
         _ => return None,
     })
 }

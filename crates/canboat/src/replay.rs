@@ -1,7 +1,7 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
-//! `replay`: pace a captured canboat PLAIN/FAST stream so each line
-//! is emitted at its original wall-clock rhythm.
+//! `canboat replay`: pace a captured canboat PLAIN/FAST stream so each
+//! line is emitted at its original wall-clock rhythm.
 //!
 //! Mirrors `canboat/replay/replay.c`. Each input line begins with an
 //! ISO-8601 timestamp `YYYY-MM-DDTHH:MM:SS,mmm` (or `.mmm`). We
@@ -14,25 +14,18 @@
 //! Typical use:
 //!
 //! ```text
-//!   cat capture.raw | replay | analyzer
+//!   cat capture.raw | canboat replay | canboat convert --to json
 //! ```
 
 use std::io::{self, BufRead, BufWriter, Write};
-use std::process::ExitCode;
 use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::Parser;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "replay",
-    about = "Pace canboat PLAIN/FAST stdin so it replays at real-time speed",
-    version,
-    after_help = canboat_cli::help_footer()
-)]
-struct Cli {
+#[derive(Debug, clap::Args)]
+#[command(after_help = canboat_cli::help_footer())]
+pub struct Args {
     /// Verbose / debug logging — alias of `-d`. Matches canboat's C tool.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -53,19 +46,10 @@ struct Cli {
     max_gap: u64,
 }
 
-fn main() -> ExitCode {
-    let cli = Cli::parse_from(canboat_cli::canboat_argv());
-    if let Err(e) = run(cli) {
-        eprintln!("replay: {e:#}");
-        return ExitCode::from(1);
-    }
-    ExitCode::SUCCESS
-}
-
-fn run(cli: Cli) -> Result<()> {
-    let level = if cli.quiet {
+pub fn run(args: Args) -> Result<()> {
+    let level = if args.quiet {
         "error"
-    } else if cli.debug || cli.verbose {
+    } else if args.debug || args.verbose {
         "debug"
     } else {
         "info"
@@ -90,7 +74,7 @@ fn run(cli: Cli) -> Result<()> {
         let now_ms = parse_timestamp_ms(&line);
         if let (Some(now), Some(prev)) = (now_ms, prev_ms) {
             let delta = now - prev;
-            if delta > 0 && (delta as u64) < cli.max_gap {
+            if delta > 0 && (delta as u64) < args.max_gap {
                 log::debug!("sleeping {} ms", delta);
                 thread::sleep(Duration::from_millis(delta as u64));
             }

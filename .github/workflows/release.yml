@@ -27,14 +27,14 @@ env:
   # Real binaries built and packaged. `canboat` is the unified front end;
   # `replay` and `n2kd` are the last standalone tools not yet folded in.
   BINS: >-
-    canboat replay n2kd
+    canboat n2kd
   # Retired tool names that now resolve into `canboat` via argv[0].
   # Shipped as symlinks (Unix) / copies (Windows) to the canboat binary.
   # Kept in sync with `canboat`'s LEGACY_NAMES. (The `*2*` container
   # tools were dropped outright — `canboat convert` reads those formats
   # directly, so there is no legacy name to preserve.)
   SHIMS: >-
-    canboat-pipeline canboat-tui analyzer
+    canboat-pipeline canboat-tui replay analyzer
     actisense-serial ikonvert-serial socketcan-serial maretron-ipg
 
 jobs:

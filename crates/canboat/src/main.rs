@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand};
 mod convert;
 mod interface;
 mod legacy;
+mod replay;
 mod server;
 mod tui;
 
@@ -51,6 +52,9 @@ enum Command {
     /// Interactive terminal browser for a live n2kd/server stream or a capture.
     Tui(tui::Args),
 
+    /// Pace a captured PLAIN/FAST stream at its original wall-clock rhythm.
+    Replay(replay::Args),
+
     /// Install symlinks for the retired tool names (analyzer, *-serial, …).
     InstallShims {
         /// Directory to create the symlinks in. Defaults to the
@@ -73,6 +77,7 @@ fn main() -> ExitCode {
         Command::Interface(args) => interface::run(args),
         Command::Server(args) => server::run(*args),
         Command::Tui(args) => run_tui(args),
+        Command::Replay(args) => replay::run(args),
         Command::InstallShims { dir } => install_shims(dir),
     };
     finish(result)

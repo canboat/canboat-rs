@@ -46,16 +46,17 @@ be a fistful of separate tools:
   the old `candump2analyzer` / `pcap2candump` / `nif2analyzer` shunts.
 - `canboat interface` — bridge a live gateway (NGT-1 / iKonvert / SocketCAN /
   Maretron IPG) to and from stdout.
+- `canboat replay` — pace a captured PLAIN/FAST stream at its original
+  wall-clock rhythm.
 
 The retired standalone names still work: `canboat` inspects `argv[0]`, so a
 symlink named `analyzer`, `actisense-serial`, `ikonvert-serial`,
-`socketcan-serial`, `maretron-ipg`, `canboat-pipeline`, or `canboat-tui`
-dispatches into the right subcommand. `canboat install-shims` creates them.
-(`socketcan-writer` is gone too: its stdin-PLAIN → CAN-bus job is
-`canboat interface --kind socketcan -w`.)
+`socketcan-serial`, `maretron-ipg`, `replay`, `canboat-pipeline`, or
+`canboat-tui` dispatches into the right subcommand. `canboat install-shims`
+creates them. (`socketcan-writer` is gone too: its stdin-PLAIN → CAN-bus job
+is `canboat interface --kind socketcan -w`.)
 
-Still standalone for now: `n2kd` (the analyzer-JSON → TCP multiplexer) and
-`replay` (paces a capture at its original wall-clock rhythm).
+Still standalone for now: `n2kd` (the analyzer-JSON → TCP multiplexer).
 
 The decode path, the device bridges, `n2kd`, and the `server` pipeline are
 exercised against real hardware and pass a byte-for-byte golden-test suite

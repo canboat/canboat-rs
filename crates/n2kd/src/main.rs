@@ -38,10 +38,12 @@ use std::process::ExitCode;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use canboat_core::PgnDatabase;
+use canboat_core::format::parse_plain;
+use canboat_core::output::{CamelCase, JsonOptions, write_json};
 use canboat_core::snapshot::SnapshotStore;
 use clap::Parser;
 
@@ -55,6 +57,17 @@ const DEFAULT_PORT: u16 = 2597;
 const AIS_PGNS: &[u32] = &[
     129038, 129039, 129040, 129041, 129793, 129794, 129798, 129801, 129802, 129809, 129810,
 ];
+
+/// Analyzer-JSON options for the synthetic PGN 262657 filter Reports we
+/// emit onto the JSON stream: name-value (lookups carry their integer
+/// `value`, the -nv contract every consumer now expects), no empty
+/// fields, human-readable names.
+const FILTER_REPORT_JSON_OPTS: JsonOptions = JsonOptions {
+    include_empty: false,
+    name_value: true,
+    debug: false,
+    camel_case: CamelCase::Off,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -188,8 +201,12 @@ fn run(cli: Cli) -> Result<()> {
         log::debug!("--fixtime accepted but not applied to logging: {ts}");
     }
 
+    let filter = match cli.nmea0183_filter.as_deref() {
+        Some(path) => Some(NmeaFilter::load(path)?),
+        None => None,
+    };
     let engine = Arc::new(RequestEngine::new());
-    let mut hub = Hub::new(src_filter, cli.rate_limit, udp, Arc::clone(&engine));
+    let mut hub = Hub::new(src_filter, cli.rate_limit, udp, Arc::clone(&engine), filter);
     hub.nmea_to_stdout = cli.nmea0183 && !cli.restrict;
     let hub = Arc::new(hub);
 
@@ -208,7 +225,12 @@ fn run(cli: Cli) -> Result<()> {
             Arc::clone(&hub),
             Subscription::Nmea0183Stream,
         )?;
-        spawn_raw_input_listener(bind_addr, cli.port + 3, cli.output_copy && !cli.restrict)?;
+        spawn_raw_input_listener(
+            bind_addr,
+            cli.port + 3,
+            cli.output_copy && !cli.restrict,
+            Arc::clone(&hub),
+        )?;
         spawn_ais_listener(bind_addr, cli.port + 4, Arc::clone(&hub))?;
         spawn_snapshot_listener(bind_addr, cli.port, Arc::clone(&hub))?;
         spawn_status_listener(bind_addr, cli.port + 5, Arc::clone(&hub))?;
@@ -220,11 +242,7 @@ fn run(cli: Cli) -> Result<()> {
         spawn_claim_request_engine(Arc::clone(&engine));
     }
 
-    let filter = match cli.nmea0183_filter.as_deref() {
-        Some(path) => Some(NmeaFilter::load(path)?),
-        None => None,
-    };
-    run_stdin_pump(&hub, filter)
+    run_stdin_pump(&hub)
 }
 
 fn parse_src_filter(arg: Option<&str>) -> Result<Option<SrcFilter>> {
@@ -359,7 +377,12 @@ fn spawn_snapshot_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<(
     Ok(())
 }
 
-fn spawn_raw_input_listener(bind: Ipv4Addr, port: u16, copy_to_stdout: bool) -> Result<()> {
+fn spawn_raw_input_listener(
+    bind: Ipv4Addr,
+    port: u16,
+    copy_to_stdout: bool,
+    hub: Arc<Hub>,
+) -> Result<()> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding raw-input on {bind}:{port}"))?;
     log::info!("listening on {bind}:{port} (raw-input)");
@@ -374,8 +397,9 @@ fn spawn_raw_input_listener(bind: Ipv4Addr, port: u16, copy_to_stdout: bool) -> 
                         continue;
                     }
                 };
+                let hub = Arc::clone(&hub);
                 thread::Builder::new()
-                    .spawn(move || run_raw_input_client(stream, copy_to_stdout))
+                    .spawn(move || run_raw_input_client(stream, copy_to_stdout, hub))
                     .ok();
             }
         })
@@ -510,30 +534,47 @@ fn run_ais_client(mut stream: TcpStream, hub: Arc<Hub>) {
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
 
-fn run_raw_input_client(stream: TcpStream, copy_to_stdout: bool) {
+fn run_raw_input_client(stream: TcpStream, copy_to_stdout: bool, hub: Arc<Hub>) {
     let reader = BufReader::new(stream);
-    if !copy_to_stdout {
-        // Drain the connection to keep the client side healthy, but
-        // discard — matches canboat C's default (echo only with `-o`).
-        for _line in reader.lines().map_while(|r| r.ok()) {}
-        return;
-    }
+    // The filter control channel: a client writes PGN 262657 Set frames
+    // as PLAIN to change a rule at runtime. Those are daemon-local — we
+    // apply them and emit a fresh Report, never echoing them to stdout
+    // (they are not bus frames). Only parse when a filter is configured;
+    // otherwise the port keeps its plain forward/drain behaviour.
+    let intercept = hub.has_filter();
     let stdout = io::stdout();
-    let mut lock = stdout.lock();
     for line in reader.lines().map_while(|r| r.ok()) {
-        let mut line = line;
-        line.push('\n');
-        if lock.write_all(line.as_bytes()).is_err() {
-            return;
+        if intercept {
+            let trimmed = line.trim_end_matches(['\r', '\n']);
+            if let Ok(frame) = parse_plain(trimmed)
+                && n2kd::nmea_filter::is_set_frame(&frame)
+            {
+                if let Some(f) = hub.filter.lock().unwrap().as_mut() {
+                    f.apply_set_frame(&frame.data);
+                }
+                hub.emit_filter_report();
+                continue;
+            }
         }
-        let _ = lock.flush();
+        // Default (canboat C): forward to stdout only with `-o`, else
+        // drain and discard to keep the client side healthy.
+        if copy_to_stdout {
+            let mut lock = stdout.lock();
+            let mut line = line;
+            line.push('\n');
+            if lock.write_all(line.as_bytes()).is_err() {
+                return;
+            }
+            let _ = lock.flush();
+        }
     }
 }
 
-fn run_stdin_pump(hub: &Hub, mut filter: Option<NmeaFilter>) -> Result<()> {
+fn run_stdin_pump(hub: &Hub) -> Result<()> {
     let stdin = io::stdin();
     let mut lock = stdin.lock();
     let mut line = String::with_capacity(4096);
+    let mut last_filter_report = Instant::now();
     loop {
         line.clear();
         let n = lock.read_line(&mut line).context("reading stdin")?;
@@ -596,10 +637,10 @@ fn run_stdin_pump(hub: &Hub, mut filter: Option<NmeaFilter>) -> Result<()> {
         // Address Claims — `iso_name()` re-packs it from the decoded
         // fields (the same helper the live pipeline uses), returning
         // `None` for any non-claim PGN.
-        if let Some(f) = filter.as_mut()
+        if hub.has_filter()
             && let Some(name) = decoded.as_ref().and_then(|d| d.iso_name())
         {
-            f.note_address_claim(meta.src, name);
+            hub.note_address_claim(meta.src, name);
         }
         if let Some(decoded) = decoded.as_ref() {
             let mut rl = hub.rate_limiter.lock().unwrap();
@@ -612,8 +653,8 @@ fn run_stdin_pump(hub: &Hub, mut filter: Option<NmeaFilter>) -> Result<()> {
         // Mute redundant devices' 0183 by NAME before it goes out. When
         // the filter empties the buffer (every sentence muted) there's
         // nothing to broadcast.
-        if let Some(f) = filter.as_mut() {
-            f.apply(meta.src, &mut nmea);
+        if hub.has_filter() {
+            hub.apply_filter(meta.src, &mut nmea);
         }
         if !nmea.is_empty() {
             hub.broadcast(Subscription::Nmea0183Stream, &nmea);
@@ -624,6 +665,16 @@ fn run_stdin_pump(hub: &Hub, mut filter: Option<NmeaFilter>) -> Result<()> {
                 let _ = lock.write_all(nmea.as_bytes());
                 let _ = lock.flush();
             }
+        }
+        // Re-advertise the full filter state periodically so a TUI that
+        // connects mid-stream learns it without asking. Driven off the
+        // input line rate (like the live pipeline's frame loop); a quiet
+        // stream has no new state to report anyway.
+        if hub.has_filter()
+            && last_filter_report.elapsed() >= n2kd::nmea_filter::FILTER_REPORT_INTERVAL
+        {
+            hub.emit_filter_report();
+            last_filter_report = Instant::now();
         }
     }
     Ok(())
@@ -663,6 +714,13 @@ struct Hub {
     /// `--nmea0183` mode: NMEA / AIVDM sentences are also written to
     /// the process's stdout. Off in the normal TCP-multiplex mode.
     nmea_to_stdout: bool,
+    /// Per-device NMEA 0183 filter (`--nmea0183-filter`), shared between
+    /// the stdin pump (learn NAME from claims, mute output) and the
+    /// raw-input port (apply runtime PGN 262657 Set frames). `has_filter`
+    /// is a cheap gate so the pump's hot path skips the lock entirely
+    /// when no filter is configured.
+    filter: Mutex<Option<NmeaFilter>>,
+    has_filter: bool,
 }
 
 impl Hub {
@@ -671,6 +729,7 @@ impl Hub {
         rate_limit: bool,
         udp: Option<UdpBroadcast>,
         engine: Arc<RequestEngine>,
+        filter: Option<NmeaFilter>,
     ) -> Self {
         Self {
             cache: SnapshotStore::new(),
@@ -680,6 +739,53 @@ impl Hub {
             rate_limiter: Mutex::new(RateLimiter::new(rate_limit)),
             udp,
             nmea_to_stdout: false,
+            has_filter: filter.is_some(),
+            filter: Mutex::new(filter),
+        }
+    }
+
+    /// Whether a per-device 0183 filter is configured. Cheap enough to
+    /// call per line — lets the pump avoid taking [`Self::filter`]'s
+    /// lock on the hot path when the feature is off.
+    fn has_filter(&self) -> bool {
+        self.has_filter
+    }
+
+    /// Learn `src → NAME` from an ISO Address Claim, for the filter.
+    fn note_address_claim(&self, src: u8, name: u64) {
+        if let Some(f) = self.filter.lock().unwrap().as_mut() {
+            f.note_address_claim(src, name);
+        }
+    }
+
+    /// Mute the just-converted 0183 buffer per device NAME in place.
+    fn apply_filter(&self, src: u8, buf: &mut String) {
+        if let Some(f) = self.filter.lock().unwrap().as_mut() {
+            f.apply(src, buf);
+        }
+    }
+
+    /// Emit the current filter state as PGN 262657 Report records onto
+    /// the JSON stream (and snapshot cache) so a connected TUI can
+    /// render the device/sentence mute matrix and a late joiner catches
+    /// up. No-op when the filter is empty or unset.
+    fn emit_filter_report(&self) {
+        let frames = match self.filter.lock().unwrap().as_ref() {
+            Some(f) => f.report_frames(),
+            None => return,
+        };
+        let db = PgnDatabase::embedded();
+        let mut json = String::new();
+        for frame in &frames {
+            let Ok(decoded) = db.decode(frame) else {
+                continue;
+            };
+            json.clear();
+            if write_json(&mut json, &decoded, &FILTER_REPORT_JSON_OPTS).is_ok() {
+                self.store(&json);
+                json.push('\n');
+                self.broadcast(Subscription::JsonStream, &json);
+            }
         }
     }
 
@@ -748,6 +854,32 @@ mod tests {
     use super::*;
 
     #[test]
+    fn filter_report_frame_decodes_to_nv_json() {
+        // A PGN 262657 Report frame (Function=0, Source=35,
+        // Sentence="VHW", Muted=1) must decode via the embedded schema
+        // and render as the -nv analyzer JSON the JSON-stream clients
+        // read — this is the whole outbound half of n2kd's control
+        // channel.
+        let frame = canboat_core::RawFrame::new(
+            None,
+            7,
+            262657,
+            0,
+            255,
+            [0u8, 35, b'V', b'H', b'W', 1, 0, 0],
+        );
+        let db = PgnDatabase::embedded();
+        let decoded = db.decode(&frame).expect("262657 decodes via embedded db");
+        let mut json = String::new();
+        write_json(&mut json, &decoded, &FILTER_REPORT_JSON_OPTS).unwrap();
+        assert!(json.contains("262657"), "json: {json}");
+        assert!(json.contains("\"Source\":35"), "json: {json}");
+        assert!(json.contains("\"Sentence\":\"VHW\""), "json: {json}");
+        assert!(json.contains("\"Muted\":1"), "json: {json}");
+        assert!(json.contains("\"Function\":0"), "json: {json}");
+    }
+
+    #[test]
     fn extracts_pgn_src() {
         let line = r#"{"timestamp":"2026-01-01T00:00:00","prio":2,"src":7,"dst":255,"pgn":127251,"description":"Rate of Turn","fields":{"Rate":0}}"#;
         let meta = extract_meta(line).unwrap();
@@ -812,7 +944,7 @@ mod tests {
     /// enough surface to exercise `Hub::store` and the snapshot dump.
     fn test_hub() -> Hub {
         let engine = Arc::new(RequestEngine::new());
-        Hub::new(None, false, None, engine)
+        Hub::new(None, false, None, engine, None)
     }
 
     #[test]

@@ -498,6 +498,60 @@ mod tests {
     }
 
     #[test]
+    fn set_frame_applies_and_report_frames_reflect_it() {
+        let mut f = filter_with(&[]);
+        f.path = std::env::temp_dir().join("canboat-nmea-filter-setframe.json");
+        f.note_address_claim(35, NAME_AIRMAR);
+        // Observe a VHW sentence so it shows up in the report matrix.
+        let mut buf = "$CDVHW,,T,,M,4.6,N,8.6,K*5E\r\n".to_string();
+        f.apply(35, &mut buf);
+        assert_eq!(buf, "$CDVHW,,T,,M,4.6,N,8.6,K*5E\r\n"); // no rule yet
+
+        // A TUI Set frame: mute VHW on src 35. The `\0` pad exercises
+        // the trim in `apply_set_frame`.
+        f.apply_set_frame(&[FILTER_FN_SET, 35, b'V', b'H', b'W', 1]);
+        let mut buf = "$CDVHW,,T,,M,4.6,N,8.6,K*5E\r\n".to_string();
+        f.apply(35, &mut buf);
+        assert!(buf.is_empty(), "VHW should now be muted");
+
+        // report_frames advertises the state: a VHW row muted for src 35.
+        let frames = f.report_frames();
+        assert!(
+            frames.iter().any(|fr| fr.pgn == PGN_NMEA0183_FILTER
+                && fr.data.len() >= 6
+                && fr.data[0] == FILTER_FN_REPORT
+                && fr.data[1] == 35
+                && &fr.data[2..5] == b"VHW"
+                && fr.data[5] == 1),
+            "expected a muted VHW report row for src 35, got {frames:?}"
+        );
+    }
+
+    #[test]
+    fn is_set_frame_matches_only_the_set_function() {
+        let set = RawFrame::new(
+            None,
+            7,
+            PGN_NMEA0183_FILTER,
+            0,
+            255,
+            [FILTER_FN_SET, 35, b'V', b'H', b'W', 1, 0xff, 0xff],
+        );
+        assert!(is_set_frame(&set));
+        let report = RawFrame::new(
+            None,
+            7,
+            PGN_NMEA0183_FILTER,
+            0,
+            255,
+            [FILTER_FN_REPORT, 35, b'V', b'H', b'W', 1, 0xff, 0xff],
+        );
+        assert!(!is_set_frame(&report), "a Report is not a Set");
+        let other = RawFrame::new(None, 6, 127251, 5, 255, [0u8; 8]);
+        assert!(!is_set_frame(&other), "a non-262657 PGN is not a Set");
+    }
+
+    #[test]
     fn formatter_extraction() {
         assert_eq!(sentence_formatter("$CBVHW,x*54\r\n"), Some("VHW"));
         assert_eq!(sentence_formatter("$AARSA,2.0*6B\r\n"), Some("RSA"));

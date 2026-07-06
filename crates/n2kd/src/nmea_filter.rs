@@ -5,7 +5,7 @@
 //! The pipeline converts every decoded N2K record to NMEA 0183, so a
 //! bus where several devices report the same measurement produces
 //! several copies of each sentence on the 0183 outputs. The [`RateLimiter`]
-//! (`n2kd::nmea0183`) caps each *source* to 1 Hz, but N devices reporting
+//! (`crate::nmea0183`) caps each *source* to 1 Hz, but N devices reporting
 //! one quantity still yield N sentences/s. This filter removes the
 //! redundant *devices*: the user picks which device should own each
 //! measurement, and the others are muted.

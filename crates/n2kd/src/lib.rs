@@ -13,5 +13,6 @@ pub mod ais_decoded;
 pub mod decoded;
 pub mod json;
 pub mod nmea0183;
+pub mod nmea_filter;
 pub mod request_engine;
 pub mod serving;

@@ -41,7 +41,6 @@
 //! | 2603 | `--raw-port`            | out | raw frame output stream |
 //! | 2604 | `--analyzer-binary-port`| out | binary `WirePgn` stream |
 
-mod nmea_filter;
 mod pipeline;
 mod quirks;
 mod snapshot;
@@ -514,7 +513,7 @@ pub fn run(cli: Args) -> Result<()> {
 
     let nmea_filter = match cli.nmea0183_filter.as_deref() {
         Some(path) => {
-            let f = nmea_filter::NmeaFilter::load(path)?;
+            let f = n2kd::nmea_filter::NmeaFilter::load(path)?;
             log::info!(
                 "NMEA 0183 per-device filter enabled from {}",
                 path.display()

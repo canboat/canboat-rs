@@ -28,7 +28,7 @@
 //! doesn't emit AIVDM sentences yet.
 
 use n2kd::request_engine::{self, RequestEngine};
-use n2kd::{ais, json, nmea0183};
+use n2kd::{ais_decoded, json, nmea0183};
 
 use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
@@ -40,6 +40,7 @@ use std::thread;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
+use canboat_core::PgnDatabase;
 use canboat_core::snapshot::SnapshotStore;
 use clap::Parser;
 
@@ -570,17 +571,23 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         hub.broadcast(Subscription::JsonStream, &line);
         // The AIS port is a one-shot snapshot now, not a live stream —
         // see `spawn_ais_listener`. No per-line broadcast.
-        // NMEA 0183 conversion: append each generated sentence to a
-        // small buffer and ship it once. AIS PGNs get the AIVDM
-        // encoder; everything else goes through the simple-sentence
-        // table.
+        // NMEA 0183 conversion. Rebuild the line into a DecodedPgn
+        // once, then run the struct-path converters directly (the same
+        // code the live `server` pipeline uses) — AIS PGNs through the
+        // AIVDM encoder, everything else through the simple-sentence
+        // table. The JSON-parsing `convert` wrappers are only the
+        // .j2k-input adapters now; the daemon works on DecodedPgn.
         let mut nmea = String::new();
-        let n_sentences = if AIS_PGNS.contains(&meta.pgn) {
-            let mut rl = hub.rate_limiter.lock().unwrap();
-            ais::convert(&mut nmea, trimmed, &mut rl.ais_seq)
-        } else {
-            let mut rl = hub.rate_limiter.lock().unwrap();
-            nmea0183::convert(&mut nmea, trimmed, &mut rl)
+        let n_sentences = match canboat_core::json_to_decoded(trimmed, PgnDatabase::embedded()) {
+            Some(decoded) => {
+                let mut rl = hub.rate_limiter.lock().unwrap();
+                if AIS_PGNS.contains(&meta.pgn) {
+                    ais_decoded::convert(&mut nmea, &decoded, &mut rl.ais_seq)
+                } else {
+                    nmea0183::convert_decoded(&mut nmea, &decoded, &mut rl)
+                }
+            }
+            None => 0,
         };
         if n_sentences > 0 {
             hub.broadcast(Subscription::Nmea0183Stream, &nmea);

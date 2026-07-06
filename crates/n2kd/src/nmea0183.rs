@@ -18,7 +18,7 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use canboat_core::PgnDatabase;
+use canboat_core::{DecodedPgn, PgnDatabase};
 
 use crate::decoded::{self, Handles};
 
@@ -106,7 +106,18 @@ pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> u
     let Some(decoded) = canboat_core::json_to_decoded(msg, PgnDatabase::embedded()) else {
         return 0;
     };
-    decoded::convert_nmea0183(out, &decoded, rate_limiter, handles())
+    convert_decoded(out, &decoded, rate_limiter)
+}
+
+/// Convert an already-rebuilt [`DecodedPgn`] — the daemon's parse-once
+/// path, and what [`convert`] delegates to after the JSON parse. Wraps
+/// [`crate::decoded::convert_nmea0183`] with the shared [`Handles`].
+pub fn convert_decoded(
+    out: &mut String,
+    decoded: &DecodedPgn,
+    rate_limiter: &mut RateLimiter,
+) -> usize {
+    decoded::convert_nmea0183(out, decoded, rate_limiter, handles())
 }
 
 /// The pre-resolved [`Handles`] the struct-path converter needs, built

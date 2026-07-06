@@ -2497,9 +2497,18 @@ fn draw_pgn_top(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &A
         rows.len(),
         total_rate
     );
+    // A solid-background highlight (not REVERSED): REVERSED would flip
+    // the green rate bar to the panel background, hiding the busiest
+    // row's full-width bar. The green selection bar recolours the bar's
+    // blocks to white instead, so the bar length stays visible.
     let list = List::new(items)
         .block(panel_block(title))
-        .highlight_style(panel_highlight())
+        .highlight_style(
+            Style::default()
+                .bg(menu::SELECT_BG)
+                .fg(menu::SELECT_FG)
+                .add_modifier(Modifier::BOLD),
+        )
         .highlight_symbol(" ▶ ")
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, area, &mut app.pgn_top_state);

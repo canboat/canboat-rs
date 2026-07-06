@@ -2172,7 +2172,7 @@ fn draw_device_detail(
     let rows = app.detail_rows(src, state);
     let items: Vec<ListItem> = rows
         .iter()
-        .map(|e| ListItem::new(format_entry_row(e, state.status.mode)))
+        .map(|e| ListItem::new(format_entry_row(e, state)))
         .collect();
     let title = match state.device_list().iter().find(|d| d.src == src) {
         Some(d) => format!(
@@ -2202,7 +2202,52 @@ fn draw_device_detail(
     }
 }
 
-fn format_entry_row(e: &Entry, mode: Mode) -> Line<'static> {
+/// Robust transmission interval for an entry: the median gap between its
+/// most recent observations' wire timestamps. A first→last average
+/// (`Entry::interval`) divides the whole capture span by the count, so
+/// on an intermittent / merged log it dilutes every cadence with the
+/// idle gaps between segments (a 60 s heartbeat reads as "every 361 s").
+/// The median of a trailing window ignores those gap outliers and
+/// reports the real cadence. Falls back to `Entry::interval` when the
+/// records carry no parseable timestamps.
+fn robust_interval(e: &Entry, state: &AppState) -> Option<std::time::Duration> {
+    const WINDOW: usize = 64;
+    // Last WINDOW+1 parseable wire timestamps (ms), oldest-first.
+    let mut stamps: Vec<i64> = e
+        .history_indices
+        .iter()
+        .rev()
+        .take(WINDOW + 1)
+        .filter_map(|&i| state.history.get(i))
+        .filter_map(|h| h.timestamp.as_deref())
+        .filter_map(canboat_core::parse_iso_ms)
+        .collect();
+    if stamps.len() < 2 {
+        return e.interval();
+    }
+    stamps.reverse();
+    // Positive consecutive gaps (a merged clock reset yields a negative
+    // or huge gap — dropped / out-voted by the median).
+    let mut deltas: Vec<i64> = stamps
+        .windows(2)
+        .map(|w| w[1] - w[0])
+        .filter(|&d| d > 0)
+        .collect();
+    if deltas.is_empty() {
+        return e.interval();
+    }
+    deltas.sort_unstable();
+    let mid = deltas.len() / 2;
+    let median = if deltas.len() % 2 == 1 {
+        deltas[mid]
+    } else {
+        (deltas[mid - 1] + deltas[mid]) / 2
+    };
+    Some(std::time::Duration::from_millis(median as u64))
+}
+
+fn format_entry_row(e: &Entry, state: &AppState) -> Line<'static> {
+    let mode = state.status.mode;
     // `count == 0` is the sentinel for a synthetic silenced-override
     // row — no live data, no measured interval, no meaningful age.
     // Render it as an OFF row in dim grey so the user can see at a
@@ -2232,7 +2277,10 @@ fn format_entry_row(e: &Entry, mode: Mode) -> Line<'static> {
         Span::styled(format!(" {:6} ", e.pgn), Style::default().fg(Color::Cyan)),
         Span::raw(format!("{:14.14}", sec)),
         Span::raw(format!(" {:30.30}", e.description)),
-        Span::raw(format!(" every {}", format_interval(e.interval()))),
+        Span::raw(format!(
+            " every {}",
+            format_interval(robust_interval(e, state))
+        )),
     ];
     // "age" is wall-clock seconds since `last_update` — a real
     // measurement in Live mode, but in Log mode it's just "how long
@@ -3644,6 +3692,33 @@ mod tests {
             }
             _ => panic!("expected a Save command"),
         }
+    }
+
+    #[test]
+    fn robust_interval_ignores_merge_gaps() {
+        // A 60 s heartbeat with a big idle gap in the middle (as in a
+        // merged capture): the first→last average is skewed long, but
+        // the median of recent gaps recovers ~60 s.
+        let mut s = seeded_state();
+        let ts =
+            |ms: i64| json!({"pgn": 126993, "timestamp": canboat_core::format_iso_ms(ms as u64)});
+        // 10 frames at 60 s, then a 6-hour gap, then 10 more at 60 s.
+        let mut t = 0i64;
+        for _ in 0..10 {
+            s.upsert(126993, 20, None, "Heartbeat".into(), ts(t));
+            t += 60_000;
+        }
+        t += 6 * 3_600_000; // idle gap
+        for _ in 0..10 {
+            s.upsert(126993, 20, None, "Heartbeat".into(), ts(t));
+            t += 60_000;
+        }
+        let e = s.entries.get(&(126993, 20, None)).unwrap();
+        // First→last average is badly inflated by the gap...
+        assert!(e.interval().unwrap().as_secs() > 1_000);
+        // ...but the robust median lands on the true 60 s cadence.
+        let robust = robust_interval(e, &s).unwrap().as_secs();
+        assert!((59..=61).contains(&robust), "got {robust}s");
     }
 
     #[test]

@@ -6,6 +6,7 @@ members = [
     "crates/canboat-io",
     "crates/canboat-tokio",
     "crates/canboat-cli",
+    "crates/canboat",
     "crates/analyzer",
     "crates/actisense-serial",
     "crates/ikonvert-serial",

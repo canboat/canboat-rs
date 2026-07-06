@@ -1,0 +1,24 @@
+# (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
+[package]
+name        = "canboat"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "The canboat NMEA 2000 toolkit: one binary with convert / interface / server / tui subcommands."
+
+[[bin]]
+name = "canboat"
+path = "src/main.rs"
+
+[dependencies]
+canboat-core = { workspace = true }
+canboat-io   = { workspace = true }
+canboat-cli  = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+env_logger   = { workspace = true }
+log          = { workspace = true }

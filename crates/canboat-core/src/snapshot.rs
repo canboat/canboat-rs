@@ -974,6 +974,77 @@ mod tests {
         assert!(dump.ends_with("}\n"));
     }
 
+    /// The two producer models the daemons feed one store with must
+    /// coexist and render together: n2kd hands over an already-
+    /// serialized line via [`SnapshotStore::store`] (`Ready`), while the
+    /// pipeline defers `write_json` of a `DecodedPgn` via
+    /// [`SnapshotStore::store_lazy`] (`Lazy`). This is the contract the
+    /// serving convergence stands on — so it is worth pinning:
+    ///
+    /// * the `Ready` line is served **byte-identically** (n2kd's
+    ///   JSON-port parity depends on the input line passing through
+    ///   untouched — not a re-serialization);
+    /// * the `Lazy` closure runs **only when a reader asks**, and then
+    ///   exactly once per read;
+    /// * both keys appear in the same `snapshot()` dump.
+    #[test]
+    fn ready_and_lazy_producers_share_one_store() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let s = SnapshotStore::new();
+
+        // n2kd path: the exact JSON line, stored verbatim.
+        let ready_line = r#"{"pgn":127251,"src":7,"fields":{"Rate":0}}"#;
+        s.store(SnapshotInput {
+            pgn: 127251,
+            src: 7,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Rate of Turn".to_string(),
+            line: ready_line.to_string(),
+        });
+
+        // pipeline path: serialization deferred to read time.
+        let renders = Arc::new(AtomicUsize::new(0));
+        let lazy_line = r#"{"pgn":127245,"src":9,"fields":{"Position":1.5}}"#;
+        let r = Arc::clone(&renders);
+        s.store_lazy(
+            127245,
+            9,
+            None,
+            false,
+            "Rudder",
+            Box::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+                lazy_line.to_string()
+            }),
+            Instant::now(),
+        );
+
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            0,
+            "Lazy payload must not serialize before a reader connects"
+        );
+
+        let dump = s.snapshot();
+
+        assert!(
+            dump.contains(ready_line),
+            "Ready line must be served byte-for-byte:\n{dump}"
+        );
+        assert!(
+            dump.contains(lazy_line),
+            "Lazy record must render into the same dump:\n{dump}"
+        );
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            1,
+            "Lazy payload renders exactly once, on read"
+        );
+    }
+
     #[test]
     fn snapshot_keys_src_with_secondary_when_present() {
         // Non-AIS PGN with an Instance secondary so the entry isn't

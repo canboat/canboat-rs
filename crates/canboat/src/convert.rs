@@ -64,6 +64,26 @@ pub struct Args {
     /// Filter: only emit frames with this PGN.
     #[arg(long, value_name = "PGN")]
     pgn: Option<u32>,
+
+    /// `.nif` containers only: emit just the `raw` full-traffic
+    /// captures, skipping the filtered device roster.
+    #[arg(long, conflicts_with = "filtered_only")]
+    raw_only: bool,
+
+    /// `.nif` containers only: emit just the `filtered` device-roster
+    /// captures.
+    #[arg(long)]
+    filtered_only: bool,
+}
+
+impl Args {
+    /// Which capture groups of a `.nif` to unwrap.
+    fn container_opts(&self) -> container::Options {
+        container::Options {
+            filtered: !self.raw_only,
+            raw: !self.filtered_only,
+        }
+    }
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -81,7 +101,7 @@ pub fn run(args: Args) -> Result<()> {
 /// case is exactly [`canboat_io::copy`]; with filters we run the same
 /// pull loop with a per-frame predicate.
 fn convert_raw<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut W) -> Result<()> {
-    let source = open_source(args.file.as_deref())?;
+    let source = open_source(args.file.as_deref(), args.container_opts())?;
     let mut reader = match forced {
         Some(fmt) => LineFrameReader::with_format(source, fmt),
         None => LineFrameReader::new(source),
@@ -139,7 +159,7 @@ fn convert_decoded<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut
         }
     };
 
-    let source = open_source(args.file.as_deref())?;
+    let source = open_source(args.file.as_deref(), args.container_opts())?;
     analyze::decode_stream(source, &cfg, sink).context("decoding input")?;
     if let Some(e) = sink_err {
         return Err(e).context("writing output");
@@ -149,11 +169,11 @@ fn convert_decoded<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut
 
 /// Open the input as a canboat PLAIN-capable [`BufRead`]. A `.nif` /
 /// `.pcap` container is unwrapped on the fly; `None` or `-` is stdin.
-fn open_source(file: Option<&Path>) -> Result<Box<dyn BufRead>> {
+fn open_source(file: Option<&Path>, opts: container::Options) -> Result<Box<dyn BufRead>> {
     match file {
         Some(path) if path.as_os_str() != "-" => {
             if container::is_container(path) {
-                container::plain_reader(path, Default::default())
+                container::plain_reader(path, opts)
                     .with_context(|| format!("opening {}", path.display()))
             } else {
                 let f = File::open(path).with_context(|| format!("opening {}", path.display()))?;

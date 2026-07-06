@@ -114,13 +114,36 @@ pub struct Args {
     #[arg(long, value_name = "PASSWORD")]
     password: Option<String>,
 
-    /// SocketCAN: preferred source address to claim (default 0).
-    #[arg(long, value_name = "N")]
-    address: Option<u8>,
+    /// SocketCAN: preferred source address to claim.
+    #[arg(short = 'a', long, value_name = "ADDR", default_value_t = 0)]
+    address: u8,
 
     /// SocketCAN: passive sniff — skip the ISO address-claim handshake.
-    #[arg(long)]
+    #[arg(short = 'n', long)]
     no_claim: bool,
+
+    /// SocketCAN: unique number for the ISO NAME (default derived from
+    /// the machine id, stable per-host across restarts).
+    #[arg(short = 'u', long, value_name = "N", default_value_t = 0)]
+    unique: u32,
+
+    /// SocketCAN: manufacturer code for the ISO NAME (999 = Signal K).
+    #[arg(short = 'm', long, value_name = "N", default_value_t = 999)]
+    manufacturer: u16,
+
+    /// SocketCAN: Heartbeat (PGN 126993) interval in ms; 0 disables.
+    #[arg(long, alias = "hb", value_name = "MS", default_value_t = 60_000)]
+    heartbeat: u64,
+
+    /// SocketCAN: ISO NAME System Instance, 0..15. Default 15 (max) so
+    /// our NAME yields to real hardware rather than stealing addresses.
+    #[arg(long, alias = "si", value_name = "N", default_value_t = 15)]
+    system_instance: u8,
+
+    /// Quit if no frame is received for this many seconds (0 disables).
+    /// SocketCAN only.
+    #[arg(short = 't', long, value_name = "SECONDS", default_value_t = 0)]
+    timeout: u64,
 }
 
 pub fn run(args: Args) -> Result<()> {
@@ -241,11 +264,16 @@ fn open_device(args: &Args) -> Result<DeviceHandle> {
             if args.file.is_some() {
                 bail!("--file replay is not supported for the socketcan transport");
             }
-            let mut config = device::socketcan::Config::default();
-            if let Some(addr) = args.address {
-                config.address = addr;
-            }
-            config.no_claim = args.no_claim;
+            let config = device::socketcan::Config {
+                address: args.address,
+                unique: args.unique,
+                manufacturer: args.manufacturer,
+                system_instance: args.system_instance,
+                heartbeat_ms: args.heartbeat,
+                no_claim: args.no_claim,
+                timeout_secs: args.timeout,
+                ..device::socketcan::Config::default()
+            };
             let claim = Arc::new(AtomicU8::new(config.address));
             // On non-Linux this returns ErrorKind::Unsupported.
             device::socketcan::run(&args.device, config, claim)

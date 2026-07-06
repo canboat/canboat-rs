@@ -44,7 +44,7 @@ mod config {
         /// Preferred source address to claim. Defaults to 0.
         pub address: u8,
         /// Unique number for the ISO NAME's identity field. 0 = derive
-        /// from the process id.
+        /// from the machine id (stable per-host across restarts).
         pub unique: u32,
         /// Manufacturer code for the ISO NAME. Defaults to 999 (Signal K).
         pub manufacturer: u16,

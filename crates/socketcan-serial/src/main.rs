@@ -80,7 +80,7 @@ struct Cli {
     )]
     address: u8,
 
-    /// Unique number for the ISO NAME (default derived from the pid).
+    /// Unique number for the ISO NAME (default derived from the machine id).
     #[arg(short = 'u', long = "unique", value_name = "N", default_value_t = 0)]
     unique: u32,
 

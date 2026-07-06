@@ -2,17 +2,19 @@
 
 //! Lazy broadcast hub for the read-only TCP outputs.
 //!
-//! `canboat-pipeline` exposes three read streams a TCP client can
-//! subscribe to: PLAIN/FAST CSV (also accepting writes — see
-//! [`crate::server::tcp`]), NMEA 0183 incl. AIVDM, and analyzer JSON. All
-//! three share this `Hub` structure: clients subscribe, the pipeline
-//! calls [`Hub::broadcast`] per produced line, dead subscribers are
-//! pruned on the next broadcast.
+//! A daemon exposes several read streams a TCP client can subscribe
+//! to: PLAIN/FAST CSV, NMEA 0183 (incl. AIVDM), and analyzer JSON. Each
+//! stream is one `Hub`: clients subscribe, the producer calls
+//! [`Hub::broadcast`] per line, dead subscribers are pruned on the next
+//! broadcast.
 //!
-//! The point of the abstraction is the [`Hub::has_subscribers`]
-//! gate: the pipeline checks it *before* invoking the formatter
-//! (PLAIN/FAST, NMEA 0183, JSON). When no one is connected, the
-//! steady-state cost per frame is a single relaxed atomic load.
+//! The point of the abstraction is the [`Hub::has_subscribers`] gate:
+//! the producer checks it *before* running the formatter. When no one
+//! is connected, the steady-state cost per frame is a single relaxed
+//! atomic load.
+//!
+//! Shared by the `server` pipeline and the `n2kd` daemon — the serving
+//! layer both feed (see [`super::tcp`]).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -63,7 +65,7 @@ impl Default for Hub {
 }
 
 /// Binary sibling of [`Hub`] for the length-prefixed postcard stream
-/// (see the `--analyzer-binary-port` server). Identical lazy-broadcast
+/// (the `--analyzer-binary-port` server). Identical lazy-broadcast
 /// design — `has_subscribers` gates the (comparatively expensive)
 /// `WirePgn` encode in the pipeline — but the payload is an opaque
 /// `Arc<[u8]>` chunk of whole frames rather than a text line.

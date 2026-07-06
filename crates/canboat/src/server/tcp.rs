@@ -25,7 +25,7 @@
 //!   that only need to inject N2K traffic.
 //!
 //! All read-side streams are lazy: the pipeline only formats data
-//! when at least one client is subscribed (see [`crate::server::hub::Hub`]).
+//! when at least one client is subscribed (see [`n2kd::serving::Hub`]).
 //! The snapshot port pulls from a cache populated by the pipeline.
 
 use std::io::{BufRead, BufReader, Write};
@@ -67,8 +67,8 @@ pub struct InjectPoint {
 /// parseActisense` use this to skip per-CAN-frame reassembly.
 pub const CANBOAT_FORMAT_FAST_HEADER: &[u8] = b"# format=FAST\n";
 
-use crate::server::hub::{BinHub, Hub};
 use crate::server::snapshot::SnapshotStore;
+use n2kd::serving::{BinHub, Hub};
 
 // Nagle's algorithm is deliberately left ENABLED on every client
 // socket (no `set_nodelay`). These are telemetry streams, not

@@ -37,9 +37,9 @@ use n2kd::request_engine::RequestEngine;
 
 use canboat_wire::WirePgn;
 
-use crate::server::hub::{BinHub, Hub};
 use crate::server::quirks::Quirks;
 use crate::server::snapshot::SnapshotStore;
+use n2kd::serving::{BinHub, Hub};
 
 thread_local! {
     static JSON_BUF: RefCell<String> = const { RefCell::new(String::new()) };

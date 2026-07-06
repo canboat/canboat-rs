@@ -96,7 +96,7 @@ pub enum QuirkKind {
 }
 
 /// Stateful side of the quirk machinery. Owned by the pipeline; lives
-/// inside [`crate::server::hub::Hubs`] for the lifetime of `pipeline::run`.
+/// inside [`crate::server::pipeline::Hubs`] for the lifetime of `pipeline::run`.
 pub struct Quirks {
     kinds: Vec<QuirkKind>,
     /// One entry per learned SCX-20 unit, keyed by its currently

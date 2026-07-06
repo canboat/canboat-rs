@@ -41,7 +41,6 @@
 //! | 2603 | `--raw-port`            | out | raw frame output stream |
 //! | 2604 | `--analyzer-binary-port`| out | binary `WirePgn` stream |
 
-mod hub;
 mod nmea_filter;
 mod pipeline;
 mod quirks;
@@ -66,9 +65,9 @@ use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
 use n2kd::request_engine::{self, RequestEngine};
 
-use crate::server::hub::{BinHub, Hub};
 use crate::server::pipeline::Hubs;
 use crate::server::snapshot::SnapshotStore;
+use n2kd::serving::{BinHub, Hub};
 
 /// Single-process device-reader → analyzer → n2kd pipeline server.
 #[derive(Debug, clap::Args)]

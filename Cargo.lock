@@ -159,9 +159,13 @@ dependencies = [
  "canboat-cli",
  "canboat-core",
  "canboat-io",
+ "canboat-wire",
  "clap",
  "env_logger",
  "log",
+ "n2kd",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
@@ -202,23 +206,6 @@ dependencies = [
  "serialport",
  "socketcan",
  "tar",
-]
-
-[[package]]
-name = "canboat-pipeline"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "canboat-io",
- "canboat-wire",
- "clap",
- "env_logger",
- "log",
- "n2kd",
- "serde",
- "serde_json",
 ]
 
 [[package]]

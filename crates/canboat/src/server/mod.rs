@@ -56,7 +56,6 @@ use std::sync::mpsc;
 use std::thread;
 
 use anyhow::{Result, bail};
-use clap::Parser;
 
 use canboat_core::format::{
     InputFormat, detect, header_implies_coalesced, parse_format_header, parse_with,
@@ -67,18 +66,14 @@ use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
 use n2kd::request_engine::{self, RequestEngine};
 
-use crate::hub::{BinHub, Hub};
-use crate::pipeline::Hubs;
-use crate::snapshot::SnapshotStore;
+use crate::server::hub::{BinHub, Hub};
+use crate::server::pipeline::Hubs;
+use crate::server::snapshot::SnapshotStore;
 
-#[derive(Debug, Parser)]
-#[command(
-    name = "canboat-pipeline",
-    about = "Single-process device-reader \u{2192} analyzer \u{2192} n2kd pipeline",
-    version,
-    after_help = canboat_cli::help_footer()
-)]
-struct Cli {
+/// Single-process device-reader → analyzer → n2kd pipeline server.
+#[derive(Debug, clap::Args)]
+#[command(after_help = canboat_cli::help_footer())]
+pub struct Args {
     /// Read frames from an Actisense NGT-1 / W2K-1 on this serial
     /// device path (e.g. `/dev/ttyUSB0`).
     #[arg(
@@ -317,12 +312,7 @@ struct Cli {
     quiet: bool,
 }
 
-fn main() -> Result<()> {
-    let cli = Cli::parse_from(canboat_cli::canboat_argv());
-    run(cli)
-}
-
-fn run(cli: Cli) -> Result<()> {
+pub fn run(cli: Args) -> Result<()> {
     // Refuse --quirk without --socketcan up front: every other device
     // backend rewrites the source address on outbound, which makes the
     // quirk's impersonation a no-op on the wire.
@@ -584,7 +574,7 @@ struct OpenedSource {
     claim_addr: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
-fn open_source(cli: &Cli) -> Result<OpenedSource> {
+fn open_source(cli: &Args) -> Result<OpenedSource> {
     if let Some(path) = cli.actisense.as_deref() {
         let baud = cli.baud.unwrap_or(115_200);
         let path = path.to_string();

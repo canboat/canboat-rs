@@ -21,6 +21,7 @@ use clap::{Parser, Subcommand};
 
 mod convert;
 mod interface;
+mod server;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -41,6 +42,9 @@ enum Command {
 
     /// Bridge a live gateway (NGT-1 / iKonvert / Maretron / SocketCAN) to/from stdout.
     Interface(interface::Args),
+
+    /// Run the single-process device → analyzer → n2kd pipeline server.
+    Server(Box<server::Args>),
 }
 
 fn main() -> ExitCode {
@@ -48,6 +52,7 @@ fn main() -> ExitCode {
     let result = match cli.command {
         Command::Convert(args) => convert::run(args),
         Command::Interface(args) => interface::run(args),
+        Command::Server(args) => server::run(*args),
     };
     if let Err(e) = result {
         eprintln!("canboat: {e:#}");

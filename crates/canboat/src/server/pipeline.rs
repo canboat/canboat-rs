@@ -37,9 +37,9 @@ use n2kd::request_engine::RequestEngine;
 
 use canboat_wire::WirePgn;
 
-use crate::hub::{BinHub, Hub};
-use crate::quirks::Quirks;
-use crate::snapshot::SnapshotStore;
+use crate::server::hub::{BinHub, Hub};
+use crate::server::quirks::Quirks;
+use crate::server::snapshot::SnapshotStore;
 
 thread_local! {
     static JSON_BUF: RefCell<String> = const { RefCell::new(String::new()) };
@@ -185,7 +185,7 @@ fn is_ais_pgn(pgn: u32) -> bool {
 }
 
 /// Synthetic BEM PGN carrying the per-device NMEA 0183 filter control
-/// channel (see `crate::nmea_filter` and `data/synthetic-pgns.json`).
+/// channel (see `crate::server::nmea_filter` and `data/synthetic-pgns.json`).
 /// Never appears on the N2K bus.
 pub const PGN_NMEA0183_FILTER: u32 = 262657;
 /// PGN 262657 `Function` values.
@@ -197,7 +197,7 @@ const FILTER_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// Decode a PGN 262657 Set payload (`[function, source, s0, s1, s2,
 /// muted, …]`) and apply it to the filter.
-fn apply_filter_control(f: &mut crate::nmea_filter::NmeaFilter, data: &[u8]) {
+fn apply_filter_control(f: &mut crate::server::nmea_filter::NmeaFilter, data: &[u8]) {
     if data.len() < 6 {
         return;
     }
@@ -213,7 +213,7 @@ fn apply_filter_control(f: &mut crate::nmea_filter::NmeaFilter, data: &[u8]) {
 
 /// Queue one PGN 262657 Report frame per filter row so they flow out
 /// the analyzer / raw ports as normal decoded records the TUI reads.
-fn queue_filter_report(f: &crate::nmea_filter::NmeaFilter, out: &mut VecDeque<RawFrame>) {
+fn queue_filter_report(f: &crate::server::nmea_filter::NmeaFilter, out: &mut VecDeque<RawFrame>) {
     for row in f.report() {
         let b = row.sentence.as_bytes();
         let data = [
@@ -273,7 +273,7 @@ pub struct Nmea0183Options {
     /// Enable the 1 Hz per-`(src, quantity)` rate limit.
     pub rate_limit: bool,
     /// Per-device NAME filter; `None` disables it.
-    pub filter: Option<crate::nmea_filter::NmeaFilter>,
+    pub filter: Option<crate::server::nmea_filter::NmeaFilter>,
 }
 
 /// Pipeline entry point. Returns when `frames_rx` is closed.
@@ -298,7 +298,7 @@ pub struct Nmea0183Options {
 ///   0183 consumers; AIS is emitted on a separate path and never
 ///   limited. `false` emits every converted sentence unthrottled.
 /// * `nmea_filter`, when `Some`, mutes NMEA 0183 sentences per device
-///   NAME (see [`crate::nmea_filter`]): it learns `src → NAME` from
+///   NAME (see [`crate::server::nmea_filter`]): it learns `src → NAME` from
 ///   PGN 60928 and drops a converted sentence block when the source is
 ///   unknown or muted. `None` disables it (every converted sentence is
 ///   emitted). AIS is never routed through it.

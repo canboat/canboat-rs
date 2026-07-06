@@ -4,7 +4,7 @@
 //!
 //! `canboat-pipeline` exposes three read streams a TCP client can
 //! subscribe to: PLAIN/FAST CSV (also accepting writes — see
-//! [`crate::tcp`]), NMEA 0183 incl. AIVDM, and analyzer JSON. All
+//! [`crate::server::tcp`]), NMEA 0183 incl. AIVDM, and analyzer JSON. All
 //! three share this `Hub` structure: clients subscribe, the pipeline
 //! calls [`Hub::broadcast`] per produced line, dead subscribers are
 //! pruned on the next broadcast.

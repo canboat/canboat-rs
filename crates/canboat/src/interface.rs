@@ -17,15 +17,13 @@
 //! per-kind producer name is preserved so the n2kd parity harness keeps
 //! comparing like with like).
 
-use std::fs::File;
 use std::io::{self, BufWriter, Read, Write};
 use std::net::TcpStream;
-use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::AtomicU8;
 use std::thread;
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 
 use canboat_core::RawFrame;
 use canboat_io::device::{self, DeviceHandle};
@@ -80,11 +78,6 @@ pub struct Args {
     /// or CAN interface name such as `can0` (socketcan).
     #[arg(value_name = "DEVICE")]
     device: String,
-
-    /// Replay from a captured device byte stream instead of opening a
-    /// live serial port (ngt1/ikonvert only).
-    #[arg(long, value_name = "PATH")]
-    file: Option<PathBuf>,
 
     /// Serial baud rate. Defaults to 115200 (ngt1) / 230400 (ikonvert).
     #[arg(short = 'b', long)]
@@ -239,16 +232,11 @@ fn open_device(args: &Args) -> Result<DeviceHandle> {
                 rx_list: args.rx.clone(),
                 tx_list: args.tx.clone(),
                 rate_limit_off: args.rate_limit_off,
-                // No device on the far end of a file replay to ACK the
-                // init handshake, so skip it.
-                skip_init: args.file.is_some(),
+                skip_init: false,
             };
             Ok(device::ikonvert::run(r, w, config))
         }
         Kind::Maretron => {
-            if args.file.is_some() {
-                bail!("--file replay is not supported for the maretron transport");
-            }
             let stream = TcpStream::connect(&args.device)
                 .with_context(|| format!("connecting to {}", args.device))?;
             let reader: Box<dyn Read + Send> =
@@ -261,9 +249,6 @@ fn open_device(args: &Args) -> Result<DeviceHandle> {
             Ok(device::maretron::run(reader, writer, config))
         }
         Kind::Socketcan => {
-            if args.file.is_some() {
-                bail!("--file replay is not supported for the socketcan transport");
-            }
             let config = device::socketcan::Config {
                 address: args.address,
                 unique: args.unique,
@@ -282,16 +267,11 @@ fn open_device(args: &Args) -> Result<DeviceHandle> {
     }
 }
 
-/// Byte-stream transport (serial device or `--file` replay) as an
-/// independent `(reader, writer)` pair.
+/// Open the serial transport as an independent `(reader, writer)` pair.
+/// `interface` is live-device only — captured byte streams are decoded
+/// with `canboat convert`, not here.
 fn open_stream(args: &Args) -> Result<(Box<dyn Read + Send>, Box<dyn Write + Send>)> {
-    if let Some(path) = &args.file {
-        let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-        // Nothing to write to on replay — swallow the write side.
-        Ok((Box::new(file), Box::new(io::sink())))
-    } else {
-        let baud = args.baud.unwrap_or_else(|| args.kind.default_baud());
-        open_serial_rw(&args.device, baud)
-            .with_context(|| format!("opening serial port {}", args.device))
-    }
+    let baud = args.baud.unwrap_or_else(|| args.kind.default_baud());
+    open_serial_rw(&args.device, baud)
+        .with_context(|| format!("opening serial port {}", args.device))
 }

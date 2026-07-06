@@ -43,6 +43,11 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     file: Option<PathBuf>,
 
+    /// Input file as a positional argument — an alternative spelling of
+    /// `--file` (e.g. `canboat convert capture.nif`).
+    #[arg(value_name = "FILE", conflicts_with = "file")]
+    file_pos: Option<PathBuf>,
+
     /// Force the input format instead of auto-detecting it. One of:
     /// plain, plain-mix-fast, actisense, ydwg02, ikonvert, airmar,
     /// chetco, garmin, garmin-csv2.
@@ -77,6 +82,12 @@ pub struct Args {
 }
 
 impl Args {
+    /// The input path: `--file` or the positional form, whichever was
+    /// given. `None` means stdin.
+    fn input(&self) -> Option<&Path> {
+        self.file.as_deref().or(self.file_pos.as_deref())
+    }
+
     /// Which capture groups of a `.nif` to unwrap.
     fn container_opts(&self) -> container::Options {
         container::Options {
@@ -101,7 +112,7 @@ pub fn run(args: Args) -> Result<()> {
 /// case is exactly [`canboat_io::copy`]; with filters we run the same
 /// pull loop with a per-frame predicate.
 fn convert_raw<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut W) -> Result<()> {
-    let source = open_source(args.file.as_deref(), args.container_opts())?;
+    let source = open_source(args.input(), args.container_opts())?;
     let mut reader = match forced {
         Some(fmt) => LineFrameReader::with_format(source, fmt),
         None => LineFrameReader::new(source),
@@ -159,7 +170,7 @@ fn convert_decoded<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut
         }
     };
 
-    let source = open_source(args.file.as_deref(), args.container_opts())?;
+    let source = open_source(args.input(), args.container_opts())?;
     analyze::decode_stream(source, &cfg, sink).context("decoding input")?;
     if let Some(e) = sink_err {
         return Err(e).context("writing output");

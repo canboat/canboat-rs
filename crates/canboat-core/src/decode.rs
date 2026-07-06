@@ -405,6 +405,43 @@ impl DecodedPgn {
             .iter()
             .find(|f| f.repeat_set == 0 && f.name() == name)
     }
+
+    /// The 64-bit ISO NAME of a PGN 60928 (ISO Address Claim) record —
+    /// the ISO 11783-5 bit-packing of the claim's fields, identical to
+    /// `u64::from_le_bytes(payload[..8])` for a spec-compliant frame.
+    /// Returns `None` for any other PGN.
+    ///
+    /// Packs from the decoded *fields* (LSB-first, in schema order)
+    /// rather than the raw bytes, so it works both for a record decoded
+    /// from a frame and one rebuilt from analyzer JSON (which carries no
+    /// payload). That makes it the canonical device key for the
+    /// per-NAME NMEA 0183 filter, computed identically by every daemon.
+    /// The reserved `Spare` bit is taken as its spec value 0; every
+    /// consumer computing the NAME the same way still gets a stable key.
+    pub fn iso_name(&self) -> Option<u64> {
+        if self.pgn != 60928 {
+            return None;
+        }
+        let f = |name: &str, bits: u32| -> u64 {
+            let v = self
+                .field_by_name(name)
+                .and_then(|df| df.value.as_i64())
+                .unwrap_or(0) as u64;
+            v & ((1u64 << bits) - 1)
+        };
+        Some(
+            f("Unique Number", 21)
+                | f("Manufacturer Code", 11) << 21
+                | f("Device Instance Lower", 3) << 32
+                | f("Device Instance Upper", 5) << 35
+                | f("Device Function", 8) << 40
+                // bit 48: Spare (reserved, 0)
+                | f("Device Class", 7) << 49
+                | f("System Instance", 4) << 56
+                | f("Industry Group", 3) << 60
+                | f("Arbitrary address capable", 1) << 63,
+        )
+    }
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -1769,6 +1806,27 @@ mod tests {
             FieldValue::Lookup { value, .. } => assert_eq!(*value, 155),
             other => panic!("expected lookup, got {other:?}"),
         }
+
+        // iso_name() re-packs the fields to the exact wire NAME, i.e.
+        // the little-endian payload — the key the per-NAME 0183 filter
+        // uses. Reproducing it from fields (not bytes) is what lets the
+        // JSON-in daemon derive the same NAME.
+        let wire_name = u64::from_le_bytes([0xfb, 0x9b, 0x70, 0x22, 0x00, 0x9b, 0x50, 0xc0]);
+        assert_eq!(dec.iso_name(), Some(wire_name));
+    }
+
+    #[test]
+    fn iso_name_is_none_for_non_claim_pgn() {
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 6,
+            pgn: 127251,
+            src: 5,
+            dst: 255,
+            data: smallvec::smallvec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00],
+        };
+        let dec = db().decode(&frame).expect("decode");
+        assert_eq!(dec.iso_name(), None);
     }
 
     #[test]

@@ -478,15 +478,16 @@ pub fn run(
         hubs.engine.note_device_seen(decoded.pgn, decoded.src);
 
         // Learn `src → NAME` for the per-device 0183 filter. The NAME
-        // is the full 64-bit ISO Address Claim payload (little-endian),
-        // so even a device with an "unavailable" manufacturer code is
-        // uniquely identified. A source that never claims stays
-        // unmapped and produces no 0183 — the "no NAME, no output" rule.
-        if decoded.pgn == 60928
-            && assembled.data.len() >= 8
-            && let Some(f) = nmea_filter.as_mut()
+        // is the 64-bit ISO Address Claim identity, so even a device
+        // with an "unavailable" manufacturer code is uniquely
+        // identified. `iso_name()` re-packs it from the decoded fields
+        // (returning `None` for any non-claim PGN) — the same helper
+        // n2kd uses, which has no raw payload to read. A source that
+        // never claims stays unmapped and produces no 0183 — the "no
+        // NAME, no output" rule.
+        if let Some(f) = nmea_filter.as_mut()
+            && let Some(name) = decoded.iso_name()
         {
-            let name = u64::from_le_bytes(assembled.data[..8].try_into().expect("8 bytes"));
             f.note_address_claim(decoded.src, name);
         }
 

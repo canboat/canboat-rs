@@ -625,3 +625,30 @@ fn split_aton_name(s: &str) -> (&str, &str) {
     }
     (&s[..20], s[20..].trim_end_matches('\0'))
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use canboat_core::{PgnDatabase, json_to_decoded};
+
+    /// Build a DecodedPgn from an analyzer name-value line for testing
+    /// the struct-path field helpers.
+    fn decode(line: &str) -> DecodedPgn {
+        json_to_decoded(line, PgnDatabase::embedded()).expect("known PGN")
+    }
+
+    #[test]
+    fn sog_clamps_above_range() {
+        // 999 m/s ≈ 1940 kn; canboat clamps to the 1023 "unknown"
+        // sentinel. (Ported from the deleted JSON-path `ais::sog` test.)
+        let d = decode(r#"{"pgn":129039,"src":1,"fields":{"SOG":999.0}}"#);
+        assert_eq!(sog(&d, "SOG"), 1023);
+    }
+
+    #[test]
+    fn longitude_default_on_missing() {
+        // No Longitude field → ITU "not available" sentinel.
+        let d = decode(r#"{"pgn":129039,"src":1,"fields":{}}"#);
+        assert_eq!(longitude(&d, "Longitude"), 0x6791AC0);
+    }
+}

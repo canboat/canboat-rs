@@ -35,7 +35,7 @@ pub fn json_to_decoded(line: &str, db: &PgnDatabase) -> Option<DecodedPgn> {
 
     let mut fields = Vec::with_capacity(info.fields.len());
     for fi in info.fields {
-        if let Some(value) = field_value_from_json(line, fi) {
+        if let Some(value) = field_value_from_json(line, fi, db) {
             fields.push(DecodedField {
                 info: fi,
                 value,
@@ -69,7 +69,7 @@ pub fn json_to_decoded(line: &str, db: &PgnDatabase) -> Option<DecodedPgn> {
 /// keyed by the human `name` (canboat default, non-camel). Returns
 /// `None` when the field is absent from the line or its type isn't one
 /// the converters consume.
-fn field_value_from_json(line: &str, fi: &FieldInfo) -> Option<FieldValue> {
+fn field_value_from_json(line: &str, fi: &FieldInfo, db: &PgnDatabase) -> Option<FieldValue> {
     use FieldType::*;
     let name = fi.name;
     match fi.field_type {
@@ -78,11 +78,15 @@ fn field_value_from_json(line: &str, fi: &FieldInfo) -> Option<FieldValue> {
         // resolved name is `&'static` in a live decode; we don't have
         // one here, and no `-nv` consumer needs it (they read the int).
         Some(Lookup | BitLookup | IndirectLookup | DynamicFieldKey | FieldIndex) => {
-            let v = json::lookup_int(line, name)?;
-            Some(FieldValue::Lookup {
-                value: v as u64,
-                name: None,
-            })
+            let value = match json::lookup_int(line, name) {
+                Some(v) => v as u64,
+                // Fallback for non-`-nv` JSON (older / hand-written
+                // captures): resolve the bare name-string against the
+                // field's lookup enumeration. Production `.j2k` is
+                // always `-nv`, so this is the slow path.
+                None => resolve_lookup_name(db, fi, json::value(line, name)?)?,
+            };
+            Some(FieldValue::Lookup { value, name: None })
         }
         // `-nv`: {"value":<days>,"name":"YYYY.MM.DD"} — take the raw days.
         Some(Date) => Some(FieldValue::Date(nested_or_bare_int(line, name)? as u16)),
@@ -119,6 +123,20 @@ fn field_value_from_json(line: &str, fi: &FieldInfo) -> Option<FieldValue> {
         // no converter reads them; skip.
         _ => None,
     }
+}
+
+/// Reverse-resolve a lookup `name`-string to its enum integer via the
+/// field's lookup enumeration. Only reached for non-`-nv` input.
+fn resolve_lookup_name(db: &PgnDatabase, fi: &FieldInfo, name: &str) -> Option<u64> {
+    let table = fi
+        .lookup_enumeration
+        .or(fi.lookup_bit_enumeration)
+        .or(fi.lookup_indirect_enumeration)?;
+    db.lookup(table)?
+        .values
+        .iter()
+        .find(|v| v.name == name)
+        .map(|v| v.value)
 }
 
 /// `true` for fields the decoder keeps as a bare integer: resolution of

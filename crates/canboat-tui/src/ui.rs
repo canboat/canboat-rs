@@ -2246,6 +2246,19 @@ fn robust_interval(e: &Entry, state: &AppState) -> Option<std::time::Duration> {
     Some(std::time::Duration::from_millis(median as u64))
 }
 
+/// Whether canboat's schema marks this PGN as transmitted irregularly
+/// (on request / on event) rather than on a fixed interval — e.g. ISO
+/// Address Claim, Product / Configuration Information. For these a
+/// measured "every X" is meaningless. Uses the first definition for the
+/// PGN number (good enough; proprietary variants that share a number
+/// mostly agree, and the standard on-request PGNs are unambiguous).
+fn pgn_on_request(pgn: u32) -> bool {
+    canboat_core::PgnDatabase::embedded()
+        .first_pgn(pgn)
+        .and_then(|p| p.transmission_irregular)
+        .unwrap_or(false)
+}
+
 fn format_entry_row(e: &Entry, state: &AppState) -> Line<'static> {
     let mode = state.status.mode;
     // `count == 0` is the sentinel for a synthetic silenced-override
@@ -2277,10 +2290,15 @@ fn format_entry_row(e: &Entry, state: &AppState) -> Line<'static> {
         Span::styled(format!(" {:6} ", e.pgn), Style::default().fg(Color::Cyan)),
         Span::raw(format!("{:14.14}", sec)),
         Span::raw(format!(" {:30.30}", e.description)),
-        Span::raw(format!(
-            " every {}",
-            format_interval(robust_interval(e, state))
-        )),
+        // On-request / irregular PGNs (per canboat's schema) have no
+        // cadence — any "every X" would be fiction — so label them
+        // explicitly. Same 14-col width as " every <7>" so `count`
+        // stays aligned.
+        Span::raw(if pgn_on_request(e.pgn) {
+            format!(" {:>13}", "on request")
+        } else {
+            format!(" every {}", format_interval(robust_interval(e, state)))
+        }),
     ];
     // "age" is wall-clock seconds since `last_update` — a real
     // measurement in Live mode, but in Log mode it's just "how long
@@ -3692,6 +3710,17 @@ mod tests {
             }
             _ => panic!("expected a Save command"),
         }
+    }
+
+    #[test]
+    fn on_request_pgns_are_flagged() {
+        // Schema-irregular (on request / on event).
+        assert!(pgn_on_request(60928)); // ISO Address Claim
+        assert!(pgn_on_request(126996)); // Product Information
+        assert!(pgn_on_request(126998)); // Configuration Information
+        // Regular, fixed-interval PGNs.
+        assert!(!pgn_on_request(126993)); // Heartbeat (60 s)
+        assert!(!pgn_on_request(129025)); // Position, Rapid Update
     }
 
     #[test]

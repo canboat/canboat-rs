@@ -617,7 +617,7 @@ fn decode_fields(
 /// no decoded field — truncated payloads, NotAvailable filtered
 /// out, or schema positions belonging to a repeating set — keep
 /// the `i8::MIN` sentinel.
-fn build_index_by_order(fields: &[DecodedField]) -> [i8; 32] {
+pub(crate) fn build_index_by_order(fields: &[DecodedField]) -> [i8; 32] {
     let mut idx = [i8::MIN; 32];
     for (pos, f) in fields.iter().enumerate() {
         if f.repeat_set != 0 {

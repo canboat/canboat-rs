@@ -179,9 +179,9 @@ pub struct PgnLoadRow {
     pub sources: usize,
     /// Total records observed across all sources.
     pub count: u64,
-    /// Summed transmission rate in messages/second, computed from each
-    /// contributing entry's measured interval. `0.0` while no entry
-    /// has enough samples to measure a cadence yet.
+    /// Average bus rate in messages/second: total observations divided
+    /// by the capture duration. `0.0` when the duration can't be
+    /// measured (a single instant, or no timestamps at all).
     pub rate: f32,
 }
 
@@ -626,11 +626,19 @@ impl AppState {
     }
 
     /// Aggregate every entry by PGN for the `top`-style load view.
-    /// Sums observation counts and measured message rates across all
-    /// sources of each PGN, then sorts busiest-first (rate desc, then
+    /// Sums observation counts across all sources of each PGN and
+    /// divides by the capture duration to get the average bus rate
+    /// (messages/second), then sorts busiest-first (rate desc, then
     /// count desc, then PGN asc for a stable tie-break).
+    ///
+    /// The rate is `count / duration`, NOT the sum of per-source
+    /// instantaneous cadences: a bursty request-only PGN (e.g. 126996
+    /// Product Information, a couple of frames from each of 48 sources
+    /// at startup) would otherwise report a wildly inflated rate despite
+    /// contributing almost nothing to the bus over the whole capture.
     pub fn pgn_load_rows(&self) -> Vec<PgnLoadRow> {
-        let mut agg: HashMap<u32, (String, HashSet<u8>, u64, f32)> = HashMap::new();
+        let dur = self.capture_duration_secs();
+        let mut agg: HashMap<u32, (String, HashSet<u8>, u64)> = HashMap::new();
         for e in self.entries.values() {
             // `count == 0` is the synthetic silenced-override sentinel —
             // no real traffic, so it doesn't belong in a load view.
@@ -643,21 +651,15 @@ impl AppState {
             }
             slot.1.insert(e.src);
             slot.2 += e.count;
-            if let Some(iv) = e.interval() {
-                let ms = iv.as_millis() as f32;
-                if ms > 0.0 {
-                    slot.3 += 1000.0 / ms;
-                }
-            }
         }
         let mut rows: Vec<PgnLoadRow> = agg
             .into_iter()
-            .map(|(pgn, (description, srcs, count, rate))| PgnLoadRow {
+            .map(|(pgn, (description, srcs, count))| PgnLoadRow {
                 pgn,
                 description,
                 sources: srcs.len(),
                 count,
-                rate,
+                rate: if dur > 0.0 { count as f32 / dur } else { 0.0 },
             })
             .collect();
         rows.sort_by(|a, b| {
@@ -668,6 +670,37 @@ impl AppState {
                 .then_with(|| a.pgn.cmp(&b.pgn))
         });
         rows
+    }
+
+    /// Wall-time span of the capture in seconds, from the wire
+    /// timestamps (earliest first-seen to latest last-seen across all
+    /// entries). Falls back to the monotonic arrival span when the log
+    /// carried no timestamps — the best we can do there, though in
+    /// log-replay mode that reflects ingest time, not the real capture.
+    /// `0.0` when there's nothing (or a single instant) to measure.
+    pub fn capture_duration_secs(&self) -> f32 {
+        let (mut min_ms, mut max_ms) = (i64::MAX, i64::MIN);
+        for e in self.entries.values() {
+            if let Some(f) = e.first_stamp_ms {
+                min_ms = min_ms.min(f);
+            }
+            if let Some(l) = e.last_stamp_ms {
+                max_ms = max_ms.max(l);
+            }
+        }
+        if max_ms > min_ms {
+            return (max_ms - min_ms) as f32 / 1000.0;
+        }
+        // No usable wire timestamps: fall back to the arrival-clock span.
+        let (mut earliest, mut latest): (Option<Instant>, Option<Instant>) = (None, None);
+        for e in self.entries.values() {
+            earliest = Some(earliest.map_or(e.first_seen, |x: Instant| x.min(e.first_seen)));
+            latest = Some(latest.map_or(e.last_update, |x: Instant| x.max(e.last_update)));
+        }
+        match (earliest, latest) {
+            (Some(a), Some(b)) if b > a => b.duration_since(a).as_secs_f32(),
+            _ => 0.0,
+        }
     }
 
     /// All entries for `src`, sorted by PGN then secondary so the UI
@@ -905,5 +938,32 @@ mod tests {
         // Ties on rate (all zero until a cadence is measured) break by
         // count desc, so the 3-count PGN sorts ahead of the 1-count one.
         assert_eq!(rows[0].pgn, 129025);
+    }
+
+    #[test]
+    fn pgn_load_rate_is_count_over_capture_duration() {
+        // A bursty low-count PGN must not out-rate a steady high-count
+        // one just because its few frames clustered in time.
+        let mut s = state();
+        let ts = |ms: i64| json!({"pgn": 1, "timestamp": canboat_core::format_iso_ms(ms as u64)});
+        // 100-second capture window: t=0 .. t=100_000ms.
+        // Bursty PGN 126996: two frames 1 s apart from each of two srcs.
+        s.upsert(126996, 10, None, "Product".into(), ts(0));
+        s.upsert(126996, 10, None, "Product".into(), ts(1_000));
+        s.upsert(126996, 11, None, "Product".into(), ts(0));
+        s.upsert(126996, 11, None, "Product".into(), ts(1_000));
+        // Steady PGN 127250: 5 frames spread across the whole window.
+        for k in 0..5 {
+            s.upsert(127250, 10, None, "Heading".into(), ts(k * 25_000));
+        }
+        assert_eq!(s.capture_duration_secs(), 100.0);
+        let rows = s.pgn_load_rows();
+        let bursty = rows.iter().find(|r| r.pgn == 126996).unwrap();
+        let steady = rows.iter().find(|r| r.pgn == 127250).unwrap();
+        // count / 100 s — not the old summed instantaneous cadence.
+        assert!((bursty.rate - 4.0 / 100.0).abs() < 1e-4, "{}", bursty.rate);
+        assert!((steady.rate - 5.0 / 100.0).abs() < 1e-4, "{}", steady.rate);
+        // Steady (higher count) sorts ahead of bursty.
+        assert!(steady.rate > bursty.rate);
     }
 }

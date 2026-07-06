@@ -25,15 +25,17 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Real binaries built and packaged. `canboat` is the unified front end;
-  # the legacy tool crates are still here as a fallback until the argv[0]
-  # shims are verified against the parity harness, then retired.
+  # `replay` and `n2kd` are the last standalone tools not yet folded in.
   BINS: >-
-    canboat analyzer actisense-serial ikonvert-serial maretron-ipg replay
-    candump2analyzer pcap2candump nif2analyzer socketcan-serial n2kd
-  # Retired crates whose names now resolve into `canboat` via argv[0].
+    canboat replay n2kd
+  # Retired tool names that now resolve into `canboat` via argv[0].
   # Shipped as symlinks (Unix) / copies (Windows) to the canboat binary.
+  # Kept in sync with `canboat`'s LEGACY_NAMES. (The `*2*` container
+  # tools were dropped outright — `canboat convert` reads those formats
+  # directly, so there is no legacy name to preserve.)
   SHIMS: >-
-    canboat-pipeline canboat-tui
+    canboat-pipeline canboat-tui analyzer
+    actisense-serial ikonvert-serial socketcan-serial maretron-ipg
 
 jobs:
   build-linux:
@@ -104,7 +106,7 @@ jobs:
               "target/x86_64-apple-darwin/release/$b" \
               -output "universal/$b"
           done
-          file universal/analyzer
+          file universal/canboat
 
       - name: Package
         run: |

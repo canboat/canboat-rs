@@ -3,20 +3,6 @@
 version = 4
 
 [[package]]
-name = "actisense-serial"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "canboat-io",
- "clap",
- "env_logger",
- "log",
- "serialport",
-]
-
-[[package]]
 name = "adler2"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -27,19 +13,6 @@ name = "allocator-api2"
 version = "0.2.21"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
-
-[[package]]
-name = "analyzer"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "canboat-io",
- "clap",
- "env_logger",
- "log",
-]
 
 [[package]]
 name = "android_system_properties"
@@ -239,18 +212,6 @@ dependencies = [
  "canboat-core",
  "postcard",
  "serde",
-]
-
-[[package]]
-name = "candump2analyzer"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "clap",
- "env_logger",
- "log",
 ]
 
 [[package]]
@@ -729,20 +690,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
-name = "ikonvert-serial"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "canboat-io",
- "clap",
- "env_logger",
- "log",
- "serialport",
-]
-
-[[package]]
 name = "indexmap"
 version = "2.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -892,18 +839,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "maretron-ipg"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "clap",
- "env_logger",
- "log",
-]
-
-[[package]]
 name = "memchr"
 version = "2.8.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -999,16 +934,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "nif2analyzer"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-io",
- "clap",
-]
-
-[[package]]
 name = "nix"
 version = "0.26.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1081,15 +1006,6 @@ name = "paste"
 version = "1.0.15"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
-
-[[package]]
-name = "pcap2candump"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "clap",
-]
 
 [[package]]
 name = "pin-project-lite"
@@ -1397,21 +1313,6 @@ dependencies = [
  "nix 0.29.0",
  "socket2 0.5.10",
  "thiserror",
-]
-
-[[package]]
-name = "socketcan-serial"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "canboat-io",
- "clap",
- "env_logger",
- "libc",
- "log",
- "socketcan",
 ]
 
 [[package]]

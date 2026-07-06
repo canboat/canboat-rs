@@ -12,7 +12,6 @@
 #   make fmt           - `cargo fmt --all`
 #   make clippy        - Workspace clippy at `-D warnings` (what CI enforces)
 #   make precommit     - fmt + clippy + test — run this before pushing
-#   make analyzer      - Release build of just the `analyzer` binary
 #   make pipeline      - Release build of just `canboat-pipeline`
 #   make tui           - Release build of just `canboat-tui`
 #   make n2kd          - Release build of just `n2kd`
@@ -25,7 +24,7 @@
 CARGO ?= cargo
 
 .PHONY: all build debug check test fmt fmt-check clippy precommit sync-canboat \
-        analyzer pipeline tui n2kd \
+        pipeline tui n2kd \
         clean help
 
 all: build
@@ -72,9 +71,6 @@ sync-canboat:
 
 # Per-binary release shortcuts. `cargo build --release -p <crate>` under
 # the hood — handy when you only need one specific tool.
-analyzer:
-	$(CARGO) build --release -p analyzer
-
 pipeline:
 	$(CARGO) build --release -p canboat-pipeline
 
@@ -102,7 +98,6 @@ help:
 	@echo "  make precommit      fmt + clippy + test"
 	@echo "  make sync-canboat   REF=<ref> — vendor canboat.json from upstream"
 	@echo ""
-	@echo "  make analyzer       Release build of just analyzer"
 	@echo "  make pipeline       Release build of just canboat-pipeline"
 	@echo "  make tui            Release build of just canboat-tui"
 	@echo "  make n2kd           Release build of just n2kd"

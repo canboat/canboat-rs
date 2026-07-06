@@ -30,26 +30,36 @@ crate structure is better. This is still v0.x, so expect breakage!
 
 ## The tool side
 
-`canboat-pipeline` is the flagship: a single process that reads a device
-(iKonvert, Actisense, SocketCAN, Maretron IPG, or a log file), decodes, and
-serves snapshot / analyzer-JSON / NMEA 0183 / CSV over TCP, with
-supervisor-based device reconnect.
+`canboat` is the single front-end binary. Its subcommands cover what used to
+be a fistful of separate tools:
 
-`canboat-tui` is a text user interface à la `top` that allows you to view
-messages either live or from a log file, in various ways. It will improve
-over time to become the go-to way of reading log files, monitoring
-interesting situations on a live bus, and configuring devices.
+- `canboat server` — the flagship: one process that reads a device
+  (iKonvert, Actisense, SocketCAN, Maretron IPG, or a log file), decodes, and
+  serves snapshot / analyzer-JSON / NMEA 0183 / CSV over TCP, with
+  supervisor-based device reconnect.
+- `canboat tui` — a text user interface à la `top` for viewing messages live
+  or from a log file. The go-to way of reading log files, monitoring a live
+  bus, and configuring devices.
+- `canboat convert` — decode/convert any capture (PLAIN/FAST/Actisense/
+  YDWG02/iKonvert, and `.pcap`/`.pcap.gz`/`.nif` containers unwrapped
+  automatically) to PLAIN, JSON, or text. Drop-in for the C `analyzer` and
+  the old `candump2analyzer` / `pcap2candump` / `nif2analyzer` shunts.
+- `canboat interface` — bridge a live gateway (NGT-1 / iKonvert / SocketCAN /
+  Maretron IPG) to and from stdout.
 
-The rest are canboat-compatible building blocks: `analyzer` (drop-in for the
-C analyzer, PLAIN/FAST/Actisense/YDWG02/iKonvert input, text or JSON out),
-`n2kd`, the device bridges (`actisense-serial`, `ikonvert-serial`,
-`maretron-ipg`, `socketcan-serial`), and the small utilities (`replay`,
-`candump2analyzer`, `pcap2candump`). (`socketcan-writer` has been removed:
-its stdin-PLAIN → CAN-bus job is done by `socketcan-serial -w`.)
+The retired standalone names still work: `canboat` inspects `argv[0]`, so a
+symlink named `analyzer`, `actisense-serial`, `ikonvert-serial`,
+`socketcan-serial`, `maretron-ipg`, `canboat-pipeline`, or `canboat-tui`
+dispatches into the right subcommand. `canboat install-shims` creates them.
+(`socketcan-writer` is gone too: its stdin-PLAIN → CAN-bus job is
+`canboat interface --kind socketcan -w`.)
 
-`analyzer`, `ikonvert-serial`, `n2kd`, `canboat-pipeline`, and
-`socketcan-serial` are exercised against real hardware and pass a
-byte-for-byte golden-test suite against canboat C's output.
+Still standalone for now: `n2kd` (the analyzer-JSON → TCP multiplexer) and
+`replay` (paces a capture at its original wall-clock rhythm).
+
+The decode path, the device bridges, `n2kd`, and the `server` pipeline are
+exercised against real hardware and pass a byte-for-byte golden-test suite
+against canboat C's output.
 
 ## Installation
 

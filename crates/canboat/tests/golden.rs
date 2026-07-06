@@ -1,9 +1,15 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
+// argv[0] routing (the `analyzer` alias) is a Unix symlink concept;
+// `CommandExt::arg0` is Unix-only. The golden fixtures live in a
+// sibling canboat checkout that isn't present on Windows CI anyway,
+// so gate the whole module to Unix.
+#![cfg(unix)]
+
 //! Golden tests against canboat's `analyzer/tests/*.in` / `*.out`
-//! files. Each case feeds an `.in` through the Rust `analyzer` binary
-//! with the same flags canboat passes, then byte-diffs against the
-//! corresponding `.out`.
+//! files. Each case feeds an `.in` through the `canboat` binary
+//! invoked as `analyzer` (its argv[0] alias) with the same flags
+//! canboat C passes, then byte-diffs against the corresponding `.out`.
 //!
 //! Test data is read straight from the sibling canboat checkout at
 //! `../canboat/analyzer/tests/`. If that directory isn't present the
@@ -16,6 +22,7 @@
 //! missing features) as their support lands.
 
 use std::io::Write;
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 
@@ -67,8 +74,8 @@ fn canboat_tests_dir() -> Option<PathBuf> {
     if p.is_dir() { Some(p) } else { None }
 }
 
-fn analyzer_path() -> PathBuf {
-    PathBuf::from(env!("CARGO_BIN_EXE_analyzer"))
+fn canboat_path() -> PathBuf {
+    PathBuf::from(env!("CARGO_BIN_EXE_canboat"))
 }
 
 /// Drive the analyzer binary on `<test_dir>/<in_name>` with `args`,
@@ -95,7 +102,10 @@ fn run_case_skipping(in_name: &str, expected_name: &str, args: &[&str], skip_lin
     let input = std::fs::read(dir.join(in_name)).expect("read .in");
     let expected = std::fs::read(dir.join(expected_name)).expect("read .out");
 
-    let mut child = Command::new(analyzer_path())
+    // Invoke the canboat binary as `analyzer` so its argv[0] alias
+    // dispatches into the analyzer path — same as the installed shim.
+    let mut child = Command::new(canboat_path())
+        .arg0("analyzer")
         .args(args)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
@@ -348,7 +358,8 @@ fn dms_format_text() {
     let expected = std::fs::read(dir.join("dms-format.out")).expect("read .out");
     let mut combined = Vec::new();
     for geo in ["dd", "dm", "dms"] {
-        let mut child = Command::new(analyzer_path())
+        let mut child = Command::new(canboat_path())
+            .arg0("analyzer")
             .args(["--geo", geo])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())

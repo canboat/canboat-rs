@@ -13,6 +13,7 @@ members = [
     "crates/replay",
     "crates/candump2analyzer",
     "crates/pcap2candump",
+    "crates/nif2analyzer",
     "crates/socketcan-writer",
     "crates/socketcan-serial",
     "crates/n2kd",
@@ -55,6 +56,12 @@ serialport = { version = "4", default-features = false }
 tokio        = { version = "1", features = ["rt", "rt-multi-thread", "io-util", "macros", "sync"] }
 tokio-serial = "5"
 futures      = "0.3"
+
+# Container formats: `.nif` is gzip(tar); the inner CAN captures are
+# gzip(pcap). flate2's default (miniz_oxide) backend keeps the static
+# musl release builds pure-Rust — no system zlib to link.
+flate2 = "1"
+tar    = "0.4"
 
 [profile.release]
 lto         = "thin"

@@ -26,7 +26,7 @@ env:
   CARGO_TERM_COLOR: always
   BINS: >-
     analyzer actisense-serial ikonvert-serial maretron-ipg replay
-    candump2analyzer pcap2candump socketcan-serial socketcan-writer
+    candump2analyzer pcap2candump nif2analyzer socketcan-serial socketcan-writer
     n2kd canboat-pipeline canboat-tui
 
 jobs:

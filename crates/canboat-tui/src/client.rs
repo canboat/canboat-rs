@@ -180,7 +180,11 @@ pub fn spawn_log_load(path: PathBuf, state: Arc<Mutex<AppState>>) -> Vec<JoinHan
     let path_for_blocker = path.clone();
     let state_for_err = state.clone();
     let decode = tokio::task::spawn_blocking(move || {
-        let result = if looks_like_json_capture(&path_for_blocker) {
+        let result = if canboat_io::container::is_container(&path_for_blocker) {
+            // Binary `.pcap` / `.pcap.gz` / `.nif` — unwrapped to PLAIN
+            // by the analyzer's container-aware `decode_file`.
+            ingest_raw_capture(&path_for_blocker, &tx)
+        } else if looks_like_json_capture(&path_for_blocker) {
             ingest_json_capture(&path_for_blocker, &tx)
         } else {
             ingest_raw_capture(&path_for_blocker, &tx)

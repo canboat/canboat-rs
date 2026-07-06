@@ -1,0 +1,21 @@
+# (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
+[package]
+name        = "nif2analyzer"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "Unpack a Navico .nif diagnostic export and emit its CAN captures as canboat PLAIN lines."
+
+[[bin]]
+name = "nif2analyzer"
+path = "src/main.rs"
+
+[dependencies]
+canboat-io   = { workspace = true }
+canboat-cli  = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }

@@ -67,6 +67,7 @@ use n2kd::request_engine::{self, RequestEngine};
 
 use crate::server::pipeline::Hubs;
 use crate::server::snapshot::SnapshotStore;
+use n2kd::serving::tcp as serving_tcp;
 use n2kd::serving::{BinHub, Hub};
 
 /// Single-process device-reader → analyzer → n2kd pipeline server.
@@ -428,10 +429,10 @@ pub fn run(cli: Args) -> Result<()> {
 
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();
     if let Some(store) = snapshot.as_ref() {
-        tcp_joins.push(tcp::spawn_snapshot(
+        tcp_joins.push(serving_tcp::spawn_snapshot(
             cli.bind,
             cli.snapshot_port,
-            store.clone(),
+            store.core(),
         )?);
     }
     // Write-only input port (canboat C `n2kd` `port+3`
@@ -453,18 +454,18 @@ pub fn run(cli: Args) -> Result<()> {
     // canboatjs) know the stream is pre-coalesced. Read-only — writes
     // go to `--input-port`.
     if cli.raw_port != 0 {
-        tcp_joins.push(tcp::spawn_stream_server(
+        tcp_joins.push(serving_tcp::spawn_stream_server(
             "raw",
             cli.bind,
             cli.raw_port,
             hubs.raw.clone(),
-            Some(tcp::CANBOAT_FORMAT_FAST_HEADER),
+            Some(serving_tcp::CANBOAT_FORMAT_FAST_HEADER),
         )?);
     }
     if cli.nmea0183_port != 0 {
         // NMEA 0183 is strictly read-only — clients trying to write
         // get an immediate FIN on the read direction.
-        tcp_joins.push(tcp::spawn_stream_server(
+        tcp_joins.push(serving_tcp::spawn_stream_server(
             "nmea0183",
             cli.bind,
             cli.nmea0183_port,
@@ -477,7 +478,7 @@ pub fn run(cli: Args) -> Result<()> {
         // n2kd's `port+1` stream port. Injection lives on the
         // input port instead. (Kept free for a future "analyzed
         // write" feature that would accept JSON here.)
-        tcp_joins.push(tcp::spawn_stream_server(
+        tcp_joins.push(serving_tcp::spawn_stream_server(
             "analyzer",
             cli.bind,
             cli.analyzer_port,
@@ -487,10 +488,10 @@ pub fn run(cli: Args) -> Result<()> {
     }
     if cli.ais_port != 0 {
         if let Some(store) = snapshot.as_ref() {
-            tcp_joins.push(tcp::spawn_ais_snapshot(
+            tcp_joins.push(serving_tcp::spawn_ais_snapshot(
                 cli.bind,
                 cli.ais_port,
-                store.clone(),
+                store.core(),
             )?);
         } else {
             log::warn!(

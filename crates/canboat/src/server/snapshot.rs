@@ -41,6 +41,14 @@ impl SnapshotStore {
         }
     }
 
+    /// The shared core store this wraps. Handed to the read-only TCP
+    /// listeners in [`n2kd::serving::tcp`], which serve
+    /// `snapshot()` / `ais_snapshot()` straight off it — the same store
+    /// n2kd feeds directly.
+    pub fn core(&self) -> Arc<canboat_core::snapshot::SnapshotStore> {
+        Arc::clone(&self.inner)
+    }
+
     /// Stash this decoded record in the snapshot cache. The analyzer
     /// JSON is **not** produced here — the store holds the decoded
     /// record and serializes lazily, only when a snapshot client reads
@@ -135,20 +143,6 @@ impl SnapshotStore {
                 now,
             );
         }
-    }
-
-    /// Build the canboat-C-compatible nested JSON snapshot dump
-    /// (non-AIS PGNs + the always-shared 129026 / 129029).
-    pub fn snapshot(&self) -> String {
-        self.inner.snapshot()
-    }
-
-    /// Build the AIS snapshot dump — same nested wrapper as
-    /// [`Self::snapshot`] but filtered to AIS-described PGNs plus
-    /// PGN 129026 / 129029. Matches canboat C `n2kd`'s `port+4`
-    /// AIS port output.
-    pub fn ais_snapshot(&self) -> String {
-        self.inner.ais_snapshot()
     }
 
     /// Number of live entries (no pruning). For tests / future

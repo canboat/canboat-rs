@@ -8,6 +8,7 @@
 //! status. The read-side machinery is identical, so it lives here once:
 //!
 //! - [`hub`] — the lazy per-stream broadcast [`Hub`] / [`BinHub`].
+//! - [`tcp`] — the read-only TCP listeners (snapshot / AIS / stream).
 //!
 //! The snapshot *store* is already shared (`canboat_core::snapshot`);
 //! each daemon keeps its own input glue (DecodedPgn → `store_lazy` for
@@ -15,5 +16,6 @@
 //! only for the parts that genuinely differ.
 
 pub mod hub;
+pub mod tcp;
 
 pub use hub::{BinHub, Hub};

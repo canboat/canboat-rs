@@ -43,8 +43,9 @@ interesting situations on a live bus, and configuring devices.
 The rest are canboat-compatible building blocks: `analyzer` (drop-in for the
 C analyzer, PLAIN/FAST/Actisense/YDWG02/iKonvert input, text or JSON out),
 `n2kd`, the device bridges (`actisense-serial`, `ikonvert-serial`,
-`maretron-ipg`, `socketcan-serial`, `socketcan-writer`), and the small
-utilities (`replay`, `candump2analyzer`, `pcap2candump`).
+`maretron-ipg`, `socketcan-serial`), and the small utilities (`replay`,
+`candump2analyzer`, `pcap2candump`). (`socketcan-writer` has been removed:
+its stdin-PLAIN → CAN-bus job is done by `socketcan-serial -w`.)
 
 `analyzer`, `ikonvert-serial`, `n2kd`, `canboat-pipeline`, and
 `socketcan-serial` are exercised against real hardware and pass a

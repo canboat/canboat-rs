@@ -15,7 +15,6 @@ members = [
     "crates/candump2analyzer",
     "crates/pcap2candump",
     "crates/nif2analyzer",
-    "crates/socketcan-writer",
     "crates/socketcan-serial",
     "crates/n2kd",
     "crates/canboat-wire",

@@ -1,18 +1,28 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
-//! Library form of the analyzer's input → decode pipeline.
+//! The analyzer decode pipeline: line/container input →
+//! reassembly → schema decode → [`DecodedPgn`].
+//!
+//! This is the exact parse / reassemble / decode path the `analyzer`
+//! binary drives, lifted into the library so any in-process consumer
+//! (the `canboat` binary's `convert`, `canboat-tui`'s log-replay mode)
+//! runs the same behaviour without shelling out to a subprocess.
+//!
+//! The front half — format auto-detection, `# format=<NAME>` headers,
+//! per-line parsing — lives in [`LineFrameReader`](crate::LineFrameReader).
+//! This module owns only the analyzer-specific back half: source-based
+//! filtering, fast-packet / ISO-TP reassembly, and the schema decode.
 
 use std::fs::File;
-use std::io::{BufRead, BufReader};
+use std::io::{self, BufRead, BufReader};
 use std::path::Path;
-
-use anyhow::{Context, Result};
 
 use canboat_core::format::InputFormat;
 use canboat_core::{
     CANBOAT_BEM, DecodedPgn, FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
 };
-use canboat_io::{FrameReader, LineFrameReader};
+
+use crate::{FrameReader, LineFrameReader};
 
 /// Per-call options for [`decode_stream`] / [`decode_file`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -37,21 +47,25 @@ pub struct Config {
     pub suppress_startup_record: bool,
 }
 
-/// Open `path` and stream-decode it via [`decode_stream`]. Errors
-/// from the parse / reassembly / decode steps are logged via the
-/// `log` crate (matching the analyzer binary's behaviour) and the
-/// stream continues; only a hard read error stops the loop.
-pub fn decode_file<F: FnMut(&DecodedPgn)>(path: &Path, cfg: &Config, sink: F) -> Result<()> {
-    // Binary capture containers (`.pcap`, `.pcap.gz`, `.nif`) are
-    // unwrapped into PLAIN text on the fly, then fed through the same
-    // line pipeline as any other input.
-    if canboat_io::container::is_container(path) {
-        let reader = canboat_io::container::plain_reader(path, Default::default())
-            .with_context(|| format!("opening {}", path.display()))?;
+/// Open `path` and stream-decode it via [`decode_stream`]. Binary
+/// capture containers (`.pcap`, `.pcap.gz`, `.nif`) are unwrapped into
+/// PLAIN on the fly. Parse / reassembly / decode errors are logged via
+/// the `log` crate and the stream continues; only a hard I/O error
+/// stops the loop.
+pub fn decode_file<F: FnMut(&DecodedPgn)>(path: &Path, cfg: &Config, sink: F) -> io::Result<()> {
+    if crate::container::is_container(path) {
+        let reader = crate::container::plain_reader(path, Default::default())
+            .map_err(|e| open_error(path, e))?;
         return decode_stream(reader, cfg, sink);
     }
-    let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let file = File::open(path).map_err(|e| open_error(path, e))?;
     decode_stream(BufReader::new(file), cfg, sink)
+}
+
+/// Wrap an open failure with the offending path, preserving the
+/// original [`io::ErrorKind`].
+fn open_error(path: &Path, e: io::Error) -> io::Error {
+    io::Error::new(e.kind(), format!("opening {}: {e}", path.display()))
 }
 
 /// Drive the analyzer pipeline over `source`. For each decoded
@@ -67,7 +81,7 @@ pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
     source: R,
     cfg: &Config,
     mut sink: F,
-) -> Result<()> {
+) -> io::Result<()> {
     let db = PgnDatabase::embedded();
     let mut reader = match cfg.forced_format {
         Some(fmt) => LineFrameReader::with_format(source, fmt),
@@ -80,7 +94,7 @@ pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
     let mut coalesced_mode = false;
     let mut reasm = Reassembler::new();
 
-    while let Some(frame) = reader.read_frame().context("reading input line")? {
+    while let Some(frame) = reader.read_frame()? {
         // A `# format=<NAME>` header (consumed inside `read_frame`)
         // may have declared an already-coalesced format.
         coalesced_mode |= reader.header_coalesced();

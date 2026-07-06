@@ -111,11 +111,11 @@ fn ingest_raw_capture(path: &Path, tx: &mpsc::UnboundedSender<LoadItem>) -> anyh
     use canboat_core::frame::RawFrame;
     use canboat_core::output::{JsonOptions, write_json};
     use canboat_core::snapshot::classify_json_line;
-    let cfg = analyzer::replay::Config::default();
+    let cfg = canboat_io::analyze::Config::default();
     let json_opts = JsonOptions::default();
     let mut buf = String::with_capacity(512);
     let mut raw = String::with_capacity(128);
-    analyzer::replay::decode_file(path, &cfg, |decoded| {
+    canboat_io::analyze::decode_file(path, &cfg, |decoded| {
         // Re-emit the wire bytes as one coalesced PLAIN/FAST line so a
         // later "Save ▸ Raw" can round-trip the capture. Sent once per
         // frame, ahead of its classifier splits.

@@ -8,8 +8,8 @@
 //! - **Prefix-translate**: the legacy CLI is a subset of a `canboat`
 //!   subcommand, so we just rewrite argv to
 //!   `canboat <subcommand> <fixed args> <rest>` and let clap parse it.
-//!   Used for the device bridges → `interface`, `nif2analyzer` →
-//!   `convert`, `canboat-pipeline` → `server`, `canboat-tui` → `tui`.
+//!   Used for the device bridges → `interface`, `canboat-pipeline` →
+//!   `server`, `canboat-tui` → `tui`.
 //! - **Alias-module**: the legacy CLI is too different to translate
 //!   (e.g. `analyzer`'s golden-tested flag surface), so its parser +
 //!   glue live verbatim in a submodule, dispatched by name.
@@ -33,7 +33,6 @@ pub const LEGACY_NAMES: &[&str] = &[
     "socketcan-serial",
     "maretron-ipg",
     // prefix-translate → other subcommands
-    "nif2analyzer",
     "canboat-pipeline",
     "canboat-tui",
     // alias-module
@@ -75,7 +74,6 @@ fn prefix_subcommand(prog: &str) -> Option<&'static [&'static str]> {
         "ikonvert-serial" => &["interface", "--kind", "ikonvert"],
         "socketcan-serial" => &["interface", "--kind", "socketcan"],
         "maretron-ipg" => &["interface", "--kind", "maretron"],
-        "nif2analyzer" => &["convert", "--to", "plain"],
         "canboat-pipeline" => &["server"],
         "canboat-tui" => &["tui"],
         _ => return None,

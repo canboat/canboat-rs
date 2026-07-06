@@ -29,13 +29,12 @@
 
 use n2kd::nmea_filter::NmeaFilter;
 use n2kd::request_engine::{self, RequestEngine};
+use n2kd::serving::{Hub as WireHub, tcp as serving_tcp};
 use n2kd::{ais_decoded, json, nmea0183};
 
-use std::collections::HashMap;
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
 use std::process::ExitCode;
-use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -211,19 +210,25 @@ fn run(cli: Cli) -> Result<()> {
     let hub = Arc::new(hub);
 
     if !cli.nmea0183 {
-        spawn_listener(
+        // Live streams + connect-and-dump snapshot/AIS ports are the
+        // shared `n2kd::serving::tcp` listeners (identical to `server`'s
+        // read-only ports), fed off the same hubs / snapshot cache. No
+        // format header on the JSON or 0183 streams. The status and
+        // raw-input ports stay n2kd-local: no `serving` equivalent for
+        // status, and raw-input carries the filter control channel.
+        serving_tcp::spawn_stream_server(
+            "json-stream",
             bind_addr,
             cli.port + 1,
-            "json-stream",
-            Arc::clone(&hub),
-            Subscription::JsonStream,
+            Arc::clone(&hub.json_hub),
+            None,
         )?;
-        spawn_listener(
+        serving_tcp::spawn_stream_server(
+            "nmea0183-stream",
             bind_addr,
             cli.port + 2,
-            "nmea0183-stream",
-            Arc::clone(&hub),
-            Subscription::Nmea0183Stream,
+            Arc::clone(&hub.nmea_hub),
+            None,
         )?;
         spawn_raw_input_listener(
             bind_addr,
@@ -231,8 +236,8 @@ fn run(cli: Cli) -> Result<()> {
             cli.output_copy && !cli.restrict,
             Arc::clone(&hub),
         )?;
-        spawn_ais_listener(bind_addr, cli.port + 4, Arc::clone(&hub))?;
-        spawn_snapshot_listener(bind_addr, cli.port, Arc::clone(&hub))?;
+        serving_tcp::spawn_ais_snapshot(bind_addr, cli.port + 4, Arc::clone(&hub.cache))?;
+        serving_tcp::spawn_snapshot(bind_addr, cli.port, Arc::clone(&hub.cache))?;
         spawn_status_listener(bind_addr, cli.port + 5, Arc::clone(&hub))?;
     }
     // Default-on like canboat C; `-r` / `--restrict` and the explicit
@@ -280,15 +285,6 @@ impl SrcFilter {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
-#[allow(clippy::enum_variant_names)]
-enum Subscription {
-    /// Every JSON line as-is.
-    JsonStream,
-    /// Converted NMEA 0183 sentences.
-    Nmea0183Stream,
-}
-
 /// Open a UDP socket bound to an ephemeral local port; we'll
 /// `send_to` the target on each broadcast. The string is `host:port`.
 fn open_udp_broadcast(target: &str) -> Result<UdpBroadcast> {
@@ -313,68 +309,6 @@ impl UdpBroadcast {
     fn send(&self, bytes: &[u8]) {
         let _ = self.sock.send_to(bytes, self.addr);
     }
-}
-
-fn spawn_listener(
-    bind: Ipv4Addr,
-    port: u16,
-    name: &'static str,
-    hub: Arc<Hub>,
-    sub: Subscription,
-) -> Result<()> {
-    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
-        .with_context(|| format!("binding {name} on {bind}:{port}"))?;
-    log::info!("listening on {bind}:{port} ({name})");
-    thread::Builder::new()
-        .name(format!("n2kd-{name}"))
-        .spawn(move || {
-            loop {
-                let stream = match listener.accept() {
-                    Ok((s, _)) => s,
-                    Err(e) => {
-                        log::warn!("accept on {name}: {e}");
-                        continue;
-                    }
-                };
-                let peer = stream
-                    .peer_addr()
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|_| "?".into());
-                log::info!("{name} client connected from {peer}");
-                let hub2 = Arc::clone(&hub);
-                thread::Builder::new()
-                    .name(format!("n2kd-{name}-{peer}"))
-                    .spawn(move || run_stream_client(stream, hub2, sub))
-                    .ok();
-            }
-        })
-        .context("spawning listener")?;
-    Ok(())
-}
-
-fn spawn_snapshot_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<()> {
-    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
-        .with_context(|| format!("binding json-snapshot on {bind}:{port}"))?;
-    log::info!("listening on {bind}:{port} (json-snapshot)");
-    thread::Builder::new()
-        .name("n2kd-json-snapshot".into())
-        .spawn(move || {
-            loop {
-                let stream = match listener.accept() {
-                    Ok((s, _)) => s,
-                    Err(e) => {
-                        log::warn!("accept on json-snapshot: {e}");
-                        continue;
-                    }
-                };
-                let hub2 = Arc::clone(&hub);
-                thread::Builder::new()
-                    .spawn(move || run_snapshot_client(stream, hub2))
-                    .ok();
-            }
-        })
-        .context("spawning snapshot listener")?;
-    Ok(())
 }
 
 fn spawn_raw_input_listener(
@@ -404,35 +338,6 @@ fn spawn_raw_input_listener(
             }
         })
         .context("spawning raw-input listener")?;
-    Ok(())
-}
-
-/// AIS port — connect-and-dump like the JSON snapshot port, but the
-/// filter is AIS-described PGNs plus the special-cased PGNs 129026
-/// (COG/SOG) and 129029 (Position). Mirrors canboat C n2kd's
-/// `CLIENT_AIS` path in `n2kd/main.c:757-765`.
-fn spawn_ais_listener(bind: Ipv4Addr, port: u16, hub: Arc<Hub>) -> Result<()> {
-    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
-        .with_context(|| format!("binding ais on {bind}:{port}"))?;
-    log::info!("listening on {bind}:{port} (ais)");
-    thread::Builder::new()
-        .name("n2kd-ais".into())
-        .spawn(move || {
-            loop {
-                let stream = match listener.accept() {
-                    Ok((s, _)) => s,
-                    Err(e) => {
-                        log::warn!("accept on ais: {e}");
-                        continue;
-                    }
-                };
-                let hub2 = Arc::clone(&hub);
-                thread::Builder::new()
-                    .spawn(move || run_ais_client(stream, hub2))
-                    .ok();
-            }
-        })
-        .context("spawning ais listener")?;
     Ok(())
 }
 
@@ -506,30 +411,8 @@ fn days_to_ymd(days: i64) -> (i32, u32, u32) {
 }
 
 /// Per-stream-client handler.
-fn run_stream_client(mut stream: TcpStream, hub: Arc<Hub>, sub: Subscription) {
-    let (tx, rx) = mpsc::channel::<String>();
-    hub.subscribe(sub, tx);
-    while let Ok(line) = rx.recv() {
-        if stream.write_all(line.as_bytes()).is_err() {
-            return;
-        }
-    }
-}
-
-fn run_snapshot_client(mut stream: TcpStream, hub: Arc<Hub>) {
-    let dump = hub.snapshot();
-    let _ = stream.write_all(dump.as_bytes());
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-}
-
 fn run_status_client(mut stream: TcpStream, hub: Arc<Hub>) {
     let dump = hub.status_snapshot();
-    let _ = stream.write_all(dump.as_bytes());
-    let _ = stream.shutdown(std::net::Shutdown::Both);
-}
-
-fn run_ais_client(mut stream: TcpStream, hub: Arc<Hub>) {
-    let dump = hub.ais_snapshot();
     let _ = stream.write_all(dump.as_bytes());
     let _ = stream.shutdown(std::net::Shutdown::Both);
 }
@@ -587,7 +470,7 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         }
         if trimmed.starts_with("{\"version\"") {
             // Analyzer banner — broadcast on JSON stream, skip cache.
-            hub.broadcast(Subscription::JsonStream, &line);
+            hub.json_hub.broadcast(&line);
             continue;
         }
         if !trimmed.starts_with("{\"timestamp\"") {
@@ -605,7 +488,7 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
             continue;
         }
         let Some(meta) = extract_meta(trimmed) else {
-            hub.broadcast(Subscription::JsonStream, &line);
+            hub.json_hub.broadcast(&line);
             continue;
         };
         if !hub.src_allowed(meta.src) {
@@ -622,7 +505,7 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         // spliced-down single-element `"list":[…]` so subsequent
         // records refresh the matching iteration in place.
         hub.store(trimmed);
-        hub.broadcast(Subscription::JsonStream, &line);
+        hub.json_hub.broadcast(&line);
         // The AIS port is a one-shot snapshot now, not a live stream —
         // see `spawn_ais_listener`. No per-line broadcast.
         // NMEA 0183 conversion. Rebuild the line into a DecodedPgn
@@ -657,7 +540,7 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
             hub.apply_filter(meta.src, &mut nmea);
         }
         if !nmea.is_empty() {
-            hub.broadcast(Subscription::Nmea0183Stream, &nmea);
+            hub.nmea_hub.broadcast(&nmea);
             hub.udp_broadcast(nmea.as_bytes());
             if hub.nmea_to_stdout {
                 let stdout = io::stdout();
@@ -705,9 +588,16 @@ fn extract_meta(line: &str) -> Option<Meta> {
 }
 
 struct Hub {
-    cache: SnapshotStore,
+    /// Per-`(pgn, src)` snapshot cache, shared (via `Arc`) with the
+    /// connect-and-dump snapshot / AIS listeners in `n2kd::serving::tcp`
+    /// and this crate's status listener. The pump owns the writes.
+    cache: Arc<SnapshotStore>,
     engine: Arc<RequestEngine>,
-    subscribers: Mutex<HashMap<u8, Vec<Sender<String>>>>,
+    /// Live JSON stream (`port+1`) and NMEA 0183 stream (`port+2`),
+    /// served by `n2kd::serving::tcp::spawn_stream_server`. The pump
+    /// broadcasts each line / sentence into them.
+    json_hub: Arc<WireHub>,
+    nmea_hub: Arc<WireHub>,
     src_filter: Option<SrcFilter>,
     rate_limiter: Mutex<RateLimiter>,
     udp: Option<UdpBroadcast>,
@@ -732,9 +622,10 @@ impl Hub {
         filter: Option<NmeaFilter>,
     ) -> Self {
         Self {
-            cache: SnapshotStore::new(),
+            cache: Arc::new(SnapshotStore::new()),
             engine,
-            subscribers: Mutex::new(HashMap::new()),
+            json_hub: Arc::new(WireHub::new()),
+            nmea_hub: Arc::new(WireHub::new()),
             src_filter,
             rate_limiter: Mutex::new(RateLimiter::new(rate_limit)),
             udp,
@@ -784,7 +675,7 @@ impl Hub {
             if write_json(&mut json, &decoded, &FILTER_REPORT_JSON_OPTS).is_ok() {
                 self.store(&json);
                 json.push('\n');
-                self.broadcast(Subscription::JsonStream, &json);
+                self.json_hub.broadcast(&json);
             }
         }
     }
@@ -804,42 +695,10 @@ impl Hub {
         canboat_core::snapshot::classify_json_line(line, |input| self.cache.store(input));
     }
 
-    /// Canboat C–compatible nested-JSON dump of every live cache
-    /// entry (one big string ending in `}\n`, or `\n` when empty).
-    fn snapshot(&self) -> String {
-        self.cache.snapshot()
-    }
-
     /// Canboat C–compatible per-PGN status dump
     /// (`{<pgn>:{description,<src>:{last,interval,count}}}`).
     fn status_snapshot(&self) -> String {
         self.cache.status_snapshot()
-    }
-
-    /// Canboat C–compatible AIS snapshot dump — same shape as
-    /// `snapshot()` but filtered to AIS-described PGNs + 129026 +
-    /// 129029.
-    fn ais_snapshot(&self) -> String {
-        self.cache.ais_snapshot()
-    }
-
-    fn subscribe(&self, sub: Subscription, tx: Sender<String>) {
-        let key = sub as u8;
-        self.subscribers
-            .lock()
-            .unwrap()
-            .entry(key)
-            .or_default()
-            .push(tx);
-    }
-
-    fn broadcast(&self, sub: Subscription, line: &str) {
-        let key = sub as u8;
-        let mut subs = self.subscribers.lock().unwrap();
-        let Some(list) = subs.get_mut(&key) else {
-            return;
-        };
-        list.retain(|tx| tx.send(line.to_string()).is_ok());
     }
 
     fn udp_broadcast(&self, bytes: &[u8]) {
@@ -959,7 +818,7 @@ mod tests {
         // so the per-iteration `27_<key>` entries asserted below
         // verify the classifier emits them correctly.
         hub.store(line);
-        let dump = hub.snapshot();
+        let dump = hub.cache.snapshot();
         assert!(
             dump.contains("\"27_126\":"),
             "missing src_<key=126> (Polar Speed):\n{dump}"
@@ -991,7 +850,7 @@ mod tests {
         let update = r#"{"src":27,"pgn":130824,"description":"B&G: key-value data","fields":{"list":[{"Key":{"value":126},"Length":2,"Value":4.00}]}}"#;
         hub.store(update);
 
-        let dump = hub.snapshot();
+        let dump = hub.cache.snapshot();
         // Both Keys still present — partial update didn't blow away
         // the non-mentioned iteration.
         assert!(dump.contains("\"27_126\":"), "Polar Speed missing:\n{dump}");

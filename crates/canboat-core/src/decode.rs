@@ -1437,8 +1437,21 @@ fn decode_string_lau(data: &[u8], bit_offset: u32) -> (FieldValue, u32) {
             String::from_utf16_lossy(&code_units)
         }
         _ => {
-            // 1 = ASCII / UTF-8 (canboat doesn't differentiate).
-            String::from_utf8_lossy(body).into_owned()
+            // 1 = ASCII / UTF-8 (canboat doesn't differentiate). An
+            // encoding byte of 0xff marks an *unset* field: the length
+            // byte is present but the encoding and content are 0xff
+            // filler (seen on the H5000 pilot in PGN 126998). Trim the
+            // trailing 0xff / NUL / '@' / space run off the raw bytes
+            // *before* decoding, so an all-filler body collapses to an
+            // empty (omitted) field instead of a run of U+FFFD
+            // replacement chars — canboat's printString trims the same
+            // bytes, and its C analyzer would otherwise abort the whole
+            // PGN on "Unhandled string type 255".
+            let end = body
+                .iter()
+                .rposition(|&b| !matches!(b, 0xff | 0x00 | b'@' | b' '))
+                .map_or(0, |i| i + 1);
+            String::from_utf8_lossy(&body[..end]).into_owned()
         }
     };
     // Canboat's `printString` trims trailing 0xff / NUL / '@' / spaces
@@ -1692,6 +1705,31 @@ mod tests {
 
     fn db() -> &'static PgnDatabase {
         PgnDatabase::embedded()
+    }
+
+    #[test]
+    fn string_lau_ff_encoding_is_unset_field() {
+        // An unset STRING_LAU: length byte present, but the encoding byte
+        // and all content are 0xff filler (H5000 pilot, PGN 126998).
+        // canboat's C analyzer used to abort the whole PGN with
+        // "Unhandled string type 255"; here it must decode as an empty
+        // (NotAvailable) field, not a run of U+FFFD replacement chars.
+        let data = [0x05u8, 0xff, 0xff, 0xff, 0xff]; // len=5, enc=0xff, body=3×0xff
+        let (value, bits) = decode_string_lau(&data, 0);
+        assert!(matches!(value, FieldValue::NotAvailable), "{value:?}");
+        assert_eq!(bits, 40);
+    }
+
+    #[test]
+    fn string_lau_ascii_still_decodes() {
+        // 1 = ASCII, "Hi" with a trailing 0xff pad byte → "Hi".
+        let data = [0x05u8, 0x01, b'H', b'i', 0xff];
+        let (value, bits) = decode_string_lau(&data, 0);
+        assert!(
+            matches!(value, FieldValue::String(ref s) if s == "Hi"),
+            "{value:?}"
+        );
+        assert_eq!(bits, 40);
     }
 
     #[test]

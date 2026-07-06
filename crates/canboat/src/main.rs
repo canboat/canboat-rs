@@ -20,6 +20,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod convert;
+mod interface;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -37,12 +38,16 @@ struct Cli {
 enum Command {
     /// Convert a capture between formats (any input → PLAIN / JSON / text).
     Convert(convert::Args),
+
+    /// Bridge a live gateway (NGT-1 / iKonvert / Maretron / SocketCAN) to/from stdout.
+    Interface(interface::Args),
 }
 
 fn main() -> ExitCode {
     let cli = Cli::parse_from(canboat_cli::canboat_argv());
     let result = match cli.command {
         Command::Convert(args) => convert::run(args),
+        Command::Interface(args) => interface::run(args),
     };
     if let Err(e) = result {
         eprintln!("canboat: {e:#}");

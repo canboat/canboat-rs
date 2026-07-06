@@ -8,14 +8,11 @@ use std::path::Path;
 
 use anyhow::{Context, Result};
 
-use canboat_core::format::plain::ParseError;
-use canboat_core::format::{
-    InputFormat, detect, header_implies_coalesced, parse_format_header, parse_with,
-};
+use canboat_core::format::InputFormat;
 use canboat_core::{
     CANBOAT_BEM, DecodedPgn, FramePacketType, PacketType, PgnDatabase, Reassembled, Reassembler,
 };
-use canboat_io::LineReader;
+use canboat_io::{FrameReader, LineFrameReader};
 
 /// Per-call options for [`decode_stream`] / [`decode_file`].
 #[derive(Debug, Default, Clone, Copy)]
@@ -51,24 +48,31 @@ pub fn decode_file<F: FnMut(&DecodedPgn)>(path: &Path, cfg: &Config, sink: F) ->
     if canboat_io::container::is_container(path) {
         let reader = canboat_io::container::plain_reader(path, Default::default())
             .with_context(|| format!("opening {}", path.display()))?;
-        return decode_stream(LineReader::new(reader), cfg, sink);
+        return decode_stream(reader, cfg, sink);
     }
     let file = File::open(path).with_context(|| format!("opening {}", path.display()))?;
-    decode_stream(LineReader::new(BufReader::new(file)), cfg, sink)
+    decode_stream(BufReader::new(file), cfg, sink)
 }
 
-/// Drive the analyzer pipeline over `reader`. For each decoded
+/// Drive the analyzer pipeline over `source`. For each decoded
 /// record, invoke `sink` with the resulting [`DecodedPgn`]. The
 /// `DecodedPgn` borrows static schema data so callers can pass it
 /// straight to `canboat_core::output::{write_json, write_text}`
 /// without re-decoding.
+///
+/// The line parsing / format detection is delegated to
+/// [`LineFrameReader`]; this function owns only the analyzer-specific
+/// back half: filtering, fast-packet/TP reassembly, and schema decode.
 pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
-    mut reader: LineReader<R>,
+    source: R,
     cfg: &Config,
     mut sink: F,
 ) -> Result<()> {
     let db = PgnDatabase::embedded();
-    let mut active_format = cfg.forced_format;
+    let mut reader = match cfg.forced_format {
+        Some(fmt) => LineFrameReader::with_format(source, fmt),
+        None => LineFrameReader::new(source),
+    };
     // canboat's PLAIN_OR_FAST mode locks into "coalesced" once any
     // line carries more than 8 payload bytes — from then on every
     // frame is assumed to be pre-assembled and the reassembler is
@@ -76,40 +80,10 @@ pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
     let mut coalesced_mode = false;
     let mut reasm = Reassembler::new();
 
-    while let Some(line) = reader.next_line().context("reading input line")? {
-        if line.is_empty() {
-            continue;
-        }
-        // Honour `# format=<NAME>` headers from the canboat reader
-        // binaries (actisense-serial / ikonvert-serial / maretron-ipg).
-        if line.starts_with('#') {
-            if let Some(fmt) = parse_format_header(line) {
-                if active_format.is_none() {
-                    active_format = Some(fmt);
-                    log::info!("input format set by header: {fmt:?}");
-                }
-                if header_implies_coalesced(line) {
-                    coalesced_mode = true;
-                    log::debug!("header declares coalesced format; skipping reassembly");
-                }
-            }
-            continue;
-        }
-        // Auto-detect on the first content line if not forced.
-        if active_format.is_none() {
-            active_format = detect(line).or(Some(InputFormat::Plain));
-            log::debug!("input format: {:?}", active_format);
-        }
-        let format = active_format.expect("active_format set above");
-        let frame = match parse_with(format, line) {
-            Ok(Some(f)) => f,
-            Ok(None) => continue, // iKonvert control sentences etc.
-            Err(ParseError::Empty) => continue,
-            Err(e) => {
-                log::warn!("skipping malformed input line: {e}");
-                continue;
-            }
-        };
+    while let Some(frame) = reader.read_frame().context("reading input line")? {
+        // A `# format=<NAME>` header (consumed inside `read_frame`)
+        // may have declared an already-coalesced format.
+        coalesced_mode |= reader.header_coalesced();
 
         if cfg.suppress_startup_record && frame.pgn == CANBOAT_BEM {
             continue;
@@ -133,7 +107,7 @@ pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
         // Once any line carries > 8 payload bytes, assume FAST is
         // pre-coalesced and skip reassembly for the remainder of the
         // stream. PlainMixFast intentionally interleaves so opt out.
-        if frame.data.len() > 8 && format != InputFormat::PlainMixFast {
+        if frame.data.len() > 8 && reader.active_format() != Some(InputFormat::PlainMixFast) {
             coalesced_mode = true;
         }
         let packet_type = if coalesced_mode {

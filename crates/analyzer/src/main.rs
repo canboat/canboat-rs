@@ -16,14 +16,12 @@ use std::process::ExitCode;
 use anyhow::{Context, Result};
 use clap::Parser;
 
+use analyzer::replay::{self, Config};
 use canboat_core::{
     PgnDatabase,
     format::InputFormat,
     output::{CamelCase, GeoFormat, JsonOptions, TextOptions, write_json, write_text},
 };
-use canboat_io::LineReader;
-
-use analyzer::replay::{self, Config};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -216,7 +214,7 @@ fn run(cli: Cli) -> Result<()> {
         replay::decode_file(path, &cfg, sink)
     } else {
         let stdin = io::stdin();
-        replay::decode_stream(LineReader::new(stdin.lock()), &cfg, sink)
+        replay::decode_stream(stdin.lock(), &cfg, sink)
     };
     if let Some(e) = sink_err {
         return Err(e);

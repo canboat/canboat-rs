@@ -27,6 +27,7 @@
 //! PGNs flow unchanged through the AIS port; the NMEA stream simply
 //! doesn't emit AIVDM sentences yet.
 
+use n2kd::nmea_filter::NmeaFilter;
 use n2kd::request_engine::{self, RequestEngine};
 use n2kd::{ais_decoded, json, nmea0183};
 
@@ -138,6 +139,14 @@ struct Cli {
     /// Quiet — only show errors.
     #[arg(short = 'q', long)]
     quiet: bool,
+
+    /// Mute redundant NMEA 0183 output per device NAME using the rules
+    /// in this JSON file: when several devices report the same
+    /// measurement, keep the one the rules name and drop the rest.
+    /// Devices with no rule pass through. The `src → NAME` mapping is
+    /// learned from ISO Address Claims on the stream.
+    #[arg(long = "nmea0183-filter", value_name = "PATH")]
+    nmea0183_filter: Option<std::path::PathBuf>,
 }
 
 fn main() -> ExitCode {
@@ -211,7 +220,11 @@ fn run(cli: Cli) -> Result<()> {
         spawn_claim_request_engine(Arc::clone(&engine));
     }
 
-    run_stdin_pump(&hub)
+    let filter = match cli.nmea0183_filter.as_deref() {
+        Some(path) => Some(NmeaFilter::load(path)?),
+        None => None,
+    };
+    run_stdin_pump(&hub, filter)
 }
 
 fn parse_src_filter(arg: Option<&str>) -> Result<Option<SrcFilter>> {
@@ -517,7 +530,7 @@ fn run_raw_input_client(stream: TcpStream, copy_to_stdout: bool) {
     }
 }
 
-fn run_stdin_pump(hub: &Hub) -> Result<()> {
+fn run_stdin_pump(hub: &Hub, mut filter: Option<NmeaFilter>) -> Result<()> {
     let stdin = io::stdin();
     let mut lock = stdin.lock();
     let mut line = String::with_capacity(4096);
@@ -578,18 +591,31 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         // table. The JSON-parsing `convert` wrappers are only the
         // .j2k-input adapters now; the daemon works on DecodedPgn.
         let mut nmea = String::new();
-        let n_sentences = match canboat_core::json_to_decoded(trimmed, PgnDatabase::embedded()) {
-            Some(decoded) => {
-                let mut rl = hub.rate_limiter.lock().unwrap();
-                if AIS_PGNS.contains(&meta.pgn) {
-                    ais_decoded::convert(&mut nmea, &decoded, &mut rl.ais_seq)
-                } else {
-                    nmea0183::convert_decoded(&mut nmea, &decoded, &mut rl)
-                }
+        let decoded = canboat_core::json_to_decoded(trimmed, PgnDatabase::embedded());
+        // Learn `src → NAME` for the per-device 0183 filter from ISO
+        // Address Claims — `iso_name()` re-packs it from the decoded
+        // fields (the same helper the live pipeline uses), returning
+        // `None` for any non-claim PGN.
+        if let Some(f) = filter.as_mut()
+            && let Some(name) = decoded.as_ref().and_then(|d| d.iso_name())
+        {
+            f.note_address_claim(meta.src, name);
+        }
+        if let Some(decoded) = decoded.as_ref() {
+            let mut rl = hub.rate_limiter.lock().unwrap();
+            if AIS_PGNS.contains(&meta.pgn) {
+                ais_decoded::convert(&mut nmea, decoded, &mut rl.ais_seq);
+            } else {
+                nmea0183::convert_decoded(&mut nmea, decoded, &mut rl);
             }
-            None => 0,
-        };
-        if n_sentences > 0 {
+        }
+        // Mute redundant devices' 0183 by NAME before it goes out. When
+        // the filter empties the buffer (every sentence muted) there's
+        // nothing to broadcast.
+        if let Some(f) = filter.as_mut() {
+            f.apply(meta.src, &mut nmea);
+        }
+        if !nmea.is_empty() {
             hub.broadcast(Subscription::Nmea0183Stream, &nmea);
             hub.udp_broadcast(nmea.as_bytes());
             if hub.nmea_to_stdout {

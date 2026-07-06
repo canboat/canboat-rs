@@ -280,6 +280,9 @@ mod tests {
         let careful = request_transmission_interval_proprietary(52, 130842, 1855, 4, 0);
         let careless =
             request_transmission_interval_proprietary(52, 130842, 0xF800 | 1855, 4 | 0xF0, 0);
-        assert_eq!(careful, careless);
+        // Compare payloads only — the leading ISO timestamp is sampled
+        // per call, so two calls that straddle a millisecond would
+        // otherwise differ despite identical wire bytes.
+        assert_eq!(no_ts(&careful), no_ts(&careless));
     }
 }

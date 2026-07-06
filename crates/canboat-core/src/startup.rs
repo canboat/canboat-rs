@@ -77,17 +77,28 @@ pub fn format_iso_ms(ms: u64) -> String {
 
 /// Parse an ISO-8601 timestamp of the shape emitted by
 /// [`format_iso_ms`] (`YYYY-MM-DDTHH:MM:SS[.mmm][Z]`) into Unix
-/// milliseconds. Accepts a `T` or space between date and time,
-/// makes the fractional seconds and trailing `Z` optional, and
+/// milliseconds. Accepts a `T`, space, or `-` between date and time
+/// (the last is canboat analyzer / n2kd's own `YYYY-MM-DD-HH:MM:SS`
+/// form), makes the fractional seconds and trailing `Z` optional, and
 /// rejects anything else — this isn't a full RFC-3339 parser, just
-/// the specific shape canboat analyzer / n2kd / EBL reader emit.
+/// the specific shapes canboat analyzer / n2kd / EBL reader emit.
 ///
 /// Returns `None` on parse failure so callers can fall back to a
 /// local monotonic clock (canboat-tui's `Entry::interval` does this
 /// when the analyzer JSON line didn't carry a `timestamp` field).
 pub fn parse_iso_ms(s: &str) -> Option<i64> {
     let s = s.trim_end_matches('Z');
-    let (date, time) = s.split_once('T').or_else(|| s.split_once(' '))?;
+    let (date, time) = s
+        .split_once('T')
+        .or_else(|| s.split_once(' '))
+        .or_else(|| {
+            // canboat analyzer / n2kd form: `YYYY-MM-DD-HH:MM:SS[.mmm]`.
+            // The date's two internal '-' come first, so the 3rd '-'
+            // separates date from time.
+            s.match_indices('-')
+                .nth(2)
+                .map(|(i, _)| (&s[..i], &s[i + 1..]))
+        })?;
     // YYYY-MM-DD
     let mut date_parts = date.split('-');
     let y: i32 = date_parts.next()?.parse().ok()?;
@@ -191,6 +202,21 @@ mod tests {
             parse_iso_ms("2026-01-01T00:00:00.5"),
             Some(1_767_225_600_500)
         );
+    }
+
+    #[test]
+    fn parse_iso_ms_accepts_canboat_dash_form() {
+        // canboat analyzer / n2kd JSON timestamps join date and time
+        // with a '-' rather than 'T' — must parse identically.
+        assert_eq!(
+            parse_iso_ms("2026-01-01-00:00:00.500"),
+            parse_iso_ms("2026-01-01T00:00:00.500")
+        );
+        assert_eq!(
+            parse_iso_ms("2026-07-02-10:43:23.516"),
+            parse_iso_ms("2026-07-02T10:43:23.516")
+        );
+        assert!(parse_iso_ms("2026-07-02-10:43:23.516").is_some());
     }
 
     #[test]

@@ -25,7 +25,8 @@
 //! apply each incoming line. No background derivation runs; views are
 //! computed on demand from the cached JSON values.
 
-use std::collections::{BTreeMap, HashMap, VecDeque};
+use std::cmp::Ordering;
+use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
 use indexmap::IndexMap;
@@ -154,6 +155,36 @@ pub struct Nmea0183Row {
     pub muted: bool,
 }
 
+/// Progress of a long-running background operation (currently the
+/// capture save). Rendered as a bar; `done`/`total` are record counts.
+#[derive(Debug, Clone)]
+pub struct Progress {
+    pub label: String,
+    pub done: usize,
+    pub total: usize,
+}
+
+/// One row in the `top`-style PGN-load view: a single PGN aggregated
+/// across every source producing it, with the total observation count
+/// and the summed message rate (messages/second). Highest-rate PGNs
+/// sort first, so the busiest traffic floats to the top the way
+/// `top(1)` shows the hungriest processes.
+#[derive(Debug, Clone)]
+pub struct PgnLoadRow {
+    pub pgn: u32,
+    /// Description from any contributing entry (they share a PGN, so
+    /// the wording is the same modulo per-source manufacturer prefix).
+    pub description: String,
+    /// Distinct source addresses transmitting this PGN.
+    pub sources: usize,
+    /// Total records observed across all sources.
+    pub count: u64,
+    /// Average bus rate in messages/second: total observations divided
+    /// by the capture duration. `0.0` when the duration can't be
+    /// measured (a single instant, or no timestamps at all).
+    pub rate: f32,
+}
+
 /// The `ALL` sentence token in PGN 262657 (whole-source mute). Mirrors
 /// `canboat_pipeline::nmea_filter::ALL_SENTENCES`.
 pub const NMEA0183_ALL: &str = "ALL";
@@ -217,6 +248,23 @@ impl Status {
             last_error: None,
         }
     }
+
+    /// Idle startup state (no `--host` / `--log`): a Log-shaped status
+    /// with no source. `snapshot_loaded` is set so the status bar reads
+    /// settled rather than a perpetual "loading…"; the UI opens the
+    /// File ▸ Load dialog to get the user to a real source.
+    pub fn new_idle() -> Self {
+        Self {
+            mode: Mode::Log,
+            host: "(no source — File ▸ Load / Connect)".to_string(),
+            snapshot_port: 0,
+            stream_port: 0,
+            snapshot_loaded: true,
+            stream_connected: false,
+            messages_seen: 0,
+            last_error: None,
+        }
+    }
 }
 
 /// One observation of any PGN, in arrival order. The TUI keeps the
@@ -258,6 +306,15 @@ pub struct AppState {
     /// Bounded to [`MAX_PENDING_ALERTS`] entries — oldest dropped
     /// when the bus is shouting faster than the user can read.
     pub alerts: VecDeque<String>,
+    /// A one-shot positive notice (e.g. "✓ Loaded N records", "✓ Saved
+    /// …") raised by a background task. The UI drains it into its toast
+    /// slot so the user gets confirmation an async load / save finished.
+    pub notice: Option<String>,
+    /// Progress of an in-flight capture save, `None` when idle. While
+    /// `Some`, the UI shows a progress bar and Save / Load / Connect are
+    /// disabled (the save task holds append-only indices into `history` /
+    /// `raw_lines` that a reset would invalidate).
+    pub save_progress: Option<Progress>,
     /// Persistent NAME → device-info cache, loaded at startup and
     /// saved at exit. Enriches `device_list()` with fields the
     /// current session hasn't observed (typical case: a log capture
@@ -273,6 +330,12 @@ pub struct AppState {
     /// Per-source NMEA 0183 filter state, fed by the pipeline's PGN
     /// 262657 Report frames. Drives the `Screen::Nmea0183` view.
     pub nmea0183: BTreeMap<u8, Nmea0183Device>,
+    /// Coalesced canboat PLAIN/FAST lines, one per decoded frame, in
+    /// arrival order — the source for a "Save ▸ Raw" export. Only
+    /// populated in log-replay mode, where the wire bytes are still
+    /// available (`DecodedPgn::data`); the live JSON stream carries no
+    /// raw bytes, so this stays empty there.
+    pub raw_lines: Vec<String>,
 }
 
 impl AppState {
@@ -282,9 +345,12 @@ impl AppState {
             history: Vec::new(),
             status,
             alerts: VecDeque::new(),
+            notice: None,
+            save_progress: None,
             device_cache,
             src_to_name: HashMap::new(),
             nmea0183: BTreeMap::new(),
+            raw_lines: Vec::new(),
         }
     }
 
@@ -559,6 +625,84 @@ impl AppState {
         rows
     }
 
+    /// Aggregate every entry by PGN for the `top`-style load view.
+    /// Sums observation counts across all sources of each PGN and
+    /// divides by the capture duration to get the average bus rate
+    /// (messages/second), then sorts busiest-first (rate desc, then
+    /// count desc, then PGN asc for a stable tie-break).
+    ///
+    /// The rate is `count / duration`, NOT the sum of per-source
+    /// instantaneous cadences: a bursty request-only PGN (e.g. 126996
+    /// Product Information, a couple of frames from each of 48 sources
+    /// at startup) would otherwise report a wildly inflated rate despite
+    /// contributing almost nothing to the bus over the whole capture.
+    pub fn pgn_load_rows(&self) -> Vec<PgnLoadRow> {
+        let dur = self.capture_duration_secs();
+        let mut agg: HashMap<u32, (String, HashSet<u8>, u64)> = HashMap::new();
+        for e in self.entries.values() {
+            // `count == 0` is the synthetic silenced-override sentinel —
+            // no real traffic, so it doesn't belong in a load view.
+            if e.count == 0 {
+                continue;
+            }
+            let slot = agg.entry(e.pgn).or_default();
+            if slot.0.is_empty() && !e.description.is_empty() {
+                slot.0 = e.description.clone();
+            }
+            slot.1.insert(e.src);
+            slot.2 += e.count;
+        }
+        let mut rows: Vec<PgnLoadRow> = agg
+            .into_iter()
+            .map(|(pgn, (description, srcs, count))| PgnLoadRow {
+                pgn,
+                description,
+                sources: srcs.len(),
+                count,
+                rate: if dur > 0.0 { count as f32 / dur } else { 0.0 },
+            })
+            .collect();
+        rows.sort_by(|a, b| {
+            b.rate
+                .partial_cmp(&a.rate)
+                .unwrap_or(Ordering::Equal)
+                .then_with(|| b.count.cmp(&a.count))
+                .then_with(|| a.pgn.cmp(&b.pgn))
+        });
+        rows
+    }
+
+    /// Wall-time span of the capture in seconds, from the wire
+    /// timestamps (earliest first-seen to latest last-seen across all
+    /// entries). Falls back to the monotonic arrival span when the log
+    /// carried no timestamps — the best we can do there, though in
+    /// log-replay mode that reflects ingest time, not the real capture.
+    /// `0.0` when there's nothing (or a single instant) to measure.
+    pub fn capture_duration_secs(&self) -> f32 {
+        let (mut min_ms, mut max_ms) = (i64::MAX, i64::MIN);
+        for e in self.entries.values() {
+            if let Some(f) = e.first_stamp_ms {
+                min_ms = min_ms.min(f);
+            }
+            if let Some(l) = e.last_stamp_ms {
+                max_ms = max_ms.max(l);
+            }
+        }
+        if max_ms > min_ms {
+            return (max_ms - min_ms) as f32 / 1000.0;
+        }
+        // No usable wire timestamps: fall back to the arrival-clock span.
+        let (mut earliest, mut latest): (Option<Instant>, Option<Instant>) = (None, None);
+        for e in self.entries.values() {
+            earliest = Some(earliest.map_or(e.first_seen, |x: Instant| x.min(e.first_seen)));
+            latest = Some(latest.map_or(e.last_update, |x: Instant| x.max(e.last_update)));
+        }
+        match (earliest, latest) {
+            (Some(a), Some(b)) if b > a => b.duration_since(a).as_secs_f32(),
+            _ => 0.0,
+        }
+    }
+
     /// All entries for `src`, sorted by PGN then secondary so the UI
     /// shows a stable list.
     pub fn entries_for_src(&self, src: u8) -> Vec<&Entry> {
@@ -774,5 +918,52 @@ mod tests {
         s.upsert(262657, 0, None, String::new(), report(53, NMEA0183_ALL, 1));
         let rows = s.nmea0183_rows();
         assert!(rows[0].sentence.is_none() && rows[0].muted);
+    }
+
+    #[test]
+    fn pgn_load_rows_aggregate_across_sources_and_sort_busiest_first() {
+        let mut s = state();
+        // 129025 seen from two sources (two observations from one of
+        // them), 127250 seen once.
+        s.upsert(129025, 10, None, "Position".into(), json!({"pgn": 129025}));
+        s.upsert(129025, 10, None, "Position".into(), json!({"pgn": 129025}));
+        s.upsert(129025, 11, None, "Position".into(), json!({"pgn": 129025}));
+        s.upsert(127250, 10, None, "Heading".into(), json!({"pgn": 127250}));
+        let rows = s.pgn_load_rows();
+        assert_eq!(rows.len(), 2);
+        let pos = rows.iter().find(|r| r.pgn == 129025).unwrap();
+        assert_eq!(pos.sources, 2);
+        assert_eq!(pos.count, 3);
+        assert_eq!(pos.description, "Position");
+        // Ties on rate (all zero until a cadence is measured) break by
+        // count desc, so the 3-count PGN sorts ahead of the 1-count one.
+        assert_eq!(rows[0].pgn, 129025);
+    }
+
+    #[test]
+    fn pgn_load_rate_is_count_over_capture_duration() {
+        // A bursty low-count PGN must not out-rate a steady high-count
+        // one just because its few frames clustered in time.
+        let mut s = state();
+        let ts = |ms: i64| json!({"pgn": 1, "timestamp": canboat_core::format_iso_ms(ms as u64)});
+        // 100-second capture window: t=0 .. t=100_000ms.
+        // Bursty PGN 126996: two frames 1 s apart from each of two srcs.
+        s.upsert(126996, 10, None, "Product".into(), ts(0));
+        s.upsert(126996, 10, None, "Product".into(), ts(1_000));
+        s.upsert(126996, 11, None, "Product".into(), ts(0));
+        s.upsert(126996, 11, None, "Product".into(), ts(1_000));
+        // Steady PGN 127250: 5 frames spread across the whole window.
+        for k in 0..5 {
+            s.upsert(127250, 10, None, "Heading".into(), ts(k * 25_000));
+        }
+        assert_eq!(s.capture_duration_secs(), 100.0);
+        let rows = s.pgn_load_rows();
+        let bursty = rows.iter().find(|r| r.pgn == 126996).unwrap();
+        let steady = rows.iter().find(|r| r.pgn == 127250).unwrap();
+        // count / 100 s — not the old summed instantaneous cadence.
+        assert!((bursty.rate - 4.0 / 100.0).abs() < 1e-4, "{}", bursty.rate);
+        assert!((steady.rate - 5.0 / 100.0).abs() < 1e-4, "{}", steady.rate);
+        // Steady (higher count) sorts ahead of bursty.
+        assert!(steady.rate > bursty.rate);
     }
 }

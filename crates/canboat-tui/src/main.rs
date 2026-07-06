@@ -30,11 +30,13 @@ use futures::StreamExt;
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use tokio::sync::Mutex;
-use tokio::time::interval;
+use tokio::task::JoinHandle;
 
 mod client;
 mod device_cache;
+mod filebrowser;
 mod iso;
+mod menu;
 mod overrides;
 mod state;
 mod ui;
@@ -48,11 +50,11 @@ use crate::state::{AppState, Status};
     after_help = canboat_cli::help_footer()
 )]
 struct Args {
-    /// Hostname or IP of the n2kd / canboat-pipeline endpoint.
-    /// Required unless `--log` is set (there is no default: pick a
-    /// live endpoint or a capture on purpose, don't blindly connect
-    /// to localhost).
-    #[arg(long, required_unless_present = "log", conflicts_with = "log")]
+    /// Hostname or IP of the n2kd / canboat-pipeline endpoint. Optional:
+    /// with neither `--host` nor `--log` the TUI starts idle and opens
+    /// the File ▸ Load dialog so you can pick a capture (or Connect from
+    /// the menu). There is no implicit localhost default.
+    #[arg(long, conflicts_with = "log")]
     host: Option<String>,
     /// Snapshot port (default 2597 — canboat-pipeline `--snapshot-port`
     /// or n2kd JSON snapshot). Ignored when `--log` is set.
@@ -97,12 +99,13 @@ async fn main() -> Result<()> {
     }
 
     let args = Args::parse();
-    // Clap enforces `--host XOR --log` above — so exactly one of
-    // these branches matches.
+    // `--host` and `--log` are mutually exclusive (clap); with neither
+    // we start idle and prompt for a capture via File ▸ Load.
+    let idle = args.log.is_none() && args.host.is_none();
     let status = match (&args.log, &args.host) {
         (Some(path), _) => Status::new_log(path.display().to_string()),
         (None, Some(host)) => Status::new_live(host.clone(), args.snapshot_port, args.stream_port),
-        (None, None) => unreachable!("clap's required_unless_present guarantees one is Some"),
+        (None, None) => Status::new_idle(),
     };
     // Load the persistent NAME → info device cache. Enriches the
     // device list with anything we've learned across past sessions.
@@ -115,32 +118,55 @@ async fn main() -> Result<()> {
     // on Mode::Live), but having the same `Writer` shape keeps the
     // UI code path uniform.
     let (writer, writer_rx) = client::make_writer();
-    if let Some(path) = args.log.clone() {
-        // Log mode: drive the analyzer's library decode pipeline on a
-        // blocking thread; no snapshot/stream sockets. Drop
-        // `writer_rx` — nothing will write to the channel.
-        drop(writer_rx);
-        client::spawn_log_load(path, state.clone());
-    } else {
-        // Live mode: kick off both network tasks in the background;
-        // the UI loop surfaces their progress / errors via the status
-        // bar. `args.host` is guaranteed `Some` here by the CLI
-        // match above.
-        let host = args.host.clone().expect("--host required in live mode");
-        client::spawn_snapshot_load(host.clone(), args.snapshot_port, state.clone());
-        client::spawn_stream_connection(host, args.stream_port, state.clone(), writer_rx);
+    // Track the background task handles so File ▸ Connect / Load can
+    // abort the current connection before starting a new one.
+    let mut tasks: Vec<JoinHandle<()>> = Vec::new();
+    match (args.log.clone(), args.host.clone()) {
+        (Some(path), _) => {
+            // Log mode: drive the analyzer's library decode pipeline on
+            // a blocking thread; no snapshot/stream sockets. Drop
+            // `writer_rx` — nothing will write to the channel.
+            drop(writer_rx);
+            tasks.extend(client::spawn_log_load(path, state.clone()));
+        }
+        (None, Some(host)) => {
+            // Live mode: kick off both network tasks in the background;
+            // the UI loop surfaces their progress / errors via the
+            // status bar.
+            tasks.push(client::spawn_snapshot_load(
+                host.clone(),
+                args.snapshot_port,
+                state.clone(),
+            ));
+            tasks.push(client::spawn_stream_connection(
+                host,
+                args.stream_port,
+                state.clone(),
+                writer_rx,
+            ));
+        }
+        (None, None) => {
+            // Idle: nothing to read from yet. Drop the writer receiver;
+            // File ▸ Connect / Load will start a real source later.
+            drop(writer_rx);
+        }
     }
 
     let mut app = ui::App::new();
-    if args.log.is_none() {
+    if args.host.is_some() {
         // Persisted overrides are queued to the writer immediately;
-        // they flush to the socket as soon as the stream task
-        // connects. Log mode has nothing to write back to, so skip.
+        // they flush to the socket as soon as the stream task connects.
+        // Log / idle modes have nothing to write back to, so skip.
         app.replay_overrides(&writer);
+    }
+    if idle {
+        // No source chosen — greet the user with the Load dialog once
+        // the intro animation finishes.
+        app.prompt_load();
     }
 
     let mut tty = setup_tty()?;
-    let res = run_loop(&mut tty, &mut app, state.clone(), writer).await;
+    let res = run_loop(&mut tty, &mut app, state.clone(), writer, tasks).await;
     restore_tty(&mut tty)?;
     // Persist the freshly-enriched NAME → info cache so a subsequent
     // log-mode session sees whatever this run learned. Failures
@@ -159,11 +185,24 @@ async fn run_loop(
     tty: &mut ui::Tty,
     app: &mut ui::App,
     state: Arc<Mutex<AppState>>,
-    writer: client::Writer,
+    mut writer: client::Writer,
+    mut tasks: Vec<JoinHandle<()>>,
 ) -> Result<()> {
     let mut events = EventStream::new();
-    let mut redraw = interval(Duration::from_millis(250));
+    // Whether a capture save is streaming out (seen on the previous
+    // frame). While it is, tick faster so the progress bar animates.
+    let mut saving = false;
     loop {
+        // Tick fast while the intro animation is playing so the zoom is
+        // smooth (~17 fps) or a save is running so the bar advances;
+        // fall back to a lazy 250 ms once idle.
+        let frame_delay = if app.splash.is_some() {
+            Duration::from_millis(60)
+        } else if saving {
+            Duration::from_millis(100)
+        } else {
+            Duration::from_millis(250)
+        };
         tokio::select! {
             biased;
             ev = events.next() => {
@@ -180,10 +219,15 @@ async fn run_loop(
                     None => break,
                 }
             }
-            _ = redraw.tick() => {}
+            _ = tokio::time::sleep(frame_delay) => {}
         }
         if app.should_quit {
             break;
+        }
+        // Enact any File-menu command the UI recorded this iteration
+        // (it owns none of the runtime plumbing — we do).
+        if let Some(cmd) = app.pending_command.take() {
+            execute_command(cmd, &mut writer, &mut tasks, &state, app).await;
         }
         let mut s = state.lock().await;
         // Drain one queued bus-side alert into the UI's display slot
@@ -194,9 +238,106 @@ async fn run_loop(
         if app.alert.is_none() {
             app.alert = s.alerts.pop_front();
         }
+        // Surface a one-shot completion notice (load / save done) as a
+        // toast the user can dismiss with any key.
+        if let Some(notice) = s.notice.take() {
+            app.toast = Some(notice);
+        }
+        saving = s.save_progress.is_some();
         ui::draw(tty, app, &s)?;
     }
     Ok(())
+}
+
+/// Carry out a File-menu command: reconnect to a new endpoint, load a
+/// capture file, or save the current capture. Connect / Load tear down
+/// the running tasks and swap in a fresh [`AppState`] (preserving the
+/// persistent device cache) so no stale data or task bleeds across.
+async fn execute_command(
+    cmd: ui::PendingCommand,
+    writer: &mut client::Writer,
+    tasks: &mut Vec<JoinHandle<()>>,
+    state: &Arc<Mutex<AppState>>,
+    app: &mut ui::App,
+) {
+    // Connect / Load reset the whole AppState; refuse them while a save
+    // is streaming out of `history` / `raw_lines` so it can't read into
+    // a swapped-out buffer.
+    if matches!(
+        cmd,
+        ui::PendingCommand::Connect { .. } | ui::PendingCommand::Load { .. }
+    ) && state.lock().await.save_progress.is_some()
+    {
+        app.toast = Some("Wait for the save to finish".to_string());
+        return;
+    }
+    match cmd {
+        ui::PendingCommand::Connect {
+            host,
+            snapshot_port,
+            stream_port,
+        } => {
+            for t in tasks.drain(..) {
+                t.abort();
+            }
+            {
+                let mut s = state.lock().await;
+                let cache = std::mem::take(&mut s.device_cache);
+                *s = AppState::new(
+                    Status::new_live(host.clone(), snapshot_port, stream_port),
+                    cache,
+                );
+            }
+            let (new_writer, rx) = client::make_writer();
+            tasks.push(client::spawn_snapshot_load(
+                host.clone(),
+                snapshot_port,
+                state.clone(),
+            ));
+            tasks.push(client::spawn_stream_connection(
+                host,
+                stream_port,
+                state.clone(),
+                rx,
+            ));
+            *writer = new_writer;
+            app.reset_views();
+            app.connecting_dismissed = false;
+            app.replay_overrides(writer);
+        }
+        ui::PendingCommand::Load { path } => {
+            for t in tasks.drain(..) {
+                t.abort();
+            }
+            {
+                let mut s = state.lock().await;
+                let cache = std::mem::take(&mut s.device_cache);
+                *s = AppState::new(Status::new_log(path.display().to_string()), cache);
+            }
+            tasks.extend(client::spawn_log_load(path, state.clone()));
+            app.reset_views();
+            // Log mode has no connection to wait for; the draw path
+            // auto-dismisses the connecting overlay immediately.
+            app.connecting_dismissed = true;
+        }
+        ui::PendingCommand::Save { path, format } => {
+            // Refuse while a load is still in flight (would race the
+            // save task's history indices) or another save is running.
+            let (loading, saving) = {
+                let s = state.lock().await;
+                (!s.status.snapshot_loaded, s.save_progress.is_some())
+            };
+            if loading {
+                app.toast = Some("Still loading — try Save again once it's done".to_string());
+            } else if saving {
+                app.toast = Some("A save is already in progress".to_string());
+            } else {
+                // Runs in the background with a progress bar; the write
+                // never holds the state lock long enough to stall the UI.
+                tasks.push(client::spawn_save(path, format, state.clone()));
+            }
+        }
+    }
 }
 
 fn setup_tty() -> Result<ui::Tty> {

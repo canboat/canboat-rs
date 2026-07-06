@@ -27,3 +27,7 @@ crossterm    = { version = "0.28", features = ["event-stream"] }
 ratatui      = "0.29"
 indexmap     = { workspace = true }
 futures      = { workspace = true }
+# Local-time formatting for the file browser. `clock` pulls the OS
+# timezone (cross-platform, incl. Windows) and, unlike the `time` crate,
+# resolves the local offset fine under our multi-threaded runtime.
+chrono       = { version = "0.4", default-features = false, features = ["clock"] }

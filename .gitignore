@@ -5,3 +5,6 @@ Cargo.lock.bak
 .idea/
 .vscode/
 Makefile.local
+
+# canboat-tui default capture save artifacts
+canboat-capture.*

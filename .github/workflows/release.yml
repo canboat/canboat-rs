@@ -24,10 +24,16 @@ on:
 
 env:
   CARGO_TERM_COLOR: always
+  # Real binaries built and packaged. `canboat` is the unified front end;
+  # the legacy tool crates are still here as a fallback until the argv[0]
+  # shims are verified against the parity harness, then retired.
   BINS: >-
-    analyzer actisense-serial ikonvert-serial maretron-ipg replay
-    candump2analyzer pcap2candump nif2analyzer socketcan-serial socketcan-writer
-    n2kd canboat-pipeline canboat-tui
+    canboat analyzer actisense-serial ikonvert-serial maretron-ipg replay
+    candump2analyzer pcap2candump nif2analyzer socketcan-serial n2kd
+  # Retired crates whose names now resolve into `canboat` via argv[0].
+  # Shipped as symlinks (Unix) / copies (Windows) to the canboat binary.
+  SHIMS: >-
+    canboat-pipeline canboat-tui
 
 jobs:
   build-linux:
@@ -60,7 +66,8 @@ jobs:
       - name: Package
         run: |
           cd target/${{ matrix.target }}/release
-          tar -czf "$GITHUB_WORKSPACE/canboat-rs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" ${BINS}
+          for s in ${SHIMS}; do ln -sf canboat "$s"; done
+          tar -czf "$GITHUB_WORKSPACE/canboat-rs-${{ github.ref_name }}-${{ matrix.target }}.tar.gz" ${BINS} ${SHIMS}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -102,7 +109,8 @@ jobs:
       - name: Package
         run: |
           cd universal
-          tar -czf "$GITHUB_WORKSPACE/canboat-rs-${{ github.ref_name }}-universal-apple-darwin.tar.gz" ${BINS}
+          for s in ${SHIMS}; do ln -sf canboat "$s"; done
+          tar -czf "$GITHUB_WORKSPACE/canboat-rs-${{ github.ref_name }}-universal-apple-darwin.tar.gz" ${BINS} ${SHIMS}
 
       - name: Upload artifact
         uses: actions/upload-artifact@v7
@@ -127,7 +135,13 @@ jobs:
 
       - name: Package
         run: |
-          $paths = $env:BINS -split '\s+' | ForEach-Object { "target/release/$_.exe" }
+          # Windows has no reliable symlinks in a zip; ship the shim names
+          # as copies. argv[0] routing works the same on a copy.
+          foreach ($s in $env:SHIMS.Trim() -split '\s+') {
+            Copy-Item "target/release/canboat.exe" "target/release/$s.exe"
+          }
+          $names = ($env:BINS.Trim() -split '\s+') + ($env:SHIMS.Trim() -split '\s+')
+          $paths = $names | ForEach-Object { "target/release/$_.exe" }
           Compress-Archive -Path $paths -DestinationPath "canboat-rs-${{ github.ref_name }}-x86_64-pc-windows-msvc.zip"
 
       - name: Upload artifact

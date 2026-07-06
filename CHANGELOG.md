@@ -1,5 +1,26 @@
 # Changelog
 
+## [0.5.0](https://github.com/canboat/canboat-rs/compare/v0.4.0...v0.5.0) (2026-07-06)
+
+
+### Features
+
+* **io:** read Navico .nif and SocketCAN .pcap captures ([5e5ccfc](https://github.com/canboat/canboat-rs/commit/5e5ccfcb6db4565880d591c97193d3cc5fed8403))
+* **io:** read Navico .nif and SocketCAN .pcap captures ([9821de7](https://github.com/canboat/canboat-rs/commit/9821de7714d1ff7188b3ffba14337b860ce59074))
+* **tui:** Turbo Pascal UI — menus, file browser, async save, faster timeline ([787ea93](https://github.com/canboat/canboat-rs/commit/787ea938f618447ff02a6cfbda207e82e3d23549))
+* **tui:** update UI to Turbo Pascal like — menus, file browser, async save, perf & fixes ([4b7cc18](https://github.com/canboat/canboat-rs/commit/4b7cc1891f77766c60534485eac413b5ced09158))
+
+
+### Bug Fixes
+
+* **core:** decode STRING_LAU with 0xff encoding byte as an empty field ([987fe13](https://github.com/canboat/canboat-rs/commit/987fe135bb8231f827f3c96fed772b2967b8d43a))
+* **core:** decode STRING_LAU with 0xff encoding byte as empty ([6b9b4d3](https://github.com/canboat/canboat-rs/commit/6b9b4d3060e1bd0f46bef9d8f300136d70ac541f))
+* **core:** parse canboat's dash-separated timestamp in parse_iso_ms ([1fc507d](https://github.com/canboat/canboat-rs/commit/1fc507d41f4d01f4151cc68e720826ba0a5b81be))
+* **tui:** keep the PGN-load rate bar visible on the selected row ([17164e2](https://github.com/canboat/canboat-rs/commit/17164e2d53c441abd58802d8f2ede18c007f3c44))
+* **tui:** label on-request PGNs "on request" instead of a fake cadence ([82484ad](https://github.com/canboat/canboat-rs/commit/82484adf4bc543e41e1e6044f6b8a6847100d3d3))
+* **tui:** PGN-load rate is occurrences over capture duration ([dd74c1a](https://github.com/canboat/canboat-rs/commit/dd74c1aac6e459bf1827465c0e439415cf9fa135))
+* **tui:** show a robust median cadence for the device-detail "every" ([b62190e](https://github.com/canboat/canboat-rs/commit/b62190ef5886867043d1c91eb477c02fb5c7373a))
+
 ## [0.4.0](https://github.com/canboat/canboat-rs/compare/v0.3.0...v0.4.0) (2026-07-05)
 
 

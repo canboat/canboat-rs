@@ -4,7 +4,7 @@ version = 4
 
 [[package]]
 name = "actisense-serial"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -30,7 +30,7 @@ checksum = "683d7910e743518b0e34f1186f92494becacb047c7b6bf616c96772180fef923"
 
 [[package]]
 name = "analyzer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -153,7 +153,7 @@ checksum = "1e748733b7cbc798e1434b6ac524f0c1ff2ab456fe201501e6497c8417a4fc33"
 
 [[package]]
 name = "canboat-cli"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-core",
@@ -165,7 +165,7 @@ dependencies = [
 
 [[package]]
 name = "canboat-core"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "canboat-schema",
  "indexmap",
@@ -179,7 +179,7 @@ dependencies = [
 
 [[package]]
 name = "canboat-io"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "canboat-core",
  "flate2",
@@ -193,7 +193,7 @@ dependencies = [
 
 [[package]]
 name = "canboat-pipeline"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -210,11 +210,11 @@ dependencies = [
 
 [[package]]
 name = "canboat-schema"
-version = "0.4.0"
+version = "0.5.0"
 
 [[package]]
 name = "canboat-tokio"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-core",
@@ -228,7 +228,7 @@ dependencies = [
 
 [[package]]
 name = "canboat-tui"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "analyzer",
  "anyhow",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "canboat-wire"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "canboat-core",
  "postcard",
@@ -259,7 +259,7 @@ dependencies = [
 
 [[package]]
 name = "candump2analyzer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -746,7 +746,7 @@ checksum = "b9e0384b61958566e926dc50660321d12159025e767c18e043daf26b70104c39"
 
 [[package]]
 name = "ikonvert-serial"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -909,7 +909,7 @@ dependencies = [
 
 [[package]]
 name = "maretron-ipg"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -971,7 +971,7 @@ dependencies = [
 
 [[package]]
 name = "n2kd"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -1014,7 +1014,7 @@ dependencies = [
 
 [[package]]
 name = "nif2analyzer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -1098,7 +1098,7 @@ checksum = "57c0d7b74b563b49d38dae00a0c37d4d6de9b432382b2892f0574ddcae73fd0a"
 
 [[package]]
 name = "pcap2candump"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -1189,7 +1189,7 @@ dependencies = [
 
 [[package]]
 name = "replay"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -1415,7 +1415,7 @@ dependencies = [
 
 [[package]]
 name = "socketcan-serial"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",
@@ -1430,7 +1430,7 @@ dependencies = [
 
 [[package]]
 name = "socketcan-writer"
-version = "0.4.0"
+version = "0.5.0"
 dependencies = [
  "anyhow",
  "canboat-cli",

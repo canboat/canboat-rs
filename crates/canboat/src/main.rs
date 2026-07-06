@@ -22,6 +22,7 @@ use clap::{Parser, Subcommand};
 mod convert;
 mod interface;
 mod server;
+mod tui;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -45,6 +46,9 @@ enum Command {
 
     /// Run the single-process device → analyzer → n2kd pipeline server.
     Server(Box<server::Args>),
+
+    /// Interactive terminal browser for a live n2kd/server stream or a capture.
+    Tui(tui::Args),
 }
 
 fn main() -> ExitCode {
@@ -53,10 +57,22 @@ fn main() -> ExitCode {
         Command::Convert(args) => convert::run(args),
         Command::Interface(args) => interface::run(args),
         Command::Server(args) => server::run(*args),
+        Command::Tui(args) => run_tui(args),
     };
     if let Err(e) = result {
         eprintln!("canboat: {e:#}");
         return ExitCode::from(1);
     }
     ExitCode::SUCCESS
+}
+
+/// The TUI is async; the rest of `canboat` is not. Spin up a dedicated
+/// multi-threaded runtime (matching the old `#[tokio::main]` shape) just
+/// for this subcommand rather than making the whole binary async.
+fn run_tui(args: tui::Args) -> anyhow::Result<()> {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .build()?;
+    rt.block_on(tui::run(args))
 }

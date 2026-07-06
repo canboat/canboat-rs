@@ -3,14 +3,14 @@
 //! A minimal directory/file browser backing the File ▸ Load dialog.
 //!
 //! Pure state + filesystem logic (no ratatui) so it can be unit-tested
-//! headless; [`crate::ui`] owns the rendering and key wiring. Entries
+//! headless; [`crate::tui::ui`] owns the rendering and key wiring. Entries
 //! are listed parent-first, then sub-directories, then files, each
 //! group sorted case-insensitively.
 
 use std::path::PathBuf;
 use std::time::SystemTime;
 
-use crate::client::SaveFormat;
+use crate::tui::client::SaveFormat;
 
 /// One row in the browser: a directory (including the `..` parent) or a
 /// selectable file.

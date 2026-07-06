@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::Result;
-use clap::Parser;
 use crossterm::event::{Event, EventStream};
 use crossterm::execute;
 use crossterm::terminal::{
@@ -41,15 +40,12 @@ mod overrides;
 mod state;
 mod ui;
 
-use crate::state::{AppState, Status};
+use crate::tui::state::{AppState, Status};
 
-#[derive(Parser, Debug)]
-#[command(
-    name = "canboat-tui",
-    about = "Interactive terminal UI for an NMEA 2000 bus, fed by n2kd or canboat-pipeline.",
-    after_help = canboat_cli::help_footer()
-)]
-struct Args {
+/// Interactive terminal UI for an NMEA 2000 bus, fed by n2kd or the server.
+#[derive(clap::Args, Debug)]
+#[command(after_help = canboat_cli::help_footer())]
+pub struct Args {
     /// Hostname or IP of the n2kd / canboat-pipeline endpoint. Optional:
     /// with neither `--host` nor `--log` the TUI starts idle and opens
     /// the File ▸ Load dialog so you can pick a capture (or Connect from
@@ -75,8 +71,7 @@ struct Args {
     log: Option<std::path::PathBuf>,
 }
 
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() -> Result<()> {
+pub async fn run(args: Args) -> Result<()> {
     // The TUI takes over the terminal via crossterm's alt-screen, so
     // any log line emitted on stderr paints garbage over the UI. Route
     // logs to a file instead, and quiet the default filter (WARN) so a
@@ -98,7 +93,6 @@ async fn main() -> Result<()> {
         canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
     }
 
-    let args = Args::parse();
     // `--host` and `--log` are mutually exclusive (clap); with neither
     // we start idle and prompt for a capture via File ▸ Load.
     let idle = args.log.is_none() && args.host.is_none();

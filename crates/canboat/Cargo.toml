@@ -23,6 +23,14 @@ n2kd         = { path = "../n2kd", version = "0.5.0" } # x-release-please-versio
 anyhow       = { workspace = true }
 clap         = { workspace = true }
 serde        = { workspace = true }
-serde_json   = { workspace = true }
+serde_json   = { workspace = true, features = ["preserve_order"] }
 env_logger   = { workspace = true }
 log          = { workspace = true }
+# Async runtime + terminal UI, used only by the `tui` subcommand.
+tokio        = { workspace = true, features = ["net", "time", "fs"] }
+crossterm    = { version = "0.28", features = ["event-stream"] }
+ratatui      = "0.29"
+indexmap     = { workspace = true }
+futures      = { workspace = true }
+# Local-time formatting for the tui file browser (cross-platform).
+chrono       = { version = "0.4", default-features = false, features = ["clock"] }

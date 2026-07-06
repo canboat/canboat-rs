@@ -19,7 +19,6 @@ members = [
     "crates/socketcan-serial",
     "crates/n2kd",
     "crates/canboat-wire",
-    "crates/canboat-tui",
 ]
 
 [workspace.package]

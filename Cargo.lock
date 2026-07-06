@@ -160,12 +160,18 @@ dependencies = [
  "canboat-core",
  "canboat-io",
  "canboat-wire",
+ "chrono",
  "clap",
+ "crossterm",
  "env_logger",
+ "futures",
+ "indexmap",
  "log",
  "n2kd",
+ "ratatui",
  "serde",
  "serde_json",
+ "tokio",
 ]
 
 [[package]]
@@ -224,27 +230,6 @@ dependencies = [
  "log",
  "tokio",
  "tokio-serial",
-]
-
-[[package]]
-name = "canboat-tui"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "canboat-io",
- "chrono",
- "clap",
- "crossterm",
- "env_logger",
- "futures",
- "indexmap",
- "log",
- "ratatui",
- "serde",
- "serde_json",
- "tokio",
 ]
 
 [[package]]

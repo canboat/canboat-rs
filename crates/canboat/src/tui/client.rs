@@ -3,7 +3,7 @@
 //! TCP client to either `n2kd` or `canboat-pipeline`.
 //!
 //! On startup the client opens the snapshot port (default 2597),
-//! drains the one-shot JSON blob, and seeds [`crate::state::AppState`]
+//! drains the one-shot JSON blob, and seeds [`crate::tui::state::AppState`]
 //! with everything currently in the cache. Then it opens the
 //! analyzer/stream port (default 2598) and stays subscribed for the
 //! lifetime of the process — each incoming line goes through
@@ -36,7 +36,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::state::{AppState, Progress};
+use crate::tui::state::{AppState, Progress};
 
 /// Per-connection timeout for the initial TCP connect. Without this
 /// the TUI sits black forever when the endpoint isn't reachable (the
@@ -672,7 +672,7 @@ async fn writer_task(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Status;
+    use crate::tui::state::Status;
     use serde_json::json;
     use std::collections::HashMap;
 

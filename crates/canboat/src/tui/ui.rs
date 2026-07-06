@@ -50,15 +50,15 @@ use ratatui::widgets::{
     Block, BorderType, Borders, Clear, HighlightSpacing, List, ListItem, ListState, Paragraph, Wrap,
 };
 
-use crate::client::SaveFormat;
-use crate::filebrowser::FileBrowser;
-use crate::iso;
-use crate::menu::{
+use crate::tui::client::SaveFormat;
+use crate::tui::filebrowser::FileBrowser;
+use crate::tui::iso;
+use crate::tui::menu::{
     self, DESKTOP_BG, Menu, MenuAction, MenuBar, MenuEntry, MenuItem, PANEL_BG, PANEL_BORDER,
     PANEL_FG, PANEL_TITLE, SURFACE_ACCENT, SURFACE_BG, SURFACE_FG,
 };
-use crate::overrides::{self, INTERVAL_OFF, Override, Overrides, default_path};
-use crate::state::{AppState, DeviceInfo, Entry, HistoryRecord, Mode, PgnLoadRow, Progress};
+use crate::tui::overrides::{self, INTERVAL_OFF, Override, Overrides, default_path};
+use crate::tui::state::{AppState, DeviceInfo, Entry, HistoryRecord, Mode, PgnLoadRow, Progress};
 
 /// Per-PGN well-known transmit defaults, used purely as UI hints
 /// when the user opens the override dialog. Picking the right default
@@ -410,7 +410,7 @@ impl App {
     /// Re-emit every stored override to the bus. Called on startup
     /// after the stream connection is up so user changes persist
     /// across target reboots.
-    pub fn replay_overrides(&self, writer: &crate::client::Writer) {
+    pub fn replay_overrides(&self, writer: &crate::tui::client::Writer) {
         for ov in &self.overrides.entries {
             let line = match (ov.manufacturer_code, ov.industry_code) {
                 (Some(mfr), Some(ind)) => iso::request_transmission_interval_proprietary(
@@ -565,7 +565,12 @@ impl App {
     /// Route a keystroke while the menu bar is open. Left/Right switch
     /// menus, Up/Down move the highlight, Enter / hotkey fire, Esc
     /// closes.
-    fn handle_menu_key(&mut self, key: KeyEvent, state: &AppState, writer: &crate::client::Writer) {
+    fn handle_menu_key(
+        &mut self,
+        key: KeyEvent,
+        state: &AppState,
+        writer: &crate::tui::client::Writer,
+    ) {
         let menus = self.build_menus(state);
         let Some(open) = self.menu.open else {
             return;
@@ -628,7 +633,7 @@ impl App {
         &mut self,
         action: MenuAction,
         state: &AppState,
-        writer: &crate::client::Writer,
+        writer: &crate::tui::client::Writer,
     ) {
         match action {
             MenuAction::Quit => self.should_quit = true,
@@ -708,7 +713,7 @@ impl App {
 
     /// Activate the current selection on the focused screen — the
     /// shared "Enter" behaviour, reused by the Device ▸ Open menu item.
-    fn activate_selection(&mut self, state: &AppState, writer: &crate::client::Writer) {
+    fn activate_selection(&mut self, state: &AppState, writer: &crate::tui::client::Writer) {
         match self.screen {
             Screen::Devices => {
                 let devs = state.device_list();
@@ -742,7 +747,7 @@ impl App {
 
     /// Send an ISO Request for PGN 126464 to `src` (Device ▸ ISO
     /// Request). Shared by the `i` accelerator.
-    fn send_iso_126464(&mut self, src: u8, writer: &crate::client::Writer) {
+    fn send_iso_126464(&mut self, src: u8, writer: &crate::tui::client::Writer) {
         let line = iso::iso_request(src, 126464);
         if writer.send(line) {
             self.toast = Some(format!("Sent ISO Request 126464 → src {src}"));
@@ -1056,13 +1061,13 @@ impl App {
 
     /// Toggle the mute state of the highlighted NMEA 0183 row. Shared
     /// by the Nmea0183 Space/Enter accelerator and Device ▸ Open.
-    fn toggle_nmea0183_selection(&mut self, state: &AppState, writer: &crate::client::Writer) {
+    fn toggle_nmea0183_selection(&mut self, state: &AppState, writer: &crate::tui::client::Writer) {
         let rows = state.nmea0183_rows();
         if let Some(row) = self.nmea0183_state.selected().and_then(|i| rows.get(i)) {
             let sentence = row
                 .sentence
                 .as_deref()
-                .unwrap_or(crate::state::NMEA0183_ALL);
+                .unwrap_or(crate::tui::state::NMEA0183_ALL);
             let line = iso::nmea0183_filter_set(row.src, sentence, !row.muted);
             if writer.send(line) {
                 let what = row.sentence.clone().unwrap_or_else(|| "all".into());
@@ -1077,7 +1082,12 @@ impl App {
         }
     }
 
-    pub fn handle_key(&mut self, key: KeyEvent, state: &AppState, writer: &crate::client::Writer) {
+    pub fn handle_key(
+        &mut self,
+        key: KeyEvent,
+        state: &AppState,
+        writer: &crate::tui::client::Writer,
+    ) {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return;
         }
@@ -1351,7 +1361,7 @@ impl App {
                     let sentence = row
                         .sentence
                         .as_deref()
-                        .unwrap_or(crate::state::NMEA0183_ALL);
+                        .unwrap_or(crate::tui::state::NMEA0183_ALL);
                     let line = iso::nmea0183_filter_set(row.src, sentence, !row.muted);
                     if writer.send(line) {
                         let what = row.sentence.clone().unwrap_or_else(|| "all".into());
@@ -1651,7 +1661,7 @@ impl App {
         self.time_state.select(Some(target));
     }
 
-    fn handle_modal_key(&mut self, key: KeyEvent, writer: &crate::client::Writer) {
+    fn handle_modal_key(&mut self, key: KeyEvent, writer: &crate::tui::client::Writer) {
         let Some(modal) = self.modal.as_mut() else {
             return;
         };
@@ -2371,7 +2381,7 @@ fn format_interval(d: Option<std::time::Duration>) -> String {
     }
 }
 
-fn draw_pgn_lists(f: &mut ratatui::Frame<'_>, area: Rect, lists: &crate::state::PgnLists) {
+fn draw_pgn_lists(f: &mut ratatui::Frame<'_>, area: Rect, lists: &crate::tui::state::PgnLists) {
     let tx = lists
         .tx
         .iter()
@@ -2614,7 +2624,7 @@ fn format_pgn_top_row(r: &PgnLoadRow, max_rate: f32) -> Line<'static> {
 /// Canonical row string for search matching — a plain-text form of
 /// [`format_time_row`] without ANSI/ratatui styling. Kept in sync so
 /// searching for whatever the user sees on-screen finds the row.
-fn row_search_string(h: &crate::state::HistoryRecord) -> String {
+fn row_search_string(h: &crate::tui::state::HistoryRecord) -> String {
     let stamp = h.timestamp.as_deref().unwrap_or("");
     let sec = h.secondary.as_deref().unwrap_or("");
     format!(
@@ -2626,7 +2636,7 @@ fn row_search_string(h: &crate::state::HistoryRecord) -> String {
 /// One row on the `TimeView` screen — index, timestamp, src, pgn,
 /// and description columns. Timestamp column is right-padded to a
 /// fixed width so `src`/`pgn` line up column-wise across rows.
-fn format_time_row(idx: usize, h: &crate::state::HistoryRecord) -> Line<'static> {
+fn format_time_row(idx: usize, h: &crate::tui::state::HistoryRecord) -> Line<'static> {
     // Prefer the wire timestamp from the analyzer JSON; fall back
     // to relative wall-clock age (`+<N>s`) computed from `seen_at`
     // when the record didn't carry one.
@@ -3439,7 +3449,7 @@ fn draw_src_select_modal(f: &mut ratatui::Frame<'_>, area: Rect, sel: &SrcSelect
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::state::Status;
+    use crate::tui::state::Status;
     use ratatui::Terminal;
     use ratatui::backend::TestBackend;
     use serde_json::json;
@@ -3774,7 +3784,7 @@ mod tests {
     #[test]
     fn open_dialog_swallows_menu_and_help_keys() {
         let state = seeded_state();
-        let (writer, _rx) = crate::client::make_writer();
+        let (writer, _rx) = crate::tui::client::make_writer();
         // With the file browser up, F10 / Alt+F / F1 must not open the
         // menu or Help behind it.
         let mut app = ui_app();

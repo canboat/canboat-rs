@@ -32,7 +32,7 @@ use std::time::Instant;
 use indexmap::IndexMap;
 use serde_json::Value;
 
-use crate::device_cache::{CachedInfo, NameKey};
+use crate::tui::device_cache::{CachedInfo, NameKey};
 
 /// Cap on how many pending alerts (e.g. NAKed PGN 126208 ACKs) we
 /// keep before dropping the oldest. Twenty is more than the user

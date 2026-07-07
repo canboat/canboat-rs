@@ -12,8 +12,7 @@
 #   make fmt           - `cargo fmt --all`
 #   make clippy        - Workspace clippy at `-D warnings` (what CI enforces)
 #   make precommit     - fmt + clippy + test — run this before pushing
-#   make pipeline      - Release build of just `canboat-pipeline`
-#   make tui           - Release build of just `canboat-tui`
+#   make canboat       - Release build of just the `canboat` binary
 #   make clean         - `cargo clean`
 #
 # Per-developer targets (SSH deploys to your own boxes, scratch experiments,
@@ -23,7 +22,7 @@
 CARGO ?= cargo
 
 .PHONY: all build debug check test fmt fmt-check clippy precommit sync-canboat \
-        pipeline tui \
+        canboat \
         clean help
 
 all: build
@@ -68,13 +67,11 @@ precommit: fmt clippy test
 sync-canboat:
 	./scripts/sync-canboat.sh $(REF)
 
-# Per-binary release shortcuts. `cargo build --release -p <crate>` under
-# the hood — handy when you only need one specific tool.
-pipeline:
-	$(CARGO) build --release -p canboat-pipeline
-
-tui:
-	$(CARGO) build --release -p canboat-tui
+# Release shortcut for just the front-end binary. `cargo build --release
+# -p canboat` under the hood — handy when you don't need the whole
+# workspace (every tool is now a `canboat` subcommand).
+canboat:
+	$(CARGO) build --release -p canboat
 
 clean:
 	$(CARGO) clean
@@ -94,8 +91,7 @@ help:
 	@echo "  make precommit      fmt + clippy + test"
 	@echo "  make sync-canboat   REF=<ref> — vendor canboat.json from upstream"
 	@echo ""
-	@echo "  make pipeline       Release build of just canboat-pipeline"
-	@echo "  make tui            Release build of just canboat-tui"
+	@echo "  make canboat        Release build of just the canboat binary"
 	@echo ""
 	@echo "  make clean          cargo clean"
 	@echo ""

@@ -9,8 +9,8 @@ the CANboat database, built with modern tools: the PGN database is compiled
 into a sans-I/O core library, with thin sync and async adapters above it, so
 you can embed NMEA 2000 decoding in your own application instead of parsing
 another program's output. Second, more polished end-to-end solutions —
-`canboat-pipeline` runs the whole device-to-services chain in one process,
-and `canboat-tui` puts an interactive monitor on top of it.
+`canboat server` runs the whole device-to-services chain in one process,
+and `canboat tui` puts an interactive monitor on top of it.
 
 ## The library side
 
@@ -104,17 +104,17 @@ Same decode work — `-json -nv` over 1.26 M PGN frames (canboat's
 |------------------------|----------:|--------------:|
 | canboatjs (Node 25)    |  27.8 s   |   **8.1 ×**   |
 | canboat C              |   9.1 s   |   **2.6 ×**   |
-| canboat-rs `analyzer`  |   3.4 s   |       1.0 ×   |
+| canboat-rs `canboat convert` |   3.4 s   |       1.0 ×   |
 
-`canboat-pipeline` goes one step further and collapses the
-`analyzer | n2kd` pipeline into a single process with no JSON text
-serialisation between stages:
+`canboat server` goes one step further and collapses the
+`canboat convert | canboat n2kd` pipeline into a single process with no
+JSON text serialisation between stages:
 
-| Pipeline                                | Wall time | Throughput            |
-|-----------------------------------------|----------:|-----------------------|
-| `analyzer` alone (PGN decode only)      |   3.3 s   | 380 k frames / s      |
-| `analyzer \| n2kd` (piped, two procs)   |   6.5 s   | 194 k sentences / s   |
-| `canboat-pipeline` (single proc)        |   3.5 s   | 360 k sentences / s   |
+| Pipeline                                          | Wall time | Throughput          |
+|---------------------------------------------------|----------:|---------------------|
+| `canboat convert` alone (PGN decode only)         |   3.3 s   | 380 k frames / s    |
+| `canboat convert \| canboat n2kd` (piped, 2 proc) |   6.5 s   | 194 k sentences / s |
+| `canboat server` (single proc)                    |   3.5 s   | 360 k sentences / s |
 
 That's 46 % less wall time than the piped setup while doing strictly more
 work (it's a long-running service with TCP fan-out); on CPU time the ratio

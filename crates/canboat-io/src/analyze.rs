@@ -102,28 +102,39 @@ pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
 
         // Defensive: a stream that declared itself coalesced
         // (`# format=FAST`) but carries an 8-byte frame of a fast-packet
-        // PGN is almost certainly *single* frames mislabeled as
-        // coalesced — a complete coalesced fast-packet message is always
-        // > 8 bytes. In coalesced mode we skip reassembly, so we would
-        // decode only the first fragment and silently drop most fields.
-        // Warn once so the producer's mislabel is visible rather than
-        // corrupting output in silence.
-        if coalesced_mode
-            && !warned_mislabeled
-            && frame.data.len() <= 8
-            && db
-                .first_pgn(frame.pgn)
-                .or_else(|| db.fallback_pgn(frame.pgn))
-                .is_some_and(|p| matches!(p.packet_type, PacketType::Fast))
-        {
-            log::warn!(
-                "input declared a coalesced stream (# format=FAST) but carries an \
-                 8-byte frame of fast-packet PGN {}; this looks like single frames \
-                 mislabeled as coalesced — fast-packet PGNs will decode incompletely. \
-                 Re-emit the source with `# format=FRAMES` so the reassembler runs.",
-                frame.pgn
-            );
-            warned_mislabeled = true;
+        // PGN *that cannot fit in 8 bytes* is almost certainly single
+        // frames mislabeled as coalesced. In coalesced mode we skip
+        // reassembly, so we would decode only the first fragment and
+        // silently drop most fields. Warn once so the producer's
+        // mislabel is visible rather than corrupting output in silence.
+        //
+        // Only fire when *every* registered variant of the PGN needs
+        // more than 8 bytes: many proprietary fast-packet PGNs (e.g. B&G
+        // 130824, `MinLength` 2) legitimately fit a complete message in
+        // ≤ 8 bytes, and one PGN number can carry several manufacturer
+        // variants of differing lengths. If any variant could be
+        // complete at ≤ 8 bytes, an 8-byte frame is plausibly whole.
+        if coalesced_mode && !warned_mislabeled && frame.data.len() <= 8 {
+            let mut variants = db.pgn_variants(frame.pgn).peekable();
+            let all_fast_over_8 = variants.peek().is_some()
+                && variants.all(|p| {
+                    matches!(p.packet_type, PacketType::Fast)
+                        // Smallest complete message: a fixed `length`, else
+                        // `min_length`. Unknown (both None) → assume it may
+                        // be short, so this variant does not justify a warn.
+                        && p.length.or(p.min_length).is_some_and(|n| n > 8)
+                });
+            if all_fast_over_8 {
+                log::warn!(
+                    "input declared a coalesced stream (# format=FAST) but carries an \
+                     8-byte frame of fast-packet PGN {} (whose shortest complete message \
+                     exceeds 8 bytes); this looks like single frames mislabeled as \
+                     coalesced — fast-packet PGNs will decode incompletely. Re-emit the \
+                     source with `# format=FRAMES` so the reassembler runs.",
+                    frame.pgn
+                );
+                warned_mislabeled = true;
+            }
         }
 
         if cfg.suppress_startup_record && frame.pgn == CANBOAT_BEM {

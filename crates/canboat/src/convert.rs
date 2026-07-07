@@ -98,6 +98,12 @@ impl Args {
 }
 
 pub fn run(args: Args) -> Result<()> {
+    // Surface decode-path diagnostics (e.g. a stream mislabeled
+    // `# format=FAST` but carrying single frames) on stderr without
+    // polluting the converted stdout. Warnings show by default; set
+    // `RUST_LOG` for more. Ignore a double-init if a shim already set one.
+    let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
+        .try_init();
     let forced = args.from.as_deref().map(parse_format).transpose()?;
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());

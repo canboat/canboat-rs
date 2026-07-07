@@ -373,16 +373,6 @@ pub fn run(
             }
         }
 
-        // Lazy raw broadcast — one `# format=FAST` PLAIN line
-        // per coalesced `RawFrame`.
-        if raw_batch.has_subscribers() {
-            raw_line.clear();
-            if write_plain(&mut raw_line, &frame).is_ok() {
-                raw_line.push('\n');
-                raw_batch.push(&raw_line, now);
-            }
-        }
-
         // When the source already coalesces fast-packets (NGT-1,
         // iKonvert, Maretron, FAST-format stdin), the reassembler
         // must be skipped entirely. A coalesced fast-packet whose
@@ -419,6 +409,23 @@ pub fn run(
                 _ => continue,
             }
         };
+
+        // Lazy raw broadcast — one PLAIN line per *coalesced message*,
+        // i.e. the post-reassembly frame. This stream advertises
+        // `# format=FAST` (coalesced), so it must emit whole messages:
+        // broadcasting the pre-reassembly fragments here would label
+        // single CAN frames as coalesced and make downstream readers
+        // skip reassembly, so fast-packet PGNs would decode from only
+        // their first 8 bytes. Fragments (`Reassembled::Partial`) never
+        // reach this point — the `continue` above drops them.
+        if raw_batch.has_subscribers() {
+            raw_line.clear();
+            if write_plain(&mut raw_line, &assembled).is_ok() {
+                raw_line.push('\n');
+                raw_batch.push(&raw_line, now);
+            }
+        }
+
         let Ok(decoded) = db.decode(&assembled) else {
             continue;
         };

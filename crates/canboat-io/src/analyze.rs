@@ -92,12 +92,39 @@ pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
     // frame is assumed to be pre-assembled and the reassembler is
     // skipped. Mirror the analyzer binary 1:1.
     let mut coalesced_mode = false;
+    let mut warned_mislabeled = false;
     let mut reasm = Reassembler::new();
 
     while let Some(frame) = reader.read_frame()? {
         // A `# format=<NAME>` header (consumed inside `read_frame`)
         // may have declared an already-coalesced format.
         coalesced_mode |= reader.header_coalesced();
+
+        // Defensive: a stream that declared itself coalesced
+        // (`# format=FAST`) but carries an 8-byte frame of a fast-packet
+        // PGN is almost certainly *single* frames mislabeled as
+        // coalesced — a complete coalesced fast-packet message is always
+        // > 8 bytes. In coalesced mode we skip reassembly, so we would
+        // decode only the first fragment and silently drop most fields.
+        // Warn once so the producer's mislabel is visible rather than
+        // corrupting output in silence.
+        if coalesced_mode
+            && !warned_mislabeled
+            && frame.data.len() <= 8
+            && db
+                .first_pgn(frame.pgn)
+                .or_else(|| db.fallback_pgn(frame.pgn))
+                .is_some_and(|p| matches!(p.packet_type, PacketType::Fast))
+        {
+            log::warn!(
+                "input declared a coalesced stream (# format=FAST) but carries an \
+                 8-byte frame of fast-packet PGN {}; this looks like single frames \
+                 mislabeled as coalesced — fast-packet PGNs will decode incompletely. \
+                 Re-emit the source with `# format=FRAMES` so the reassembler runs.",
+                frame.pgn
+            );
+            warned_mislabeled = true;
+        }
 
         if cfg.suppress_startup_record && frame.pgn == CANBOAT_BEM {
             continue;

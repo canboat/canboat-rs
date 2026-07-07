@@ -123,7 +123,7 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     w.write_char('{')?;
     if let Some(ts) = &pgn.timestamp {
         w.write_str("\"timestamp\":")?;
-        write_json_string(w, ts)?;
+        write_json_string(w, &crate::format::normalize_timestamp(ts))?;
         w.write_char(',')?;
     }
     write!(
@@ -993,9 +993,11 @@ mod tests {
         let pgn = sample_pgn();
         let mut out = String::new();
         write_json(&mut out, &pgn, &JsonOptions::default()).unwrap();
+        // The sample timestamp lacks a trailing `Z`; the formatter
+        // canonicalises it to ISO-8601 UTC on emit.
         assert_eq!(
             out,
-            r#"{"timestamp":"2018-10-16T22:25:25.166","prio":3,"src":35,"dst":255,"pgn":128267,"description":"Water Depth","fields":{"Offset":0.000}}"#
+            r#"{"timestamp":"2018-10-16T22:25:25.166Z","prio":3,"src":35,"dst":255,"pgn":128267,"description":"Water Depth","fields":{"Offset":0.000}}"#
         );
     }
 

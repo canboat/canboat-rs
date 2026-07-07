@@ -235,13 +235,15 @@ where
     })
 }
 
-/// Write one PLAIN/FAST line to `w`. The timestamp is emitted exactly as
-/// stored (empty if `None`). Hex bytes are lowercase, two digits each.
+/// Write one PLAIN/FAST line to `w`. The timestamp is canonicalised via
+/// [`normalize_timestamp`](super::normalize_timestamp) (empty if `None`)
+/// so a comma-millis value never corrupts the comma-delimited line. Hex
+/// bytes are lowercase, two digits each.
 ///
 /// The output never includes a trailing newline; the caller decides.
 pub fn write_line<W: fmt::Write>(w: &mut W, frame: &RawFrame) -> fmt::Result {
     if let Some(ts) = &frame.timestamp {
-        w.write_str(ts)?;
+        w.write_str(&super::normalize_timestamp(ts))?;
     }
     write!(
         w,
@@ -291,8 +293,9 @@ mod tests {
 
     #[test]
     fn writes_round_trip() {
+        // A canonical timestamp round-trips unchanged.
         let frame = RawFrame::new(
-            Some("2011-04-25-06:25:03.603".into()),
+            Some("2011-04-25T06:25:03.603Z".into()),
             3,
             129029,
             36,
@@ -303,6 +306,23 @@ mod tests {
         write_line(&mut out, &frame).unwrap();
         let again = parse_line(&out).unwrap();
         assert_eq!(again, frame);
+    }
+
+    #[test]
+    fn write_canonicalises_classic_timestamp() {
+        // The classic canboat log form (dash before the time, no `Z`) is
+        // rewritten to ISO-8601 UTC on emit.
+        let frame = RawFrame::new(
+            Some("2011-04-25-06:25:03.603".into()),
+            3,
+            129029,
+            36,
+            255,
+            vec![0xe6, 0xf1, 0x3a, 0x80, 0x9c, 0xc6, 0x0d, 0xb3],
+        );
+        let mut out = String::new();
+        write_line(&mut out, &frame).unwrap();
+        assert!(out.starts_with("2011-04-25T06:25:03.603Z,"), "got {out}");
     }
 
     #[test]

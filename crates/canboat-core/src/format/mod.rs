@@ -15,6 +15,7 @@ pub mod ikonvert;
 pub mod maretron_ipg;
 pub mod ngt1;
 pub mod plain;
+pub mod timestamp;
 pub mod ydwg02;
 
 pub use ngt1::{
@@ -23,6 +24,7 @@ pub use ngt1::{
     encode_ngt_message, encode_startup_ping,
 };
 pub use plain::{ParseError as PlainError, parse_line as parse_plain, write_line as write_plain};
+pub use timestamp::normalize_timestamp;
 
 use crate::frame::RawFrame;
 

@@ -52,7 +52,7 @@ pub enum GeoFormat {
 pub fn write_text<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &TextOptions) -> fmt::Result {
     // Header: `<ts> <prio> <src:3> <dst:3> <pgn:6> <description>:`
     if let Some(ts) = &pgn.timestamp {
-        w.write_str(ts)?;
+        w.write_str(&crate::format::normalize_timestamp(ts))?;
         w.write_char(' ')?;
     }
     write!(

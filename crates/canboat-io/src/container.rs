@@ -364,7 +364,8 @@ mod tests {
         d.push_back(Source::Plain(one_record_pcap()));
         assert_eq!(
             read_all(d).trim(),
-            "2017-08-17-15:48:01.664,2,128267,35,255,8,ff,ff,ff,ff,ff,00,00,ff"
+            // The PLAIN writer canonicalises the timestamp to ISO-8601 UTC.
+            "2017-08-17T15:48:01.664Z,2,128267,35,255,8,ff,ff,ff,ff,ff,00,00,ff"
         );
     }
 

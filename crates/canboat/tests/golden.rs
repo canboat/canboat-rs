@@ -126,32 +126,22 @@ fn run_case_skipping(in_name: &str, expected_name: &str, args: &[&str], skip_lin
         String::from_utf8_lossy(&out.stderr)
     );
 
-    if skip_lines.is_empty() {
-        if out.stdout != expected {
-            let actual = String::from_utf8_lossy(&out.stdout);
-            let expected_str = String::from_utf8_lossy(&expected);
-            panic!(
-                "Golden mismatch for {in_name} → {expected_name}\n\
-                 --- expected ({} bytes) ---\n{}\n\
-                 --- actual ({} bytes) ---\n{}\n",
-                expected.len(),
-                expected_str,
-                out.stdout.len(),
-                actual,
-            );
-        }
-        return;
-    }
-
-    // Line-by-line compare with allowed skips.
+    // Line-by-line compare with allowed skips. Both sides are run
+    // through `canonicalise_timestamps` first: canboat C emits captured
+    // timestamps verbatim (comma-millis, bare time-of-day, dash-date),
+    // whereas canboat-rs normalises them to ISO-8601 UTC on output. Until
+    // the matching upstream change lands and these fixtures regenerate
+    // (see canboat/canboat#749), fold both sides to the same canonical form so
+    // the tests still assert everything *except* the timestamp
+    // reformatting. Once canboat C normalises too, this becomes a no-op.
     let actual_str = String::from_utf8(out.stdout).expect("utf-8 stdout");
     let expected_str = String::from_utf8(expected).expect("utf-8 expected");
-    let actual_lines: Vec<&str> = actual_str.lines().collect();
-    let expected_lines: Vec<&str> = expected_str.lines().collect();
+    let actual_lines: Vec<String> = actual_str.lines().map(canonicalise_timestamps).collect();
+    let expected_lines: Vec<String> = expected_str.lines().map(canonicalise_timestamps).collect();
     assert_eq!(
         actual_lines.len(),
         expected_lines.len(),
-        "line count differs: actual={} expected={}",
+        "line count differs for {in_name} → {expected_name}: actual={} expected={}",
         actual_lines.len(),
         expected_lines.len(),
     );
@@ -165,6 +155,34 @@ fn run_case_skipping(in_name: &str, expected_name: &str, args: &[&str], skip_lin
             );
         }
     }
+}
+
+/// Rewrite the timestamp on one output line to canboat-rs's canonical
+/// form, wherever it appears: the `"timestamp":"…"` field of a JSON
+/// record, or the leading whitespace-delimited token of a text line.
+/// Non-timestamp content is untouched (unrecognised values pass through
+/// [`normalize_timestamp`] verbatim).
+fn canonicalise_timestamps(line: &str) -> String {
+    use canboat_core::format::normalize_timestamp;
+
+    const KEY: &str = "\"timestamp\":\"";
+    if let Some(k) = line.find(KEY) {
+        let vstart = k + KEY.len();
+        if let Some(rel) = line[vstart..].find('"') {
+            let vend = vstart + rel;
+            let norm = normalize_timestamp(&line[vstart..vend]);
+            return format!("{}{}{}", &line[..vstart], norm, &line[vend..]);
+        }
+    }
+    // Text format: `<timestamp> <prio> <src> …`. Only the leading token
+    // can be a timestamp; normalise it if so, leave the rest verbatim.
+    if let Some(sp) = line.find(' ') {
+        let norm = normalize_timestamp(&line[..sp]);
+        if norm != line[..sp] {
+            return format!("{}{}", norm, &line[sp..]);
+        }
+    }
+    line.to_string()
 }
 
 #[test]
@@ -371,12 +389,14 @@ fn dms_format_text() {
         assert!(out.status.success(), "analyzer failed");
         combined.extend_from_slice(&out.stdout);
     }
+    // Same timestamp-canonicalisation bridge as `run_case_skipping`.
+    let combined_str = String::from_utf8(combined).expect("utf-8 stdout");
+    let expected_str = String::from_utf8(expected).expect("utf-8 expected");
+    let actual: Vec<String> = combined_str.lines().map(canonicalise_timestamps).collect();
+    let want: Vec<String> = expected_str.lines().map(canonicalise_timestamps).collect();
     assert_eq!(
-        combined,
-        expected,
-        "dms-format mismatch\nactual:\n{}\nexpected:\n{}",
-        String::from_utf8_lossy(&combined),
-        String::from_utf8_lossy(&expected),
+        actual, want,
+        "dms-format mismatch\nactual:\n{combined_str}\nexpected:\n{expected_str}",
     );
 }
 

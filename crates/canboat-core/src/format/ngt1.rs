@@ -28,26 +28,30 @@
 
 use crate::frame::RawFrame;
 
-const DLE: u8 = 0x10;
-const STX: u8 = 0x02;
-const ETX: u8 = 0x03;
+// Framing bytes are shared with the `.ebl` encoder in
+// [`crate::format::ebl`], hence `pub(crate)`. EBL framing is a superset
+// of NGT-1 framing (it adds `ESC SOH … ESC LF` header records), so the
+// decoder state machine stays here while the encoder lives next door.
+pub(crate) const DLE: u8 = 0x10;
+pub(crate) const STX: u8 = 0x02;
+pub(crate) const ETX: u8 = 0x03;
 /// Actisense `.ebl` log files frame each record with `ESC SOH ... ESC LF`
 /// (alongside the usual `DLE STX ... DLE ETX` NGT-1 frames inside). Inside
 /// any framed region ESC also doubles as an escape byte (`ESC ESC` for a
 /// literal 0x1b), so the framer can keep them distinguished from frame
 /// markers. ESC is only special in EBL mode.
-const ESC: u8 = 0x1b;
-const SOH: u8 = 0x01;
-const LF: u8 = 0x0a;
+pub(crate) const ESC: u8 = 0x1b;
+pub(crate) const SOH: u8 = 0x01;
+pub(crate) const LF: u8 = 0x0a;
 
 /// Difference between the Windows FILETIME epoch (1601-01-01) and the
 /// Unix epoch (1970-01-01), in milliseconds. EBL timestamp records carry
 /// a FILETIME (100-ns ticks since 1601); divide by 10_000 to get ms and
 /// subtract this to land on Unix ms.
-const FILETIME_TO_UNIX_MS: u64 = 11_644_473_600_000;
+pub(crate) const FILETIME_TO_UNIX_MS: u64 = 11_644_473_600_000;
 /// EBL header record types. Only `0x03` (timestamp) is currently emitted
 /// by Actisense's W2K-1 logger.
-const EBL_TIMESTAMP: u8 = 0x03;
+pub(crate) const EBL_TIMESTAMP: u8 = 0x03;
 
 /// Receive an N2K frame off the bus.
 pub const N2K_MSG_RECEIVED: u8 = 0x93;

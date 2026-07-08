@@ -22,7 +22,8 @@ use canboat_core::RawFrame;
 use canboat_core::format::InputFormat;
 use canboat_core::output::{GeoFormat, JsonOptions, TextOptions, write_json, write_text};
 use canboat_io::{
-    FrameReader, FrameWriter, LineFrameReader, PlainWriter, analyze, container, copy,
+    EblWriter, FrameReader, FrameWriter, LineFrameReader, PlainWriter, TextLineWriter, analyze,
+    container, copy,
 };
 
 /// Output format for `convert --to`.
@@ -34,6 +35,24 @@ enum OutFormat {
     Json,
     /// canboat human-readable text, one line per record.
     Text,
+    /// Yacht Devices YDWG-02 / YDEN received lines (raw frames).
+    Ydwg02,
+    /// Actisense N2K-ASCII lines (`A…`, raw frames).
+    Actisense,
+    /// Actisense `.ebl` binary log (raw frames).
+    #[value(name = "actisense-ebl")]
+    ActisenseEbl,
+}
+
+impl OutFormat {
+    /// Formats that re-encode raw frames (no PGN decode). Everything
+    /// else (`json`/`text`) runs the analyzer decode pipeline.
+    fn is_frame_level(self) -> bool {
+        matches!(
+            self,
+            OutFormat::Plain | OutFormat::Ydwg02 | OutFormat::Actisense | OutFormat::ActisenseEbl
+        )
+    }
 }
 
 /// Input line format for `convert --from`. When omitted, the format is
@@ -103,9 +122,12 @@ Container files (unwrapped automatically by file extension):
   .nif               Navico Information File (filtered + raw capture groups)
 
 Output formats (--to, default plain):
-  plain   canboat PLAIN/FAST lines (raw frames, no decode)
-  json    one decoded JSON object per record
-  text    canboat human-readable text, one line per record";
+  plain          canboat PLAIN/FAST lines (raw frames, no decode)
+  json           one decoded JSON object per record
+  text           canboat human-readable text, one line per record
+  ydwg02         Yacht Devices YDWG-02 / YDEN received lines (raw frames)
+  actisense      Actisense N2K-ASCII lines (raw frames)
+  actisense-ebl  Actisense .ebl binary log (raw frames)";
 
 #[derive(Debug, clap::Args)]
 pub struct Args {
@@ -178,30 +200,38 @@ pub fn run(args: Args) -> Result<()> {
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
-    match args.to {
-        OutFormat::Plain => convert_raw(&args, forced, &mut out),
-        OutFormat::Json | OutFormat::Text => convert_decoded(&args, forced, &mut out),
+    if args.to.is_frame_level() {
+        convert_raw(&args, forced, &mut out)
+    } else {
+        convert_decoded(&args, forced, &mut out)
     }
 }
 
-/// Raw path: input frames → PLAIN lines, no decode. The no-filter
-/// case is exactly [`canboat_io::copy`]; with filters we run the same
-/// pull loop with a per-frame predicate.
+/// Raw path: input frames → the selected frame-level format, no decode.
+/// The no-filter case is exactly [`canboat_io::copy`]; with filters we
+/// run the same pull loop with a per-frame predicate. The writer is
+/// chosen by `--to` (PLAIN / YDWG02 / Actisense ASCII / Actisense EBL).
 fn convert_raw<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut W) -> Result<()> {
     let source = open_source(args.input(), args.container_opts())?;
     let mut reader = match forced {
         Some(fmt) => LineFrameReader::with_format(source, fmt),
         None => LineFrameReader::new(source),
     };
-    let mut writer = PlainWriter::new(out);
+    let mut writer: Box<dyn FrameWriter + '_> = match args.to {
+        OutFormat::Plain => Box::new(PlainWriter::new(out)),
+        OutFormat::Ydwg02 => Box::new(TextLineWriter::ydwg02(out)),
+        OutFormat::Actisense => Box::new(TextLineWriter::actisense(out)),
+        OutFormat::ActisenseEbl => Box::new(EblWriter::new(out)),
+        OutFormat::Json | OutFormat::Text => unreachable!("decoded formats routed elsewhere"),
+    };
 
     if !args.has_filter() {
-        copy(&mut reader, &mut writer).context("converting to PLAIN")?;
+        copy(&mut reader, &mut *writer).context("converting frames")?;
         return Ok(());
     }
     while let Some(frame) = reader.read_frame().context("reading input")? {
         if args.keep(&frame) {
-            writer.write_frame(&frame).context("writing PLAIN")?;
+            writer.write_frame(&frame).context("writing frame")?;
         }
     }
     writer.flush().context("flushing output")?;

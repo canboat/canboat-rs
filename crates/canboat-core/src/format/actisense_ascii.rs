@@ -16,10 +16,32 @@
 //!
 //! Mirrors `parseRawFormatActisenseN2KAscii` in canboat/common/parse.c.
 
+use std::fmt;
+
 use smallvec::SmallVec;
 
 use crate::format::plain::ParseError;
+use crate::format::timestamp::time_of_day;
 use crate::frame::RawFrame;
+
+/// Encode `frame` as an Actisense N2K-ASCII line (no trailing newline):
+/// `A<HHMMSS.mmm> <SDP:X> <PGN:X> <contiguous upper-case hex>`, where
+/// `SDP = (src << 12) | (dst << 4) | prio`. The inverse of [`parse_line`];
+/// data bytes are packed as one hex run, as canboat emits them.
+pub fn write_line<W: fmt::Write>(w: &mut W, frame: &RawFrame) -> fmt::Result {
+    // Actisense's time token has no colons: HHMMSS.mmm.
+    let mut tod = time_of_day(frame.timestamp.as_deref());
+    tod.retain(|c| c != ':');
+    let sdp = ((frame.src as u32) << 12) | ((frame.dst as u32) << 4) | (frame.prio as u32);
+    write!(w, "A{tod} {sdp:X} {pgn:X}", pgn = frame.pgn)?;
+    if !frame.data.is_empty() {
+        w.write_char(' ')?;
+        for b in &frame.data {
+            write!(w, "{b:02X}")?;
+        }
+    }
+    Ok(())
+}
 
 pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -171,5 +193,43 @@ mod tests {
     fn rejects_missing_timestamp_prefix() {
         let line = "173321.107 23FF7 1F119";
         assert!(parse_line(line).is_err());
+    }
+
+    #[test]
+    fn write_line_round_trips_through_parse() {
+        let frame = RawFrame {
+            timestamp: Some("2026-01-01T17:33:21.107Z".into()),
+            prio: 7,
+            pgn: 0x1f119,
+            src: 0x23,
+            dst: 0xff,
+            data: [1, 2, 3, 4, 5, 6, 7, 8].into_iter().collect(),
+        };
+        let mut line = String::new();
+        write_line(&mut line, &frame).unwrap();
+        assert_eq!(line, "A173321.107 23FF7 1F119 0102030405060708");
+        let back = parse_line(&line).unwrap();
+        assert_eq!(
+            (back.prio, back.pgn, back.src, back.dst),
+            (7, 0x1f119, 0x23, 0xff)
+        );
+        assert_eq!(&back.data[..], &[1, 2, 3, 4, 5, 6, 7, 8]);
+        // Timestamp survives as the same instant (parser stores comma form).
+        assert_eq!(back.timestamp.as_deref(), Some("17:33:21,107"));
+    }
+
+    #[test]
+    fn write_line_empty_data() {
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 3,
+            pgn: 0x1f119,
+            src: 1,
+            dst: 2,
+            data: SmallVec::new(),
+        };
+        let mut line = String::new();
+        write_line(&mut line, &frame).unwrap();
+        assert_eq!(line, "A000000.000 1023 1F119");
     }
 }

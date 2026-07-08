@@ -53,6 +53,80 @@ pub fn normalize_timestamp(ts: &str) -> Cow<'_, str> {
     Cow::Borrowed(ts)
 }
 
+/// Parse a date-bearing timestamp (`YYYY-MM-DD` then `T`/`-`/space then
+/// `HH:MM:SS` with an optional `.`/`,` fraction) to Unix milliseconds.
+/// Returns `None` for a time-only or unrecognised value. Sans-clock —
+/// derived purely from the string. Mirrors `canboat/replay/replay.c`.
+pub fn to_unix_ms(ts: &str) -> Option<i64> {
+    let b = ts.as_bytes();
+    if b.len() < 19 {
+        return None;
+    }
+    let take = |r: std::ops::Range<usize>| std::str::from_utf8(&b[r]).ok();
+    let y: i64 = take(0..4)?.parse().ok()?;
+    let mo: i64 = take(5..7)?.parse().ok()?;
+    let d: i64 = take(8..10)?.parse().ok()?;
+    let h: i64 = take(11..13)?.parse().ok()?;
+    let mi: i64 = take(14..16)?.parse().ok()?;
+    let s: i64 = take(17..19)?.parse().ok()?;
+    if b[4] != b'-'
+        || b[7] != b'-'
+        || !matches!(b[10], b'T' | b'-' | b' ')
+        || b[13] != b':'
+        || b[16] != b':'
+    {
+        return None;
+    }
+    let mut ms: i64 = 0;
+    if b.len() >= 23
+        && (b[19] == b'.' || b[19] == b',')
+        && let Some(v) = take(20..23).and_then(|s| s.parse::<i64>().ok())
+    {
+        ms = v;
+    }
+    let days = days_since_epoch(y, mo, d)?;
+    Some((days * 86_400 + h * 3600 + mi * 60 + s) * 1000 + ms)
+}
+
+/// Days since the Unix epoch for a civil date. Public-domain
+/// days-from-civil algorithm (Howard Hinnant); inverse of the
+/// `days_to_ymd` used by the YDWG02 parser.
+fn days_since_epoch(y: i64, m: i64, d: i64) -> Option<i64> {
+    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
+        return None;
+    }
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = (if y >= 0 { y } else { y - 399 }) / 400;
+    let yoe = y - era * 400;
+    let mp = if m > 2 { m - 3 } else { m + 9 };
+    let doy = (153 * mp + 2) / 5 + d - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    Some(era * 146_097 + doe - 719_468)
+}
+
+/// Extract the `HH:MM:SS.mmm` time-of-day from a timestamp for the
+/// time-only wire formats (YDWG02, Actisense ASCII). The input is first
+/// run through [`normalize_timestamp`], so a date-bearing value yields
+/// its time part and a bare time is normalised in place. Returns
+/// `00:00:00.000` when the source is absent or unrecognised.
+pub fn time_of_day(ts: Option<&str>) -> String {
+    let Some(raw) = ts else {
+        return "00:00:00.000".to_string();
+    };
+    let norm = normalize_timestamp(raw);
+    let s = norm.as_ref();
+    let b = s.as_bytes();
+    // Date-bearing canonical `YYYY-MM-DDTHH:MM:SS.mmmZ`: time at [11..23].
+    if b.len() == 24 && b[10] == b'T' {
+        return s[11..23].to_string();
+    }
+    // Time-only canonical `HH:MM:SS.mmm`.
+    if b.len() == 12 && b[2] == b':' {
+        return s.to_string();
+    }
+    "00:00:00.000".to_string()
+}
+
 /// True when `ts` is already exactly `YYYY-MM-DDTHH:MM:SS.mmmZ`.
 fn is_canonical(ts: &str) -> bool {
     let b = ts.as_bytes();
@@ -199,5 +273,36 @@ mod tests {
     fn out_of_range_time_is_left_verbatim() {
         // 25:00:00 is not a valid time — don't pretend to normalise it.
         assert_eq!(normalize_timestamp("25:00:00"), "25:00:00");
+    }
+
+    #[test]
+    fn time_of_day_from_date_bearing() {
+        assert_eq!(time_of_day(Some("2011-04-25-06:25:03.603")), "06:25:03.603");
+        assert_eq!(
+            time_of_day(Some("2026-07-06T23:24:29.065Z")),
+            "23:24:29.065"
+        );
+    }
+
+    #[test]
+    fn time_of_day_from_time_only_and_absent() {
+        assert_eq!(time_of_day(Some("17:33:21,107")), "17:33:21.107");
+        assert_eq!(time_of_day(Some("20:11:00")), "20:11:00.000");
+        assert_eq!(time_of_day(None), "00:00:00.000");
+        assert_eq!(time_of_day(Some("garbage")), "00:00:00.000");
+    }
+
+    #[test]
+    fn to_unix_ms_known_values() {
+        assert_eq!(to_unix_ms("1970-01-01T00:00:00.000"), Some(0));
+        assert_eq!(to_unix_ms("1970-01-01-00:00:01.000"), Some(1000));
+        // 2025-04-25 17:05:21.993Z — the EBL sample instant.
+        assert_eq!(
+            to_unix_ms("2025-04-25T17:05:21.993Z"),
+            Some(1_745_600_721_993)
+        );
+        // Time-only / unrecognised → None.
+        assert_eq!(to_unix_ms("17:33:21.107"), None);
+        assert_eq!(to_unix_ms("garbage"), None);
     }
 }

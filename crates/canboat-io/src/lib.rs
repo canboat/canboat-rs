@@ -16,7 +16,9 @@ pub mod device;
 pub mod fastpacket;
 pub mod stream;
 
-pub use stream::{FrameReader, FrameWriter, LineFrameReader, PlainWriter, copy};
+pub use stream::{
+    EblWriter, FrameReader, FrameWriter, LineFrameReader, PlainWriter, TextLineWriter, copy,
+};
 
 use std::io::{self, BufRead, Read, Write};
 use std::time::Duration;

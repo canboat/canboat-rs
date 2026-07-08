@@ -10,6 +10,7 @@
 pub mod actisense_ascii;
 pub mod airmar;
 pub mod chetco;
+pub mod ebl;
 pub mod garmin_csv;
 pub mod ikonvert;
 pub mod maretron_ipg;

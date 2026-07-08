@@ -22,7 +22,10 @@ use std::io::{self, BufRead, Write};
 use std::sync::mpsc;
 
 use canboat_core::RawFrame;
+use canboat_core::format::actisense_ascii::write_line as write_actisense;
+use canboat_core::format::ebl::encode_frame as encode_ebl;
 use canboat_core::format::plain::write_line as write_plain;
+use canboat_core::format::ydwg02::write_line as write_ydwg02;
 use canboat_core::format::{
     InputFormat, detect, header_implies_coalesced, parse_format_header, parse_with,
 };
@@ -200,6 +203,77 @@ impl<W: Write> FrameWriter for PlainWriter<W> {
         write_plain(&mut self.buf, frame).expect("PLAIN write to String");
         self.buf.push('\n');
         self.inner.write_all(self.buf.as_bytes())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A [`FrameWriter`] emitting one line per frame via a core text
+/// encoder (`fn(&mut String, &RawFrame)`), used for the YDWG02 and
+/// Actisense-ASCII output formats. Mirrors [`PlainWriter`].
+pub struct TextLineWriter<W: Write> {
+    inner: W,
+    buf: String,
+    encode: fn(&mut String, &RawFrame) -> std::fmt::Result,
+}
+
+impl<W: Write> TextLineWriter<W> {
+    /// YDWG02 / YDEN received lines (`<time> R <canid> <hex…>`).
+    pub fn ydwg02(inner: W) -> Self {
+        Self::new(inner, write_ydwg02)
+    }
+
+    /// Actisense N2K-ASCII lines (`A<time> <sdp> <pgn> <hex>`).
+    pub fn actisense(inner: W) -> Self {
+        Self::new(inner, write_actisense)
+    }
+
+    fn new(inner: W, encode: fn(&mut String, &RawFrame) -> std::fmt::Result) -> Self {
+        Self {
+            inner,
+            buf: String::with_capacity(256),
+            encode,
+        }
+    }
+}
+
+impl<W: Write> FrameWriter for TextLineWriter<W> {
+    fn write_frame(&mut self, frame: &RawFrame) -> io::Result<()> {
+        self.buf.clear();
+        (self.encode)(&mut self.buf, frame).expect("text write to String");
+        self.buf.push('\n');
+        self.inner.write_all(self.buf.as_bytes())
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// A [`FrameWriter`] emitting each frame as an Actisense `.ebl` binary
+/// record pair (timestamp header + `N2K_MSG_RECEIVED`). No line
+/// terminator — the framing is self-delimiting.
+pub struct EblWriter<W: Write> {
+    inner: W,
+    buf: Vec<u8>,
+}
+
+impl<W: Write> EblWriter<W> {
+    pub fn new(inner: W) -> Self {
+        Self {
+            inner,
+            buf: Vec::with_capacity(256),
+        }
+    }
+}
+
+impl<W: Write> FrameWriter for EblWriter<W> {
+    fn write_frame(&mut self, frame: &RawFrame) -> io::Result<()> {
+        self.buf.clear();
+        encode_ebl(frame, &mut self.buf);
+        self.inner.write_all(&self.buf)
     }
 
     fn flush(&mut self) -> io::Result<()> {

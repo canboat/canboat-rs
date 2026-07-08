@@ -19,10 +19,30 @@
 //!
 //! Mirrors `parseRawFormatYDWG02` in canboat/common/parse.c.
 
+use std::fmt;
+
 use smallvec::SmallVec;
 
 use crate::format::plain::ParseError;
+use crate::format::timestamp::time_of_day;
 use crate::frame::RawFrame;
+
+/// Encode `frame` as a YDWG-02 / YDEN *received* line (no trailing
+/// newline): `<HH:MM:SS.mmm> R <CANID:08X> <HH HH …>`, upper-case hex,
+/// one space-separated byte each. The inverse of [`parse_line`] for the
+/// receive direction. Mirrors the shape in `parseRawFormatYDWG02`.
+pub fn write_line<W: fmt::Write>(w: &mut W, frame: &RawFrame) -> fmt::Result {
+    let canid = iso11783_compose(frame.prio, frame.pgn, frame.src, frame.dst);
+    write!(
+        w,
+        "{} R {canid:08X}",
+        time_of_day(frame.timestamp.as_deref())
+    )?;
+    for b in &frame.data {
+        write!(w, " {b:02X}")?;
+    }
+    Ok(())
+}
 
 pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {
     let line = line.trim_end_matches(['\r', '\n']);
@@ -134,6 +154,24 @@ pub fn iso11783_decompose(id: u32) -> (u8, u32, u8, u8) {
     (prio, pgn, src, dst)
 }
 
+/// Build the 29-bit ISO 11783 CAN identifier from N2K fields — the
+/// inverse of [`iso11783_decompose`]. Mirrors `getCanIdFromISO11783Bits`
+/// in canboat/common/common.c. For a PDU1 PGN (PF < 240) the `dst`
+/// occupies the PS byte; for PDU2 it is part of the PGN and `dst` is
+/// ignored (always the 0xFF broadcast on decode).
+pub fn iso11783_compose(prio: u8, pgn: u32, src: u8, dst: u8) -> u32 {
+    let mut id = src as u32;
+    let pf = (pgn >> 8) & 0xff;
+    if pf < 240 {
+        id |= (dst as u32) << 8;
+        id |= pgn << 8;
+    } else {
+        id |= pgn << 8;
+    }
+    id |= (prio as u32) << 26;
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -175,5 +213,62 @@ mod tests {
         assert_eq!(f.pgn, 0xee00);
         assert_eq!(f.dst, 0xff);
         assert_eq!(f.src, 0x05);
+    }
+
+    #[test]
+    fn compose_is_inverse_of_decompose() {
+        // PDU2 (dst is not encoded — decode yields 0xff).
+        assert_eq!(
+            iso11783_decompose(iso11783_compose(3, 0x1f50b, 0x23, 0xff)),
+            (3, 0x1f50b, 0x23, 0xff)
+        );
+        // PDU1 (dst rides in the PS byte).
+        assert_eq!(
+            iso11783_decompose(iso11783_compose(6, 0xee00, 0x05, 0xff)),
+            (6, 0xee00, 0x05, 0xff)
+        );
+        assert_eq!(
+            iso11783_decompose(iso11783_compose(2, 0xef00, 0x11, 0x22)),
+            (2, 0xef00, 0x11, 0x22)
+        );
+    }
+
+    #[test]
+    fn write_line_round_trips_through_parse() {
+        let frame = RawFrame {
+            timestamp: Some("2026-01-01T00:17:55.475Z".into()),
+            prio: 3,
+            pgn: 0x1f50b,
+            src: 0x23,
+            dst: 0xff,
+            data: [0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0x00, 0xff]
+                .into_iter()
+                .collect(),
+        };
+        let mut line = String::new();
+        write_line(&mut line, &frame).unwrap();
+        assert_eq!(line, "00:17:55.475 R 0DF50B23 FF FF FF FF FF 00 00 FF");
+        let back = parse_line(&line).unwrap();
+        assert_eq!(
+            (back.prio, back.pgn, back.src, back.dst),
+            (3, 0x1f50b, 0x23, 0xff)
+        );
+        assert_eq!(back.data.as_slice(), frame.data.as_slice());
+        assert!(back.timestamp.as_deref().unwrap().contains("00:17:55.475"));
+    }
+
+    #[test]
+    fn write_line_empty_data() {
+        let frame = RawFrame {
+            timestamp: None,
+            prio: 6,
+            pgn: 0xee00,
+            src: 0x05,
+            dst: 0xff,
+            data: SmallVec::new(),
+        };
+        let mut line = String::new();
+        write_line(&mut line, &frame).unwrap();
+        assert_eq!(line, "00:00:00.000 R 18EEFF05");
     }
 }

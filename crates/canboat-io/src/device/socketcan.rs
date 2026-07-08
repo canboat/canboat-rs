@@ -243,7 +243,6 @@ mod imp {
         ((y + i64::from(m <= 2)) as i32, m, d)
     }
 
-
     /// Build the 64-bit ISO NAME from a [`Config`].
     fn build_name(config: &Config) -> u64 {
         let unique = if config.unique != 0 {

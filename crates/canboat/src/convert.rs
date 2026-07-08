@@ -121,7 +121,7 @@ Container files (unwrapped automatically by file extension):
   .pcap / .pcap.gz   libpcap SocketCAN capture (link-type 227)
   .nif               Navico Information File (filtered + raw capture groups)
 
-Output formats (--to, default plain):
+Output formats (--to, default json):
   plain          canboat PLAIN/FAST lines (raw frames, no decode)
   json           one decoded JSON object per record
   text           canboat human-readable text, one line per record
@@ -147,7 +147,7 @@ pub struct Args {
     from: Option<FromFormat>,
 
     /// Output format.
-    #[arg(long, value_enum, default_value_t = OutFormat::Plain)]
+    #[arg(long, value_enum, default_value_t = OutFormat::Json)]
     to: OutFormat,
 
     /// Filter: only emit frames with this source address.

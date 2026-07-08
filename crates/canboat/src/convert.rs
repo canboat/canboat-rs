@@ -36,6 +36,77 @@ enum OutFormat {
     Text,
 }
 
+/// Input line format for `convert --from`. When omitted, the format is
+/// auto-detected from the first line. Mirrors the ASCII line formats
+/// canboat itself recognises.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+enum FromFormat {
+    /// canboat PLAIN / FAST — `<ts>,<prio>,<pgn>,<src>,<dst>,<len>,<hex>…`.
+    #[value(name = "plain", alias = "fast")]
+    Plain,
+    /// PLAIN with single frames interleaved among coalesced fast-packets.
+    #[value(name = "plain-mix-fast")]
+    PlainMixFast,
+    /// Actisense NGT-1 ASCII (`A<time> …`).
+    #[value(name = "actisense", alias = "actisense-ascii")]
+    Actisense,
+    /// Yacht Devices YDWG-02 / YDEN (`<time> R/T <canid> <hex>…`).
+    #[value(name = "ydwg02", alias = "yden")]
+    Ydwg02,
+    /// Digital Yacht iKonvert (`!PDGY,<pgn>,…`).
+    #[value(name = "ikonvert")]
+    Ikonvert,
+    /// Airmar (`<ts> - <pgn> <canid> <hex>…`).
+    #[value(name = "airmar")]
+    Airmar,
+    /// Chetco sea-gauge (`$PCDIN,…`).
+    #[value(name = "chetco")]
+    Chetco,
+    /// Garmin CSV (relative ms-since-boot timestamps).
+    #[value(name = "garmin", alias = "garmin-csv")]
+    Garmin,
+    /// Garmin CSV2 (absolute timestamps + `Processed PGN` column).
+    #[value(name = "garmin-csv2")]
+    GarminCsv2,
+}
+
+impl FromFormat {
+    /// Map to the canboat-core parser selector.
+    fn to_input_format(self) -> InputFormat {
+        match self {
+            FromFormat::Plain => InputFormat::Plain,
+            FromFormat::PlainMixFast => InputFormat::PlainMixFast,
+            FromFormat::Actisense => InputFormat::ActisenseAscii,
+            FromFormat::Ydwg02 => InputFormat::Ydwg02,
+            FromFormat::Ikonvert => InputFormat::Ikonvert,
+            FromFormat::Airmar => InputFormat::Airmar,
+            FromFormat::Chetco => InputFormat::Chetco,
+            FromFormat::Garmin => InputFormat::GarminCsv,
+            FromFormat::GarminCsv2 => InputFormat::GarminCsv2,
+        }
+    }
+}
+
+/// Long help for `canboat convert --help`. Kept next to the parser and
+/// wired into the subcommand from `main.rs` (clap takes the subcommand's
+/// short `about` from the enum variant's doc comment, so `long_about`
+/// has to be attached there).
+pub const LONG_ABOUT: &str = "\
+Convert a capture between formats: any supported input → PLAIN, JSON, or text.
+
+Input line formats (auto-detected from the first line, or forced with --from):
+  plain, plain-mix-fast, actisense, ydwg02, ikonvert, airmar, chetco,
+  garmin, garmin-csv2.
+
+Container files (unwrapped automatically by file extension):
+  .pcap / .pcap.gz   libpcap SocketCAN capture (link-type 227)
+  .nif               Navico Information File (filtered + raw capture groups)
+
+Output formats (--to, default plain):
+  plain   canboat PLAIN/FAST lines (raw frames, no decode)
+  json    one decoded JSON object per record
+  text    canboat human-readable text, one line per record";
+
 #[derive(Debug, clap::Args)]
 pub struct Args {
     /// Input file. A `.pcap` / `.pcap.gz` / `.nif` container is
@@ -48,11 +119,10 @@ pub struct Args {
     #[arg(value_name = "FILE", conflicts_with = "file")]
     file_pos: Option<PathBuf>,
 
-    /// Force the input format instead of auto-detecting it. One of:
-    /// plain, plain-mix-fast, actisense, ydwg02, ikonvert, airmar,
-    /// chetco, garmin, garmin-csv2.
-    #[arg(long, value_name = "NAME")]
-    from: Option<String>,
+    /// Force the input line format instead of auto-detecting it from
+    /// the first line. Ignored for `.pcap`/`.nif` containers.
+    #[arg(long, value_enum, value_name = "FORMAT")]
+    from: Option<FromFormat>,
 
     /// Output format.
     #[arg(long, value_enum, default_value_t = OutFormat::Plain)]
@@ -104,7 +174,7 @@ pub fn run(args: Args) -> Result<()> {
     // `RUST_LOG` for more. Ignore a double-init if a shim already set one.
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .try_init();
-    let forced = args.from.as_deref().map(parse_format).transpose()?;
+    let forced = args.from.map(FromFormat::to_input_format);
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
@@ -213,21 +283,4 @@ impl Args {
             && self.dst.is_none_or(|d| frame.dst == d)
             && self.pgn.is_none_or(|p| frame.pgn == p)
     }
-}
-
-/// Map a `--from` name to an [`InputFormat`]. Mirrors the analyzer
-/// binary's `--format` spellings.
-fn parse_format(name: &str) -> Result<InputFormat> {
-    Ok(match name.to_ascii_lowercase().as_str() {
-        "plain" | "fast" | "plain_or_fast" => InputFormat::Plain,
-        "plain_mix_fast" | "plain-mix-fast" => InputFormat::PlainMixFast,
-        "actisense" | "actisense-ascii" | "actisense_n2k_ascii" => InputFormat::ActisenseAscii,
-        "ydwg02" | "yden" => InputFormat::Ydwg02,
-        "ikonvert" => InputFormat::Ikonvert,
-        "airmar" => InputFormat::Airmar,
-        "chetco" => InputFormat::Chetco,
-        "garmin" | "garmin-csv" | "garmin_csv1" => InputFormat::GarminCsv,
-        "garmin-csv2" | "garmin_csv2" => InputFormat::GarminCsv2,
-        other => anyhow::bail!("unknown --from format {other:?}"),
-    })
 }

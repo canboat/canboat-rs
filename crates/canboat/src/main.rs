@@ -43,6 +43,7 @@ struct Cli {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Convert a capture between formats (any input → PLAIN / JSON / text).
+    #[command(long_about = convert::LONG_ABOUT)]
     Convert(convert::Args),
 
     /// Bridge a live gateway (NGT-1 / iKonvert / Maretron / SocketCAN) to/from stdout.

@@ -89,9 +89,15 @@ pub fn to_unix_ms(ts: &str) -> Option<i64> {
 }
 
 /// Days since the Unix epoch for a civil date. Public-domain
-/// days-from-civil algorithm (Howard Hinnant); inverse of the
-/// `days_to_ymd` used by the YDWG02 parser.
-fn days_since_epoch(y: i64, m: i64, d: i64) -> Option<i64> {
+/// days-from-civil algorithm (Howard Hinnant); inverse of
+/// [`days_to_ymd`]. Returns `None` when the arguments are out of range
+/// (month 1..=12, day 1..=31).
+///
+/// The canonical calendar helper — every timestamp formatter/parser
+/// across the workspace (converters, `output`, `startup`, `replay`,
+/// n2kd, the SocketCAN/quirk synthesisers) shares this one copy rather
+/// than carrying its own.
+pub fn days_since_epoch(y: i64, m: i64, d: i64) -> Option<i64> {
     if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
         return None;
     }
@@ -102,6 +108,24 @@ fn days_since_epoch(y: i64, m: i64, d: i64) -> Option<i64> {
     let doy = (153 * mp + 2) / 5 + d - 1;
     let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
     Some(era * 146_097 + doe - 719_468)
+}
+
+/// Civil `(year, month, day)` for a count of days since 1970-01-01.
+/// Public-domain civil-from-days algorithm (Howard Hinnant); the
+/// inverse of [`days_since_epoch`]. The shared copy for the whole
+/// workspace (see that function's note).
+pub fn days_to_ymd(days: i64) -> (i32, u32, u32) {
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z - era * 146_097;
+    let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+    let y = (yoe + era * 400) as i32;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
+    let m = (if mp < 10 { mp + 3 } else { mp - 9 }) as u32;
+    let y = if m <= 2 { y + 1 } else { y };
+    (y, m, d)
 }
 
 /// Extract the `HH:MM:SS.mmm` time-of-day from a timestamp for the
@@ -304,5 +328,21 @@ mod tests {
         // Time-only / unrecognised → None.
         assert_eq!(to_unix_ms("17:33:21.107"), None);
         assert_eq!(to_unix_ms("garbage"), None);
+    }
+
+    #[test]
+    fn days_to_ymd_known_values() {
+        assert_eq!(days_to_ymd(0), (1970, 1, 1));
+        assert_eq!(days_to_ymd(1), (1970, 1, 2));
+        assert_eq!(days_to_ymd(19245), (2022, 9, 10));
+        assert_eq!(days_to_ymd(19782), (2024, 2, 29)); // leap day
+    }
+
+    #[test]
+    fn days_round_trip_through_epoch() {
+        for &(y, m, d) in &[(1970, 1, 1), (2024, 2, 29), (2026, 7, 9), (1601, 1, 1)] {
+            let days = days_since_epoch(y, m, d).unwrap();
+            assert_eq!(days_to_ymd(days), (y as i32, m as u32, d as u32));
+        }
     }
 }

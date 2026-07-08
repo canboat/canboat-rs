@@ -22,6 +22,7 @@ use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use canboat_core::RawFrame;
+use canboat_core::format::days_to_ymd;
 
 /// NMEA 2000 PGN numbers the matcher cares about.
 const PGN_ISO_REQUEST: u32 = 59904;
@@ -245,19 +246,6 @@ fn now_iso() -> String {
     let (y, mo, d) = days_to_ymd(days);
     let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
     format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
-}
-
-fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    ((y + i64::from(m <= 2)) as i32, m, d)
 }
 
 #[cfg(test)]

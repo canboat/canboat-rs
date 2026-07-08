@@ -25,8 +25,8 @@
 
 use smallvec::SmallVec;
 
+use crate::format::common::iso11783_decompose;
 use crate::format::plain::ParseError;
-use crate::format::ydwg02::iso11783_decompose;
 use crate::frame::{FASTPACKET_MAX_SIZE, RawFrame};
 
 pub fn parse_line(line: &str) -> Result<RawFrame, ParseError> {

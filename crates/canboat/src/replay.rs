@@ -22,6 +22,7 @@ use std::thread;
 use std::time::Duration;
 
 use anyhow::Result;
+use canboat_core::format::days_since_epoch;
 
 #[derive(Debug, clap::Args)]
 #[command(after_help = canboat_cli::help_footer())]
@@ -128,22 +129,6 @@ fn parse_timestamp_ms(line: &str) -> Option<i64> {
     let days = days_since_epoch(y, mo as i64, d as i64)?;
     let secs = days * 86_400 + (h as i64) * 3600 + (m as i64) * 60 + s as i64;
     Some(secs * 1000 + ms)
-}
-
-/// Days from 1970-01-01 (inclusive) to the given civil date.
-/// Howard Hinnant's days-from-civil algorithm. Returns `None` only
-/// on grossly out-of-range inputs (we accept the full canboat date
-/// surface so realistically this never trips).
-fn days_since_epoch(y: i64, m: i64, d: i64) -> Option<i64> {
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    let y = if m <= 2 { y - 1 } else { y };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = (y - era * 400) as u32; // [0, 399]
-    let doy = (153 * (if m > 2 { m - 3 } else { m + 9 }) + 2) / 5 + d - 1; // [0, 365]
-    let doe = yoe as i64 * 365 + (yoe as i64 / 4) - (yoe as i64 / 100) + doy; // [0, 146096]
-    Some(era * 146_097 + doe - 719_468)
 }
 
 #[cfg(test)]

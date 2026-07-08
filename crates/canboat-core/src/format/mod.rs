@@ -10,6 +10,7 @@
 pub mod actisense_ascii;
 pub mod airmar;
 pub mod chetco;
+pub mod common;
 pub mod ebl;
 pub mod garmin_csv;
 pub mod ikonvert;
@@ -19,13 +20,14 @@ pub mod plain;
 pub mod timestamp;
 pub mod ydwg02;
 
+pub use common::{iso11783_compose, iso11783_decompose};
 pub use ngt1::{
     EblHeader, N2K_MSG_RECEIVED, N2K_MSG_SEND, NGT_MSG_RECEIVED, NGT_MSG_SEND, NGT_STARTUP_SEQ,
     Ngt1Decoder, NgtError, NgtEvent, NgtMessage, encode_n2k_send_frame, encode_n2k_send_payload,
     encode_ngt_message, encode_startup_ping,
 };
 pub use plain::{ParseError as PlainError, parse_line as parse_plain, write_line as write_plain};
-pub use timestamp::normalize_timestamp;
+pub use timestamp::{days_since_epoch, days_to_ymd, normalize_timestamp};
 
 use crate::frame::RawFrame;
 

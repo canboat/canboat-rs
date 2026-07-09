@@ -553,21 +553,34 @@ async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Re
         s.status.snapshot_loaded = true;
         return Ok(());
     }
+    let mut guard = state.lock().await;
+    seed_state_from_snapshot(&mut guard, doc)?;
+    guard.status.snapshot_loaded = true;
+    Ok(())
+}
+
+/// Parse a snapshot document (banner already stripped) and seed
+/// `state` with every `(pgn, src, secondary)` record it holds.
+///
+/// Handles both snapshot layouts: the default canboat-C layout keys
+/// each group by the numeric PGN and stores bare `-json` records, while
+/// `server --camel` keys each group by the pgn's camelCase id and stores
+/// the records unwrapped with camelCase field keys. For the camel layout
+/// we re-wrap each record as `{"<id>":{…}}` so `AppState::upsert`'s
+/// normalizer rekeys the fields back to human names — the same path the
+/// live stream uses — which is what keeps the device-info cache
+/// (PGN 60928 / 126996 / 126998) populated under `--camel`.
+fn seed_state_from_snapshot(state: &mut AppState, doc: &str) -> Result<()> {
     let root: Value = serde_json::from_str(doc).context("parsing snapshot JSON")?;
     let Some(by_pgn) = root.as_object() else {
         anyhow::bail!("snapshot top-level is not a JSON object");
     };
-
-    let mut guard = state.lock().await;
     for (group_key, group) in by_pgn {
         let Some(group_obj) = group.as_object() else {
             continue;
         };
-        // `server --camel` keys each group by the pgn's camelCase id and
-        // stores unwrapped, camelCase-field records; the default (canboat
-        // C) layout keys by the numeric PGN. Re-wrap the camel record as
-        // `{"<id>":{…}}` so `upsert`'s normalizer rekeys the fields back
-        // to human names.
+        // A non-numeric group key means the camel layout: the key is the
+        // pgn's camelCase id and each record is stored unwrapped.
         let camel_id: Option<&str> = match group_key.parse::<u32>() {
             Ok(_) => None,
             Err(_) => Some(group_key.as_str()),
@@ -601,10 +614,9 @@ async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Re
                 Some(id) => serde_json::json!({ id: line_val.clone() }),
                 None => line_val.clone(),
             };
-            guard.upsert(pgn, src, secondary, description, record);
+            state.upsert(pgn, src, secondary, description, record);
         }
     }
-    guard.status.snapshot_loaded = true;
     Ok(())
 }
 
@@ -890,6 +902,54 @@ mod tests {
         assert_eq!(strip_snapshot_banner(pretty), pretty);
         // Banner-only (empty cache): `banner\n\n` → empty doc.
         assert_eq!(strip_snapshot_banner("{\"version\":\"x\"}\n\n"), "");
+    }
+
+    /// End-to-end regression for the `--camel` device-info cache: a
+    /// server in `--camel` reshapes its snapshot (id-keyed groups,
+    /// unwrapped records), and the TUI must still learn each device's
+    /// NAME (PGN 60928) and product info (PGN 126996) from it. Drive the
+    /// real `SnapshotStore` reshaping into `seed_state_from_snapshot` and
+    /// assert the persistent cache is populated.
+    #[test]
+    fn camel_snapshot_seeds_device_cache() {
+        use crate::tui::device_cache::NameKey;
+        use canboat_core::snapshot::{SnapshotInput, SnapshotStore};
+
+        let store = SnapshotStore::new();
+        // ISO Address Claim first so the src→NAME mapping exists when the
+        // Product Information for the same src arrives.
+        store.store(SnapshotInput {
+            pgn: 60928,
+            src: 51,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "ISO Address Claim".into(),
+            line: r#"{"isoAddressClaim":{"prio":6,"src":51,"dst":255,"pgn":60928,"description":"isoAddressClaim","fields":{"uniqueNumber":1605586,"manufacturerCode":{"value":419,"name":"Fusion Electronics"},"deviceFunction":{"value":130,"name":"Multimedia Player"},"deviceClass":{"value":125,"name":"Entertainment"},"industryGroup":{"value":4,"name":"Marine Industry"}}}}"#.into(),
+        });
+        store.store(SnapshotInput {
+            pgn: 126996,
+            src: 51,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Product Information".into(),
+            line: r#"{"productInformation":{"prio":6,"src":51,"dst":255,"pgn":126996,"description":"productInformation","fields":{"nmea2000Version":2100,"productCode":419,"modelId":"FUSION-MS","certificationLevel":2,"loadEquivalency":1}}}"#.into(),
+        });
+        let doc = store.snapshot();
+
+        let mut s = AppState::new(Status::new_log("x".into()), HashMap::new());
+        seed_state_from_snapshot(&mut s, &doc).expect("seed camel snapshot");
+
+        let key = NameKey {
+            manufacturer_code: 419,
+            unique_number: 1605586,
+        };
+        let cached = s.device_cache.get(&key).expect("device cached under NAME");
+        assert_eq!(
+            cached.manufacturer_name.as_deref(),
+            Some("Fusion Electronics")
+        );
+        assert_eq!(cached.product_code, Some(419));
+        assert_eq!(cached.model_id.as_deref(), Some("FUSION-MS"));
     }
 
     #[test]

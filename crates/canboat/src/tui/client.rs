@@ -559,12 +559,18 @@ async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Re
     };
 
     let mut guard = state.lock().await;
-    for (pgn_str, group) in by_pgn {
-        let Ok(pgn) = pgn_str.parse::<u32>() else {
-            continue;
-        };
+    for (group_key, group) in by_pgn {
         let Some(group_obj) = group.as_object() else {
             continue;
+        };
+        // `server --camel` keys each group by the pgn's camelCase id and
+        // stores unwrapped, camelCase-field records; the default (canboat
+        // C) layout keys by the numeric PGN. Re-wrap the camel record as
+        // `{"<id>":{…}}` so `upsert`'s normalizer rekeys the fields back
+        // to human names.
+        let camel_id: Option<&str> = match group_key.parse::<u32>() {
+            Ok(_) => None,
+            Err(_) => Some(group_key.as_str()),
         };
         for (key, line_val) in group_obj {
             if key == "description" {
@@ -578,12 +584,24 @@ async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Re
             let Ok(src) = src_str.parse::<u8>() else {
                 continue;
             };
+            // The numeric PGN lives inside the record in both layouts;
+            // fall back to the group key for the bare (numeric) layout.
+            let pgn = line_val
+                .pointer("/pgn")
+                .and_then(Value::as_u64)
+                .map(|n| n as u32)
+                .or_else(|| group_key.parse::<u32>().ok())
+                .unwrap_or(0);
             let description = line_val
                 .pointer("/description")
                 .and_then(Value::as_str)
                 .unwrap_or("")
                 .to_string();
-            guard.upsert(pgn, src, secondary, description, line_val.clone());
+            let record = match camel_id {
+                Some(id) => serde_json::json!({ id: line_val.clone() }),
+                None => line_val.clone(),
+            };
+            guard.upsert(pgn, src, secondary, description, record);
         }
     }
     guard.status.snapshot_loaded = true;

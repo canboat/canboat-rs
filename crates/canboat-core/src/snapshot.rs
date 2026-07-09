@@ -638,19 +638,38 @@ impl SnapshotStore {
             by_pgn.entry(*pgn).or_default().push(((*src, sec), entry));
         }
 
+        let db = crate::PgnDatabase::embedded(crate::Units::Metric);
         let mut out = String::with_capacity(2048);
         let mut first_pgn = true;
         for (pgn, entries) in by_pgn.iter() {
             let desc = &entries[0].1.pgn_short_description;
+            // Render each stored line once; `-camel` records are wrapped
+            // `{"<pgnId>":{…}}`, bare `-json` is not. When they're camel,
+            // key the group by the pgn's camelCase id (which we already
+            // have — no need to repeat the numeric PGN as we descend) and
+            // unwrap each record; otherwise keep canboat C's numeric-key
+            // layout verbatim.
+            let rendered: Vec<Cow<'_, str>> =
+                entries.iter().map(|(_, e)| e.payload.render()).collect();
+            let camel_id = crate::analyzer_json::camel_wrapper_id(&rendered[0]);
+            let full_desc = camel_id
+                .and_then(|id| db.pgn_by_id(id))
+                .map_or(desc.as_str(), |info| info.description);
             if first_pgn {
                 out.push_str("{\"");
                 first_pgn = false;
             } else {
                 out.push_str("\n,\"");
             }
-            let _ = write!(out, "{pgn}\":\n  {{\"description\":");
+            match camel_id {
+                Some(id) => out.push_str(id),
+                None => {
+                    let _ = write!(out, "{pgn}");
+                }
+            }
+            out.push_str("\":\n  {\"description\":");
             write_json_string(&mut out, desc);
-            for ((src, sec), entry) in entries {
+            for (((src, sec), _), payload) in entries.iter().zip(rendered.iter()) {
                 out.push_str("\n  ,\"");
                 let _ = write!(out, "{src}");
                 if let Some(s) = sec.as_deref() {
@@ -658,7 +677,10 @@ impl SnapshotStore {
                     out.push_str(s);
                 }
                 out.push_str("\":");
-                out.push_str(&entry.payload.render());
+                match camel_id {
+                    Some(id) => out.push_str(&unwrap_camel_record(payload, id, full_desc)),
+                    None => out.push_str(payload),
+                }
             }
             out.push_str("\n  }");
         }
@@ -762,6 +784,27 @@ pub fn short_description(desc: &str) -> String {
         Some(idx) => desc[..idx].to_string(),
         None => desc.to_string(),
     }
+}
+
+/// Turn a `-camel` analyzer payload (`{"<id>":{…}}`) into the logical
+/// snapshot record shape: strip the redundant `{"<id>":…}` wrapper (the
+/// id is already the snapshot's group key) and replace the record's
+/// `"description":"<id>"` — which `-camel` sets to the pgn id — with the
+/// human-readable `full_desc`. Field keys stay camelCase.
+///
+/// Falls back to the payload verbatim if it doesn't have the expected
+/// wrapper (defensive; every camel line the store holds does).
+fn unwrap_camel_record(payload: &str, camel_id: &str, full_desc: &str) -> String {
+    let prefix = format!("{{\"{camel_id}\":");
+    let Some(inner) = payload.trim().strip_prefix(&prefix) else {
+        return payload.to_string();
+    };
+    // Drop the wrapper's balancing `}` to expose the bare record object.
+    let inner = inner.strip_suffix('}').unwrap_or(inner);
+    let needle = format!("\"description\":\"{camel_id}\"");
+    let mut desc_json = String::new();
+    write_json_string(&mut desc_json, full_desc);
+    inner.replacen(&needle, &format!("\"description\":{desc_json}"), 1)
 }
 
 /// Write `s` as a JSON string literal (`"`, `\`, and control chars
@@ -992,6 +1035,30 @@ mod tests {
         assert!(dump.starts_with("{\"127251\":\n  {\"description\":\"Rate of Turn\""));
         assert!(dump.contains("\"7\":{\"pgn\":127251,\"src\":7,\"fields\":{\"Rate\":0}}"));
         assert!(dump.ends_with("}\n"));
+    }
+
+    /// `server --camel` stores `{"<pgnId>":{…}}` lines. The snapshot
+    /// keys the group by that camelCase id (not the numeric PGN), unwraps
+    /// each record, and restores the human `description` (which `-camel`
+    /// otherwise renders as the id). Field keys stay camelCase.
+    #[test]
+    fn snapshot_camel_keys_by_id_and_unwraps_record() {
+        let s = SnapshotStore::new();
+        s.store(SnapshotInput {
+            pgn: 60928,
+            src: 51,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "ISO Address Claim".to_string(),
+            line: r#"{"isoAddressClaim":{"prio":6,"src":51,"dst":255,"pgn":60928,"description":"isoAddressClaim","fields":{"uniqueNumber":1605586}}}"#.to_string(),
+        });
+        let expected = r#"{"isoAddressClaim":
+  {"description":"ISO Address Claim"
+  ,"51":{"prio":6,"src":51,"dst":255,"pgn":60928,"description":"ISO Address Claim","fields":{"uniqueNumber":1605586}}
+  }
+}
+"#;
+        assert_eq!(s.snapshot(), expected);
     }
 
     /// The two producer models the daemons feed one store with must

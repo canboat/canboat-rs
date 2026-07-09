@@ -43,10 +43,6 @@ use canboat_core::format_iso_ms;
 /// outbound traffic and that suffices for the TUI.
 pub const TUI_SRC: u8 = 0;
 
-/// "Don't change" sentinel for the 16‑bit Transmission interval
-/// offset field. Real captures always send `0xFFFF` here.
-const OFFSET_DONT_CHANGE: u16 = 0xFFFF;
-
 /// Format a canboat PLAIN line. `data` is the raw PGN payload.
 pub fn format_plain(prio: u8, pgn: u32, src: u8, dst: u8, data: &[u8]) -> String {
     let ts = current_timestamp();
@@ -120,73 +116,88 @@ pub fn nmea0183_filter_request() -> String {
     format_plain(7, 262657, TUI_SRC, 255, &data)
 }
 
-/// PLAIN line for PGN 126208 **Request** (function code 0) addressed
-/// to `dst`, asking it to set the transmission interval of
-/// `commanded_pgn` to `interval_ms` (1 ms units; `0` means stop
-/// transmitting).
+/// PLAIN line for the server's PGN-rate-override control PGN (262658),
+/// **Set** form: ask the server to set the device at source `src` to
+/// transmit `pgn` every `interval_ms` ms (`0` = stop). `mfr`/`industry`
+/// scope proprietary PGNs (`None` for standard). The server persists the
+/// override (keyed by the device's NAME) and injects the actual PGN
+/// 126208 Request; this control PGN never reaches the bus.
 ///
-/// Body layout (matches `nmeaRequestGroupFunction` in
-/// `../canboat/docs/canboat.json`):
-///
-/// ```text
-///   B0       : Function Code = 0 (Request)
-///   B1..B3   : Requested PGN (LE, 24 bits)
-///   B4..B7   : Transmission interval (LE, 32 bits, 1 ms units)
-///   B8..B9   : Transmission interval offset (LE, 16 bits)
-///   B10      : Number of Parameters = 0
-/// ```
-///
-/// Use this overload for **standard** (non‑proprietary) PGNs.
-pub fn request_transmission_interval(dst: u8, commanded_pgn: u32, interval_ms: u32) -> String {
-    let mut data = Vec::with_capacity(11);
-    write_request_header(&mut data, commanded_pgn, interval_ms);
-    data.push(0); // Number of Parameters
-    format_plain(3, 126208, TUI_SRC, dst, &data)
-}
-
-/// PLAIN line for PGN 126208 **Request** scoping the rate change to
-/// the manufacturer + industry whose proprietary PGN this is —
-/// appends two parameter pairs at field indices 1 (Manufacturer
-/// Code, 11‑bit → 2 bytes) and 3 (Industry Code, 3‑bit → 1 byte).
-/// These are the field positions every proprietary PGN uses for
-/// those values (see e.g. `../canboat/docs/canboat.json` PGN 130842
-/// `furunoSixDegreesOfFreedomMovement`).
-///
-/// Captured Furuno SCX‑20 traffic in
-/// `../canboat/samples/scx20-setting-tool-pgn-130578to130846-on.raw`
-/// is byte‑identical to what this builder emits — see the test at
-/// the bottom of the module.
-pub fn request_transmission_interval_proprietary(
-    dst: u8,
-    commanded_pgn: u32,
-    manufacturer_code: u16,
-    industry_code: u8,
+/// Payload: `[Function=1, Source, pgn(3 LE), interval(4 LE), mfr(2 LE),
+/// industry]` (12 bytes).
+pub fn override_set(
+    src: u8,
+    pgn: u32,
     interval_ms: u32,
+    mfr: Option<u16>,
+    industry: Option<u8>,
 ) -> String {
-    let mut data = Vec::with_capacity(16);
-    write_request_header(&mut data, commanded_pgn, interval_ms);
-    data.push(2); // Number of Parameters = 2 (mfr + industry)
-    // Parameter pair 1: index = 1 (Manufacturer Code), value = 11‑bit
-    // field rounded up to 2 LE bytes. The top 5 bits of the value
-    // word stay 0 — only the 11‑bit Manufacturer Code is carried
-    // here, the adjacent Reserved + Industry Code bits live in their
-    // own field indices.
-    data.push(1);
-    data.extend_from_slice(&(manufacturer_code & 0x07FF).to_le_bytes());
-    // Parameter pair 2: index = 3 (Industry Code), value = 3‑bit
-    // field rounded up to 1 byte.
-    data.push(3);
-    data.push(industry_code & 0x07);
-    format_plain(3, 126208, TUI_SRC, dst, &data)
+    format_plain(
+        7,
+        crate::n2kd::overrides::PGN_PGN_OVERRIDE,
+        TUI_SRC,
+        255,
+        &override_payload(
+            crate::n2kd::overrides::OV_FN_SET,
+            src,
+            pgn,
+            interval_ms,
+            mfr,
+            industry,
+        ),
+    )
 }
 
-/// Write B0..B9 of the PGN 126208 Request envelope (everything up to
-/// and not including the `Number of Parameters` byte).
-fn write_request_header(out: &mut Vec<u8>, commanded_pgn: u32, interval_ms: u32) {
-    out.push(0x00); // Function Code: Request
-    out.extend_from_slice(&commanded_pgn.to_le_bytes()[..3]);
-    out.extend_from_slice(&interval_ms.to_le_bytes());
-    out.extend_from_slice(&OFFSET_DONT_CHANGE.to_le_bytes());
+/// PLAIN line for the override control PGN (262658), **Delete** form:
+/// remove the override for `pgn` on the device at source `src`.
+pub fn override_delete(src: u8, pgn: u32) -> String {
+    format_plain(
+        7,
+        crate::n2kd::overrides::PGN_PGN_OVERRIDE,
+        TUI_SRC,
+        255,
+        &override_payload(
+            crate::n2kd::overrides::OV_FN_DELETE,
+            src,
+            pgn,
+            0,
+            None,
+            None,
+        ),
+    )
+}
+
+/// PLAIN line for the override control PGN (262658), **Request** form:
+/// ask the server to (re-)send the current override state.
+pub fn override_request() -> String {
+    let mut data = vec![crate::n2kd::overrides::OV_FN_REQUEST];
+    data.resize(12, 0xff);
+    format_plain(
+        7,
+        crate::n2kd::overrides::PGN_PGN_OVERRIDE,
+        TUI_SRC,
+        255,
+        &data,
+    )
+}
+
+/// Build the 12-byte PGN 262658 payload common to Set / Delete.
+fn override_payload(
+    function: u8,
+    src: u8,
+    pgn: u32,
+    interval_ms: u32,
+    mfr: Option<u16>,
+    industry: Option<u8>,
+) -> Vec<u8> {
+    let mut data = Vec::with_capacity(12);
+    data.push(function);
+    data.push(src);
+    data.extend_from_slice(&pgn.to_le_bytes()[..3]);
+    data.extend_from_slice(&interval_ms.to_le_bytes());
+    data.extend_from_slice(&mfr.unwrap_or(0xffff).to_le_bytes());
+    data.push(industry.unwrap_or(0xff));
+    data
 }
 
 fn current_timestamp() -> String {
@@ -238,82 +249,32 @@ mod tests {
         assert!(line.ends_with(",6,59904,0,35,3,00,ee,01"));
     }
 
-    /// Reproduces the exact 11‑byte standard‑PGN Request line emitted
-    /// by the Furuno SCX‑20 setting tool when disabling PGN 130578:
-    ///
-    /// ```text
-    /// ,3,126208,0,52,11,00,12,fe,01,00,00,00,00,ff,ff,00
-    /// ```
-    ///
-    /// (See `../canboat/samples/scx20-setting-tool-pgn-130578to130846-off.raw`.)
     #[test]
-    fn request_standard_pgn_disable_matches_scx20_sample() {
-        let line = request_transmission_interval(52, 130578, 0);
+    fn override_set_payload_layout() {
+        // Function=1, src=52, pgn=130578 (LE 12,fe,01), 1000 ms
+        // (e8,03,00,00), mfr n/a (ff,ff), industry n/a (ff).
+        let line = override_set(52, 130578, 1000, None, None);
         assert_eq!(
             no_ts(&line),
-            "3,126208,0,52,11,00,12,fe,01,00,00,00,00,ff,ff,00",
-            "got: {line}"
+            "7,262658,0,255,12,01,34,12,fe,01,e8,03,00,00,ff,ff,ff"
         );
     }
 
-    /// Same standard PGN with a 1000 ms interval — taken from the
-    /// `…-on.raw` companion sample.
     #[test]
-    fn request_standard_pgn_enable_matches_scx20_sample() {
-        let line = request_transmission_interval(52, 130578, 1000);
+    fn override_delete_payload_layout() {
+        // Function=3, src=52, pgn=130578, interval unused (0), n/a codes.
+        let line = override_delete(52, 130578);
         assert_eq!(
             no_ts(&line),
-            "3,126208,0,52,11,00,12,fe,01,e8,03,00,00,ff,ff,00",
-            "got: {line}"
+            "7,262658,0,255,12,03,34,12,fe,01,00,00,00,00,ff,ff,ff"
         );
     }
 
-    /// Reproduces the 16‑byte proprietary Request line that disables
-    /// Furuno's PGN 130842:
-    ///
-    /// ```text
-    /// ,3,126208,0,52,16,00,1a,ff,01,00,00,00,00,ff,ff,02,01,3f,07,03,04
-    /// ```
-    ///
-    /// Furuno = manufacturer 1855 (0x73F), Marine industry = 4. The
-    /// two parameter pairs at the tail are `(idx=1, mfr 2B LE)` and
-    /// `(idx=3, industry 1B)` — the schema field positions for those
-    /// values on every proprietary PGN.
     #[test]
-    fn request_proprietary_pgn_disable_matches_scx20_sample() {
-        let line = request_transmission_interval_proprietary(52, 130842, 1855, 4, 0);
-        assert_eq!(
-            no_ts(&line),
-            "3,126208,0,52,16,00,1a,ff,01,00,00,00,00,ff,ff,02,01,3f,07,03,04",
-            "got: {line}"
-        );
-    }
-
-    /// Companion to the disable test — same envelope but the four
-    /// interval bytes carry 200 ms (`c8,00,00,00`). Taken verbatim
-    /// from the `…-on.raw` sample line for PGN 130842.
-    #[test]
-    fn request_proprietary_pgn_enable_matches_scx20_sample() {
-        let line = request_transmission_interval_proprietary(52, 130842, 1855, 4, 200);
-        assert_eq!(
-            no_ts(&line),
-            "3,126208,0,52,16,00,1a,ff,01,c8,00,00,00,ff,ff,02,01,3f,07,03,04",
-            "got: {line}"
-        );
-    }
-
-    /// Manufacturer Code mask: a value with bits above the 11‑bit
-    /// limit set must still emit only the low 11 bits, so a careless
-    /// caller can't poison the wire format. The constants 0xF800 +
-    /// 1855 share the low 11 bits with plain 1855.
-    #[test]
-    fn proprietary_request_masks_manufacturer_to_11_bits() {
-        let careful = request_transmission_interval_proprietary(52, 130842, 1855, 4, 0);
-        let careless =
-            request_transmission_interval_proprietary(52, 130842, 0xF800 | 1855, 4 | 0xF0, 0);
-        // Compare payloads only — the leading ISO timestamp is sampled
-        // per call, so two calls that straddle a millisecond would
-        // otherwise differ despite identical wire bytes.
-        assert_eq!(no_ts(&careful), no_ts(&careless));
+    fn override_request_is_a_request_frame() {
+        let line = override_request();
+        let frame = canboat_core::format::parse_plain(&line).unwrap();
+        assert!(crate::n2kd::overrides::is_request_frame(&frame));
+        assert!(!crate::n2kd::overrides::is_set_frame(&frame));
     }
 }

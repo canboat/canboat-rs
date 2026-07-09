@@ -5,10 +5,10 @@
 //! Connects to either `canboat-pipeline` or `n2kd`. On startup the
 //! TUI loads the one-shot snapshot from the status port (default
 //! 2597) and then stays subscribed to the live stream port (default
-//! 2598). Outgoing writes (ISO Requests, PGN 126208 overrides) are
-//! sent back over the stream socket — that path works against
-//! canboat-pipeline (its analyzer port is bidirectional) but is
-//! silently dropped by n2kd.
+//! 2598). Outgoing writes (ISO Requests, NMEA-0183-filter edits, and
+//! PGN-rate-override edits) go to dedicated ports derived from the
+//! stream port (see [`write_ports`]) — those work against
+//! canboat-pipeline but are absent on a plain n2kd.
 //!
 //! The state model is shared with the snapshot module
 //! ([`canboat_core::snapshot::classify_json_line`]) so the keys we
@@ -36,7 +36,6 @@ mod device_cache;
 mod filebrowser;
 mod iso;
 mod menu;
-mod overrides;
 mod state;
 mod ui;
 
@@ -142,12 +141,6 @@ pub async fn run(args: Args) -> Result<()> {
     }
 
     let mut app = ui::App::new();
-    if args.host.is_some() {
-        // Persisted overrides are queued to the writer immediately;
-        // they flush to the socket as soon as the stream task connects.
-        // Log / idle modes have nothing to write back to, so skip.
-        app.replay_overrides(&writer);
-    }
     if idle {
         // No source chosen — greet the user with the Load dialog once
         // the intro animation finishes.
@@ -219,22 +212,15 @@ async fn run_loop(
             execute_command(cmd, &mut writer, &mut tasks, &state, app).await;
         }
         let mut s = state.lock().await;
-        // Drain one queued bus-side alert into the UI's display slot
-        // per draw. The reader task pushes alerts onto `state.alerts`
-        // as they arrive; the UI shows them in the status bar and
-        // clears them on any keystroke, so the user sees each one in
-        // turn instead of just the most recent.
-        if app.alert.is_none() {
-            app.alert = s.alerts.pop_front();
+        // Drop an override the user just deleted on the Overrides screen
+        // right away, rather than waiting for the server's next report to
+        // stop listing it.
+        if let Some((src, pgn)) = app.pending_override_forget.take() {
+            s.forget_override(src, pgn);
         }
-        // Forget any override the bus NAKed this iteration so it isn't
-        // replayed on the next reconnect. The reader records the pairs;
-        // the UI thread owns the override store, so removal + save
-        // happen here.
-        if !s.nak_overrides.is_empty() {
-            let naked = std::mem::take(&mut s.nak_overrides);
-            app.forget_overrides(&naked);
-        }
+        // Age out overrides the server has stopped reporting (deleted or
+        // NAK-forgotten), so the Overrides view reflects removals.
+        s.prune_overrides();
         // Surface a one-shot completion notice (load / save done) as a
         // toast the user can dismiss with any key.
         if let Some(notice) = s.notice.take() {
@@ -252,12 +238,17 @@ async fn run_loop(
 /// persistent device cache) so no stale data or task bleeds across.
 /// Derive the two write-capable ports from the JSON stream port, using
 /// the server's canonical n2kd-relative offsets: stream = base+1,
-/// input = base+3, filter control = base+8. The Connect dialog only
-/// collects host + snapshot + stream ports, so the write ports follow
-/// the stream port rather than being entered separately.
-fn write_ports(stream_port: u16) -> (u16, u16) {
+/// input = base+3, filter control = base+8, override control = base+9.
+/// The Connect dialog only collects host + snapshot + stream ports, so
+/// the write ports follow the stream port rather than being entered
+/// separately. Returns `(input, filter, overrides)`.
+fn write_ports(stream_port: u16) -> (u16, u16, u16) {
     let base = stream_port.wrapping_sub(1);
-    (base.wrapping_add(3), base.wrapping_add(8))
+    (
+        base.wrapping_add(3),
+        base.wrapping_add(8),
+        base.wrapping_add(9),
+    )
 }
 
 /// Spawn the three live-mode connections that back the shared
@@ -272,7 +263,7 @@ fn spawn_live_connections(
     state: &Arc<Mutex<AppState>>,
     writer_rx: client::WriterRx,
 ) {
-    let (input_port, filter_port) = write_ports(stream_port);
+    let (input_port, filter_port, overrides_port) = write_ports(stream_port);
     tasks.push(client::spawn_stream_connection(
         host.clone(),
         stream_port,
@@ -285,10 +276,16 @@ fn spawn_live_connections(
         writer_rx.input,
     ));
     tasks.push(client::spawn_filter_connection(
-        host,
+        host.clone(),
         filter_port,
         state.clone(),
         writer_rx.filter,
+    ));
+    tasks.push(client::spawn_overrides_connection(
+        host,
+        overrides_port,
+        state.clone(),
+        writer_rx.overrides,
     ));
 }
 
@@ -337,7 +334,6 @@ async fn execute_command(
             *writer = new_writer;
             app.reset_views();
             app.connecting_dismissed = false;
-            app.replay_overrides(writer);
         }
         ui::PendingCommand::Load { path } => {
             for t in tasks.drain(..) {

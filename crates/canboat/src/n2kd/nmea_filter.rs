@@ -224,6 +224,13 @@ impl NmeaFilter {
 
     /// Decide what to do with `src`'s converted 0183 for one record.
     pub fn decide(&self, src: u8) -> Decision<'_> {
+        // A rule-less filter is a true no-op: pass every source through.
+        // The "no learned NAME ⇒ drop all" gate below only makes sense
+        // once the user has actually muted something, so an always-on
+        // filter with an empty config file behaves like no filter at all.
+        if self.rules.is_empty() {
+            return Decision::Keep(&[]);
+        }
         let Some(name) = self.src_name[src as usize] else {
             // No learned NAME — deliberately emit nothing.
             return Decision::DropAll;
@@ -410,11 +417,28 @@ mod tests {
     }
 
     #[test]
-    fn no_name_drops_everything() {
-        let mut f = filter_with(&[]);
+    fn no_name_drops_everything_once_a_rule_exists() {
+        // The unknown-NAME gate only engages when the filter has at
+        // least one rule; seed an unrelated mute so it's active.
+        let mut f = filter_with(&[(
+            NAME_SPEED,
+            DeviceRule {
+                muted: true,
+                ..Default::default()
+            },
+        )]);
         let mut buf = "$CBVHW,,T,,M,0.0,N,0.0,K*54\r\n".to_string();
         f.apply(33, &mut buf); // src 33 never claimed
         assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn empty_filter_passes_everything() {
+        // No rules at all ⇒ a source with no learned NAME still emits.
+        let mut f = filter_with(&[]);
+        let mut buf = "$CBVHW,,T,,M,0.0,N,0.0,K*54\r\n".to_string();
+        f.apply(33, &mut buf);
+        assert_eq!(buf, "$CBVHW,,T,,M,0.0,N,0.0,K*54\r\n");
     }
 
     #[test]

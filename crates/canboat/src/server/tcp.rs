@@ -33,6 +33,7 @@ use canboat_core::{PgnDatabase, RawFrame};
 use canboat_io::device::FrameSender;
 
 use crate::n2kd::nmea_filter::NmeaFilter;
+use crate::n2kd::overrides::OverrideEngine;
 
 /// Where a client-written frame goes. In device mode, we forward to
 /// the device *and* loop it back into the pipeline source so it
@@ -176,9 +177,12 @@ fn forward_plain_line(line: &str, inject: &InjectPoint) -> bool {
             // [`spawn_filter_control_server`]). One arriving here is
             // stale / misrouted — drop it silently rather than inject a
             // synthetic PGN onto the N2K bus.
-            if frame.pgn == crate::n2kd::nmea_filter::PGN_NMEA0183_FILTER {
+            if frame.pgn == crate::n2kd::nmea_filter::PGN_NMEA0183_FILTER
+                || frame.pgn == crate::n2kd::overrides::PGN_PGN_OVERRIDE
+            {
                 log::debug!(
-                    "dropping stray PGN 262657 on input port; the filter control channel is on --nmea0183-filter-port"
+                    "dropping stray control PGN {} on input port; control channels have dedicated ports",
+                    frame.pgn
                 );
                 return true;
             }
@@ -398,6 +402,140 @@ fn now_iso() -> String {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0);
     canboat_core::format_iso_ms(ms)
+}
+
+/// Bind the bidirectional PGN 262658 override control port. Mirrors
+/// [`spawn_filter_control_server`]: a connected client is sent the
+/// current override state, then writes `Set` / `Delete` / `Request`
+/// frames and reads `Report` frames on the same socket. A `Set` is
+/// applied immediately by injecting the resulting PGN 126208 Request
+/// through `device_sender` (the wire path shared with the pipeline).
+pub fn spawn_overrides_control_server(
+    bind: Ipv4Addr,
+    port: u16,
+    engine: Arc<Mutex<OverrideEngine>>,
+    device_sender: Option<FrameSender>,
+    json_opts: JsonOptions,
+) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding overrides-control TCP port {}:{}", bind, port))?;
+    log::info!(
+        "overrides control server listening on {}:{} (RW)",
+        bind,
+        port
+    );
+    Ok(thread::Builder::new()
+        .name("overrides-control-accept".into())
+        .spawn(move || overrides_control_accept(listener, engine, device_sender, json_opts))
+        .expect("spawn overrides-control accept"))
+}
+
+fn overrides_control_accept(
+    listener: TcpListener,
+    engine: Arc<Mutex<OverrideEngine>>,
+    device_sender: Option<FrameSender>,
+    json_opts: JsonOptions,
+) {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("overrides-control accept failed: {e}");
+                return;
+            }
+        };
+        log::info!("overrides-control client connected: {peer}");
+        let e = engine.clone();
+        let sender = device_sender.clone();
+        let opts = json_opts.clone();
+        thread::Builder::new()
+            .name("overrides-control-client".into())
+            .spawn(move || run_overrides_control_client(stream, e, sender, opts))
+            .ok();
+    }
+}
+
+fn run_overrides_control_client(
+    stream: TcpStream,
+    engine: Arc<Mutex<OverrideEngine>>,
+    device_sender: Option<FrameSender>,
+    json_opts: JsonOptions,
+) {
+    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
+    let mut write_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("overrides-control: try_clone failed: {e}");
+            return;
+        }
+    };
+    if !send_override_report(&mut write_stream, &engine, db, &json_opts) {
+        return;
+    }
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let frame = match parse_plain(trimmed) {
+            Ok(f) => f,
+            Err(PlainError::Empty) => continue,
+            Err(e) => {
+                log::debug!("overrides-control: ignoring non-PLAIN line: {e}");
+                continue;
+            }
+        };
+        if crate::n2kd::overrides::is_set_frame(&frame) {
+            // Persist + apply now: inject the PGN 126208 Request onto the
+            // bus (when there's a device writer).
+            let request = engine.lock().unwrap().apply_set_frame(&frame.data);
+            if let (Some(req), Some(sender)) = (request, device_sender.as_ref()) {
+                let _ = sender.send_frame(req);
+            }
+        } else if crate::n2kd::overrides::is_delete_frame(&frame) {
+            engine.lock().unwrap().apply_delete_frame(&frame.data);
+        } else if !crate::n2kd::overrides::is_request_frame(&frame) {
+            log::debug!("overrides-control: ignoring frame pgn {}", frame.pgn);
+            continue;
+        }
+        if !send_override_report(&mut write_stream, &engine, db, &json_opts) {
+            return;
+        }
+    }
+}
+
+/// Serialize the current override state as analyzer-JSON `Report` lines
+/// and write them. `false` only on a socket write error.
+fn send_override_report(
+    stream: &mut TcpStream,
+    engine: &Mutex<OverrideEngine>,
+    db: &PgnDatabase,
+    json_opts: &JsonOptions,
+) -> bool {
+    let frames = engine.lock().unwrap().report_frames(Some(now_iso()));
+    let mut out = String::with_capacity(frames.len() * 96);
+    for frame in &frames {
+        match db.decode(frame) {
+            Ok(decoded) => {
+                let start = out.len();
+                if write_json(&mut out, &decoded, json_opts).is_ok() {
+                    out.push('\n');
+                } else {
+                    out.truncate(start);
+                }
+            }
+            Err(e) => log::debug!("overrides-control: decoding a 262658 report failed: {e}"),
+        }
+    }
+    if out.is_empty() {
+        return true;
+    }
+    stream.write_all(out.as_bytes()).is_ok()
 }
 
 /// Bind the binary analyzer server (`--analyzer-binary-port`).

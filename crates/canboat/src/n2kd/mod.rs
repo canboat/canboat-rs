@@ -17,5 +17,6 @@ pub mod decoded;
 pub mod json;
 pub mod nmea0183;
 pub mod nmea_filter;
+pub mod overrides;
 pub mod request_engine;
 pub mod serving;

@@ -411,6 +411,21 @@ impl DecodedPgn {
         self.fields.get(idx as usize)
     }
 
+    /// Look up a non-repeating field by its generated [`crate::FieldRef`]
+    /// constant (`canboat_core::field::wind_data::WIND_ANGLE`). `O(1)` by
+    /// schema order — the compile-checked, handle-free counterpart to
+    /// [`Self::field_by_name`]: no string scan, no pre-resolved handle to
+    /// wire up. Debug-asserts (via [`Self::field`]) that the ref's PGN
+    /// matches this record, so passing a constant from the wrong PGN is
+    /// caught in debug builds.
+    #[inline]
+    pub fn field_ref(&self, f: crate::FieldRef) -> Option<&DecodedField> {
+        self.field(&crate::FieldHandle {
+            field_order: f.field.order,
+            pgn_id_hash: crate::db::djb2_hash_str(f.pgn.id),
+        })
+    }
+
     /// Look up a top-level field by name. `O(n)` linear scan over
     /// the decoded fields — fine for callers that don't have a
     /// pre-resolved [`crate::FieldHandle`] (e.g. AIS encoders that

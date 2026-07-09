@@ -287,7 +287,6 @@ pub fn run(
     let mut raw_line = String::with_capacity(256);
     let mut json_line = String::with_capacity(1024);
     let mut rl = crate::n2kd::nmea0183::RateLimiter::new(nmea0183_rate_limit);
-    let mut ais_seq: u8 = 0;
     let handles = crate::n2kd::decoded::Handles::new(db);
 
     // Quirk synthesisers can produce extra `RawFrame`s in response to
@@ -462,7 +461,8 @@ pub fn run(
         // With neither, the per-record cost is two atomic loads.
         nmea_buf.clear();
         let pgn = decoded.pgn;
-        let mut ais_branch = false;
+        // AIS output (`!AI…`) is exempt from the per-device 0183 filter.
+        let ais_branch = is_ais_pgn(pgn);
         // Convert when someone will see the 0183, OR when the filter is
         // active: the filter learns each device's producible sentences
         // by observing conversions, and the TUI needs that inventory
@@ -470,15 +470,12 @@ pub fn run(
         let want_nmea = emit_nmea_stdout || nmea_batch.has_subscribers() || nmea_filter.is_some();
         let converted = if !want_nmea {
             false
-        } else if is_ais_pgn(pgn) {
-            ais_branch = true;
-            crate::n2kd::ais_decoded::convert(&mut nmea_buf, &decoded, &mut ais_seq) > 0
         } else {
             // Struct path only — `convert_nmea0183` dispatches on the
-            // decoded variant id and yields nothing for non-NMEA PGNs.
-            // There is deliberately no JSON round-trip here, so the
-            // analyzer JSON options (`--camel`, SI) never reach the 0183
-            // output.
+            // decoded variant id, folding in AIS `!AIVDM`, and yields
+            // nothing for non-0183 PGNs. There is deliberately no JSON
+            // round-trip here, so the analyzer JSON options (`--camel`,
+            // SI) never reach the 0183 output.
             crate::n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles) > 0
         };
         // Per-device NMEA 0183 filter mutes redundant devices' `$`

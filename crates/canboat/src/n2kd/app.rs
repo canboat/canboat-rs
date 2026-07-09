@@ -30,7 +30,7 @@
 use crate::n2kd::nmea_filter::NmeaFilter;
 use crate::n2kd::request_engine::{self, RequestEngine};
 use crate::n2kd::serving::{Hub as WireHub, tcp as serving_tcp};
-use crate::n2kd::{ais_decoded, json, nmea0183};
+use crate::n2kd::{json, nmea0183};
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
@@ -47,12 +47,6 @@ use crate::n2kd::nmea0183::RateLimiter;
 
 /// Default TCP base port.
 const DEFAULT_PORT: u16 = 2597;
-
-/// AIS PGN list — these flow through the AIS port verbatim. Matches
-/// the `PGN_AIS_*` defines in nmea0183.c.
-const AIS_PGNS: &[u32] = &[
-    129038, 129039, 129040, 129041, 129793, 129794, 129798, 129801, 129802, 129809, 129810,
-];
 
 #[derive(Debug, clap::Args)]
 #[command(after_help = canboat_cli::help_footer())]
@@ -497,11 +491,9 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         }
         if let Some(decoded) = decoded.as_ref() {
             let mut rl = hub.rate_limiter.lock().unwrap();
-            if AIS_PGNS.contains(&meta.pgn) {
-                ais_decoded::convert(&mut nmea, decoded, &mut rl.ais_seq);
-            } else {
-                nmea0183::convert_decoded(&mut nmea, decoded, &mut rl);
-            }
+            // One dispatcher for both `$` sentences and AIS `!AIVDM`
+            // (folded into `convert_nmea0183`).
+            nmea0183::convert_decoded(&mut nmea, decoded, &mut rl);
         }
         // Mute redundant devices' 0183 by NAME before it goes out. When
         // the filter empties the buffer (every sentence muted) there's
@@ -531,10 +523,9 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
 /// inside a repeating set) is done inside
 /// [`canboat_core::snapshot::classify_json_line`], which the hub
 /// invokes via [`Hub::store`] — `Meta` itself doesn't carry a
-/// secondary anymore. The AIS-vs-non-AIS branch in the NMEA-0183
-/// converter loop reads `meta.pgn` and tests `AIS_PGNS.contains` at
-/// the call site, so `Meta` also doesn't need to carry an `is_ais`
-/// flag.
+/// secondary anymore. AIS vs non-AIS is decided inside
+/// [`crate::n2kd::decoded::convert_nmea0183`] (which folds in the AIS
+/// `!AIVDM` path), so `Meta` doesn't need to carry an `is_ais` flag.
 #[derive(Debug, Clone, Copy)]
 struct Meta {
     pgn: u32,

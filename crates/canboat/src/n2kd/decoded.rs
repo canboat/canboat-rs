@@ -137,6 +137,14 @@ pub fn convert_nmea0183(
     h: &Handles,
 ) -> usize {
     use canboat_core::pgn;
+    // AIS PGNs render to `!AIVDM` via the AIS encoder — its own path,
+    // deliberately not gated by the `$`-sentence rate limiter. Callers
+    // that treat AIS specially (e.g. exempt `!AI…` from the per-device
+    // 0183 filter) gate on `is_ais_pgn` themselves. Folding it in here
+    // means every producer runs one dispatcher.
+    if canboat_core::snapshot::is_ais_pgn(decoded.pgn) {
+        return crate::n2kd::ais_decoded::convert(out, decoded, &mut rl.ais_seq);
+    }
     let src = decoded.src;
     let id = decoded.id;
     let before = out.len();

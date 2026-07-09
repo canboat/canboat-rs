@@ -5,18 +5,22 @@
 //! `DecodedPgn` instead of round-tripping through analyzer JSON.
 //!
 //! The bit-packing semantics are identical to `ais.rs` (which is the
-//! canboat C reference). The only difference is the value lookup
-//! path: `field_by_name(...)` + `as_i64()/as_f64()/as_str()` instead
-//! of `json::int/number/value`.
+//! canboat C reference). What changed with the id-constants refactor:
+//! every PGN-specific field is read through its generated
+//! [`canboat_core::FieldRef`] constant
+//! (`field::ais_class_aposition_report::LONGITUDE`) via
+//! [`DecodedPgn::field_ref`] — an `O(1)`, compile-checked lookup, so a
+//! rename in canboat.json breaks the build instead of silently dropping
+//! a field. Each per-message encoder pulls in its PGN's field module as
+//! `f`, so the field set is self-documenting and variant-precise.
 //!
-//! `field_by_name` is a linear scan over the record's top-level
-//! fields — AIS PGNs carry on the order of 10–25 fields, so the scan
-//! cost is far below a JSON-substring search and we avoid the JSON
-//! serialization step entirely. Pre-resolved [`FieldHandle`]s would
-//! shave another ~5% off but at the cost of ~80 handles to wire up;
-//! we leave them on the table for now.
+//! Two fields are read by *name* on purpose: `"Message ID"` and
+//! `"AIS Transceiver information"` are the PGN-independent AIS header —
+//! present on every AIS variant with the same name — so a single
+//! name-keyed read spans all of them (the same reasoning as the TUI's
+//! proprietary-header codes). Everything else is a constant.
 
-use canboat_core::{DecodedPgn, FieldValue};
+use canboat_core::{DecodedPgn, FieldRef, FieldValue, field, pgn};
 
 use crate::n2kd::ais::{
     AIS_TRANSCEIVER_NAMES, BitVector, POSITION_ACCURACY_NAMES, RAIM_NAMES, REPEAT_NAMES,
@@ -27,22 +31,25 @@ use crate::n2kd::ais::{
 /// Returns the number of sentences emitted. Mirrors the string-input
 /// `ais::convert`.
 pub fn convert(out: &mut String, decoded: &DecodedPgn, seq_counter: &mut u8) -> usize {
-    let pgn = decoded.pgn as i64;
-    let msgid = match pgn_to_msgid(pgn, decoded) {
+    let msgid = match pgn_to_msgid(decoded) {
         Some(m) => m,
         None => return 0,
     };
     let channel = ais_channel(decoded);
     let talker = ais_talker(decoded);
     let mut bv = BitVector::new();
-    if !encode_payload(&mut bv, msgid, pgn, decoded) {
+    if !encode_payload(&mut bv, msgid, decoded) {
         return 0;
     }
     emit_sentences(out, &bv, talker, channel, seq_counter)
 }
 
-fn pgn_to_msgid(pgn: i64, decoded: &DecodedPgn) -> Option<i64> {
-    if let Some(f) = decoded.field_by_name("Message ID") {
+/// The AIVDM message type. Prefers the decoded `Message ID` (present on
+/// every AIS PGN — read by name as the common header), falling back to
+/// the variant's canboat `id` when the field is missing or carries a
+/// bare label string instead of the numeric code.
+fn pgn_to_msgid(d: &DecodedPgn) -> Option<i64> {
+    if let Some(f) = d.field_by_name("Message ID") {
         if let Some(n) = f.value.lookup_value() {
             return Some(n as i64);
         }
@@ -67,42 +74,60 @@ fn pgn_to_msgid(pgn: i64, decoded: &DecodedPgn) -> Option<i64> {
             }
         }
     }
-    Some(match pgn {
-        129038 => 1,
-        129039 => 18,
-        129040 => 19,
-        129041 => 21,
-        129793 => 4,
-        129794 => 5,
-        129798 => 9,
-        129801 => 12,
-        129802 => 14,
-        129809 | 129810 => 24,
-        _ => return None,
+    let id = d.id;
+    Some(if id == pgn::AIS_CLASS_APOSITION_REPORT.id {
+        1
+    } else if id == pgn::AIS_CLASS_BPOSITION_REPORT.id {
+        18
+    } else if id == pgn::AIS_CLASS_BEXTENDED_POSITION_REPORT.id {
+        19
+    } else if id == pgn::AIS_AIDS_TO_NAVIGATION_ATON_REPORT.id {
+        21
+    } else if id == pgn::AIS_UTC_AND_DATE_REPORT.id {
+        4
+    } else if id == pgn::AIS_CLASS_ASTATIC_AND_VOYAGE_RELATED_DATA.id {
+        5
+    } else if id == pgn::AIS_SAR_AIRCRAFT_POSITION_REPORT.id {
+        9
+    } else if id == pgn::AIS_ADDRESSED_SAFETY_RELATED_MESSAGE.id {
+        12
+    } else if id == pgn::AIS_SAFETY_RELATED_BROADCAST_MESSAGE.id {
+        14
+    } else if id == pgn::AIS_CLASS_BSTATIC_DATA_MSG24_PART_A.id
+        || id == pgn::AIS_CLASS_BSTATIC_DATA_MSG24_PART_B.id
+    {
+        24
+    } else {
+        return None;
     })
 }
 
+/// AIS radio channel ('A' / 'B') from the common `AIS Transceiver
+/// information` header field.
 fn ais_channel(decoded: &DecodedPgn) -> char {
-    let info = enum_or_name(
-        decoded,
-        "AIS Transceiver information",
-        AIS_TRANSCEIVER_NAMES,
-    );
-    if matches!(info, 1 | 3) { 'B' } else { 'A' }
+    if matches!(transceiver_info(decoded), 1 | 3) {
+        'B'
+    } else {
+        'A'
+    }
 }
 
+/// Talker id (`VDM` own-vessel-relayed vs `VDO` own-vessel) from the
+/// common `AIS Transceiver information` header field.
 fn ais_talker(decoded: &DecodedPgn) -> &'static str {
-    match enum_or_name(
-        decoded,
-        "AIS Transceiver information",
-        AIS_TRANSCEIVER_NAMES,
-    ) {
+    match transceiver_info(decoded) {
         2..=4 => "VDO",
         _ => "VDM",
     }
 }
 
-fn encode_payload(bv: &mut BitVector, msgid: i64, pgn: i64, decoded: &DecodedPgn) -> bool {
+/// `AIS Transceiver information` — the PGN-independent AIS header field,
+/// read by name (every AIS variant carries it under the same name).
+fn transceiver_info(d: &DecodedPgn) -> i64 {
+    enum_by_name(d, "AIS Transceiver information", AIS_TRANSCEIVER_NAMES)
+}
+
+fn encode_payload(bv: &mut BitVector, msgid: i64, decoded: &DecodedPgn) -> bool {
     match msgid {
         1..=3 => encode_class_a_position(bv, msgid, decoded),
         4 => encode_utc_date(bv, msgid, decoded),
@@ -113,7 +138,7 @@ fn encode_payload(bv: &mut BitVector, msgid: i64, pgn: i64, decoded: &DecodedPgn
         18 => encode_class_b_position(bv, msgid, decoded),
         19 => encode_class_b_extended(bv, msgid, decoded),
         21 => encode_aton(bv, msgid, decoded),
-        24 => encode_class_b_static(bv, msgid, pgn, decoded),
+        24 => encode_class_b_static(bv, msgid, decoded),
         _ => return false,
     }
     true
@@ -122,95 +147,112 @@ fn encode_payload(bv: &mut BitVector, msgid: i64, pgn: i64, decoded: &DecodedPgn
 // ---------- per-message-type encoders ----------
 
 fn encode_class_a_position(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_class_aposition_report as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "User ID", 0), 30);
-    bv.add_int(enum_or_name(d, "Nav Status", &[]), 4);
-    bv.add_int(rate_of_turn(d), 8);
-    bv.add_int(sog(d, "SOG"), 10);
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::USER_ID, 0), 30);
+    bv.add_int(enum_field(d, f::NAV_STATUS, &[]), 4);
+    bv.add_int(rate_of_turn(d, f::RATE_OF_TURN), 8);
+    bv.add_int(sog(d, f::SOG), 10);
     bv.add_int(
-        enum_or_name(d, "Position Accuracy", POSITION_ACCURACY_NAMES),
+        enum_field(d, f::POSITION_ACCURACY, POSITION_ACCURACY_NAMES),
         1,
     );
-    bv.add_int(longitude(d, "Longitude"), 28);
-    bv.add_int(latitude(d, "Latitude"), 27);
-    bv.add_int(cog(d, "COG"), 12);
-    bv.add_int(heading(d, "Heading"), 9);
-    bv.add_int(int_field(d, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
-    bv.add_int(enum_or_name(d, "Special Maneuver Indicator", &[]), 2);
+    bv.add_int(longitude(d, f::LONGITUDE), 28);
+    bv.add_int(latitude(d, f::LATITUDE), 27);
+    bv.add_int(cog(d, f::COG), 12);
+    bv.add_int(heading(d, f::HEADING), 9);
+    bv.add_int(int_field(d, f::TIME_STAMP).unwrap_or(60).clamp(0, 63), 6);
+    bv.add_int(enum_field(d, f::SPECIAL_MANEUVER_INDICATOR, &[]), 2);
     bv.add_int(0, 3); // Spare
-    bv.add_int(enum_or_name(d, "RAIM", RAIM_NAMES), 1);
-    bv.add_int(comm_state(d), 19);
+    bv.add_int(enum_field(d, f::RAIM, RAIM_NAMES), 1);
+    bv.add_int(comm_state(d, f::COMMUNICATION_STATE), 19);
 }
 
 fn encode_utc_date(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_utc_and_date_report as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "User ID", 0), 30);
-    bv.add_int(ais_date(d, "Position Date"), 23);
-    bv.add_int(ais_time(d, "Position Time"), 17);
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::USER_ID, 0), 30);
+    bv.add_int(ais_date(d, f::POSITION_DATE), 23);
+    bv.add_int(ais_time(d, f::POSITION_TIME), 17);
     bv.add_int(
-        enum_or_name(d, "Position Accuracy", POSITION_ACCURACY_NAMES),
+        enum_field(d, f::POSITION_ACCURACY, POSITION_ACCURACY_NAMES),
         1,
     );
-    bv.add_int(longitude(d, "Longitude"), 28);
-    bv.add_int(latitude(d, "Latitude"), 27);
-    bv.add_int(enum_or_name(d, "GNSS type", &[]), 4);
+    bv.add_int(longitude(d, f::LONGITUDE), 28);
+    bv.add_int(latitude(d, f::LATITUDE), 27);
+    bv.add_int(enum_field(d, f::GNSS_TYPE, &[]), 4);
     bv.add_int(0, 10); // Spare
-    bv.add_int(enum_or_name(d, "RAIM", RAIM_NAMES), 1);
-    bv.add_int(comm_state(d), 19);
+    bv.add_int(enum_field(d, f::RAIM, RAIM_NAMES), 1);
+    bv.add_int(comm_state(d, f::COMMUNICATION_STATE), 19);
 }
 
 fn encode_class_a_static(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_class_astatic_and_voyage_related_data as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "User ID", 0), 30);
-    bv.add_int(enum_or_name(d, "AIS version indicator", &[]), 2);
-    bv.add_int(user_id(d, "IMO number", 0), 30);
-    bv.add_string(str_field(d, "Callsign").unwrap_or(""), 42);
-    bv.add_string(str_field(d, "Name").unwrap_or(""), 120);
-    bv.add_int(enum_or_name(d, "Type of ship", &[]), 8);
-    bv.add_int(ship_dimensions(d, true), 30);
-    bv.add_int(enum_or_name(d, "GNSS type", &[]), 4);
-    bv.add_int(ais_eta(d), 20);
-    bv.add_int(draft(d), 8);
-    bv.add_string(str_field(d, "Destination").unwrap_or(""), 120);
-    bv.add_int(enum_or_name(d, "DTE", &[]), 1);
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::USER_ID, 0), 30);
+    bv.add_int(enum_field(d, f::AIS_VERSION_INDICATOR, &[]), 2);
+    bv.add_int(user_id(d, f::IMO_NUMBER, 0), 30);
+    bv.add_string(str_field(d, f::CALLSIGN).unwrap_or(""), 42);
+    bv.add_string(str_field(d, f::NAME).unwrap_or(""), 120);
+    bv.add_int(enum_field(d, f::TYPE_OF_SHIP, &[]), 8);
+    bv.add_int(
+        ship_dimensions(
+            d,
+            f::LENGTH,
+            f::BEAM,
+            f::POSITION_REFERENCE_FROM_BOW,
+            f::POSITION_REFERENCE_FROM_STARBOARD,
+        ),
+        30,
+    );
+    bv.add_int(enum_field(d, f::GNSS_TYPE, &[]), 4);
+    bv.add_int(ais_eta(d, f::ETA_DATE, f::ETA_TIME), 20);
+    bv.add_int(draft(d, f::DRAFT), 8);
+    bv.add_string(str_field(d, f::DESTINATION).unwrap_or(""), 120);
+    bv.add_int(enum_field(d, f::DTE, &[]), 1);
     bv.add_int(0, 1); // Spare
 }
 
 fn encode_sar_aircraft(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_sar_aircraft_position_report as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "User ID", 0), 30);
-    bv.add_int(altitude(d), 12);
-    bv.add_int((sog(d, "SOG") + 5) / 10, 10);
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::USER_ID, 0), 30);
+    bv.add_int(altitude(d, f::ALTITUDE), 12);
+    bv.add_int((sog(d, f::SOG) + 5) / 10, 10);
     bv.add_int(
-        enum_or_name(d, "Position Accuracy", POSITION_ACCURACY_NAMES),
+        enum_field(d, f::POSITION_ACCURACY, POSITION_ACCURACY_NAMES),
         1,
     );
-    bv.add_int(longitude(d, "Longitude"), 28);
-    bv.add_int(latitude(d, "Latitude"), 27);
-    bv.add_int(cog(d, "COG"), 12);
-    bv.add_int(int_field(d, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
+    bv.add_int(longitude(d, f::LONGITUDE), 28);
+    bv.add_int(latitude(d, f::LATITUDE), 27);
+    bv.add_int(cog(d, f::COG), 12);
+    bv.add_int(int_field(d, f::TIME_STAMP).unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(0, 8); // Regional reserved
-    bv.add_int(enum_or_name(d, "DTE", &[]), 1);
+    bv.add_int(enum_field(d, f::DTE, &[]), 1);
     bv.add_int(0, 3); // Spare
-    bv.add_int(enum_or_name(d, "AIS mode", &[]), 1);
-    bv.add_int(enum_or_name(d, "RAIM", RAIM_NAMES), 1);
-    bv.add_int(enum_or_name(d, "AIS communication state", &[]), 1);
-    bv.add_int(comm_state(d), 19);
+    // PGN 129798 has no "AIS mode" field — the JSON path read nothing
+    // here too, so the slot keeps its all-ones "not available" default.
+    bv.add_int(-1, 1);
+    bv.add_int(enum_field(d, f::RAIM, RAIM_NAMES), 1);
+    // Likewise no "AIS communication state" field on 129798.
+    bv.add_int(-1, 1);
+    bv.add_int(comm_state(d, f::COMMUNICATION_STATE), 19);
 }
 
 fn encode_addressed_safety(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_addressed_safety_related_message as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "Source ID", 0), 30);
-    bv.add_int(int_field(d, "Sequence Number").unwrap_or(0).clamp(0, 3), 2);
-    bv.add_int(user_id(d, "Destination ID", 0), 30);
-    bv.add_int(int_field(d, "Retransmit flag").unwrap_or(0).clamp(0, 1), 1);
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::SOURCE_ID, 0), 30);
+    bv.add_int(int_field(d, f::SEQUENCE_NUMBER).unwrap_or(0).clamp(0, 3), 2);
+    bv.add_int(user_id(d, f::DESTINATION_ID, 0), 30);
+    bv.add_int(int_field(d, f::RETRANSMIT_FLAG).unwrap_or(0).clamp(0, 1), 1);
     bv.add_int(0, 1); // Spare
-    let text = str_field(d, "Safety Related Text").unwrap_or("");
+    let text = str_field(d, f::SAFETY_RELATED_TEXT).unwrap_or("");
     let mut bits = text.chars().count() * 6;
     if bits > 156 {
         bits = 156;
@@ -222,11 +264,12 @@ fn encode_addressed_safety(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
 }
 
 fn encode_broadcast_safety(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_safety_related_broadcast_message as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "Source ID", 0), 30);
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::SOURCE_ID, 0), 30);
     bv.add_int(0, 2); // Spare
-    let text = str_field(d, "Safety Related Text").unwrap_or("");
+    let text = str_field(d, f::SAFETY_RELATED_TEXT).unwrap_or("");
     let mut bits = text.chars().count() * 6;
     if bits > 161 {
         bits = 161;
@@ -238,80 +281,104 @@ fn encode_broadcast_safety(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
 }
 
 fn encode_class_b_position(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_class_bposition_report as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "User ID", 0), 30);
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::USER_ID, 0), 30);
     bv.add_int(0, 8); // Regional reserved
-    bv.add_int(sog(d, "SOG"), 10);
+    bv.add_int(sog(d, f::SOG), 10);
     bv.add_int(
-        enum_or_name(d, "Position Accuracy", POSITION_ACCURACY_NAMES),
+        enum_field(d, f::POSITION_ACCURACY, POSITION_ACCURACY_NAMES),
         1,
     );
-    bv.add_int(longitude(d, "Longitude"), 28);
-    bv.add_int(latitude(d, "Latitude"), 27);
-    bv.add_int(cog(d, "COG"), 12);
-    bv.add_int(heading(d, "Heading"), 9);
-    bv.add_int(int_field(d, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
+    bv.add_int(longitude(d, f::LONGITUDE), 28);
+    bv.add_int(latitude(d, f::LATITUDE), 27);
+    bv.add_int(cog(d, f::COG), 12);
+    bv.add_int(heading(d, f::HEADING), 9);
+    bv.add_int(int_field(d, f::TIME_STAMP).unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(0, 2); // Regional reserved
-    bv.add_int(enum_or_name(d, "Unit type", &[]), 1);
-    bv.add_int(enum_or_name(d, "Integrated Display", &[]), 1);
-    bv.add_int(enum_or_name(d, "DSC", &[]), 1);
-    bv.add_int(enum_or_name(d, "Band", &[]), 1);
-    bv.add_int(enum_or_name(d, "Can handle Msg 22", &[]), 1);
-    bv.add_int(enum_or_name(d, "AIS mode", &[]), 1);
-    bv.add_int(enum_or_name(d, "RAIM", RAIM_NAMES), 1);
-    bv.add_int(enum_or_name(d, "AIS communication state", &[]), 1);
-    bv.add_int(comm_state(d), 19);
+    bv.add_int(enum_field(d, f::UNIT_TYPE, &[]), 1);
+    bv.add_int(enum_field(d, f::INTEGRATED_DISPLAY, &[]), 1);
+    bv.add_int(enum_field(d, f::DSC, &[]), 1);
+    bv.add_int(enum_field(d, f::BAND, &[]), 1);
+    bv.add_int(enum_field(d, f::CAN_HANDLE_MSG22, &[]), 1);
+    bv.add_int(enum_field(d, f::AIS_MODE, &[]), 1);
+    bv.add_int(enum_field(d, f::RAIM, RAIM_NAMES), 1);
+    bv.add_int(enum_field(d, f::AIS_COMMUNICATION_STATE, &[]), 1);
+    bv.add_int(comm_state(d, f::COMMUNICATION_STATE), 19);
 }
 
 fn encode_class_b_extended(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_class_bextended_position_report as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "User ID", 0), 30);
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::USER_ID, 0), 30);
     bv.add_int(0, 8); // Regional reserved
-    bv.add_int(sog(d, "SOG"), 10);
+    bv.add_int(sog(d, f::SOG), 10);
     bv.add_int(
-        enum_or_name(d, "Position Accuracy", POSITION_ACCURACY_NAMES),
+        enum_field(d, f::POSITION_ACCURACY, POSITION_ACCURACY_NAMES),
         1,
     );
-    bv.add_int(longitude(d, "Longitude"), 28);
-    bv.add_int(latitude(d, "Latitude"), 27);
-    bv.add_int(cog(d, "COG"), 12);
-    bv.add_int(heading(d, "True Heading"), 9);
-    bv.add_int(int_field(d, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
+    bv.add_int(longitude(d, f::LONGITUDE), 28);
+    bv.add_int(latitude(d, f::LATITUDE), 27);
+    bv.add_int(cog(d, f::COG), 12);
+    bv.add_int(heading(d, f::TRUE_HEADING), 9);
+    bv.add_int(int_field(d, f::TIME_STAMP).unwrap_or(60).clamp(0, 63), 6);
     bv.add_int(0, 4); // Regional reserved
-    bv.add_string(str_field(d, "Name").unwrap_or(""), 120);
-    bv.add_int(enum_or_name(d, "Type of ship", &[]), 8);
-    bv.add_int(ship_dimensions(d, true), 30);
-    bv.add_int(enum_or_name(d, "GNSS type", &[]), 4);
-    bv.add_int(enum_or_name(d, "RAIM", RAIM_NAMES), 1);
-    bv.add_int(enum_or_name(d, "DTE", &[]), 1);
-    bv.add_int(enum_or_name(d, "AIS mode", &[]), 1);
+    bv.add_string(str_field(d, f::NAME).unwrap_or(""), 120);
+    bv.add_int(enum_field(d, f::TYPE_OF_SHIP, &[]), 8);
+    bv.add_int(
+        ship_dimensions(
+            d,
+            f::LENGTH,
+            f::BEAM,
+            f::POSITION_REFERENCE_FROM_BOW,
+            f::POSITION_REFERENCE_FROM_STARBOARD,
+        ),
+        30,
+    );
+    bv.add_int(enum_field(d, f::GNSS_TYPE, &[]), 4);
+    bv.add_int(enum_field(d, f::RAIM, RAIM_NAMES), 1);
+    bv.add_int(enum_field(d, f::DTE, &[]), 1);
+    bv.add_int(enum_field(d, f::AIS_MODE, &[]), 1);
     bv.add_int(0, 4); // Spare
 }
 
 fn encode_aton(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
+    use field::ais_aids_to_navigation_aton_report as f;
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "User ID", 0), 30);
-    bv.add_int(enum_or_name(d, "AtoN Type", &[]), 5);
-    let aton_name = str_field(d, "AtoN Name").unwrap_or("");
+    bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+    bv.add_int(user_id(d, f::USER_ID, 0), 30);
+    bv.add_int(enum_field(d, f::ATON_TYPE, &[]), 5);
+    let aton_name = str_field(d, f::ATON_NAME).unwrap_or("");
     let (name20, ext) = split_aton_name(aton_name);
     bv.add_string(name20, 120);
     bv.add_int(
-        enum_or_name(d, "Position Accuracy", POSITION_ACCURACY_NAMES),
+        enum_field(d, f::POSITION_ACCURACY, POSITION_ACCURACY_NAMES),
         1,
     );
-    bv.add_int(longitude(d, "Longitude"), 28);
-    bv.add_int(latitude(d, "Latitude"), 27);
-    bv.add_int(ship_dimensions(d, false), 30);
-    bv.add_int(enum_or_name(d, "GNSS type", &[]), 4);
-    bv.add_int(int_field(d, "Time Stamp").unwrap_or(60).clamp(0, 63), 6);
-    bv.add_int(enum_or_name(d, "Off Position Indicator", &[]), 1);
+    bv.add_int(longitude(d, f::LONGITUDE), 28);
+    bv.add_int(latitude(d, f::LATITUDE), 27);
+    bv.add_int(
+        ship_dimensions(
+            d,
+            f::LENGTH_DIAMETER,
+            f::BEAM_DIAMETER,
+            f::POSITION_REFERENCE_FROM_TRUE_NORTH_FACING_EDGE,
+            f::POSITION_REFERENCE_FROM_STARBOARD_EDGE,
+        ),
+        30,
+    );
+    // PGN 129041 has no "GNSS type" field (its EPFD is "Position Fixing
+    // Device Type"); the JSON path read nothing here too, so keep the
+    // slot at its all-ones "not available" default.
+    bv.add_int(-1, 4);
+    bv.add_int(int_field(d, f::TIME_STAMP).unwrap_or(60).clamp(0, 63), 6);
+    bv.add_int(enum_field(d, f::OFF_POSITION_INDICATOR, &[]), 1);
     bv.add_int(0, 8); // Regional reserved
-    bv.add_int(enum_or_name(d, "RAIM", RAIM_NAMES), 1);
-    bv.add_int(enum_or_name(d, "Virtual AtoN Flag", &[]), 1);
-    bv.add_int(enum_or_name(d, "Assigned Mode Flag", &[]), 1);
+    bv.add_int(enum_field(d, f::RAIM, RAIM_NAMES), 1);
+    bv.add_int(enum_field(d, f::VIRTUAL_ATON_FLAG, &[]), 1);
+    bv.add_int(enum_field(d, f::ASSIGNED_MODE_FLAG, &[]), 1);
     bv.add_int(0, 1); // Spare
     let mut ext_bits = ext.chars().count() * 6;
     if ext_bits % 8 != 0 {
@@ -320,66 +387,86 @@ fn encode_aton(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
     bv.add_string(ext, ext_bits);
 }
 
-fn encode_class_b_static(bv: &mut BitVector, msgid: i64, pgn: i64, d: &DecodedPgn) {
+fn encode_class_b_static(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
     bv.add_int(msgid, 6);
-    bv.add_int(repeat_indicator(d), 2);
-    bv.add_int(user_id(d, "User ID", 0), 30);
-    match pgn {
-        129809 => {
-            bv.add_int(0, 2); // Part number = A
-            bv.add_string(str_field(d, "Name").unwrap_or(""), 120);
-            bv.add_int(0, 8); // Spare
-        }
-        129810 => {
-            bv.add_int(1, 2); // Part number = B
-            bv.add_int(enum_or_name(d, "Type of ship", &[]), 8);
-            bv.add_string(str_field(d, "Vendor ID").unwrap_or(""), 42);
-            bv.add_string(str_field(d, "Callsign").unwrap_or(""), 42);
-            bv.add_int(ship_dimensions(d, true), 30);
-            bv.add_int(user_id(d, "Mothership User ID", 0), 30);
-            bv.add_int(0, 6); // Spare
-        }
-        _ => {}
+    if d.id == pgn::AIS_CLASS_BSTATIC_DATA_MSG24_PART_A.id {
+        use field::ais_class_bstatic_data_msg24_part_a as f;
+        bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+        bv.add_int(user_id(d, f::USER_ID, 0), 30);
+        bv.add_int(0, 2); // Part number = A
+        bv.add_string(str_field(d, f::NAME).unwrap_or(""), 120);
+        bv.add_int(0, 8); // Spare
+    } else if d.id == pgn::AIS_CLASS_BSTATIC_DATA_MSG24_PART_B.id {
+        use field::ais_class_bstatic_data_msg24_part_b as f;
+        bv.add_int(repeat_indicator(d, f::REPEAT_INDICATOR), 2);
+        bv.add_int(user_id(d, f::USER_ID, 0), 30);
+        bv.add_int(1, 2); // Part number = B
+        bv.add_int(enum_field(d, f::TYPE_OF_SHIP, &[]), 8);
+        bv.add_string(str_field(d, f::VENDOR_ID).unwrap_or(""), 42);
+        bv.add_string(str_field(d, f::CALLSIGN).unwrap_or(""), 42);
+        bv.add_int(
+            ship_dimensions(
+                d,
+                f::LENGTH,
+                f::BEAM,
+                f::POSITION_REFERENCE_FROM_BOW,
+                f::POSITION_REFERENCE_FROM_STARBOARD,
+            ),
+            30,
+        );
+        bv.add_int(user_id(d, f::MOTHERSHIP_USER_ID, 0), 30);
+        bv.add_int(0, 6); // Spare
     }
 }
 
 // ---------- helpers ----------
 
-fn int_field(d: &DecodedPgn, name: &str) -> Option<i64> {
-    d.field_by_name(name).and_then(|f| f.value.as_i64())
+fn int_field(d: &DecodedPgn, f: FieldRef) -> Option<i64> {
+    d.field_ref(f).and_then(|x| x.value.as_i64())
 }
 
-fn num_field(d: &DecodedPgn, name: &str) -> Option<f64> {
-    d.field_by_name(name).and_then(|f| f.value.as_f64())
+fn num_field(d: &DecodedPgn, f: FieldRef) -> Option<f64> {
+    d.field_ref(f).and_then(|x| x.value.as_f64())
 }
 
 /// Like [`num_field`] but in a requested unit — the AIS bit layouts are
 /// defined in degrees (COG/heading) and deg/s (rate of turn), so ask for
 /// those and let the core convert from the stream's schema unit (Metric
 /// or SI). See [`canboat_core::DecodedField::as_f64_in`].
-fn num_field_in(d: &DecodedPgn, name: &str, unit: &str) -> Option<f64> {
-    d.field_by_name(name).and_then(|f| f.as_f64_in(unit))
+fn num_field_in(d: &DecodedPgn, f: FieldRef, unit: &str) -> Option<f64> {
+    d.field_ref(f).and_then(|x| x.as_f64_in(unit))
 }
 
-fn str_field<'a>(d: &'a DecodedPgn, name: &str) -> Option<&'a str> {
-    d.field_by_name(name).and_then(|f| f.value.as_str())
+fn str_field(d: &DecodedPgn, f: FieldRef) -> Option<&str> {
+    d.field_ref(f).and_then(|x| x.value.as_str())
 }
 
-fn repeat_indicator(d: &DecodedPgn) -> i64 {
-    enum_or_name(d, "Repeat Indicator", REPEAT_NAMES).clamp(0, 3)
+fn repeat_indicator(d: &DecodedPgn, f: FieldRef) -> i64 {
+    enum_field(d, f, REPEAT_NAMES).clamp(0, 3)
 }
 
 /// Read an MMSI or 30-bit user ID. canboat-core decodes MMSI fields
 /// to `FieldValue::Mmsi(u32)` which `as_i64()` widens cleanly.
-fn user_id(d: &DecodedPgn, field: &str, default: i64) -> i64 {
-    int_field(d, field).unwrap_or(default)
+fn user_id(d: &DecodedPgn, f: FieldRef, default: i64) -> i64 {
+    int_field(d, f).unwrap_or(default)
 }
 
-/// Resolve an enum field. `Lookup` carries the integer code directly;
-/// the `names` fallback list handles the rare case where the decoder
-/// produced a bare string we still need to map.
-fn enum_or_name(d: &DecodedPgn, field: &str, names: &[(&str, i64)]) -> i64 {
-    let Some(f) = d.field_by_name(field) else {
+/// Resolve an enum field by its constant. `Lookup` carries the integer
+/// code directly; the `names` fallback list handles the rare case where
+/// the decoder produced a bare string we still need to map. `-1` when
+/// the field is absent from the record.
+fn enum_field(d: &DecodedPgn, f: FieldRef, names: &[(&str, i64)]) -> i64 {
+    enum_of(d.field_ref(f), names)
+}
+
+/// Same as [`enum_field`] but keyed by field *name* — used only for the
+/// PGN-independent AIS header field(s).
+fn enum_by_name(d: &DecodedPgn, name: &str, names: &[(&str, i64)]) -> i64 {
+    enum_of(d.field_by_name(name), names)
+}
+
+fn enum_of(field: Option<&canboat_core::DecodedField>, names: &[(&str, i64)]) -> i64 {
+    let Some(f) = field else {
         return -1;
     };
     if let Some(n) = f.value.lookup_value() {
@@ -400,8 +487,8 @@ fn enum_or_name(d: &DecodedPgn, field: &str, names: &[(&str, i64)]) -> i64 {
 
 /// `Rate of Turn` — non-linear AIS encoding. Identical math to
 /// [`crate::n2kd::ais::rate_of_turn`].
-fn rate_of_turn(d: &DecodedPgn) -> i64 {
-    let Some(rot) = num_field_in(d, "Rate of Turn", "deg/s") else {
+fn rate_of_turn(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(rot) = num_field_in(d, f, "deg/s") else {
         return -128;
     };
     let v = rot * 60.0;
@@ -412,32 +499,32 @@ fn rate_of_turn(d: &DecodedPgn) -> i64 {
     if (-127..=127).contains(&r) { r } else { -128 }
 }
 
-fn sog(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(v) = num_field(d, field) else {
+fn sog(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(v) = num_field(d, f) else {
         return 1023;
     };
     let n = (v * 19.438_444_92 + 0.5) as i64;
     if (0..=1022).contains(&n) { n } else { 1023 }
 }
 
-fn cog(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(v) = num_field_in(d, field, "deg") else {
+fn cog(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(v) = num_field_in(d, f, "deg") else {
         return 3600;
     };
     let n = (v * 10.0 + 0.5) as i64;
     if (0..=3599).contains(&n) { n } else { 3600 }
 }
 
-fn heading(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(v) = num_field_in(d, field, "deg") else {
+fn heading(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(v) = num_field_in(d, f, "deg") else {
         return 511;
     };
     let n = (v + 0.5) as i64;
     if (0..=359).contains(&n) { n } else { 511 }
 }
 
-fn longitude(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(v) = num_field(d, field) else {
+fn longitude(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(v) = num_field(d, f) else {
         return 0x6791AC0;
     };
     let n = (v * 600_000.0).round() as i64;
@@ -448,8 +535,8 @@ fn longitude(d: &DecodedPgn, field: &str) -> i64 {
     }
 }
 
-fn latitude(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(v) = num_field(d, field) else {
+fn latitude(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(v) = num_field(d, f) else {
         return 0x3412140;
     };
     let n = (v * 600_000.0).round() as i64;
@@ -460,16 +547,16 @@ fn latitude(d: &DecodedPgn, field: &str) -> i64 {
     }
 }
 
-fn altitude(d: &DecodedPgn) -> i64 {
-    let Some(v) = num_field(d, "Altitude") else {
+fn altitude(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(v) = num_field(d, f) else {
         return 4095;
     };
     let n = (v + 0.5) as i64;
     if (0..=4094).contains(&n) { n } else { 4095 }
 }
 
-fn draft(d: &DecodedPgn) -> i64 {
-    let Some(v) = num_field(d, "Draft") else {
+fn draft(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(v) = num_field(d, f) else {
         return 0;
     };
     let n = (v * 10.0 + 0.5) as i64;
@@ -481,8 +568,8 @@ fn draft(d: &DecodedPgn) -> i64 {
 /// field type. We accept either: numeric path returns the value
 /// directly; binary path packs the first 3 bytes little-endian into
 /// the 19-bit slot, matching canboat C's text-form parser.
-fn comm_state(d: &DecodedPgn) -> i64 {
-    let Some(f) = d.field_by_name("Communication State") else {
+fn comm_state(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(f) = d.field_ref(f) else {
         return 393_222;
     };
     if let Some(n) = f.value.as_i64() {
@@ -513,9 +600,9 @@ fn comm_state(d: &DecodedPgn) -> i64 {
 
 /// Format a `FieldValue::Date(days)` as `YYYY.MM.DD`, then return a
 /// 10-byte buffer in canboat's canonical date string form. Returns
-/// `None` if the named field is missing or not a date.
-fn date_string(d: &DecodedPgn, field: &str) -> Option<String> {
-    let f = d.field_by_name(field)?;
+/// `None` if the field is missing or not a date.
+fn date_string(d: &DecodedPgn, f: FieldRef) -> Option<String> {
+    let f = d.field_ref(f)?;
     let FieldValue::Date(days) = f.value else {
         return None;
     };
@@ -524,10 +611,9 @@ fn date_string(d: &DecodedPgn, field: &str) -> Option<String> {
     Some(buf)
 }
 
-/// `Position Date` (or any DATE-typed field) packed as
-/// `(year << 9) | (month << 5) | day`.
-fn ais_date(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(s) = date_string(d, field) else {
+/// A DATE-typed field packed as `(year << 9) | (month << 5) | day`.
+fn ais_date(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(s) = date_string(d, f) else {
         return 0;
     };
     let mut parts = s.split('.');
@@ -540,9 +626,9 @@ fn ais_date(d: &DecodedPgn, field: &str) -> i64 {
     ((y as i64) << 9) | ((m as i64) << 5) | d as i64
 }
 
-/// `Position Time` packed as `(hour << 12) | (minute << 6) | second`.
-fn ais_time(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(f) = d.field_by_name(field) else {
+/// A TIME-typed field packed as `(hour << 12) | (minute << 6) | second`.
+fn ais_time(d: &DecodedPgn, f: FieldRef) -> i64 {
+    let Some(f) = d.field_ref(f) else {
         return 0;
     };
     let FieldValue::Time { seconds, .. } = f.value else {
@@ -565,9 +651,9 @@ fn ais_time(d: &DecodedPgn, field: &str) -> i64 {
 /// (month/day/hour/minute). Canboat C reads bytes 5,6 and 8,9 of the
 /// formatted date string, which works for both `YYYY.MM.DD` and
 /// `YYYY-MM-DD` separators — we do the same.
-fn ais_eta(d: &DecodedPgn) -> i64 {
+fn ais_eta(d: &DecodedPgn, eta_date: FieldRef, eta_time: FieldRef) -> i64 {
     let (mut month, mut day) = (0u32, 0u32);
-    if let Some(s) = date_string(d, "ETA Date") {
+    if let Some(s) = date_string(d, eta_date) {
         let bytes = s.as_bytes();
         if bytes.len() >= 10 {
             month =
@@ -582,7 +668,7 @@ fn ais_eta(d: &DecodedPgn) -> i64 {
         }
     }
     let (mut hour, mut minute) = (24u32, 60u32);
-    if let Some(f) = d.field_by_name("ETA Time")
+    if let Some(f) = d.field_ref(eta_time)
         && let FieldValue::Time { seconds, .. } = f.value
         && seconds.is_finite()
         && seconds >= 0.0
@@ -602,23 +688,19 @@ fn ais_eta(d: &DecodedPgn) -> i64 {
 
 /// Pack the four `Position reference / Length / Beam` fields into
 /// the 30-bit AIS dimension field. Mirrors `aisShipDimensions` in
-/// canboat C.
-fn ship_dimensions(d: &DecodedPgn, ship: bool) -> i64 {
-    let (length, beam, ref_bow, ref_starboard) = if ship {
-        (
-            num_field(d, "Length").unwrap_or(0.0) * 10.0,
-            num_field(d, "Beam").unwrap_or(0.0) * 10.0,
-            num_field(d, "Position reference from Bow").unwrap_or(0.0) * 10.0,
-            num_field(d, "Position reference from Starboard").unwrap_or(0.0) * 10.0,
-        )
-    } else {
-        (
-            num_field(d, "Length/Diameter").unwrap_or(0.0) * 10.0,
-            num_field(d, "Beam/Diameter").unwrap_or(0.0) * 10.0,
-            num_field(d, "Position Reference from True North Facing Edge").unwrap_or(0.0) * 10.0,
-            num_field(d, "Position Reference from Starboard Edge").unwrap_or(0.0) * 10.0,
-        )
-    };
+/// canboat C. The four field constants differ per PGN (ship vs AtoN),
+/// so the caller passes the right ones.
+fn ship_dimensions(
+    d: &DecodedPgn,
+    length: FieldRef,
+    beam: FieldRef,
+    ref_bow: FieldRef,
+    ref_starboard: FieldRef,
+) -> i64 {
+    let length = num_field(d, length).unwrap_or(0.0) * 10.0;
+    let beam = num_field(d, beam).unwrap_or(0.0) * 10.0;
+    let ref_bow = num_field(d, ref_bow).unwrap_or(0.0) * 10.0;
+    let ref_starboard = num_field(d, ref_starboard).unwrap_or(0.0) * 10.0;
     let to_stern = (length - ref_bow).clamp(0.0, 5110.0);
     let to_port = (beam - ref_starboard).clamp(0.0, 630.0);
     (((ref_bow + 5.0) / 10.0) as i64) << 21
@@ -651,13 +733,16 @@ mod tests {
         // 999 m/s ≈ 1940 kn; canboat clamps to the 1023 "unknown"
         // sentinel. (Ported from the deleted JSON-path `ais::sog` test.)
         let d = decode(r#"{"pgn":129039,"src":1,"fields":{"SOG":999.0}}"#);
-        assert_eq!(sog(&d, "SOG"), 1023);
+        assert_eq!(sog(&d, field::ais_class_bposition_report::SOG), 1023);
     }
 
     #[test]
     fn longitude_default_on_missing() {
         // No Longitude field → ITU "not available" sentinel.
         let d = decode(r#"{"pgn":129039,"src":1,"fields":{}}"#);
-        assert_eq!(longitude(&d, "Longitude"), 0x6791AC0);
+        assert_eq!(
+            longitude(&d, field::ais_class_bposition_report::LONGITUDE),
+            0x6791AC0
+        );
     }
 }

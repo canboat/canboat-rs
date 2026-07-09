@@ -22,8 +22,8 @@ use canboat_core::RawFrame;
 use canboat_core::format::InputFormat;
 use canboat_core::output::{GeoFormat, JsonOptions, TextOptions, write_json, write_text};
 use canboat_io::{
-    EblWriter, FrameReader, FrameWriter, LineFrameReader, PlainWriter, TextLineWriter, analyze,
-    container, copy,
+    EblReader, EblWriter, FrameReader, FrameWriter, LineFrameReader, PlainWriter, TextLineWriter,
+    analyze, container, copy,
 };
 
 /// Output format for `convert --to`.
@@ -87,12 +87,17 @@ enum FromFormat {
     /// Garmin CSV2 (absolute timestamps + `Processed PGN` column).
     #[value(name = "garmin-csv2")]
     GarminCsv2,
+    /// Actisense `.ebl` binary log. Not a line format — decoded via the
+    /// EBL frame reader, so it has no [`InputFormat`] mapping.
+    #[value(name = "actisense-ebl")]
+    ActisenseEbl,
 }
 
 impl FromFormat {
-    /// Map to the canboat-core parser selector.
-    fn to_input_format(self) -> InputFormat {
-        match self {
+    /// Map to the canboat-core line-parser selector. `None` for the
+    /// binary `.ebl` format, which uses its own frame reader.
+    fn to_input_format(self) -> Option<InputFormat> {
+        Some(match self {
             FromFormat::Plain => InputFormat::Plain,
             FromFormat::PlainMixFast => InputFormat::PlainMixFast,
             FromFormat::Actisense => InputFormat::ActisenseAscii,
@@ -102,7 +107,8 @@ impl FromFormat {
             FromFormat::Chetco => InputFormat::Chetco,
             FromFormat::Garmin => InputFormat::GarminCsv,
             FromFormat::GarminCsv2 => InputFormat::GarminCsv2,
-        }
+            FromFormat::ActisenseEbl => return None,
+        })
     }
 }
 
@@ -196,26 +202,46 @@ pub fn run(args: Args) -> Result<()> {
     // `RUST_LOG` for more. Ignore a double-init if a shim already set one.
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("warn"))
         .try_init();
-    let forced = args.from.map(FromFormat::to_input_format);
+    let forced = args.from.and_then(FromFormat::to_input_format);
+    let ebl = ebl_input(&args);
     let stdout = io::stdout();
     let mut out = BufWriter::new(stdout.lock());
 
     if args.to.is_frame_level() {
-        convert_raw(&args, forced, &mut out)
+        convert_raw(&args, forced, ebl, &mut out)
     } else {
-        convert_decoded(&args, forced, &mut out)
+        convert_decoded(&args, forced, ebl, &mut out)
     }
+}
+
+/// True when the input is an Actisense `.ebl` binary log: `--from
+/// actisense-ebl`, or (unforced) a `.ebl` filename.
+fn ebl_input(args: &Args) -> bool {
+    matches!(args.from, Some(FromFormat::ActisenseEbl))
+        || (args.from.is_none()
+            && args
+                .input()
+                .is_some_and(|p| p.extension().is_some_and(|e| e.eq_ignore_ascii_case("ebl"))))
 }
 
 /// Raw path: input frames → the selected frame-level format, no decode.
 /// The no-filter case is exactly [`canboat_io::copy`]; with filters we
 /// run the same pull loop with a per-frame predicate. The writer is
 /// chosen by `--to` (PLAIN / YDWG02 / Actisense ASCII / Actisense EBL).
-fn convert_raw<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut W) -> Result<()> {
+fn convert_raw<W: Write>(
+    args: &Args,
+    forced: Option<InputFormat>,
+    ebl: bool,
+    out: &mut W,
+) -> Result<()> {
     let source = open_source(args.input(), args.container_opts())?;
-    let mut reader = match forced {
-        Some(fmt) => LineFrameReader::with_format(source, fmt),
-        None => LineFrameReader::new(source),
+    let mut reader: Box<dyn FrameReader> = if ebl {
+        Box::new(EblReader::new(source))
+    } else {
+        match forced {
+            Some(fmt) => Box::new(LineFrameReader::with_format(source, fmt)),
+            None => Box::new(LineFrameReader::new(source)),
+        }
     };
     let mut writer: Box<dyn FrameWriter + '_> = match args.to {
         OutFormat::Plain => Box::new(PlainWriter::new(out)),
@@ -226,7 +252,7 @@ fn convert_raw<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut W) 
     };
 
     if !args.has_filter() {
-        copy(&mut reader, &mut *writer).context("converting frames")?;
+        copy(&mut *reader, &mut *writer).context("converting frames")?;
         return Ok(());
     }
     while let Some(frame) = reader.read_frame().context("reading input")? {
@@ -240,7 +266,12 @@ fn convert_raw<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut W) 
 
 /// Decoded path: drive the analyzer pipeline and render each record as
 /// JSON or text. Filters are pushed into the pipeline's `Config`.
-fn convert_decoded<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut W) -> Result<()> {
+fn convert_decoded<W: Write>(
+    args: &Args,
+    forced: Option<InputFormat>,
+    ebl: bool,
+    out: &mut W,
+) -> Result<()> {
     let json_opts = JsonOptions::default();
     let text_opts = TextOptions {
         show_unavailable: false,
@@ -277,7 +308,27 @@ fn convert_decoded<W: Write>(args: &Args, forced: Option<InputFormat>, out: &mut
     };
 
     let source = open_source(args.input(), args.container_opts())?;
-    analyze::decode_stream(source, &cfg, sink).context("decoding input")?;
+    if ebl {
+        // `.ebl` records are already complete N2K messages, so skip the
+        // line-reader / reassembly / coalesced-mode machinery entirely:
+        // pull each frame and decode it directly, honouring the filters.
+        let db = canboat_core::PgnDatabase::embedded(canboat_core::Units::Metric);
+        let mut reader = EblReader::new(source);
+        let mut sink = sink;
+        while let Some(frame) = reader.read_frame().context("reading .ebl input")? {
+            if cfg.pgn_filter.is_some_and(|w| frame.pgn != w)
+                || cfg.src_filter.is_some_and(|w| frame.src != w)
+                || cfg.dst_filter.is_some_and(|w| frame.dst != w)
+            {
+                continue;
+            }
+            if let Ok(decoded) = db.decode(&frame) {
+                sink(&decoded);
+            }
+        }
+    } else {
+        analyze::decode_stream(source, &cfg, sink).context("decoding input")?;
+    }
     if let Some(e) = sink_err {
         return Err(e).context("writing output");
     }

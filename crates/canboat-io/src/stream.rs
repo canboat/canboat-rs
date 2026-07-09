@@ -18,12 +18,14 @@
 //! every existing source, including a live CAN interface drained
 //! through [`crate::device::DeviceHandle`].
 
-use std::io::{self, BufRead, Write};
+use std::collections::VecDeque;
+use std::io::{self, BufRead, Read, Write};
 use std::sync::mpsc;
 
 use canboat_core::RawFrame;
 use canboat_core::format::actisense_ascii::write_line as write_actisense;
 use canboat_core::format::ebl::encode_frame as encode_ebl;
+use canboat_core::format::ngt1::{EblHeader, Ngt1Decoder, NgtEvent};
 use canboat_core::format::plain::write_line as write_plain;
 use canboat_core::format::ydwg02::write_line as write_ydwg02;
 use canboat_core::format::{
@@ -278,6 +280,74 @@ impl<W: Write> FrameWriter for EblWriter<W> {
 
     fn flush(&mut self) -> io::Result<()> {
         self.inner.flush()
+    }
+}
+
+/// A [`FrameReader`] over an Actisense `.ebl` byte stream — the inverse
+/// of [`EblWriter`]. Drives [`Ngt1Decoder::with_ebl`] (EBL framing is a
+/// superset of NGT-1 framing) and hands back one [`RawFrame`] per
+/// `N2K_MSG_RECEIVED` record. The per-record `ESC SOH` timestamp header
+/// is folded onto the following frame as an ISO-8601 UTC timestamp.
+///
+/// Binary, not line-based, so it implements [`FrameReader`] directly
+/// rather than going through [`LineFrameReader`].
+pub struct EblReader<R: Read> {
+    inner: R,
+    decoder: Ngt1Decoder,
+    queue: VecDeque<RawFrame>,
+    /// Most recent `.ebl` header timestamp (Unix ms) to stamp onto the
+    /// next message frame.
+    pending_ts: Option<u64>,
+    buf: Box<[u8; 8192]>,
+    eof: bool,
+}
+
+impl<R: Read> EblReader<R> {
+    pub fn new(inner: R) -> Self {
+        Self {
+            inner,
+            decoder: Ngt1Decoder::with_ebl(),
+            queue: VecDeque::new(),
+            pending_ts: None,
+            buf: Box::new([0u8; 8192]),
+            eof: false,
+        }
+    }
+}
+
+impl<R: Read> FrameReader for EblReader<R> {
+    fn read_frame(&mut self) -> io::Result<Option<RawFrame>> {
+        loop {
+            if let Some(frame) = self.queue.pop_front() {
+                return Ok(Some(frame));
+            }
+            if self.eof {
+                return Ok(None);
+            }
+            let n = self.inner.read(&mut self.buf[..])?;
+            if n == 0 {
+                self.eof = true;
+                continue;
+            }
+            for ev in self.decoder.push_bytes(&self.buf[..n]) {
+                match ev {
+                    NgtEvent::Header(EblHeader::Timestamp(ms)) => self.pending_ts = Some(ms),
+                    NgtEvent::Message(m) => {
+                        if let Some(mut frame) = m.to_raw_frame() {
+                            // The NGT message's own timestamp is 0 in an
+                            // `.ebl`; the real instant rides in the header.
+                            if let Some(ms) = self.pending_ts.take() {
+                                frame.timestamp = Some(canboat_core::format_iso_ms(ms));
+                            }
+                            self.queue.push_back(frame);
+                        }
+                    }
+                    // Skip an unknown header record or a framing error —
+                    // resync on the next valid `ESC SOH` / `DLE STX`.
+                    NgtEvent::Header(_) | NgtEvent::Error(_) => {}
+                }
+            }
+        }
     }
 }
 

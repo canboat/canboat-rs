@@ -543,13 +543,17 @@ async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Re
         .context("reading snapshot blob timed out (peer did not close)")?
         .context("reading snapshot blob")?;
 
-    let trimmed = buf.trim();
-    if trimmed.is_empty() {
+    // Strip the optional leading banner from the raw payload (before any
+    // trim — an empty cache arrives as `banner\n\n`, and trimming first
+    // would fuse the banner and the empty doc).
+    let doc = strip_snapshot_banner(&buf);
+    if doc.is_empty() {
+        // Empty payload, or banner-only (empty cache) — nothing to load.
         let mut s = state.lock().await;
         s.status.snapshot_loaded = true;
         return Ok(());
     }
-    let root: Value = serde_json::from_str(trimmed).context("parsing snapshot JSON")?;
+    let root: Value = serde_json::from_str(doc).context("parsing snapshot JSON")?;
     let Some(by_pgn) = root.as_object() else {
         anyhow::bail!("snapshot top-level is not a JSON object");
     };
@@ -753,6 +757,17 @@ async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<Ap
     s.status.stream_connected = false;
 }
 
+/// Drop a `canboat server` snapshot's leading one-line version/units
+/// banner (`{"version":…}`) so only the cache document is parsed. A
+/// server without the banner (older, or n2kd) sends the document as the
+/// whole payload, which passes through unchanged.
+fn strip_snapshot_banner(payload: &str) -> &str {
+    match payload.split_once('\n') {
+        Some((first, rest)) if first.trim_start().starts_with("{\"version\"") => rest.trim(),
+        _ => payload.trim(),
+    }
+}
+
 /// If `line` is a PGN 126208 Acknowledge (Function Code = 2) carrying
 /// at least one non-zero error code, format a one-line summary
 /// suitable for the UI toast slot. Returns `None` for non-ACKs and
@@ -842,6 +857,22 @@ mod tests {
     use crate::tui::state::Status;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn snapshot_banner_is_stripped() {
+        // Banner-led snapshot (canboat server): only the doc remains.
+        let with = "{\"version\":\"0.5.0\",\"units\":\"si\"}\n{\"130306\":{\"7\":{}}}";
+        assert_eq!(strip_snapshot_banner(with), "{\"130306\":{\"7\":{}}}");
+        // No banner (older server / n2kd): whole payload is the doc.
+        let without = "{\"130306\":{\"7\":{}}}";
+        assert_eq!(strip_snapshot_banner(without), without);
+        // A doc whose first line merely starts with `{` but isn't a
+        // version banner is left intact.
+        let pretty = "{\n  \"130306\": {}\n}";
+        assert_eq!(strip_snapshot_banner(pretty), pretty);
+        // Banner-only (empty cache): `banner\n\n` → empty doc.
+        assert_eq!(strip_snapshot_banner("{\"version\":\"x\"}\n\n"), "");
+    }
 
     #[test]
     fn filter_control_lines_are_recognised_by_pgn() {

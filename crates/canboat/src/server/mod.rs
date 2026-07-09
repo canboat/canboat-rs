@@ -385,6 +385,21 @@ pub fn run(cli: Args) -> Result<()> {
         camel_case,
     };
 
+    // The analyzer version banner (version, commit, units,
+    // showLookupValues) leads the analyzer stream (2598) and the snapshot
+    // (2597) so consumers can detect the unit system on connect — the
+    // same first line canboat C's `analyzer` emits. Computed once and
+    // leaked: it lives for the whole process, so a `&'static` is honest
+    // and lets the accept threads hold it without an Arc.
+    let banner: &'static [u8] = Box::leak(
+        format!(
+            "{}\n",
+            crate::build_info::version_banner(cli.si, json_opts.name_value)
+        )
+        .into_bytes()
+        .into_boxed_slice(),
+    );
+
     let snapshot = if cli.snapshot_port != 0 {
         Some(Arc::new(SnapshotStore::new(json_opts.clone())))
     } else {
@@ -461,6 +476,7 @@ pub fn run(cli: Args) -> Result<()> {
             cli.bind,
             cli.snapshot_port,
             store.core(),
+            Some(banner),
         )?);
     }
     // Write-only input port (canboat C `n2kd` `port+3`
@@ -511,7 +527,7 @@ pub fn run(cli: Args) -> Result<()> {
             cli.bind,
             cli.analyzer_port,
             hubs.analyzer.clone(),
-            None,
+            Some(banner),
         )?);
     }
     if cli.ais_port != 0 {

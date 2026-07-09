@@ -199,7 +199,7 @@ pub fn run(args: Args) -> Result<()> {
         )?;
         spawn_raw_input_listener(bind_addr, cli.port + 3, cli.output_copy && !cli.restrict)?;
         serving_tcp::spawn_ais_snapshot(bind_addr, cli.port + 4, Arc::clone(&hub.cache))?;
-        serving_tcp::spawn_snapshot(bind_addr, cli.port, Arc::clone(&hub.cache))?;
+        serving_tcp::spawn_snapshot(bind_addr, cli.port, Arc::clone(&hub.cache), None)?;
         spawn_status_listener(bind_addr, cli.port + 5, Arc::clone(&hub))?;
     }
     // Default-on like canboat C; `-r` / `--restrict` and the explicit

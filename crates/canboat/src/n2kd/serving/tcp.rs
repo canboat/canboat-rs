@@ -51,17 +51,22 @@ pub fn spawn_snapshot(
     bind: Ipv4Addr,
     port: u16,
     store: Arc<SnapshotStore>,
+    header: Option<&'static [u8]>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding snapshot TCP port {}:{}", bind, port))?;
     log::info!("snapshot server listening on {}:{}", bind, port);
     Ok(thread::Builder::new()
         .name("snapshot-accept".into())
-        .spawn(move || snapshot_accept(listener, store))
+        .spawn(move || snapshot_accept(listener, store, header))
         .expect("spawn snapshot accept"))
 }
 
-fn snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
+fn snapshot_accept(
+    listener: TcpListener,
+    store: Arc<SnapshotStore>,
+    header: Option<&'static [u8]>,
+) {
     loop {
         let (stream, peer) = match listener.accept() {
             Ok(s) => s,
@@ -74,18 +79,29 @@ fn snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
         let s = store.clone();
         thread::Builder::new()
             .name("snapshot-client".into())
-            .spawn(move || run_snapshot_client(stream, s))
+            .spawn(move || run_snapshot_client(stream, s, header))
             .ok();
     }
 }
 
-fn run_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
+fn run_snapshot_client(
+    mut stream: TcpStream,
+    store: Arc<SnapshotStore>,
+    header: Option<&'static [u8]>,
+) {
     // Snapshot is a strictly read-only one-shot: FIN the read
     // direction immediately so any client writes during the brief
     // window before the dump completes get ECONNRESET / EPIPE
     // instead of piling up in the kernel's receive buffer.
     if let Err(e) = stream.shutdown(Shutdown::Read) {
         log::debug!("snapshot: shutdown(read) failed: {e}");
+    }
+    // Optional version/units banner as the first line, so a consumer can
+    // detect the unit system before parsing the JSON document.
+    if let Some(bytes) = header
+        && stream.write_all(bytes).is_err()
+    {
+        return;
     }
     // Snapshot is a one-shot dump — build the JSON document under
     // the cache lock, then drop the lock before sending so a slow

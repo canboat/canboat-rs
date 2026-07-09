@@ -211,6 +211,11 @@ pub struct Hubs {
     /// external consumers (e.g. an NGT-1 on the same bus) see it.
     /// `None` in stdin-only mode where there's no device writer.
     pub device_sender: Option<FrameSender>,
+    /// Server-owned PGN-rate overrides. Shared behind a mutex with the
+    /// dedicated control-port server; the pipeline replays a device's
+    /// overrides on first sight (PGN 60928) and forgets one the bus NAKs
+    /// (PGN 126208 Acknowledge). `None` when the config dir is unwritable.
+    pub overrides: Option<Arc<Mutex<crate::n2kd::overrides::OverrideEngine>>>,
 }
 
 /// NMEA 0183 output options for [`run`], bundled to keep the entry
@@ -434,6 +439,36 @@ pub fn run(
             && let Some(name) = decoded.iso_name()
         {
             f.lock().unwrap().note_address_claim(decoded.src, name);
+        }
+
+        // Server-owned PGN-rate overrides. On an ISO Address Claim, replay
+        // this device's overrides (first sight this session, or after it
+        // moved to a new source) by injecting the PGN 126208 Requests. On
+        // a PGN 126208 Acknowledge that NAKs (non-zero error), forget the
+        // override the bus rejected so it isn't replayed forever. Both
+        // resolve the device by src → NAME inside the engine.
+        if let Some(ov) = hubs.overrides.as_ref() {
+            if let Some(name) = decoded.iso_name() {
+                let replay = ov.lock().unwrap().note_address_claim(decoded.src, name);
+                if let Some(sender) = hubs.device_sender.as_ref() {
+                    for frame in replay {
+                        let _ = sender.send_frame(frame);
+                    }
+                }
+            } else if decoded.pgn == 126208 {
+                use canboat_core::field::nmea_acknowledge_group_function as ack;
+                let field_int = |f| decoded.field_ref(f).and_then(|d| d.value.as_i64());
+                if field_int(ack::FUNCTION_CODE) == Some(2) {
+                    let pgn_err = field_int(ack::PGN_ERROR_CODE).unwrap_or(0);
+                    let iv_err =
+                        field_int(ack::TRANSMISSION_INTERVAL_PRIORITY_ERROR_CODE).unwrap_or(0);
+                    if (pgn_err != 0 || iv_err != 0)
+                        && let Some(acked) = field_int(ack::PGN)
+                    {
+                        ov.lock().unwrap().note_nak(decoded.src, acked as u32);
+                    }
+                }
+            }
         }
 
         // Snapshot cache: hand the store the decoded record and let it

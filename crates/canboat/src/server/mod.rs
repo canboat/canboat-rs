@@ -54,6 +54,7 @@ mod tcp;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -285,15 +286,24 @@ pub struct Args {
     #[arg(long = "no-nmea0183-rate-limit")]
     no_nmea0183_rate_limit: bool,
 
-    /// Enable the per-device NMEA 0183 filter, reading mute rules from
-    /// this JSON file (a missing file starts with no mutes). When set,
-    /// the 0183 outputs only carry sentences from devices whose NAME
-    /// (PGN 60928) the pipeline has learned and that aren't muted — so
-    /// several devices reporting one measurement no longer each reach
-    /// downstream 0183 consumers. Off when unset: every converted
-    /// sentence is emitted, as before. The N2K bus is never affected.
+    /// Override the per-device NMEA 0183 filter mute-rules file. The
+    /// filter is **always on**, reading `nmea0183-filter.json` from the
+    /// config dir (see `--config-dir`) by default; a rule-less file is a
+    /// no-op (every converted sentence is emitted). Once ≥1 mute rule
+    /// exists, the 0183 outputs only carry sentences from devices whose
+    /// NAME (PGN 60928) the pipeline has learned and that aren't muted.
+    /// The N2K bus is never affected. Use this to point at a specific
+    /// file instead of the config dir's.
     #[arg(long = "nmea0183-filter", value_name = "PATH")]
-    nmea0183_filter: Option<std::path::PathBuf>,
+    nmea0183_filter: Option<PathBuf>,
+
+    /// Directory holding the server's persistent state files —
+    /// `overrides.json` (PGN-rate overrides) and `nmea0183-filter.json`
+    /// (0183 mute rules). Both features are on by default. When unset the
+    /// dir is resolved automatically: `/etc/default/canboat` if writable
+    /// (the systemd/root case), otherwise `$HOME/.local/canboat`.
+    #[arg(long = "config-dir", value_name = "DIR")]
+    config_dir: Option<PathBuf>,
 
     /// Port for the bidirectional NMEA 0183 filter control channel (PGN
     /// 262657). This is the one write-capable output port: the TUI
@@ -305,6 +315,14 @@ pub struct Args {
     /// `0` disables. Slot 2605, after the binary analyzer stream.
     #[arg(long, default_value_t = 2605)]
     nmea0183_filter_port: u16,
+
+    /// Port for the bidirectional PGN-rate-override control channel (PGN
+    /// 262658). Like the filter port: the TUI connects, receives the
+    /// current override state, then writes `Set` / `Delete` / `Request`
+    /// frames and reads `Report` frames on the same socket. `0` disables.
+    /// Slot 2606, after the filter control port.
+    #[arg(long, default_value_t = 2606)]
+    overrides_port: u16,
 
     /// Emit field keys + PGN descriptions as camelCase
     /// identifiers (`"uniqueNumber"` instead of `"Unique Number"`)
@@ -436,6 +454,8 @@ pub fn run(cli: Args) -> Result<()> {
         engine: Arc::clone(&engine),
         quirks: quirks::Quirks::new(quirks_kinds),
         device_sender: device_sender.clone(),
+        // Filled in below once the config dir is resolved.
+        overrides: None,
     };
 
     // In device mode treat stdin like `actisense-serial -p`: parse
@@ -556,45 +576,78 @@ pub fn run(cli: Args) -> Result<()> {
 
     let _ = inject; // No further use in this function
 
-    let nmea_filter = match cli.nmea0183_filter.as_deref() {
-        Some(path) => {
-            let f = crate::n2kd::nmea_filter::NmeaFilter::load(path)?;
+    // Persistent server state (0183 mute rules + PGN-rate overrides) lives
+    // in a shared config dir, both features on by default. An empty/absent
+    // file is a no-op, so this changes nothing for a default install.
+    let cfg_dir = resolve_config_dir(cli.config_dir.as_deref());
+    let filter_path = cli
+        .nmea0183_filter
+        .clone()
+        .unwrap_or_else(|| cfg_dir.join("nmea0183-filter.json"));
+    let nmea_filter = match crate::n2kd::nmea_filter::NmeaFilter::load(&filter_path) {
+        Ok(f) => {
             log::info!(
-                "NMEA 0183 per-device filter enabled from {}",
-                path.display()
+                "NMEA 0183 per-device filter loaded from {}",
+                filter_path.display()
             );
             // Shared with the control-port server below; the pipeline
             // reads through it, the control port mutates it.
             Some(Arc::new(Mutex::new(f)))
         }
-        None => None,
+        Err(e) => {
+            log::warn!("NMEA 0183 filter disabled: {e:#}");
+            None
+        }
+    };
+    let overrides_path = cfg_dir.join("overrides.json");
+    let overrides = match crate::n2kd::overrides::OverrideEngine::load(&overrides_path) {
+        Ok(engine) => {
+            log::info!(
+                "PGN-rate overrides loaded from {}",
+                overrides_path.display()
+            );
+            Some(Arc::new(Mutex::new(engine)))
+        }
+        Err(e) => {
+            log::warn!("PGN-rate overrides disabled: {e:#}");
+            None
+        }
     };
 
     // Dedicated bidirectional control port for the PGN 262657 filter
-    // channel. Only meaningful when the filter itself is enabled — with
-    // no filter there is nothing to report or mutate.
-    match nmea_filter.as_ref() {
-        Some(filter) if cli.nmea0183_filter_port != 0 => {
-            tcp_joins.push(tcp::spawn_filter_control_server(
-                cli.bind,
-                cli.nmea0183_filter_port,
-                filter.clone(),
-                json_opts.clone(),
-            )?);
-        }
-        None if cli.nmea0183_filter_port != 0 => {
-            log::debug!(
-                "--nmea0183-filter-port {} idle: enable the filter with --nmea0183-filter",
-                cli.nmea0183_filter_port
-            );
-        }
-        _ => {}
+    // channel (always on now, like the filter itself).
+    if let Some(filter) = nmea_filter.as_ref()
+        && cli.nmea0183_filter_port != 0
+    {
+        tcp_joins.push(tcp::spawn_filter_control_server(
+            cli.bind,
+            cli.nmea0183_filter_port,
+            filter.clone(),
+            json_opts.clone(),
+        )?);
+    }
+    // Dedicated bidirectional control port for the PGN 262658 override
+    // channel. The control server applies a `Set` immediately by injecting
+    // the PGN 126208 Request through the device sender.
+    if let Some(engine) = overrides.as_ref()
+        && cli.overrides_port != 0
+    {
+        tcp_joins.push(tcp::spawn_overrides_control_server(
+            cli.bind,
+            cli.overrides_port,
+            engine.clone(),
+            device_sender.clone(),
+            json_opts.clone(),
+        )?);
     }
 
     pipeline::run(
         db,
         frames_rx,
-        hubs,
+        Hubs {
+            overrides: overrides.clone(),
+            ..hubs
+        },
         pre_coalesced,
         json_opts,
         pipeline::Nmea0183Options {
@@ -639,6 +692,46 @@ struct OpenedSource {
     /// only `--socketcan` exposes one). Read by the CSV-port
     /// injector to rewrite client-supplied default-`src` frames.
     claim_addr: Option<Arc<std::sync::atomic::AtomicU8>>,
+}
+
+/// Resolve the directory holding the server's persistent state files.
+/// An explicit `--config-dir` wins; otherwise prefer `/etc/default/canboat`
+/// when it's writable (the systemd/root case) and fall back to
+/// `$HOME/.local/canboat`. The engines themselves create the dir on first
+/// save, so this only needs to pick the path.
+fn resolve_config_dir(explicit: Option<&Path>) -> PathBuf {
+    if let Some(p) = explicit {
+        return p.to_path_buf();
+    }
+    let system = PathBuf::from("/etc/default/canboat");
+    if dir_is_writable(&system) {
+        return system;
+    }
+    if let Ok(home) = std::env::var("HOME") {
+        return PathBuf::from(home).join(".local/canboat");
+    }
+    system
+}
+
+/// `true` when `dir` can be created (if needed) and written to — probed
+/// with a temp file that's removed immediately.
+fn dir_is_writable(dir: &Path) -> bool {
+    if std::fs::create_dir_all(dir).is_err() {
+        return false;
+    }
+    let probe = dir.join(".canboat-write-test");
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(&probe)
+    {
+        Ok(_) => {
+            let _ = std::fs::remove_file(&probe);
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 fn open_source(cli: &Args) -> Result<OpenedSource> {

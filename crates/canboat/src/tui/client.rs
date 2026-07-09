@@ -10,29 +10,31 @@
 //! [`canboat_core::snapshot::classify_json_line`] so the keys we
 //! produce are byte-identical to the ones the snapshot port stores.
 //!
-//! The stream port is read-only. Outgoing traffic goes to two other
-//! ports, both derived from the stream port's canonical offsets (see
+//! The stream port is read-only. Outgoing traffic goes to three other
+//! ports, all derived from the stream port's canonical offsets (see
 //! `super::write_ports`) and fed by the same [`Writer`], which routes
 //! each PLAIN line by PGN:
 //!
 //! * the **write-only input port** (`base+3`, default 2600) — ISO
-//!   Requests and PGN 126208 transmission-interval overrides, injected
-//!   onto the N2K bus;
+//!   Requests, injected onto the N2K bus;
 //! * the **bidirectional filter control port** (`base+8`, default 2605)
 //!   — the PGN 262657 NMEA-0183-filter channel: `Set` / `Request` out,
-//!   `Report` JSON back on the same socket.
+//!   `Report` JSON back on the same socket;
+//! * the **bidirectional overrides control port** (`base+9`, default
+//!   2606) — the PGN 262658 transmission-interval-override channel:
+//!   `Set` / `Delete` / `Request` out, `Report` JSON back. The server
+//!   owns the overrides (persists them, replays them, forgets NAKed
+//!   ones) and injects the actual PGN 126208 Requests onto the bus.
 //!
 //! Against an endpoint that doesn't offer those ports (e.g. a plain
-//! n2kd, or a `server` started without `--nmea0183-filter`), the
-//! respective connection simply fails quietly and that feature is
-//! inert — the read-only stream still works.
+//! n2kd), the respective connection simply fails quietly and that
+//! feature is inert — the read-only stream still works.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use canboat_core::field;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -41,7 +43,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::tui::state::{AppState, Progress, field_value, normalize_camel};
+use crate::tui::state::{AppState, Progress};
 
 /// Per-connection timeout for the initial TCP connect. Without this
 /// the TUI sits black forever when the endpoint isn't reachable (the
@@ -63,19 +65,22 @@ const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(15);
 /// * the **filter control PGN (262657)** → the bidirectional control
 ///   port (`--nmea0183-filter-port`), where the server answers with
 ///   `Report` frames on the same socket;
-/// * **everything else** (ISO requests, PGN 126208 rate overrides) →
-///   the write-only **input port** (`--input-port`), which injects them
-///   onto the N2K bus.
+/// * the **override control PGN (262658)** → the bidirectional override
+///   control port (`--overrides-port`), likewise request/response;
+/// * **everything else** (ISO requests) → the write-only **input port**
+///   (`--input-port`), which injects them onto the N2K bus.
 ///
-/// Both channels are created upfront — sends queue here until the
+/// All channels are created upfront — sends queue here until the
 /// respective connection task comes up, so the UI is usable from the
-/// first frame. In log / idle mode neither receiver is drained.
+/// first frame. In log / idle mode no receiver is drained.
 #[derive(Clone)]
 pub struct Writer {
-    /// Bus injection (ISO / override frames) → the input port.
+    /// Bus injection (ISO requests) → the input port.
     input_tx: mpsc::UnboundedSender<String>,
     /// PGN 262657 filter control → the bidirectional control port.
     filter_tx: mpsc::UnboundedSender<String>,
+    /// PGN 262658 override control → the bidirectional control port.
+    overrides_tx: mpsc::UnboundedSender<String>,
 }
 
 impl Writer {
@@ -84,42 +89,59 @@ impl Writer {
     pub fn send(&self, line: String) -> bool {
         if line_is_filter_control(&line) {
             self.filter_tx.send(line).is_ok()
+        } else if line_is_overrides_control(&line) {
+            self.overrides_tx.send(line).is_ok()
         } else {
             self.input_tx.send(line).is_ok()
         }
     }
 }
 
-/// The two receivers a live-mode setup wires to its connection tasks:
-/// bus-injection lines and filter-control lines respectively.
+/// The receivers a live-mode setup wires to its connection tasks:
+/// bus-injection, filter-control, and override-control lines.
 pub struct WriterRx {
     pub input: mpsc::UnboundedReceiver<String>,
     pub filter: mpsc::UnboundedReceiver<String>,
+    pub overrides: mpsc::UnboundedReceiver<String>,
 }
 
-/// `true` when a canboat PLAIN line targets the NMEA 0183 filter
-/// control PGN (262657). The PGN is the third comma-separated field
-/// (`<ts>,<prio>,<pgn>,…`). A line we can't parse falls through to the
-/// bus path — the safe default, since the input port simply ignores a
-/// non-frame.
-fn line_is_filter_control(line: &str) -> bool {
+/// The PGN of a canboat PLAIN line — its third comma-separated field
+/// (`<ts>,<prio>,<pgn>,…`). `None` when the line can't be parsed.
+fn line_pgn(line: &str) -> Option<u32> {
     line.split(',')
         .nth(2)
         .and_then(|s| s.trim().parse::<u32>().ok())
-        == Some(crate::n2kd::nmea_filter::PGN_NMEA0183_FILTER)
+}
+
+/// `true` when a PLAIN line targets the NMEA 0183 filter control PGN
+/// (262657). A line we can't parse falls through to the bus path — the
+/// safe default, since the input port simply ignores a non-frame.
+fn line_is_filter_control(line: &str) -> bool {
+    line_pgn(line) == Some(crate::n2kd::nmea_filter::PGN_NMEA0183_FILTER)
+}
+
+/// `true` when a PLAIN line targets the override control PGN (262658).
+fn line_is_overrides_control(line: &str) -> bool {
+    line_pgn(line) == Some(crate::n2kd::overrides::PGN_PGN_OVERRIDE)
 }
 
 /// Build the writer channels and return the shared [`Writer`] plus the
-/// two receivers for the connection tasks to drain once they connect.
+/// receivers for the connection tasks to drain once they connect.
 pub fn make_writer() -> (Writer, WriterRx) {
     let (input_tx, input) = mpsc::unbounded_channel();
     let (filter_tx, filter) = mpsc::unbounded_channel();
+    let (overrides_tx, overrides) = mpsc::unbounded_channel();
     (
         Writer {
             input_tx,
             filter_tx,
+            overrides_tx,
         },
-        WriterRx { input, filter },
+        WriterRx {
+            input,
+            filter,
+            overrides,
+        },
     )
 }
 
@@ -526,6 +548,26 @@ pub fn spawn_filter_connection(
     })
 }
 
+/// Spawn the bidirectional override control-port connection: reads PGN
+/// 262658 `Report` JSON into `state` (same `upsert` path as the bus
+/// stream) and writes the UI's `Set` / `Delete` frames plus a periodic
+/// `Request` poll so removals (here or NAK-forgotten server-side) and new
+/// overrides keep the view current.
+pub fn spawn_overrides_connection(
+    host: String,
+    port: u16,
+    state: Arc<Mutex<AppState>>,
+    rx: mpsc::UnboundedReceiver<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = connect_overrides(&host, port, state.clone(), rx).await {
+            // Like the filter port, an unreachable override port is the
+            // normal "server doesn't have it" case, not a UI error.
+            log::debug!("override control connection to {host}:{port} ended: {e:#}");
+        }
+    })
+}
+
 /// Pull the entire snapshot blob from `host:port` and seed `state`
 /// with it. Connection is closed by the server when the dump
 /// completes; both the connect and the read are bounded by
@@ -685,6 +727,54 @@ async fn connect_filter(
     Ok(())
 }
 
+async fn connect_overrides(
+    host: &str,
+    port: u16,
+    state: Arc<Mutex<AppState>>,
+    rx: mpsc::UnboundedReceiver<String>,
+) -> Result<()> {
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .with_context(|| format!("connect overrides port {host}:{port} timed out"))?
+        .with_context(|| format!("connecting overrides port {host}:{port}"))?;
+    stream.set_nodelay(true).ok();
+    let (read_half, write_half) = stream.into_split();
+    tokio::select! {
+        _ = reader_task(read_half, state.clone()) => {}
+        _ = overrides_writer_task(write_half, rx, state.clone()) => {}
+    }
+    Ok(())
+}
+
+/// Writer half of the override control connection: drains `Set` / `Delete`
+/// lines from the UI and periodically polls with `Request` so the view
+/// picks up server-side removals (NAK-forgotten overrides) and refreshes.
+async fn overrides_writer_task(
+    mut writer: OwnedWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<String>,
+    state: Arc<Mutex<AppState>>,
+) {
+    let mut poll = tokio::time::interval(crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL);
+    poll.tick().await;
+    loop {
+        let mut line = tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(l) => l,
+                None => break,
+            },
+            _ = poll.tick() => crate::tui::iso::override_request(),
+        };
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        if let Err(e) = writer.write_all(line.as_bytes()).await {
+            let mut s = state.lock().await;
+            s.status.last_error = Some(format!("overrides write: {e}"));
+            break;
+        }
+    }
+}
+
 /// Writer half of the filter control connection: drains `Set` lines from
 /// the UI and, on every [`crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL`]
 /// tick, sends a `Request` so the server re-reports — catching sources /
@@ -755,32 +845,13 @@ async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<Ap
         }
         let mut s = state.lock().await;
         for input in inputs {
-            // Re-parse the (possibly spliced) line so the entry
-            // carries a structured Value the UI can pointer-walk.
-            // Canonicalize `server --camel` here too — `nak_alert` reads
-            // it below, before `upsert` would normalize it. `upsert`
-            // re-runs the same step (a no-op once unwrapped).
+            // Re-parse the (possibly spliced) line so the entry carries a
+            // structured Value the UI can pointer-walk. `upsert`
+            // canonicalizes `server --camel` records itself.
             let value = match serde_json::from_str::<Value>(&input.line) {
-                Ok(v) => normalize_camel(v),
+                Ok(v) => v,
                 Err(_) => continue,
             };
-            // Surface every non-OK PGN 126208 Acknowledge as a
-            // user-visible alert. Devices that accept a Request
-            // typically stay silent (the SCX-20 only ACKs failures
-            // — see device-scx20 memory) so reacting only to
-            // failures is the right signal.
-            if input.pgn == 126208
-                && let Some(nak) = nak_alert(input.src, &value)
-            {
-                s.push_alert(nak.message);
-                // Forget the persisted override that drew this NAK so we
-                // stop replaying a rate change the device rejects. The
-                // ACK's `src` is the device we addressed the Request to,
-                // which is the override's `src`.
-                if nak.acked_pgn != 0 {
-                    s.record_nak_override(input.src, nak.acked_pgn);
-                }
-            }
             s.upsert(
                 input.pgn,
                 input.src,
@@ -803,85 +874,6 @@ fn strip_snapshot_banner(payload: &str) -> &str {
         Some((first, rest)) if first.trim_start().starts_with("{\"version\"") => rest.trim(),
         _ => payload.trim(),
     }
-}
-
-/// A NAKed PGN 126208 Request, extracted from an inbound Acknowledge.
-struct Nak {
-    /// One-line summary for the UI alert slot.
-    message: String,
-    /// The PGN the acknowledging device errored on — matched against a
-    /// persisted override's `pgn` to forget it. `0` when the ACK had no
-    /// readable PGN, so the caller skips removal.
-    acked_pgn: u32,
-}
-
-/// If `line` is a PGN 126208 Acknowledge (Function Code = 2) carrying
-/// at least one non-zero error code, return a [`Nak`] with a one-line
-/// summary and the acknowledged PGN. Returns `None` for non-ACKs and
-/// for ACKs whose error codes are all zero ("Acknowledge" — no
-/// error). The summary names both the acknowledging device
-/// (`src` of the inbound record) and the PGN the ACK references, so
-/// the user can match it back to whichever Request they just sent.
-fn nak_alert(ack_src: u8, line: &Value) -> Option<Nak> {
-    use field::nmea_acknowledge_group_function as ack;
-    let function_code = read_lookup_int(field_value(line, ack::FUNCTION_CODE))?;
-    if function_code != 2 {
-        return None;
-    }
-    let pgn_field = field_value(line, ack::PGN);
-    let acked_pgn = read_lookup_int(pgn_field).unwrap_or(0);
-    let acked_pgn_name = pgn_field
-        .and_then(|v| v.pointer("/name").and_then(Value::as_str))
-        .unwrap_or("");
-    let pgn_err = read_lookup_int(field_value(line, ack::PGN_ERROR_CODE)).unwrap_or(0);
-    let pgn_err_name = read_lookup_name(field_value(line, ack::PGN_ERROR_CODE)).unwrap_or_default();
-    // The field name is literally `Transmission interval/Priority error
-    // code` — one field with a `/` in it. The old raw
-    // `line.pointer("/fields/Transmission interval/Priority error code")`
-    // mis-split on that slash and always read nothing; `field_value`
-    // escapes it (RFC 6901 `~1`), so this now actually resolves.
-    let interval_err = read_lookup_int(field_value(
-        line,
-        ack::TRANSMISSION_INTERVAL_PRIORITY_ERROR_CODE,
-    ))
-    .unwrap_or(0);
-    let interval_err_name = read_lookup_name(field_value(
-        line,
-        ack::TRANSMISSION_INTERVAL_PRIORITY_ERROR_CODE,
-    ))
-    .unwrap_or_default();
-    if pgn_err == 0 && interval_err == 0 {
-        return None;
-    }
-    let pgn_label = if acked_pgn_name.is_empty() {
-        format!("PGN {acked_pgn}")
-    } else {
-        format!("PGN {acked_pgn} ({acked_pgn_name})")
-    };
-    Some(Nak {
-        message: format!(
-            "⚠ src {ack_src} NAK {pgn_label} — PGN err {pgn_err} {pgn_err_name} / interval err {interval_err} {interval_err_name}"
-        ),
-        acked_pgn: u32::try_from(acked_pgn).unwrap_or(0),
-    })
-}
-
-/// Pull a numeric value out of a canboat lookup field — handles both
-/// the bare integer shape and the `-nv` `{value, name, key}` object.
-fn read_lookup_int(v: Option<&Value>) -> Option<i64> {
-    let v = v?;
-    if let Some(n) = v.as_i64() {
-        return Some(n);
-    }
-    v.pointer("/value").and_then(Value::as_i64)
-}
-
-/// Pull the display name from a canboat lookup field (the `-nv`
-/// object's `.name`). Returns `None` for plain-integer shapes.
-fn read_lookup_name(v: Option<&Value>) -> Option<String> {
-    v?.pointer("/name")
-        .and_then(Value::as_str)
-        .map(|s| s.to_string())
 }
 
 async fn writer_task(
@@ -972,38 +964,6 @@ mod tests {
         assert_eq!(cached.model_id.as_deref(), Some("FUSION-MS"));
     }
 
-    /// A NAKed PGN 126208 Acknowledge (function code 2, non-zero error)
-    /// yields a `Nak` naming the acked PGN so the UI can forget the
-    /// matching override; an all-OK Acknowledge (error codes 0) yields
-    /// `None`.
-    #[test]
-    fn nak_alert_reports_acked_pgn_for_errors_only() {
-        let nak = json!({
-            "pgn": 126208,
-            "description": "NMEA - Acknowledge group function",
-            "fields": {
-                "Function Code": {"value": 2, "name": "Acknowledge"},
-                "PGN": 127258,
-                "PGN error code": {"value": 4, "name": "Not supported"},
-                "Transmission interval/Priority error code": {"value": 4, "name": "Not supported"},
-            }
-        });
-        let got = nak_alert(48, &nak).expect("errored ACK is a NAK");
-        assert_eq!(got.acked_pgn, 127258);
-        assert!(got.message.contains("NAK PGN 127258"));
-
-        let ok = json!({
-            "pgn": 126208,
-            "fields": {
-                "Function Code": {"value": 2, "name": "Acknowledge"},
-                "PGN": 127258,
-                "PGN error code": {"value": 0, "name": "ACK"},
-                "Transmission interval/Priority error code": {"value": 0, "name": "ACK"},
-            }
-        });
-        assert!(nak_alert(48, &ok).is_none(), "all-OK ACK is not a NAK");
-    }
-
     #[test]
     fn filter_control_lines_are_recognised_by_pgn() {
         assert!(line_is_filter_control(
@@ -1016,15 +976,30 @@ mod tests {
     }
 
     #[test]
+    fn overrides_control_lines_are_recognised_by_pgn() {
+        assert!(line_is_overrides_control(
+            "2026-01-01T00:00:00.000Z,7,262658,0,255,12,01,34,12,fe,01,e8,03,00,00,ff,ff,ff"
+        ));
+        assert!(!line_is_overrides_control(
+            "2026-01-01T00:00:00.000Z,7,262657,0,255,8,01,21,41,4c,4c,01,ff,ff"
+        ));
+        assert!(!line_is_overrides_control("garbage"));
+    }
+
+    #[test]
     fn writer_routes_by_pgn() {
         let (writer, mut rx) = make_writer();
-        // 262657 → filter channel; ISO request (59904) → input channel.
+        // 262657 → filter channel; 262658 → overrides channel;
+        // ISO request (59904) → input channel.
         assert!(writer.send(crate::tui::iso::nmea0183_filter_request()));
+        assert!(writer.send(crate::tui::iso::override_request()));
         assert!(writer.send(crate::tui::iso::iso_request(35, 126464)));
         assert!(rx.filter.try_recv().is_ok());
+        assert!(rx.overrides.try_recv().is_ok());
         assert!(rx.input.try_recv().is_ok());
         // Each landed in exactly one channel.
         assert!(rx.filter.try_recv().is_err());
+        assert!(rx.overrides.try_recv().is_err());
         assert!(rx.input.try_recv().is_err());
     }
 

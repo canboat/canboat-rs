@@ -29,12 +29,14 @@
 //!    any key dismisses it manually.
 //! 3. **Override** — opened with `o` from `DeviceDetail` for the
 //!    highlighted PGN. Accepts a transmission interval in ms; `0`
-//!    means "stop transmitting". Hidden entirely (no key binding,
-//!    not advertised in the hint bar) when the overrides file
-//!    can't be persisted — see `App::overrides_writable`. A
-//!    silenced PGN stays visible on its device's list (with an OFF
-//!    marker, sourced from the overrides file) so the user can
-//!    later re-enable it.
+//!    means "stop transmitting". Available only in live mode; the
+//!    server owns override persistence and application, so the modal
+//!    just sends a `canboatPgnOverride` Set to the overrides control
+//!    port. A silenced PGN stays visible on its device's list (with
+//!    an OFF marker, sourced from the server's override report) so
+//!    the user can later re-enable it. The dedicated **Overrides**
+//!    view lists every override in place and lets the user change or
+//!    delete them.
 
 use std::io::Stdout;
 use std::path::PathBuf;
@@ -57,8 +59,12 @@ use crate::tui::menu::{
     self, DESKTOP_BG, Menu, MenuAction, MenuBar, MenuEntry, MenuItem, PANEL_BG, PANEL_BORDER,
     PANEL_FG, PANEL_TITLE, SURFACE_ACCENT, SURFACE_BG, SURFACE_FG,
 };
-use crate::tui::overrides::{self, INTERVAL_OFF, Override, Overrides, default_path};
-use crate::tui::state::{AppState, DeviceInfo, Entry, HistoryRecord, Mode, PgnLoadRow, Progress};
+use crate::tui::state::{
+    AppState, DeviceInfo, Entry, HistoryRecord, Mode, OverrideRow, PgnLoadRow, Progress,
+};
+
+/// "Stop transmitting" interval value (ms) for a PGN 126208 Request.
+const INTERVAL_OFF: u32 = 0;
 
 /// Per-PGN well-known transmit defaults, used purely as UI hints
 /// when the user opens the override dialog. Picking the right default
@@ -113,6 +119,11 @@ pub enum Screen {
     /// Space toggles a whole source or an individual sentence, sending
     /// a PGN 262657 Set to the pipeline. Fed by its Report frames.
     Nmea0183,
+    /// PGN-rate overrides the server holds (live mode + pipeline only).
+    /// Lists each `(src, pgn)` override with its interval; `e`/Enter
+    /// edits the interval, `d`/Del removes it — both via the PGN 262658
+    /// control channel. Fed by the server's Report frames.
+    Overrides,
 }
 
 pub struct App {
@@ -121,6 +132,8 @@ pub struct App {
     pub detail_state: ListState,
     /// Selection state for the `Nmea0183` filter screen.
     pub nmea0183_state: ListState,
+    /// Selection state for the `Overrides` screen.
+    pub overrides_state: ListState,
     /// Selection state for the `TimeView` screen — one row per
     /// observation in `AppState::history`.
     pub time_state: ListState,
@@ -148,30 +161,18 @@ pub struct App {
     pub browse_dir: Option<PathBuf>,
     /// A File-menu operation awaiting execution by the event loop.
     pub pending_command: Option<PendingCommand>,
+    /// An override the user just deleted on the Overrides screen. The
+    /// event loop drops it from `AppState::overrides` on the next frame
+    /// (we only hold a shared borrow of the state in the key handler),
+    /// so the row disappears immediately instead of waiting for the
+    /// server's report to stop listing it.
+    pub pending_override_forget: Option<(u8, u32)>,
     /// Vertical scroll offset for the pretty-printed JSON in the
     /// `EntryDetail` screen. Reset to 0 when drilling in.
     pub entry_scroll: u16,
-    pub overrides: Overrides,
-    pub overrides_path: std::path::PathBuf,
-    /// Set at startup by probing the overrides file with
-    /// [`overrides::is_writable`]. When `false` the `o` override
-    /// affordance is removed everywhere — the key binding does
-    /// nothing and the per-screen hint bar omits it — so the user
-    /// isn't shown a feature whose state can't be persisted. If a
-    /// later `save()` fails (disk full, perms revoked) we flip this
-    /// back to `false` and surface the error.
-    pub overrides_writable: bool,
     pub modal: Option<OverrideModal>,
     /// Last status / error toast (cleared on next keystroke).
     pub toast: Option<String>,
-    /// Current bus-side alert shown in the status bar — drained one
-    /// per draw from `AppState::alerts` (e.g. a NAKed PGN 126208
-    /// Acknowledge). Cleared on any keystroke, at which point the
-    /// next draw pulls the next pending alert if any. Has higher
-    /// priority than `toast` in the status-bar render path so
-    /// device-reported failures don't get drowned out by our own
-    /// "Sent override" confirmations.
-    pub alert: Option<String>,
     pub should_quit: bool,
     /// True once the user has dismissed the startup "Connecting…"
     /// modal (or it auto-dismissed itself after both connections
@@ -261,17 +262,12 @@ pub struct OverrideModal {
     pub input: String,
     pub manufacturer_code: Option<u16>,
     pub industry_code: Option<u8>,
-    /// PGN description captured at modal open time — stored on the
-    /// resulting [`Override`] so a later silenced-row display can
-    /// label the PGN even after the live cache entry ages out.
+    /// PGN description captured at modal open time, for display.
     pub description: Option<String>,
 }
 
 impl App {
     pub fn new() -> Self {
-        let overrides_path = default_path();
-        let overrides = Overrides::load_or_default(&overrides_path);
-        let overrides_writable = overrides::is_writable(&overrides_path);
         let mut devices_state = ListState::default();
         devices_state.select(Some(0));
         let mut detail_state = ListState::default();
@@ -280,6 +276,8 @@ impl App {
         time_state.select(Some(0));
         let mut nmea0183_state = ListState::default();
         nmea0183_state.select(Some(0));
+        let mut overrides_state = ListState::default();
+        overrides_state.select(Some(0));
         let mut pgn_top_state = ListState::default();
         pgn_top_state.select(Some(0));
         Self {
@@ -287,6 +285,7 @@ impl App {
             devices_state,
             detail_state,
             nmea0183_state,
+            overrides_state,
             time_state,
             time_offset: 0,
             pgn_top_state,
@@ -297,13 +296,10 @@ impl App {
             file_browser: None,
             browse_dir: None,
             pending_command: None,
+            pending_override_forget: None,
             entry_scroll: 0,
-            overrides,
-            overrides_path,
-            overrides_writable,
             modal: None,
             toast: None,
-            alert: None,
             should_quit: false,
             connecting_dismissed: false,
             last_acknowledged_error: None,
@@ -393,11 +389,11 @@ impl App {
     pub fn detail_rows(&self, src: u8, state: &AppState) -> Vec<Entry> {
         let mut rows: Vec<Entry> = state.entries_for_src(src).into_iter().cloned().collect();
         let live_pgns: std::collections::HashSet<u32> = rows.iter().map(|e| e.pgn).collect();
-        for ov in self.overrides.silenced() {
-            if ov.src != src || live_pgns.contains(&ov.pgn) {
+        for ov in state.override_rows() {
+            if ov.interval_ms != INTERVAL_OFF || ov.src != src || live_pgns.contains(&ov.pgn) {
                 continue;
             }
-            rows.push(synthesize_silenced_entry(ov));
+            rows.push(synthesize_silenced_entry(&ov));
         }
         rows.sort_by(|a, b| {
             a.pgn
@@ -405,42 +401,6 @@ impl App {
                 .then_with(|| a.secondary.cmp(&b.secondary))
         });
         rows
-    }
-
-    /// Re-emit every stored override to the bus. Called on startup
-    /// after the stream connection is up so user changes persist
-    /// across target reboots.
-    pub fn replay_overrides(&self, writer: &crate::tui::client::Writer) {
-        for ov in &self.overrides.entries {
-            let line = match (ov.manufacturer_code, ov.industry_code) {
-                (Some(mfr), Some(ind)) => iso::request_transmission_interval_proprietary(
-                    ov.src,
-                    ov.pgn,
-                    mfr,
-                    ind,
-                    ov.interval_ms,
-                ),
-                _ => iso::request_transmission_interval(ov.src, ov.pgn, ov.interval_ms),
-            };
-            let _ = writer.send(line);
-        }
-    }
-
-    /// Drop and un-persist every override the bus NAKed (recorded in
-    /// [`AppState::nak_overrides`] by the stream reader). A device that
-    /// answers a rate-change Request with "not supported" would
-    /// otherwise be re-sent the same rejected Request on every
-    /// reconnect; forgetting it stops the churn. Best-effort: a save
-    /// failure surfaces as a toast but doesn't drop the in-memory
-    /// removal, so the silenced-row list stays consistent this session.
-    pub fn forget_overrides(&mut self, naked: &[(u8, u32)]) {
-        let mut removed = false;
-        for &(src, pgn) in naked {
-            removed |= self.overrides.remove(src, pgn);
-        }
-        if removed && let Err(e) = self.overrides.save(&self.overrides_path) {
-            self.toast = Some(format!("override save failed: {e:#}"));
-        }
     }
 
     /// Build the menu bar for the current context. Rebuilt every frame
@@ -501,6 +461,13 @@ impl App {
                         MenuAction::ViewNmea0183,
                         live,
                     ),
+                    MenuItem::maybe(
+                        "PGN Overrides",
+                        Some('O'),
+                        "o",
+                        MenuAction::ViewOverrides,
+                        live,
+                    ),
                     MenuEntry::Separator,
                     MenuItem::maybe("Back", Some('B'), "Esc", MenuAction::Back, not_devices),
                 ],
@@ -528,7 +495,7 @@ impl App {
                         Some('V'),
                         "o",
                         MenuAction::OverrideInterval,
-                        on_device_detail && live && self.overrides_writable,
+                        on_device_detail && live,
                     ),
                 ],
             },
@@ -669,6 +636,12 @@ impl App {
                     self.screen = Screen::Nmea0183;
                 }
             }
+            MenuAction::ViewOverrides => {
+                if state.status.mode == Mode::Live {
+                    self.overrides_state.select(Some(0));
+                    self.screen = Screen::Overrides;
+                }
+            }
             MenuAction::Back => self.go_back(),
             MenuAction::OpenSelected => self.activate_selection(state, writer),
             MenuAction::IsoRequest126464 => {
@@ -681,7 +654,6 @@ impl App {
             MenuAction::OverrideInterval => {
                 if let Screen::DeviceDetail { src } = self.screen
                     && state.status.mode == Mode::Live
-                    && self.overrides_writable
                 {
                     self.open_override_modal(src, state);
                 }
@@ -758,7 +730,45 @@ impl App {
             }
             Screen::TimeView => self.drill_into_time_selection(state),
             Screen::Nmea0183 => self.toggle_nmea0183_selection(state, writer),
+            Screen::Overrides => self.open_selected_override_modal(state),
             Screen::EntryDetail { .. } | Screen::PgnTop => {}
+        }
+    }
+
+    /// Open the interval modal for the highlighted row on the Overrides
+    /// screen so the user can change it. The modal Enter path sends a
+    /// `canboatPgnOverride` Set exactly like the DeviceDetail `o` path.
+    fn open_selected_override_modal(&mut self, state: &AppState) {
+        let rows = state.override_rows();
+        if let Some(ov) = self.overrides_state.selected().and_then(|i| rows.get(i)) {
+            let desc = (!ov.description.is_empty()).then(|| ov.description.clone());
+            self.modal = Some(OverrideModal {
+                src: ov.src,
+                pgn: ov.pgn,
+                input: ov.interval_ms.to_string(),
+                manufacturer_code: ov.manufacturer_code,
+                industry_code: ov.industry_code,
+                description: desc,
+            });
+        }
+    }
+
+    /// Delete the highlighted override on the Overrides screen: send a
+    /// `canboatPgnOverride` Delete to the server and optimistically drop
+    /// the row locally (the next server Report is authoritative). The
+    /// local removal is deferred to the event loop via
+    /// [`App::pending_override_forget`] because we only hold a shared
+    /// borrow of the state here.
+    fn delete_selected_override(&mut self, state: &AppState, writer: &crate::tui::client::Writer) {
+        let rows = state.override_rows();
+        if let Some(ov) = self.overrides_state.selected().and_then(|i| rows.get(i)) {
+            let (src, pgn) = (ov.src, ov.pgn);
+            if writer.send(iso::override_delete(src, pgn)) {
+                self.pending_override_forget = Some((src, pgn));
+                self.toast = Some(format!("Deleted override → src {src} pgn {pgn}"));
+            } else {
+                self.toast = Some("Writer channel closed".into());
+            }
         }
     }
 
@@ -780,15 +790,11 @@ impl App {
         let rows = self.detail_rows(src, state);
         if let Some(row) = self.detail_state.selected().and_then(|i| rows.get(i)) {
             let (mfr, ind, desc) = if row.count == 0 {
-                let ov = self
-                    .overrides
-                    .entries
-                    .iter()
-                    .find(|o| o.src == row.src && o.pgn == row.pgn);
+                let ov = state.overrides.get(&(row.src, row.pgn));
                 (
                     ov.and_then(|o| o.manufacturer_code),
                     ov.and_then(|o| o.industry_code),
-                    ov.and_then(|o| o.description.clone()),
+                    ov.map(|o| o.description.clone()).filter(|d| !d.is_empty()),
                 )
             } else {
                 let (m, i) = proprietary_codes(row);
@@ -1192,7 +1198,6 @@ impl App {
             return;
         }
         self.toast = None;
-        self.alert = None;
         // Left/right on EntryDetail steps through past instances.
         // Handled *before* the shared-borrow match so we can grab a
         // `&mut history_pos` inside the Screen without conflicting
@@ -1366,6 +1371,29 @@ impl App {
                 self.nmea0183_state.select(Some(0));
                 self.screen = Screen::Nmea0183;
             }
+            // PGN Overrides view — live pipeline only (needs the 262658
+            // control channel to be answered).
+            (Screen::Devices, KeyCode::Char('o')) if state.status.mode == Mode::Live => {
+                self.overrides_state.select(Some(0));
+                self.screen = Screen::Overrides;
+            }
+            (Screen::Overrides, KeyCode::Down) | (Screen::Overrides, KeyCode::Char('j')) => {
+                navigate_list(&mut self.overrides_state, state.override_rows().len(), 1);
+            }
+            (Screen::Overrides, KeyCode::Up) | (Screen::Overrides, KeyCode::Char('k')) => {
+                navigate_list(&mut self.overrides_state, state.override_rows().len(), -1);
+            }
+            (Screen::Overrides, KeyCode::Enter) | (Screen::Overrides, KeyCode::Char('e')) => {
+                self.open_selected_override_modal(state);
+            }
+            (Screen::Overrides, KeyCode::Char('d')) | (Screen::Overrides, KeyCode::Delete) => {
+                self.delete_selected_override(state, writer);
+            }
+            (Screen::Overrides, KeyCode::Esc)
+            | (Screen::Overrides, KeyCode::Backspace)
+            | (Screen::Overrides, KeyCode::Char('h')) => {
+                self.screen = Screen::Devices;
+            }
             (Screen::Nmea0183, KeyCode::Down) | (Screen::Nmea0183, KeyCode::Char('j')) => {
                 navigate_list(&mut self.nmea0183_state, state.nmea0183_rows().len(), 1);
             }
@@ -1445,39 +1473,9 @@ impl App {
                 }
             }
             (Screen::DeviceDetail { src }, KeyCode::Char('o'))
-                if state.status.mode == Mode::Live && self.overrides_writable =>
+                if state.status.mode == Mode::Live =>
             {
-                let rows = self.detail_rows(*src, state);
-                if let Some(row) = self.detail_state.selected().and_then(|i| rows.get(i)) {
-                    // Live row: read mfr/ind off the cached JSON.
-                    // Silenced row (`count == 0`): line is Null — pull
-                    // mfr/ind/description back from the override file
-                    // entry that put it on the list in the first place.
-                    let (mfr, ind, desc) = if row.count == 0 {
-                        let ov = self
-                            .overrides
-                            .entries
-                            .iter()
-                            .find(|o| o.src == row.src && o.pgn == row.pgn);
-                        (
-                            ov.and_then(|o| o.manufacturer_code),
-                            ov.and_then(|o| o.industry_code),
-                            ov.and_then(|o| o.description.clone()),
-                        )
-                    } else {
-                        let (m, i) = proprietary_codes(row);
-                        let d = (!row.description.is_empty()).then(|| row.description.clone());
-                        (m, i, d)
-                    };
-                    self.modal = Some(OverrideModal {
-                        src: *src,
-                        pgn: row.pgn,
-                        input: default_interval_hint(row.pgn).to_string(),
-                        manufacturer_code: mfr,
-                        industry_code: ind,
-                        description: desc,
-                    });
-                }
+                self.open_override_modal(*src, state);
             }
             (Screen::DeviceDetail { .. }, KeyCode::Esc)
             | (Screen::DeviceDetail { .. }, KeyCode::Backspace)
@@ -1700,46 +1698,26 @@ impl App {
                         return;
                     }
                 };
-                let line = match (modal.manufacturer_code, modal.industry_code) {
-                    (Some(mfr), Some(ind)) => iso::request_transmission_interval_proprietary(
-                        modal.src,
-                        modal.pgn,
-                        mfr,
-                        ind,
-                        interval_ms,
-                    ),
-                    _ => iso::request_transmission_interval(modal.src, modal.pgn, interval_ms),
-                };
-                let sent = writer.send(line);
-                self.overrides.set(Override {
-                    src: modal.src,
-                    pgn: modal.pgn,
+                // The server owns override persistence and application:
+                // we just send a `canboatPgnOverride` Set on the
+                // overrides control port, addressed by src. The server
+                // resolves src→ISO NAME, persists, and emits the 126208
+                // Request onto the bus. The Overrides view refreshes from
+                // the server's Report frames.
+                let line = iso::override_set(
+                    modal.src,
+                    modal.pgn,
                     interval_ms,
-                    manufacturer_code: modal.manufacturer_code,
-                    industry_code: modal.industry_code,
-                    description: modal.description.clone(),
-                });
-                match self.overrides.save(&self.overrides_path) {
-                    Ok(()) if sent => {
-                        self.toast = Some(format!(
-                            "Sent PGN 126208 override → src {} pgn {} = {} ms",
-                            modal.src, modal.pgn, interval_ms
-                        ));
-                    }
-                    Ok(()) => {
-                        self.toast = Some("Override saved; writer channel closed".into());
-                    }
-                    Err(e) => {
-                        // Persistence just broke (e.g. disk full or
-                        // perms revoked). Hide the override
-                        // affordance for the rest of the session so
-                        // the user isn't shown a feature whose state
-                        // can no longer be persisted.
-                        self.overrides_writable = false;
-                        self.toast = Some(format!(
-                            "Override sent but persist failed: {e} — disabling further overrides this session"
-                        ));
-                    }
+                    modal.manufacturer_code,
+                    modal.industry_code,
+                );
+                if writer.send(line) {
+                    self.toast = Some(format!(
+                        "Sent override → src {} pgn {} = {} ms",
+                        modal.src, modal.pgn, interval_ms
+                    ));
+                } else {
+                    self.toast = Some("Writer channel closed".into());
                 }
                 self.modal = None;
             }
@@ -1909,9 +1887,10 @@ fn render(f: &mut ratatui::Frame<'_>, app: &mut App, state: &AppState) {
             Screen::TimeView => draw_time_view(f, chunks[2], app, state),
             Screen::PgnTop => draw_pgn_top(f, chunks[2], app, state),
             Screen::Nmea0183 => draw_nmea0183(f, chunks[2], app, state),
+            Screen::Overrides => draw_overrides(f, chunks[2], app, state),
         }
         // The bottom line: text prompt when `/` or `f` is active,
-        // otherwise alert / toast / error / per-screen hint.
+        // otherwise toast / error / per-screen hint.
         if let Some(prompt) = &app.text_prompt {
             draw_text_prompt(f, chunks[3], prompt);
         } else {
@@ -1968,8 +1947,8 @@ fn has_unacknowledged_error(app: &App, state: &AppState) -> bool {
 }
 
 /// Thin blue info strip under the menu bar: endpoint / connection /
-/// counters. The action feedback (alert / toast / error) now lives on
-/// the bottom status line instead.
+/// counters. The action feedback (toast / error) now lives on the
+/// bottom status line instead.
 fn draw_info_bar(f: &mut ratatui::Frame<'_>, area: Rect, state: &AppState) {
     let s = &state.status;
     let text = match s.mode {
@@ -2005,24 +1984,18 @@ fn draw_info_bar(f: &mut ratatui::Frame<'_>, area: Rect, state: &AppState) {
     f.render_widget(p, area);
 }
 
-/// Bottom status line (grey surface). Priority: alert > toast > error >
+/// Bottom status line (grey surface). Priority: toast > error >
 /// per-screen hint.
 ///
-/// * `alert` is a bus-side warning (e.g. a NAKed PGN 126208 ACK)
-///   surfaced from the stream reader — bold red so it stands out.
 /// * `toast` is a confirmation / hint for an action the user just took.
 /// * `error` is a persistent connection / I/O error not yet dismissed.
 /// * otherwise the per-screen keybinding cheat sheet.
 fn draw_bottom_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &AppState) {
     let surface = Style::default().bg(SURFACE_BG).fg(SURFACE_FG);
     f.render_widget(Block::default().style(surface), area);
-    let line: Line<'static> = match (&app.alert, &app.toast, &state.status.last_error) {
-        (Some(a), _, _) => Line::from(Span::styled(
-            format!(" {a}"),
-            surface.fg(Color::Red).add_modifier(Modifier::BOLD),
-        )),
-        (_, Some(t), _) => Line::from(Span::styled(format!(" {t}"), surface)),
-        (_, _, Some(e)) => Line::from(vec![
+    let line: Line<'static> = match (&app.toast, &state.status.last_error) {
+        (Some(t), _) => Line::from(Span::styled(format!(" {t}"), surface)),
+        (_, Some(e)) => Line::from(vec![
             Span::styled(
                 " error: ",
                 surface.fg(Color::Red).add_modifier(Modifier::BOLD),
@@ -2030,10 +2003,7 @@ fn draw_bottom_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
             Span::styled(e.clone(), surface.fg(Color::Red)),
         ]),
         _ => Line::from(Span::styled(
-            format!(
-                " {}",
-                screen_hint(&app.screen, app.overrides_writable, state.status.mode)
-            ),
+            format!(" {}", screen_hint(&app.screen, state.status.mode)),
             surface,
         )),
     };
@@ -2045,16 +2015,19 @@ fn draw_bottom_bar(f: &mut ratatui::Frame<'_>, area: Rect, app: &App, state: &Ap
 /// sync, and so a binding that doesn't apply (e.g. `i`/`o` on the
 /// EntryDetail screen, or on the DeviceDetail screen in log mode)
 /// doesn't get advertised where it would do nothing.
-fn screen_hint(screen: &Screen, overrides_writable: bool, mode: Mode) -> &'static str {
+fn screen_hint(screen: &Screen, mode: Mode) -> &'static str {
     match (screen, mode) {
         (Screen::Devices, Mode::Live) => {
-            "F10 menu | ↑↓ move | Enter open | n NMEA0183 | t timeline | p PGN load | q quit"
+            "F10 menu | ↑↓ move | Enter open | n NMEA0183 | o overrides | t timeline | p PGN load | q quit"
         }
         (Screen::Devices, _) => {
             "F10 menu | ↑↓ move | Enter open | t timeline | p PGN load | q quit"
         }
         (Screen::Nmea0183, _) => {
             "F10 menu | ↑↓ move | Space toggle mute | d/Esc back | (row = whole source or one sentence)"
+        }
+        (Screen::Overrides, _) => {
+            "F10 menu | ↑↓ move | e/Enter change interval | d/Del delete | Esc back"
         }
         (Screen::PgnTop, _) => {
             "F10 menu | ↑↓ move | Enter timeline for PGN | t timeline | d/Esc back | q quit"
@@ -2063,12 +2036,8 @@ fn screen_hint(screen: &Screen, overrides_writable: bool, mode: Mode) -> &'stati
         (Screen::DeviceDetail { .. }, Mode::Log) => {
             "F10 menu | ↑↓ move | Enter open entry | Esc back | t timeline | p PGN load"
         }
-        (Screen::DeviceDetail { .. }, Mode::Live) if overrides_writable => {
-            "F10 menu | ↑↓ move | Enter open | Esc back | i ISO 126464 | o override | p PGN load"
-        }
-        // `o` omitted when the overrides file isn't writable.
         (Screen::DeviceDetail { .. }, Mode::Live) => {
-            "F10 menu | ↑↓ move | Enter open | Esc back | t timeline | i ISO 126464 | p PGN load"
+            "F10 menu | ↑↓ move | Enter open | Esc back | i ISO 126464 | o override | p PGN load"
         }
         (Screen::EntryDetail { .. }, _) => {
             "F10 menu | ↑↓ scroll 1 | ←→ prev/next instance | PgUp/PgDn scroll 10 | Esc back"
@@ -2186,6 +2155,57 @@ fn draw_nmea0183(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &
         .highlight_symbol(" ▶ ")
         .highlight_spacing(HighlightSpacing::Always);
     f.render_stateful_widget(list, area, &mut app.nmea0183_state);
+}
+
+/// Render the PGN Overrides view: one row per override the server is
+/// currently applying, fed from its 262658 Report frames. Shows the
+/// target src, PGN + description, and the requested interval (or OFF).
+fn draw_overrides(f: &mut ratatui::Frame<'_>, area: Rect, app: &mut App, state: &AppState) {
+    let rows = state.override_rows();
+    let items: Vec<ListItem> = rows
+        .iter()
+        .map(|ov| {
+            let interval = if ov.interval_ms == INTERVAL_OFF {
+                "  OFF".to_string()
+            } else {
+                format!("{:>4} ms", ov.interval_ms)
+            };
+            let color = if ov.interval_ms == INTERVAL_OFF {
+                Color::Red
+            } else {
+                Color::Green
+            };
+            let line = Line::from(vec![
+                Span::styled(
+                    format!(" src {:3} ", ov.src),
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!("{:6} ", ov.pgn),
+                    Style::default().add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!("{:<9}", interval), Style::default().fg(color)),
+                Span::raw(format!(" {}", ov.description)),
+            ]);
+            ListItem::new(line)
+        })
+        .collect();
+    if !rows.is_empty() && app.overrides_state.selected().is_none() {
+        app.overrides_state.select(Some(0));
+    }
+    let title = if rows.is_empty() {
+        " PGN Overrides (none active) ".to_string()
+    } else {
+        format!(" PGN Overrides — {} active ", rows.len())
+    };
+    let list = List::new(items)
+        .block(panel_block(title))
+        .highlight_style(panel_highlight())
+        .highlight_symbol(" ▶ ")
+        .highlight_spacing(HighlightSpacing::Always);
+    f.render_stateful_widget(list, area, &mut app.overrides_state);
 }
 
 fn draw_device_detail(
@@ -2350,13 +2370,13 @@ fn format_entry_row(e: &Entry, state: &AppState) -> Line<'static> {
 /// it as an OFF row and what tells the `o` key handler to read
 /// mfr / industry / description back from the override file rather
 /// than the (null) `line`.
-fn synthesize_silenced_entry(ov: &Override) -> Entry {
+fn synthesize_silenced_entry(ov: &OverrideRow) -> Entry {
     let now = std::time::Instant::now();
     Entry {
         pgn: ov.pgn,
         src: ov.src,
         secondary: None,
-        description: ov.description.clone().unwrap_or_default(),
+        description: ov.description.clone(),
         line: serde_json::Value::Null,
         last_update: now,
         count: 0,
@@ -2757,22 +2777,23 @@ fn draw_modal(f: &mut ratatui::Frame<'_>, area: Rect, modal: &OverrideModal) {
         .industry_code
         .map(|i| format!(" ind={i}"))
         .unwrap_or_default();
+    let title = match &modal.description {
+        Some(d) if !d.is_empty() => {
+            format!("Override PGN {} ({d}) on src {}", modal.pgn, modal.src)
+        }
+        _ => format!("Override PGN {} on src {}", modal.pgn, modal.src),
+    };
     let text = vec![
-        Line::from(format!(
-            "Override PGN {} on src {}{mfr}{ind}",
-            modal.pgn, modal.src
-        )),
+        Line::from(format!("{title}{mfr}{ind}")),
         Line::from(""),
         Line::from(format!("New interval (ms): {}_", modal.input)),
         Line::from(""),
-        Line::from("Enter to send (and persist) • Esc to cancel"),
-        Line::from(format!(
-            "Off = interval {INTERVAL_OFF} (rejected unless allow_disable in file)"
-        )),
+        Line::from("Enter to send • Esc to cancel"),
+        Line::from(format!("{INTERVAL_OFF} = stop transmitting")),
     ];
     let p = Paragraph::new(text)
         .style(Style::default().bg(SURFACE_BG).fg(SURFACE_FG))
-        .block(dialog_block(" PGN 126208 Command "))
+        .block(dialog_block(" PGN Override "))
         .wrap(Wrap { trim: true });
     f.render_widget(p, rect);
 }
@@ -3606,6 +3627,7 @@ mod tests {
             Screen::TimeView,
             Screen::PgnTop,
             Screen::Nmea0183,
+            Screen::Overrides,
             Screen::DeviceDetail { src: 10 },
         ] {
             let mut app = ui_app();

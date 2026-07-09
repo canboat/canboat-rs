@@ -131,6 +131,23 @@
         {"Order": 3, "Id": "sentence",  "Name": "Sentence",  "BitLength": 24, "BitOffset": 16, "FieldType": "STRING_FIX", "Description": "3-letter NMEA 0183 formatter, or 'ALL' for the whole source"},
         {"Order": 4, "Id": "muted",     "Name": "Muted",     "BitLength": 8,  "BitOffset": 40, "FieldType": "NUMBER", "Resolution": 1, "Description": "0=active (emitting), 1=muted"}
       ]
+    },
+    {
+      "PGN": 262658,
+      "Id": "canboatPgnOverride",
+      "Description": "CANboat: PGN transmission-interval override",
+      "Type": "Fast",
+      "Complete": true,
+      "FieldCount": 6,
+      "Length": 12,
+      "Fields": [
+        {"Order": 1, "Id": "function",         "Name": "Function",          "BitLength": 8,  "BitOffset": 0,  "FieldType": "NUMBER", "Resolution": 1, "Description": "0=Report (server->tui), 1=Set, 2=Request, 3=Delete (tui->server)"},
+        {"Order": 2, "Id": "source",           "Name": "Source",            "BitLength": 8,  "BitOffset": 8,  "FieldType": "NUMBER", "Resolution": 1, "Description": "N2K source address of the device the override targets"},
+        {"Order": 3, "Id": "pgn",              "Name": "PGN",               "BitLength": 24, "BitOffset": 16, "FieldType": "NUMBER", "Resolution": 1, "Description": "Commanded PGN whose transmission interval is overridden"},
+        {"Order": 4, "Id": "intervalMs",       "Name": "Interval",          "BitLength": 32, "BitOffset": 40, "FieldType": "NUMBER", "Resolution": 1, "Description": "Requested transmission interval in ms; 0 = stop transmitting"},
+        {"Order": 5, "Id": "manufacturerCode", "Name": "Manufacturer Code", "BitLength": 16, "BitOffset": 72, "FieldType": "NUMBER", "Resolution": 1, "Description": "For proprietary PGNs; 0xffff = not applicable"},
+        {"Order": 6, "Id": "industryCode",     "Name": "Industry Code",     "BitLength": 8,  "BitOffset": 88, "FieldType": "NUMBER", "Resolution": 1, "Description": "For proprietary PGNs; 0xff = not applicable"}
+      ]
     }
   ]
 }

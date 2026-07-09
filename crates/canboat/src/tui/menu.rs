@@ -73,6 +73,7 @@ pub enum MenuAction {
     ViewTimeline,
     ViewPgnLoad,
     ViewNmea0183,
+    ViewOverrides,
     Back,
     OpenSelected,
     IsoRequest126464,

@@ -26,7 +26,7 @@
 //! computed on demand from the cached JSON values.
 
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::time::Instant;
 
 use canboat_core::{FieldRef, PgnDatabase, PgnInfo, Units, field};
@@ -34,12 +34,6 @@ use indexmap::IndexMap;
 use serde_json::{Map, Value};
 
 use crate::tui::device_cache::{CachedInfo, NameKey};
-
-/// Cap on how many pending alerts (e.g. NAKed PGN 126208 ACKs) we
-/// keep before dropping the oldest. Twenty is more than the user
-/// can plausibly dismiss in one breath, but small enough that a
-/// chatty bus can't grow the queue without bound.
-pub const MAX_PENDING_ALERTS: usize = 20;
 
 /// `(pgn, src, secondary)` — same shape as
 /// [`canboat_core::snapshot`]'s internal cache key.
@@ -154,6 +148,30 @@ pub struct Nmea0183Row {
     pub src: u8,
     pub sentence: Option<String>,
     pub muted: bool,
+}
+
+/// How long a PGN-rate override stays in the Overrides view after its
+/// last server Report. The TUI re-`Request`s every 2 s, so a row that
+/// stops being reported (deleted here or NAK-forgotten by the server)
+/// ages out after a few missed polls.
+pub const OVERRIDE_TTL: std::time::Duration = std::time::Duration::from_secs(6);
+
+/// One PGN-rate override as reported by the server's PGN 262658 control
+/// channel, addressed by the device's current source. Carries the fields
+/// needed to render, edit, or delete it. Overrides are owned + persisted
+/// by the server now; this is just the view model.
+#[derive(Debug, Clone)]
+pub struct OverrideRow {
+    pub src: u8,
+    pub pgn: u32,
+    /// Requested transmission interval in ms; `0` = stopped.
+    pub interval_ms: u32,
+    pub manufacturer_code: Option<u16>,
+    pub industry_code: Option<u8>,
+    /// PGN description from the schema, for display.
+    pub description: String,
+    /// When the server last reported this override; drives [`OVERRIDE_TTL`].
+    pub last_seen: Instant,
 }
 
 /// Progress of a long-running background operation (currently the
@@ -300,13 +318,6 @@ pub struct AppState {
     /// one.
     pub history: Vec<HistoryRecord>,
     pub status: Status,
-    /// Bus-side warnings queued by the stream reader (e.g. a device
-    /// NAKed one of our PGN 126208 Requests with a non-zero error
-    /// code). The UI drains them one per draw into its toast slot
-    /// so the user sees each alert and can dismiss it with any key.
-    /// Bounded to [`MAX_PENDING_ALERTS`] entries — oldest dropped
-    /// when the bus is shouting faster than the user can read.
-    pub alerts: VecDeque<String>,
     /// A one-shot positive notice (e.g. "✓ Loaded N records", "✓ Saved
     /// …") raised by a background task. The UI drains it into its toast
     /// slot so the user gets confirmation an async load / save finished.
@@ -337,13 +348,10 @@ pub struct AppState {
     /// available (`DecodedPgn::data`); the live JSON stream carries no
     /// raw bytes, so this stays empty there.
     pub raw_lines: Vec<String>,
-    /// `(src, pgn)` pairs the bus NAKed one of our PGN 126208 Requests
-    /// for — a device answered "not supported" / errored. The stream
-    /// reader records them here; the UI thread (which owns the override
-    /// store) drains them, drops the matching persisted override, and
-    /// saves — so a rejected rate change isn't replayed on every
-    /// reconnect. See [`crate::tui::ui::App::forget_overrides`].
-    pub nak_overrides: Vec<(u8, u32)>,
+    /// PGN-rate overrides the server currently holds, keyed by
+    /// `(src, pgn)` and fed by its PGN 262658 Report frames. Ages out via
+    /// [`OVERRIDE_TTL`]. Drives the `Screen::Overrides` view.
+    pub overrides: BTreeMap<(u8, u32), OverrideRow>,
 }
 
 impl AppState {
@@ -352,33 +360,14 @@ impl AppState {
             entries: IndexMap::new(),
             history: Vec::new(),
             status,
-            alerts: VecDeque::new(),
             notice: None,
             save_progress: None,
             device_cache,
             src_to_name: HashMap::new(),
             nmea0183: BTreeMap::new(),
             raw_lines: Vec::new(),
-            nak_overrides: Vec::new(),
+            overrides: BTreeMap::new(),
         }
-    }
-
-    /// Record that the bus NAKed our PGN 126208 Request for `(src, pgn)`
-    /// so the UI thread can drop the persisted override. Deduplicated —
-    /// a device that re-NAKs the same request only queues one removal.
-    pub fn record_nak_override(&mut self, src: u8, pgn: u32) {
-        if !self.nak_overrides.contains(&(src, pgn)) {
-            self.nak_overrides.push((src, pgn));
-        }
-    }
-
-    /// Append an alert to [`AppState::alerts`], evicting the oldest
-    /// entry when the queue is full.
-    pub fn push_alert(&mut self, message: String) {
-        if self.alerts.len() == MAX_PENDING_ALERTS {
-            self.alerts.pop_front();
-        }
-        self.alerts.push_back(message);
     }
 
     /// Insert or refresh one record. `line` has already been parsed
@@ -408,6 +397,13 @@ impl AppState {
         // view instead of the entry/device model.
         if pgn == 262657 {
             self.apply_nmea0183_report(&line);
+            self.status.messages_seen = self.status.messages_seen.saturating_add(1);
+            return;
+        }
+        // PGN 262658 is the server's PGN-rate-override control channel —
+        // route its Report frames into the Overrides view.
+        if pgn == 262658 {
+            self.apply_override_report(&line);
             self.status.messages_seen = self.status.messages_seen.saturating_add(1);
             return;
         }
@@ -647,6 +643,70 @@ impl AppState {
         } else {
             dev.sentences.insert(sentence, muted);
         }
+    }
+
+    /// Fold a PGN 262658 override `Report` into [`AppState::overrides`].
+    /// Addressed by the device's current source; refreshes `last_seen`
+    /// so the row survives the next few [`OVERRIDE_TTL`] windows.
+    fn apply_override_report(&mut self, line: &Value) {
+        use field::canboat_pgn_override as ov;
+        if field_number(line, ov::FUNCTION) != Some(0) {
+            return; // Reports only (function 0)
+        }
+        let Some(src) = field_number(line, ov::SOURCE) else {
+            return;
+        };
+        let Some(pgn) = field_number(line, ov::PGN) else {
+            return;
+        };
+        let src = src as u8;
+        let pgn = pgn as u32;
+        let interval_ms = field_number(line, ov::INTERVAL_MS).unwrap_or(0).max(0) as u32;
+        let manufacturer_code = field_number(line, ov::MANUFACTURER_CODE)
+            .filter(|v| *v != 0xffff)
+            .map(|v| v as u16);
+        let industry_code = field_number(line, ov::INDUSTRY_CODE)
+            .filter(|v| *v != 0xff)
+            .map(|v| v as u8);
+        let description = PgnDatabase::embedded(Units::Metric)
+            .first_pgn(pgn)
+            .map(|p| p.description.to_string())
+            .unwrap_or_default();
+        self.overrides.insert(
+            (src, pgn),
+            OverrideRow {
+                src,
+                pgn,
+                interval_ms,
+                manufacturer_code,
+                industry_code,
+                description,
+                last_seen: Instant::now(),
+            },
+        );
+    }
+
+    /// Live override rows (dropping any that have aged past
+    /// [`OVERRIDE_TTL`]), sorted by source then PGN for the Overrides view.
+    pub fn override_rows(&self) -> Vec<OverrideRow> {
+        self.overrides
+            .values()
+            .filter(|r| r.last_seen.elapsed() < OVERRIDE_TTL)
+            .cloned()
+            .collect()
+    }
+
+    /// Optimistically drop an override the user just deleted, so the row
+    /// disappears immediately instead of waiting for it to age out.
+    pub fn forget_override(&mut self, src: u8, pgn: u32) {
+        self.overrides.remove(&(src, pgn));
+    }
+
+    /// Drop overrides the server has stopped reporting (deleted here or
+    /// NAK-forgotten). Called each UI tick to bound the map.
+    pub fn prune_overrides(&mut self) {
+        self.overrides
+            .retain(|_, r| r.last_seen.elapsed() < OVERRIDE_TTL);
     }
 
     /// Flatten [`AppState::nmea0183`] into navigable rows: one
@@ -1111,6 +1171,78 @@ mod tests {
         s.upsert(262657, 0, None, String::new(), report(53, NMEA0183_ALL, 1));
         let rows = s.nmea0183_rows();
         assert!(rows[0].sentence.is_none() && rows[0].muted);
+    }
+
+    fn override_report(src: u8, pgn: u32, interval: u32, mfr: i64, industry: i64) -> Value {
+        json!({
+            "pgn": 262658,
+            "fields": {
+                "Function": 0, "Source": src, "PGN": pgn, "Interval": interval,
+                "Manufacturer Code": mfr, "Industry Code": industry
+            }
+        })
+    }
+
+    #[test]
+    fn override_report_populates_overrides_and_stays_out_of_entries() {
+        let mut s = state();
+        // Standard PGN: mfr/industry carry the "n/a" sentinels.
+        s.upsert(
+            262658,
+            0,
+            None,
+            String::new(),
+            override_report(52, 127250, 100, 0xffff, 0xff),
+        );
+        // Proprietary PGN silenced (interval 0), real mfr/industry.
+        s.upsert(
+            262658,
+            0,
+            None,
+            String::new(),
+            override_report(52, 130842, 0, 1855, 4),
+        );
+        // Control frames don't pollute the bus/device model.
+        assert!(s.entries.is_empty());
+        assert!(s.device_list().is_empty());
+        let rows = s.override_rows();
+        assert_eq!(rows.len(), 2);
+        let heading = rows.iter().find(|r| r.pgn == 127250).unwrap();
+        assert_eq!(heading.interval_ms, 100);
+        assert_eq!(heading.manufacturer_code, None);
+        assert_eq!(heading.industry_code, None);
+        assert!(!heading.description.is_empty(), "schema description filled");
+        let prop = rows.iter().find(|r| r.pgn == 130842).unwrap();
+        assert_eq!(prop.interval_ms, 0);
+        assert_eq!(prop.manufacturer_code, Some(1855));
+        assert_eq!(prop.industry_code, Some(4));
+    }
+
+    #[test]
+    fn override_report_updates_in_place_and_forget_removes() {
+        let mut s = state();
+        s.upsert(
+            262658,
+            0,
+            None,
+            String::new(),
+            override_report(52, 127250, 100, 0xffff, 0xff),
+        );
+        assert_eq!(s.override_rows().len(), 1);
+        // A fresh report for the same (src, pgn) replaces, not appends.
+        s.upsert(
+            262658,
+            0,
+            None,
+            String::new(),
+            override_report(52, 127250, 250, 0xffff, 0xff),
+        );
+        let rows = s.override_rows();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].interval_ms, 250);
+        // Optimistic delete drops it immediately.
+        s.forget_override(52, 127250);
+        assert!(s.override_rows().is_empty());
     }
 
     #[test]

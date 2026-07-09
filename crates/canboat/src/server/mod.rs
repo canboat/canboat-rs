@@ -318,6 +318,14 @@ pub struct Args {
     #[arg(long = "upper-camel")]
     upper_camel: bool,
 
+    /// Decode numeric fields into strict SI base units (`rad`, `K`,
+    /// `Pa`, …) instead of canboat's humanized Metric (`deg`, `°C`,
+    /// `bar`, …) on the analyzer JSON / snapshot TCP ports. Matches
+    /// canboat C's `-si`. Orthogonal to `--camel`. NMEA 0183 / AIS
+    /// output is unaffected — those always emit their spec units.
+    #[arg(long)]
+    si: bool,
+
     /// Verbose logging.
     #[arg(short = 'v', long)]
     verbose: bool,
@@ -353,7 +361,12 @@ pub fn run(cli: Args) -> Result<()> {
     // path discovery, no synthetic-PGN merge — `canboat-core/build.rs`
     // already folded `data/synthetic-pgns.json` into the static
     // tables.
-    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
+    let units = if cli.si {
+        canboat_core::Units::Si
+    } else {
+        canboat_core::Units::Metric
+    };
+    let db = PgnDatabase::embedded(units);
 
     let camel_case = if cli.upper_camel {
         CamelCase::Upper

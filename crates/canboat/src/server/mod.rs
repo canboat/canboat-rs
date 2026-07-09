@@ -40,6 +40,12 @@
 //! | 2602 | *(reserved)*            | —   | future status stream (n2kd `port+5`) |
 //! | 2603 | `--raw-port`            | out | raw frame output stream |
 //! | 2604 | `--analyzer-binary-port`| out | binary `WirePgn` stream |
+//! | 2605 | `--nmea0183-filter-port`| **i/o** | PGN 262657 filter control (with `--nmea0183-filter`) |
+//!
+//! The lone exception to "every output is read-only" is 2605: the
+//! filter control channel is request/response and needs to answer the
+//! client on the same socket, so it is deliberately bidirectional. It
+//! carries nothing but PGN 262657 and never touches the bus.
 
 mod pipeline;
 mod quirks;
@@ -48,9 +54,8 @@ mod tcp;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc;
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 
 use anyhow::{Result, bail};
@@ -290,6 +295,17 @@ pub struct Args {
     #[arg(long = "nmea0183-filter", value_name = "PATH")]
     nmea0183_filter: Option<std::path::PathBuf>,
 
+    /// Port for the bidirectional NMEA 0183 filter control channel (PGN
+    /// 262657). This is the one write-capable output port: the TUI
+    /// connects, is sent the current filter state, and thereafter writes
+    /// `Set` / `Request` frames and reads `Report` frames on the same
+    /// socket. Kept off the read-only analyzer stream so no other
+    /// consumer ever sees the control PGN. Only opened when
+    /// `--nmea0183-filter` is set (there's nothing to control otherwise);
+    /// `0` disables. Slot 2605, after the binary analyzer stream.
+    #[arg(long, default_value_t = 2605)]
+    nmea0183_filter_port: u16,
+
     /// Emit field keys + PGN descriptions as camelCase
     /// identifiers (`"uniqueNumber"` instead of `"Unique Number"`)
     /// on the analyzer JSON / snapshot TCP ports. Matches canboat
@@ -518,10 +534,33 @@ pub fn run(cli: Args) -> Result<()> {
                 "NMEA 0183 per-device filter enabled from {}",
                 path.display()
             );
-            Some(f)
+            // Shared with the control-port server below; the pipeline
+            // reads through it, the control port mutates it.
+            Some(Arc::new(Mutex::new(f)))
         }
         None => None,
     };
+
+    // Dedicated bidirectional control port for the PGN 262657 filter
+    // channel. Only meaningful when the filter itself is enabled — with
+    // no filter there is nothing to report or mutate.
+    match nmea_filter.as_ref() {
+        Some(filter) if cli.nmea0183_filter_port != 0 => {
+            tcp_joins.push(tcp::spawn_filter_control_server(
+                cli.bind,
+                cli.nmea0183_filter_port,
+                filter.clone(),
+                json_opts.clone(),
+            )?);
+        }
+        None if cli.nmea0183_filter_port != 0 => {
+            log::debug!(
+                "--nmea0183-filter-port {} idle: enable the filter with --nmea0183-filter",
+                cli.nmea0183_filter_port
+            );
+        }
+        _ => {}
+    }
 
     pipeline::run(
         db,

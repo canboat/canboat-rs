@@ -24,9 +24,9 @@
 use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, LineWriter, Write};
-use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::n2kd::request_engine::RequestEngine;
@@ -226,8 +226,14 @@ pub struct Nmea0183Options {
     pub emit_stdout: bool,
     /// Enable the 1 Hz per-`(src, quantity)` rate limit.
     pub rate_limit: bool,
-    /// Per-device NAME filter; `None` disables it.
-    pub filter: Option<crate::n2kd::nmea_filter::NmeaFilter>,
+    /// Per-device NAME filter; `None` disables it. Shared behind a
+    /// mutex with the dedicated control-port server (see
+    /// [`crate::server::tcp::spawn_filter_control_server`]), which owns
+    /// the `Set`/`Request`/`Report` exchange with the TUI. The pipeline
+    /// only *reads through* it here: learning `src → NAME` from address
+    /// claims and muting converted sentences. Both are ~1 Hz per source,
+    /// so the lock is uncontended on the hot path.
+    pub filter: Option<Arc<Mutex<crate::n2kd::nmea_filter::NmeaFilter>>>,
 }
 
 /// Pipeline entry point. Returns when `frames_rx` is closed.
@@ -272,7 +278,7 @@ pub fn run(
     let Nmea0183Options {
         emit_stdout: emit_nmea_stdout,
         rate_limit: nmea0183_rate_limit,
-        filter: mut nmea_filter,
+        filter: nmea_filter,
     } = nmea;
     // LineWriter (rather than BufWriter) so each NMEA 0183 sentence
     // is flushed as soon as its trailing newline arrives. Long-
@@ -288,7 +294,6 @@ pub fn run(
     let mut rl = crate::n2kd::nmea0183::RateLimiter::new(nmea0183_rate_limit);
     let mut ais_seq: u8 = 0;
     let handles = crate::n2kd::decoded::Handles::new(db);
-    let mut last_filter_report = Instant::now();
 
     // Quirk synthesisers can produce extra `RawFrame`s in response to
     // an inbound bus frame. We re-feed them through this same loop so
@@ -337,29 +342,13 @@ pub fn run(
         };
         let now = Instant::now();
 
-        // NMEA 0183 filter control channel (PGN 262657). A client Set
-        // (Function == 1, arriving via the inbound loopback) mutates the
-        // filter here and is consumed — never rebroadcast, never on the
-        // bus. Report frames (Function == 0), including the ones this
-        // loop synthesises below, fall through to normal broadcast so a
-        // subscribed TUI reads current state as analyzer JSON.
-        if crate::n2kd::nmea_filter::is_set_frame(&frame) {
-            if let Some(f) = nmea_filter.as_mut() {
-                f.apply_set_frame(&frame.data);
-                pending_synth.extend(f.report_frames());
-            }
-            continue;
-        }
-        // Periodically re-advertise the full filter state while a
-        // reader is attached, so a late-connecting TUI catches up.
-        if let Some(f) = nmea_filter.as_ref()
-            && now.duration_since(last_filter_report)
-                >= crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL
-            && (analyzer_batch.has_subscribers() || raw_batch.has_subscribers())
-        {
-            pending_synth.extend(f.report_frames());
-            last_filter_report = now;
-        }
+        // The NMEA 0183 filter control channel (PGN 262657) no longer
+        // touches this loop: its `Set`/`Request`/`Report` exchange runs
+        // entirely on the dedicated bidirectional control port (see
+        // `crate::server::tcp::spawn_filter_control_server`), so a filter
+        // frame is never broadcast onto the read-only analyzer stream and
+        // never reaches the bus. The pipeline only reads through the
+        // shared filter below (learn NAME, mute sentences).
 
         // Quirk shim: inspect the inbound bus frame, maybe synthesise.
         // Each synthetic is written to the bus (so external consumers
@@ -447,10 +436,10 @@ pub fn run(
         // n2kd uses, which has no raw payload to read. A source that
         // never claims stays unmapped and produces no 0183 — the "no
         // NAME, no output" rule.
-        if let Some(f) = nmea_filter.as_mut()
+        if let Some(f) = nmea_filter.as_ref()
             && let Some(name) = decoded.iso_name()
         {
-            f.note_address_claim(decoded.src, name);
+            f.lock().unwrap().note_address_claim(decoded.src, name);
         }
 
         // Snapshot cache: hand the store the decoded record and let it
@@ -508,9 +497,9 @@ pub fn run(
         // sentences; AIS (`!AI…`) is exempt and passes straight through.
         if converted
             && !ais_branch
-            && let Some(f) = nmea_filter.as_mut()
+            && let Some(f) = nmea_filter.as_ref()
         {
-            f.apply(decoded.src, &mut nmea_buf);
+            f.lock().unwrap().apply(decoded.src, &mut nmea_buf);
         }
         if !nmea_buf.is_empty() {
             if emit_nmea_stdout {

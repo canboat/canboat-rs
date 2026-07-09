@@ -29,9 +29,11 @@
 //! the bottom of this module.
 //!
 //! Output shape is the canboat PLAIN text line — `<ts>,<prio>,<pgn>,
-//! <src>,<dst>,<len>,<hex>,...` — exactly what canboat-pipeline
-//! accepts on its analyzer port (2598) for client-side injection and
-//! what n2kd's downstream serial writers send back to the bus.
+//! <src>,<dst>,<len>,<hex>,...`. ISO / override frames go to the
+//! server's write-only input port for bus injection; the filter control
+//! PGN (262657) goes to the bidirectional filter control port. The
+//! [`crate::tui::client::Writer`] routes each line to the right port by
+//! PGN.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -94,6 +96,24 @@ pub fn nmea0183_filter_set(source: u8, sentence: &str, muted: bool) -> String {
         *s.get(1).unwrap_or(&b' '),
         *s.get(2).unwrap_or(&b' '),
         u8::from(muted),
+        0xff,
+        0xff,
+    ];
+    format_plain(7, 262657, TUI_SRC, 255, &data)
+}
+
+/// PLAIN line for the filter control PGN (262657), **Request** form
+/// (Function 2): ask the server to (re-)send the current filter state on
+/// the control connection. Only the function byte is significant; the
+/// rest is `0xff` padding. See [`nmea0183_filter_set`] for the Set form.
+pub fn nmea0183_filter_request() -> String {
+    let data = [
+        crate::n2kd::nmea_filter::FILTER_FN_REQUEST,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
+        0xff,
         0xff,
         0xff,
     ];
@@ -198,6 +218,17 @@ mod tests {
         // source=35 (0x23), "VLW" = 56,4c,57, muted=0.
         let line = nmea0183_filter_set(35, "VLW", false);
         assert_eq!(no_ts(&line), "7,262657,0,255,8,01,23,56,4c,57,00,ff,ff");
+    }
+
+    #[test]
+    fn nmea0183_filter_request_is_a_request_frame() {
+        // Function=2, rest padding. The server recognises it via
+        // `is_request_frame`, and it must NOT look like a Set.
+        let line = nmea0183_filter_request();
+        assert_eq!(no_ts(&line), "7,262657,0,255,8,02,ff,ff,ff,ff,ff,ff,ff");
+        let frame = canboat_core::format::parse_plain(&line).unwrap();
+        assert!(crate::n2kd::nmea_filter::is_request_frame(&frame));
+        assert!(!crate::n2kd::nmea_filter::is_set_frame(&frame));
     }
 
     #[test]

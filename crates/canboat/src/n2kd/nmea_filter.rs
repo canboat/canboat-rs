@@ -39,21 +39,35 @@ use canboat_core::RawFrame;
 use serde::{Deserialize, Serialize};
 
 /// Synthetic BEM PGN carrying the per-device NMEA 0183 filter control
-/// channel — never a real bus frame. Both daemons speak it: a client
-/// (the TUI) writes a `Set` frame to change a rule; the daemon emits
-/// `Report` frames advertising the current state.
+/// channel — never a real bus frame. It rides its own **dedicated
+/// bidirectional control port** (`--nmea0183-filter-port`), never the
+/// read-only analyzer stream, so no other consumer ever sees it. The
+/// exchange is request/response: a client (the TUI) writes a `Set` to
+/// change a rule or a `Request` to (re-)poll, and the server answers on
+/// the same socket with `Report` frames describing the current state.
 pub const PGN_NMEA0183_FILTER: u32 = 262657;
-/// PGN 262657 `Function`: daemon → client, current state.
+/// PGN 262657 `Function`: server → client, current state.
 pub const FILTER_FN_REPORT: u8 = 0;
-/// PGN 262657 `Function`: client → daemon, apply a change.
+/// PGN 262657 `Function`: client → server, apply a change.
 pub const FILTER_FN_SET: u8 = 1;
-/// How often a daemon re-advertises the full filter state so a client
-/// connecting mid-stream learns it without asking.
+/// PGN 262657 `Function`: client → server, "send me the current state".
+/// The server also reports unprompted once on connect, so a client
+/// learns the state without asking; this is for re-polling as devices
+/// come and go.
+pub const FILTER_FN_REQUEST: u8 = 2;
+/// How often a client re-`Request`s the full filter state while its
+/// control connection is open, so newly-observed sources/sentences
+/// appear without the server having to push unsolicited updates.
 pub const FILTER_REPORT_INTERVAL: Duration = Duration::from_secs(2);
 
 /// `true` when `frame` is a filter `Set` control message.
 pub fn is_set_frame(frame: &RawFrame) -> bool {
     frame.pgn == PGN_NMEA0183_FILTER && frame.data.first() == Some(&FILTER_FN_SET)
+}
+
+/// `true` when `frame` is a filter `Request` control message.
+pub fn is_request_frame(frame: &RawFrame) -> bool {
+    frame.pgn == PGN_NMEA0183_FILTER && frame.data.first() == Some(&FILTER_FN_REQUEST)
 }
 
 /// Formatter token used in PGN 262657 / [`FilterReportRow`] to mean
@@ -338,10 +352,13 @@ impl NmeaFilter {
         self.set(src, sentence, data[5] != 0);
     }
 
-    /// One PGN 262657 `Report` frame per [`Self::report`] row, for a
-    /// daemon to emit onto its output streams so a client renders the
-    /// current device/sentence mute matrix.
-    pub fn report_frames(&self) -> Vec<RawFrame> {
+    /// One PGN 262657 `Report` frame per [`Self::report`] row, for the
+    /// server to answer a client's connect / `Set` / `Request` with, so
+    /// the client renders the current device/sentence mute matrix. Every
+    /// frame carries `timestamp` (the moment the report was generated) —
+    /// a real timestamp rather than the `None` the old broadcast used, so
+    /// the decoded JSON has a `timestamp` field like every other record.
+    pub fn report_frames(&self, timestamp: Option<String>) -> Vec<RawFrame> {
         self.report()
             .into_iter()
             .map(|row| {
@@ -356,7 +373,7 @@ impl NmeaFilter {
                     0xff,
                     0xff,
                 ];
-                RawFrame::new(None, 7, PGN_NMEA0183_FILTER, 0, 255, data)
+                RawFrame::new(timestamp.clone(), 7, PGN_NMEA0183_FILTER, 0, 255, data)
             })
             .collect()
     }
@@ -515,7 +532,11 @@ mod tests {
         assert!(buf.is_empty(), "VHW should now be muted");
 
         // report_frames advertises the state: a VHW row muted for src 35.
-        let frames = f.report_frames();
+        let frames = f.report_frames(Some("2026-07-09T00:00:00.000Z".into()));
+        assert!(
+            frames.iter().all(|fr| fr.timestamp.is_some()),
+            "report frames must carry a timestamp"
+        );
         assert!(
             frames.iter().any(|fr| fr.pgn == PGN_NMEA0183_FILTER
                 && fr.data.len() >= 6

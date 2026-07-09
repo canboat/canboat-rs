@@ -8,8 +8,12 @@
 //!
 //! * **Write server** (WO) — accepts PLAIN/FAST lines and injects them
 //!   onto the bus via an [`InjectPoint`] (device writer + pipeline
-//!   loopback). This is also where the BEM NMEA-0183-filter control
-//!   channel lands.
+//!   loopback).
+//!
+//! * **Filter control server** (RW) — the one bidirectional port: it
+//!   carries the PGN 262657 NMEA-0183-filter control channel between the
+//!   TUI and the pipeline's shared [`NmeaFilter`], request/response and
+//!   private per connection (see [`spawn_filter_control_server`]).
 //!
 //! * **Binary analyzer server** (RO) — the `canboat_wire` handshake
 //!   plus length-prefixed postcard `WirePgn` frames from a [`BinHub`].
@@ -17,14 +21,18 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::atomic::{AtomicU8, Ordering};
-use std::sync::{Arc, mpsc};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 
-use canboat_core::RawFrame;
 use canboat_core::format::{PlainError, parse_plain};
+use canboat_core::output::{JsonOptions, write_json};
+use canboat_core::{PgnDatabase, RawFrame};
 use canboat_io::device::FrameSender;
+
+use crate::n2kd::nmea_filter::NmeaFilter;
 
 /// Where a client-written frame goes. In device mode, we forward to
 /// the device *and* loop it back into the pipeline source so it
@@ -162,12 +170,17 @@ fn forward_plain_line(line: &str, inject: &InjectPoint) -> bool {
     }
     match parse_plain(trimmed) {
         Ok(mut frame) => {
-            // The NMEA 0183 filter control PGN is a pipeline-local
-            // message, never a bus frame: loop it into the pipeline
-            // (which owns the filter state) but do not transmit it on
-            // the N2K bus or rewrite its source.
+            // The NMEA 0183 filter control PGN is never a bus frame and
+            // no longer travels this port: it has its own dedicated
+            // bidirectional control port (see
+            // [`spawn_filter_control_server`]). One arriving here is
+            // stale / misrouted — drop it silently rather than inject a
+            // synthetic PGN onto the N2K bus.
             if frame.pgn == crate::n2kd::nmea_filter::PGN_NMEA0183_FILTER {
-                return inject.loopback.send(frame).is_ok();
+                log::debug!(
+                    "dropping stray PGN 262657 on input port; the filter control channel is on --nmea0183-filter-port"
+                );
+                return true;
             }
             // Rewrite a default / broadcast `src` to our gateway's
             // live claim address on BOTH paths. The device adapter
@@ -218,6 +231,173 @@ fn log_bad_plain_line(line: &str, err: &PlainError) {
             log::warn!("ignoring malformed PLAIN/FAST line: {err}\n  line: {line}");
         }
     }
+}
+
+/// Bind the **bidirectional** NMEA 0183 filter control port
+/// (`--nmea0183-filter-port`).
+///
+/// This is the only write-capable *output* port, and it carries exactly
+/// one thing: the PGN 262657 control channel between the TUI and the
+/// pipeline's shared [`NmeaFilter`]. The exchange is request/response
+/// and private to each connection — no filter frame ever reaches the
+/// read-only analyzer stream or the N2K bus (that's the "confusing for
+/// other consumers" problem the old broadcast had). On connect the
+/// server pushes the current state once; thereafter each client `Set`
+/// (mutate a rule) or `Request` (re-poll) is answered on the same
+/// socket with a fresh batch of `Report` lines. Reports are analyzer
+/// JSON — the exact shape the TUI already parses off the stream port —
+/// and each carries a real timestamp.
+pub fn spawn_filter_control_server(
+    bind: Ipv4Addr,
+    port: u16,
+    filter: Arc<Mutex<NmeaFilter>>,
+    json_opts: JsonOptions,
+) -> Result<JoinHandle<()>> {
+    let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
+        .with_context(|| format!("binding filter-control TCP port {}:{}", bind, port))?;
+    log::info!(
+        "nmea0183-filter control server listening on {}:{} (RW)",
+        bind,
+        port
+    );
+    Ok(thread::Builder::new()
+        .name("filter-control-accept".into())
+        .spawn(move || filter_control_accept(listener, filter, json_opts))
+        .expect("spawn filter-control accept"))
+}
+
+fn filter_control_accept(
+    listener: TcpListener,
+    filter: Arc<Mutex<NmeaFilter>>,
+    json_opts: JsonOptions,
+) {
+    loop {
+        let (stream, peer) = match listener.accept() {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("filter-control accept failed: {e}");
+                return;
+            }
+        };
+        log::info!("filter-control client connected: {peer}");
+        let f = filter.clone();
+        let opts = json_opts.clone();
+        thread::Builder::new()
+            .name("filter-control-client".into())
+            .spawn(move || run_filter_control_client(stream, f, opts))
+            .ok();
+    }
+}
+
+fn run_filter_control_client(
+    stream: TcpStream,
+    filter: Arc<Mutex<NmeaFilter>>,
+    json_opts: JsonOptions,
+) {
+    // Single-frame synthetic PGN 262657 decodes against the embedded
+    // schema with no reassembly; Metric vs SI is irrelevant (its fields
+    // are plain integers / a fixed string).
+    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
+    let mut write_stream = match stream.try_clone() {
+        Ok(s) => s,
+        Err(e) => {
+            log::debug!("filter-control: try_clone failed: {e}");
+            return;
+        }
+    };
+    // Unprompted initial report so a freshly-connected TUI paints the
+    // current state without having to ask for it.
+    if !send_filter_report(&mut write_stream, &filter, db, &json_opts) {
+        return;
+    }
+    let reader = BufReader::new(stream);
+    for line in reader.lines() {
+        let line = match line {
+            Ok(l) => l,
+            Err(_) => return,
+        };
+        let trimmed = line.trim_end_matches(['\r', '\n']);
+        if trimmed.is_empty() {
+            continue;
+        }
+        let frame = match parse_plain(trimmed) {
+            Ok(f) => f,
+            Err(PlainError::Empty) => continue,
+            Err(e) => {
+                log::debug!("filter-control: ignoring non-PLAIN line: {e}");
+                continue;
+            }
+        };
+        if crate::n2kd::nmea_filter::is_set_frame(&frame) {
+            filter.lock().unwrap().apply_set_frame(&frame.data);
+        } else if !crate::n2kd::nmea_filter::is_request_frame(&frame) {
+            // Neither Set nor Request. This port never injects onto the
+            // bus, so anything else is simply ignored.
+            log::debug!("filter-control: ignoring frame pgn {}", frame.pgn);
+            continue;
+        }
+        // Both Set and Request are answered with the full current state.
+        if !send_filter_report(&mut write_stream, &filter, db, &json_opts) {
+            return;
+        }
+    }
+}
+
+/// Serialize the current filter state as analyzer-JSON `Report` lines
+/// (one per `(src, sentence)` row) and write them to `stream`. Returns
+/// `false` only on a socket write error, so the caller drops the
+/// client. An empty state (nothing observed yet) writes nothing and
+/// keeps the connection open — the client re-`Request`s periodically.
+fn send_filter_report(
+    stream: &mut TcpStream,
+    filter: &Mutex<NmeaFilter>,
+    db: &PgnDatabase,
+    json_opts: &JsonOptions,
+) -> bool {
+    let out = filter_report_lines(filter, db, json_opts);
+    if out.is_empty() {
+        return true;
+    }
+    stream.write_all(out.as_bytes()).is_ok()
+}
+
+/// Build the newline-terminated analyzer-JSON `Report` lines for the
+/// current filter state (one per `(src, sentence)` row). Each row is the
+/// 262657 frame decoded against `db` and serialized with `json_opts`, so
+/// the shape is byte-identical to what the TUI parses off the stream
+/// port. Empty when nothing has been observed yet.
+fn filter_report_lines(
+    filter: &Mutex<NmeaFilter>,
+    db: &PgnDatabase,
+    json_opts: &JsonOptions,
+) -> String {
+    let frames = filter.lock().unwrap().report_frames(Some(now_iso()));
+    let mut out = String::with_capacity(frames.len() * 96);
+    for frame in &frames {
+        match db.decode(frame) {
+            Ok(decoded) => {
+                let start = out.len();
+                if write_json(&mut out, &decoded, json_opts).is_ok() {
+                    out.push('\n');
+                } else {
+                    out.truncate(start);
+                }
+            }
+            Err(e) => log::debug!("filter-control: decoding a 262657 report failed: {e}"),
+        }
+    }
+    out
+}
+
+/// Current wall-clock as an ISO-8601 millisecond timestamp, matching
+/// the `timestamp` field on every other analyzer record. Falls back to
+/// the epoch if the clock is somehow before 1970.
+fn now_iso() -> String {
+    let ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    canboat_core::format_iso_ms(ms)
 }
 
 /// Bind the binary analyzer server (`--analyzer-binary-port`).
@@ -283,4 +463,50 @@ fn run_binary_client(mut stream: TcpStream, hub: Arc<BinHub>) {
         }
     }
     drop(stream);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use canboat_core::output::CamelCase;
+
+    #[test]
+    fn filter_report_lines_render_nv_json_with_timestamp() {
+        // Build a filter, teach it a device NAME, observe a VHW sentence,
+        // then mute it via a Set. The lines the control port sends must
+        // decode to the -nv analyzer JSON the TUI parses, each carrying a
+        // timestamp (the fix for the old timestamp-less broadcast).
+        let path = std::env::temp_dir().join("canboat-filter-control-test.json");
+        let mut filter = NmeaFilter::load(&path).unwrap();
+        filter.note_address_claim(35, 0x0004_0000_0761_9208);
+        let mut buf = "$CDVHW,,T,,M,4.6,N,8.6,K*5E\r\n".to_string();
+        filter.apply(35, &mut buf);
+        assert!(filter.set(35, "VHW", true));
+
+        let db = PgnDatabase::embedded(canboat_core::Units::Metric);
+        let json_opts = JsonOptions {
+            include_empty: false,
+            name_value: true,
+            debug: false,
+            camel_case: CamelCase::Off,
+        };
+        let filter = Mutex::new(filter);
+        let out = filter_report_lines(&filter, db, &json_opts);
+
+        assert!(out.contains("262657"), "out: {out}");
+        assert!(
+            out.contains("\"timestamp\""),
+            "every report line must carry a timestamp: {out}"
+        );
+        assert!(
+            out.lines()
+                .any(|l| l.contains("\"Sentence\":\"VHW\"") && l.contains("\"Muted\":1")),
+            "expected a muted VHW row: {out}"
+        );
+        assert!(
+            out.contains("\"Sentence\":\"ALL\""),
+            "expected a whole-source ALL row: {out}"
+        );
+        let _ = std::fs::remove_file(&path);
+    }
 }

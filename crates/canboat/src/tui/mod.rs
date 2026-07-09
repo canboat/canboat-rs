@@ -132,12 +132,7 @@ pub async fn run(args: Args) -> Result<()> {
                 args.snapshot_port,
                 state.clone(),
             ));
-            tasks.push(client::spawn_stream_connection(
-                host,
-                args.stream_port,
-                state.clone(),
-                writer_rx,
-            ));
+            spawn_live_connections(&mut tasks, host, args.stream_port, &state, writer_rx);
         }
         (None, None) => {
             // Idle: nothing to read from yet. Drop the writer receiver;
@@ -247,6 +242,48 @@ async fn run_loop(
 /// capture file, or save the current capture. Connect / Load tear down
 /// the running tasks and swap in a fresh [`AppState`] (preserving the
 /// persistent device cache) so no stale data or task bleeds across.
+/// Derive the two write-capable ports from the JSON stream port, using
+/// the server's canonical n2kd-relative offsets: stream = base+1,
+/// input = base+3, filter control = base+8. The Connect dialog only
+/// collects host + snapshot + stream ports, so the write ports follow
+/// the stream port rather than being entered separately.
+fn write_ports(stream_port: u16) -> (u16, u16) {
+    let base = stream_port.wrapping_sub(1);
+    (base.wrapping_add(3), base.wrapping_add(8))
+}
+
+/// Spawn the three live-mode connections that back the shared
+/// [`client::Writer`]: the read-only bus JSON stream, the write-only
+/// input port (bus injection), and the bidirectional filter control
+/// port. The input / filter ports are derived from `stream_port` via
+/// [`write_ports`].
+fn spawn_live_connections(
+    tasks: &mut Vec<JoinHandle<()>>,
+    host: String,
+    stream_port: u16,
+    state: &Arc<Mutex<AppState>>,
+    writer_rx: client::WriterRx,
+) {
+    let (input_port, filter_port) = write_ports(stream_port);
+    tasks.push(client::spawn_stream_connection(
+        host.clone(),
+        stream_port,
+        state.clone(),
+    ));
+    tasks.push(client::spawn_input_connection(
+        host.clone(),
+        input_port,
+        state.clone(),
+        writer_rx.input,
+    ));
+    tasks.push(client::spawn_filter_connection(
+        host,
+        filter_port,
+        state.clone(),
+        writer_rx.filter,
+    ));
+}
+
 async fn execute_command(
     cmd: ui::PendingCommand,
     writer: &mut client::Writer,
@@ -288,12 +325,7 @@ async fn execute_command(
                 snapshot_port,
                 state.clone(),
             ));
-            tasks.push(client::spawn_stream_connection(
-                host,
-                stream_port,
-                state.clone(),
-                rx,
-            ));
+            spawn_live_connections(tasks, host, stream_port, state, rx);
             *writer = new_writer;
             app.reset_views();
             app.connecting_dismissed = false;

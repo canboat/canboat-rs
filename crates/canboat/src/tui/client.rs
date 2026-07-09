@@ -10,18 +10,22 @@
 //! [`canboat_core::snapshot::classify_json_line`] so the keys we
 //! produce are byte-identical to the ones the snapshot port stores.
 //!
-//! The stream port is RW on canboat-pipeline (`--analyzer-port` is
-//! deliberately bidirectional, see project memory) so the same socket
-//! is used to push outgoing PLAIN lines back upstream — ISO Requests
-//! and PGN 126208 transmission-interval commands.
+//! The stream port is read-only. Outgoing traffic goes to two other
+//! ports, both derived from the stream port's canonical offsets (see
+//! `super::write_ports`) and fed by the same [`Writer`], which routes
+//! each PLAIN line by PGN:
 //!
-//! n2kd's stream port is read-only; writes from the TUI to n2kd are
-//! silently ignored by the daemon, and the ISO-Request / override
-//! features will appear to do nothing. The status bar makes this
-//! explicit by labelling the endpoint as `n2kd` when the snapshot
-//! port responds with the n2kd-shaped status header (a heuristic, not
-//! a contract) — for now we just surface the IP/port and document the
-//! limitation.
+//! * the **write-only input port** (`base+3`, default 2600) — ISO
+//!   Requests and PGN 126208 transmission-interval overrides, injected
+//!   onto the N2K bus;
+//! * the **bidirectional filter control port** (`base+8`, default 2605)
+//!   — the PGN 262657 NMEA-0183-filter channel: `Set` / `Request` out,
+//!   `Report` JSON back on the same socket.
+//!
+//! Against an endpoint that doesn't offer those ports (e.g. a plain
+//! n2kd, or a `server` started without `--nmea0183-filter`), the
+//! respective connection simply fails quietly and that feature is
+//! inert — the read-only stream still works.
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -51,29 +55,71 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// fits.
 const SNAPSHOT_READ_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// Handle to the writer half of the live stream connection. The UI
-/// pushes outgoing canboat PLAIN lines (without the trailing newline)
-/// onto this channel; a background task tacks on `\n` and writes
-/// them to the socket. The channel is created upfront — sends queue
-/// here until the stream task connects, so the UI is usable from the
-/// first frame.
+/// Handle to the TUI's two outgoing connections. The UI pushes canboat
+/// PLAIN lines (without the trailing newline) via [`Writer::send`],
+/// which routes each by PGN to the right socket:
+///
+/// * the **filter control PGN (262657)** → the bidirectional control
+///   port (`--nmea0183-filter-port`), where the server answers with
+///   `Report` frames on the same socket;
+/// * **everything else** (ISO requests, PGN 126208 rate overrides) →
+///   the write-only **input port** (`--input-port`), which injects them
+///   onto the N2K bus.
+///
+/// Both channels are created upfront — sends queue here until the
+/// respective connection task comes up, so the UI is usable from the
+/// first frame. In log / idle mode neither receiver is drained.
 #[derive(Clone)]
 pub struct Writer {
-    tx: mpsc::UnboundedSender<String>,
+    /// Bus injection (ISO / override frames) → the input port.
+    input_tx: mpsc::UnboundedSender<String>,
+    /// PGN 262657 filter control → the bidirectional control port.
+    filter_tx: mpsc::UnboundedSender<String>,
 }
 
 impl Writer {
+    /// Queue a PLAIN line for transmission, routed by PGN. Returns
+    /// `false` if the destination channel's connection task has gone.
     pub fn send(&self, line: String) -> bool {
-        self.tx.send(line).is_ok()
+        if line_is_filter_control(&line) {
+            self.filter_tx.send(line).is_ok()
+        } else {
+            self.input_tx.send(line).is_ok()
+        }
     }
 }
 
-/// Build the writer channel and return both halves — the `Writer`
-/// for the UI, and the receiver for the stream task to drain once
-/// the connection comes up.
-pub fn make_writer() -> (Writer, mpsc::UnboundedReceiver<String>) {
-    let (tx, rx) = mpsc::unbounded_channel();
-    (Writer { tx }, rx)
+/// The two receivers a live-mode setup wires to its connection tasks:
+/// bus-injection lines and filter-control lines respectively.
+pub struct WriterRx {
+    pub input: mpsc::UnboundedReceiver<String>,
+    pub filter: mpsc::UnboundedReceiver<String>,
+}
+
+/// `true` when a canboat PLAIN line targets the NMEA 0183 filter
+/// control PGN (262657). The PGN is the third comma-separated field
+/// (`<ts>,<prio>,<pgn>,…`). A line we can't parse falls through to the
+/// bus path — the safe default, since the input port simply ignores a
+/// non-frame.
+fn line_is_filter_control(line: &str) -> bool {
+    line.split(',')
+        .nth(2)
+        .and_then(|s| s.trim().parse::<u32>().ok())
+        == Some(crate::n2kd::nmea_filter::PGN_NMEA0183_FILTER)
+}
+
+/// Build the writer channels and return the shared [`Writer`] plus the
+/// two receivers for the connection tasks to drain once they connect.
+pub fn make_writer() -> (Writer, WriterRx) {
+    let (input_tx, input) = mpsc::unbounded_channel();
+    let (filter_tx, filter) = mpsc::unbounded_channel();
+    (
+        Writer {
+            input_tx,
+            filter_tx,
+        },
+        WriterRx { input, filter },
+    )
 }
 
 /// One message from the log-decode thread to the apply task. A `Frame`
@@ -429,12 +475,52 @@ pub fn spawn_stream_connection(
     host: String,
     port: u16,
     state: Arc<Mutex<AppState>>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = connect_stream(&host, port, state.clone()).await {
+            let mut s = state.lock().await;
+            s.status.last_error = Some(format!("stream: {e:#}"));
+        }
+    })
+}
+
+/// Spawn the write-only input-port connection: drains bus-injection
+/// lines (ISO requests / PGN 126208 rate overrides) to the socket,
+/// which the server injects onto the N2K bus. The input port streams
+/// nothing back, so the task lives until a write fails (server gone) or
+/// the channel closes.
+pub fn spawn_input_connection(
+    host: String,
+    port: u16,
+    state: Arc<Mutex<AppState>>,
     rx: mpsc::UnboundedReceiver<String>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
-        if let Err(e) = connect_stream(&host, port, state.clone(), rx).await {
+        if let Err(e) = connect_input(&host, port, rx, state.clone()).await {
             let mut s = state.lock().await;
-            s.status.last_error = Some(format!("stream: {e:#}"));
+            s.status.last_error = Some(format!("input: {e:#}"));
+        }
+    })
+}
+
+/// Spawn the bidirectional filter control-port connection: reads PGN
+/// 262657 `Report` JSON into `state` (the same `upsert` path the bus
+/// stream uses) and writes the UI's `Set` frames plus a periodic
+/// `Request` poll so newly-observed sources / sentences keep appearing.
+pub fn spawn_filter_connection(
+    host: String,
+    port: u16,
+    state: Arc<Mutex<AppState>>,
+    rx: mpsc::UnboundedReceiver<String>,
+) -> JoinHandle<()> {
+    tokio::spawn(async move {
+        if let Err(e) = connect_filter(&host, port, state.clone(), rx).await {
+            // The filter control port only exists when the server was
+            // started with `--nmea0183-filter`. A refused/timed-out
+            // connect there is the normal "no filter configured" case,
+            // not something to splash across the status bar — log it and
+            // leave the Nmea0183 screen empty.
+            log::debug!("filter control connection to {host}:{port} ended: {e:#}");
         }
     })
 }
@@ -503,7 +589,47 @@ async fn load_snapshot(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Re
 /// on the current task. Returns when either half ends (peer closed,
 /// I/O error). The Writer channel's `rx` is owned by this task — any
 /// queued sends drain to the socket as soon as the connection is up.
-async fn connect_stream(
+async fn connect_stream(host: &str, port: u16, state: Arc<Mutex<AppState>>) -> Result<()> {
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .with_context(|| format!("connect stream port {host}:{port} timed out"))?
+        .with_context(|| format!("connecting stream port {host}:{port}"))?;
+    stream.set_nodelay(true).ok();
+    // Read-only: the bus JSON stream never accepts client writes (the
+    // server FINs its read side). Bus injection goes to the input port
+    // and the filter control channel to its own port — see `Writer`.
+    let (read_half, _write_half) = stream.into_split();
+
+    {
+        let mut s = state.lock().await;
+        s.status.stream_connected = true;
+    }
+    reader_task(read_half, state.clone()).await;
+    let mut s = state.lock().await;
+    s.status.stream_connected = false;
+    Ok(())
+}
+
+async fn connect_input(
+    host: &str,
+    port: u16,
+    rx: mpsc::UnboundedReceiver<String>,
+    state: Arc<Mutex<AppState>>,
+) -> Result<()> {
+    let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
+        .await
+        .with_context(|| format!("connect input port {host}:{port} timed out"))?
+        .with_context(|| format!("connecting input port {host}:{port}"))?;
+    stream.set_nodelay(true).ok();
+    // Write-only. The input port FINs its own write side, so we never
+    // read; dropping our read half leaves the write half open to keep
+    // injecting. The task ends when a write fails or `rx` closes.
+    let (_read_half, write_half) = stream.into_split();
+    writer_task(write_half, rx, state).await;
+    Ok(())
+}
+
+async fn connect_filter(
     host: &str,
     port: u16,
     state: Arc<Mutex<AppState>>,
@@ -511,25 +637,52 @@ async fn connect_stream(
 ) -> Result<()> {
     let stream = timeout(CONNECT_TIMEOUT, TcpStream::connect((host, port)))
         .await
-        .with_context(|| format!("connect stream port {host}:{port} timed out"))?
-        .with_context(|| format!("connecting stream port {host}:{port}"))?;
+        .with_context(|| format!("connect filter port {host}:{port} timed out"))?
+        .with_context(|| format!("connecting filter port {host}:{port}"))?;
     stream.set_nodelay(true).ok();
     let (read_half, write_half) = stream.into_split();
-
-    {
-        let mut s = state.lock().await;
-        s.status.stream_connected = true;
-    }
-
-    // Run both halves; first to finish unblocks the other (because the
-    // socket halves share a Drop tree once the task exits).
+    // Reader ingests `Report` JSON; writer drains `Set`s and polls with
+    // `Request`. First half to finish tears down the other.
     tokio::select! {
         _ = reader_task(read_half, state.clone()) => {}
-        _ = writer_task(write_half, rx, state.clone()) => {}
+        _ = filter_writer_task(write_half, rx, state.clone()) => {}
     }
-    let mut s = state.lock().await;
-    s.status.stream_connected = false;
     Ok(())
+}
+
+/// Writer half of the filter control connection: drains `Set` lines from
+/// the UI and, on every [`crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL`]
+/// tick, sends a `Request` so the server re-reports — catching sources /
+/// sentences observed since its last answer. The server also reports
+/// unprompted on connect and after each `Set`, so the poll only exists
+/// to surface newly-appearing rows.
+async fn filter_writer_task(
+    mut writer: OwnedWriteHalf,
+    mut rx: mpsc::UnboundedReceiver<String>,
+    state: Arc<Mutex<AppState>>,
+) {
+    let mut poll = tokio::time::interval(crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL);
+    // The first tick is immediate and redundant with the server's
+    // connect-time report — consume it so the first real poll is one
+    // full interval out.
+    poll.tick().await;
+    loop {
+        let mut line = tokio::select! {
+            maybe = rx.recv() => match maybe {
+                Some(l) => l,
+                None => break,
+            },
+            _ = poll.tick() => crate::tui::iso::nmea0183_filter_request(),
+        };
+        if !line.ends_with('\n') {
+            line.push('\n');
+        }
+        if let Err(e) = writer.write_all(line.as_bytes()).await {
+            let mut s = state.lock().await;
+            s.status.last_error = Some(format!("filter write: {e}"));
+            break;
+        }
+    }
 }
 
 async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<AppState>>) {
@@ -675,6 +828,30 @@ mod tests {
     use crate::tui::state::Status;
     use serde_json::json;
     use std::collections::HashMap;
+
+    #[test]
+    fn filter_control_lines_are_recognised_by_pgn() {
+        assert!(line_is_filter_control(
+            "2026-01-01T00:00:00.000Z,7,262657,0,255,8,01,21,41,4c,4c,01,ff,ff"
+        ));
+        assert!(!line_is_filter_control(
+            "2026-01-01T00:00:00.000Z,6,59904,0,35,3,00,ee,01"
+        ));
+        assert!(!line_is_filter_control("garbage"));
+    }
+
+    #[test]
+    fn writer_routes_by_pgn() {
+        let (writer, mut rx) = make_writer();
+        // 262657 → filter channel; ISO request (59904) → input channel.
+        assert!(writer.send(crate::tui::iso::nmea0183_filter_request()));
+        assert!(writer.send(crate::tui::iso::iso_request(35, 126464)));
+        assert!(rx.filter.try_recv().is_ok());
+        assert!(rx.input.try_recv().is_ok());
+        // Each landed in exactly one channel.
+        assert!(rx.filter.try_recv().is_err());
+        assert!(rx.input.try_recv().is_err());
+    }
 
     fn seeded() -> AppState {
         let mut s = AppState::new(Status::new_log("x".into()), HashMap::new());

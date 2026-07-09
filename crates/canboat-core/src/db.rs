@@ -190,6 +190,16 @@ impl PgnDatabase {
         Ok(crate::encode::MessageBuilder::for_pgn(self, pgn))
     }
 
+    /// Start encoding a message for a generated PGN constant
+    /// (`canboat_core::pgn::WIND_DATA`) — the compile-checked counterpart
+    /// to [`Self::message`]. The constant points at the SI schema array,
+    /// so this re-resolves it by `id` against this database's own arrays,
+    /// meaning field scaling happens in this db's [`Units`].
+    pub fn message_for(&'static self, pgn: &'static PgnInfo) -> crate::encode::MessageBuilder {
+        let resolved = self.pgn_by_id(pgn.id).unwrap_or(pgn);
+        crate::encode::MessageBuilder::for_pgn(self, resolved)
+    }
+
     /// Start encoding a message by PGN number. Returns
     /// [`crate::encode::EncodeError::AmbiguousPgn`] when the number has
     /// more than one schema variant — use [`Self::message`] with the id.

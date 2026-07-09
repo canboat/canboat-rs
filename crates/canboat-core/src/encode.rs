@@ -4,8 +4,11 @@
 //! inverse of [`crate::decode`].
 //!
 //! The entry point is [`PgnDatabase::message`] /
-//! [`PgnDatabase::message_by_pgn`], which hand back a [`MessageBuilder`]
-//! for a specific schema PGN variant. Push field values by name (or id),
+//! [`PgnDatabase::message_by_pgn`] (by id / by number), or
+//! [`PgnDatabase::message_for`] with a generated `pgn::…` constant, which
+//! hand back a [`MessageBuilder`] for a specific schema PGN variant. Set
+//! field values by name/id ([`push`](MessageBuilder::push)) or by a
+//! compile-checked `field::…` constant ([`set`](MessageBuilder::set)),
 //! then [`build`](MessageBuilder::build) packs them at their schema bit
 //! offsets — LSB-first, exactly the layout [`crate::bits::extract_bits`]
 //! reads back — and returns a [`RawFrame`]. Because the result is a
@@ -27,7 +30,7 @@
 use std::error::Error;
 use std::fmt;
 
-use canboat_schema::{FieldInfo, FieldType, PgnInfo};
+use canboat_schema::{FieldInfo, FieldRef, FieldType, PgnInfo};
 
 use crate::db::PgnDatabase;
 use crate::frame::RawFrame;
@@ -204,6 +207,19 @@ impl MessageBuilder {
         let raw = self.value_to_raw(&self.pgn.fields[idx], value.into())?;
         self.staged[idx] = Some(raw);
         Ok(self)
+    }
+
+    /// Set a field by its generated [`FieldRef`] constant
+    /// (`canboat_core::field::wind_data::WIND_ANGLE`) — the compile-checked
+    /// counterpart to [`Self::push`]. Resolves by the field's `id` against
+    /// this builder's PGN, so the value scales in the builder's unit system
+    /// (the constant itself points at the SI schema).
+    pub fn set(
+        &mut self,
+        field: FieldRef,
+        value: impl Into<EncodeValue>,
+    ) -> Result<&mut Self, EncodeError> {
+        self.push(field.field.id, value)
     }
 
     /// Set a field from a textual value, coercing per the field's type
@@ -460,11 +476,10 @@ mod tests {
         // The canboat `format-message` example: request Product Info
         // (126996 = 0x1F014) → PGN 59904, data 14 f0 01.
         let frame = db()
-            .message("isoRequest")
-            .unwrap()
+            .message_for(crate::pgn::ISO_REQUEST)
             .priority(6)
             .destination(255)
-            .push("PGN", 126996)
+            .set(crate::field::iso_request::PGN, 126996u32)
             .unwrap()
             .build()
             .unwrap();
@@ -489,7 +504,7 @@ mod tests {
         // Encoding with no fields set still produces a schema-length
         // frame (defaults fill in), and match_value selector fields are
         // auto-populated so the variant stays valid.
-        let frame = db().message("isoRequest").unwrap().build();
+        let frame = db().message_for(crate::pgn::ISO_REQUEST).build();
         // isoRequest has a single PGN field with no match_value; unset →
         // not-available (all ones), 3 bytes.
         let f = frame.unwrap();
@@ -503,17 +518,19 @@ mod tests {
         // number, an integer, and a lookup-by-label, then decode the
         // frame back and compare physical values (unit-agnostic — the
         // compiled schema may store angles in degrees, etc.).
+        use crate::field::wind_data as wd;
         let db = db();
         let frame = db
-            .message("windData")
+            .message_for(crate::pgn::WIND_DATA)
+            .set(wd::SID, 7)
             .unwrap()
-            .push("SID", 7)
+            .set(wd::WIND_SPEED, 5.23)
             .unwrap()
-            .push("Wind Speed", 5.23)
+            .set(wd::WIND_ANGLE, 1.5)
             .unwrap()
-            .push("Wind Angle", 1.5)
-            .unwrap()
-            .push("Reference", EncodeValue::Lookup("Apparent".into()))
+            // The lookup *label* stays a string — value-name constants are
+            // out of scope for now.
+            .set(wd::REFERENCE, EncodeValue::Lookup("Apparent".into()))
             .unwrap()
             .build()
             .unwrap();

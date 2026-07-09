@@ -7,7 +7,6 @@ members = [
     "crates/canboat-tokio",
     "crates/canboat-cli",
     "crates/canboat",
-    "crates/n2kd",
     "crates/canboat-wire",
 ]
 

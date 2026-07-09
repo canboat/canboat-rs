@@ -1,7 +1,7 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
 //! AIS AIVDM/AIVDO emission machinery, shared by the struct-path
-//! encoder in [`crate::ais_decoded`].
+//! encoder in [`crate::n2kd::ais_decoded`].
 //!
 //! Mirrors the emit half of `canboat/n2kd/gps_ais.c`: [`BitVector`]
 //! packs ITU-R M.1371 bit layouts, and [`emit_sentences`] re-encodes
@@ -10,11 +10,12 @@
 //! fragments when a message exceeds one frame.
 //!
 //! The per-message-type field encoders (which read a
-//! [`canboat_core::DecodedPgn`]) live in [`crate::ais_decoded`]; the
+//! [`canboat_core::DecodedPgn`]) live in [`crate::n2kd::ais_decoded`]; the
 //! JSON entry point [`convert`] just rebuilds the DecodedPgn and
 //! delegates there, so a JSON stream and a live device produce
 //! identical sentences.
 
+#[cfg(test)]
 use canboat_core::PgnDatabase;
 
 /// 226 bytes = 1808 bits = 301 6-bit groups — same upper bound canboat
@@ -102,17 +103,21 @@ impl Default for BitVector {
 /// of sentences emitted.
 ///
 /// Thin input adapter: the line is rebuilt into a [`DecodedPgn`] and
-/// handed to the struct-path [`crate::ais_decoded::convert`] — the same
+/// handed to the struct-path [`crate::n2kd::ais_decoded::convert`] — the same
 /// AIVDM encoder the live `server` pipeline runs. The bit-vector /
 /// 6-bit-ASCII emit machinery it uses ([`BitVector`], [`emit_sentences`])
 /// still lives here and is shared by both.
 ///
 /// [`DecodedPgn`]: canboat_core::DecodedPgn
+// Test-only since the fold-in: the live app/server paths decode JSON
+// themselves and call `ais_decoded::convert` directly, so this
+// string-input wrapper is exercised only by the round-trip tests below.
+#[cfg(test)]
 pub fn convert(out: &mut String, msg: &str, seq_counter: &mut u8) -> usize {
     let Some(decoded) = canboat_core::json_to_decoded(msg, PgnDatabase::embedded()) else {
         return 0;
     };
-    crate::ais_decoded::convert(out, &decoded, seq_counter)
+    crate::n2kd::ais_decoded::convert(out, &decoded, seq_counter)
 }
 
 pub(crate) const REPEAT_NAMES: &[(&str, i64)] = &[

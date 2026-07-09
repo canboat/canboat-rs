@@ -27,10 +27,10 @@
 //! PGNs flow unchanged through the AIS port; the NMEA stream simply
 //! doesn't emit AIVDM sentences yet.
 
-use crate::nmea_filter::NmeaFilter;
-use crate::request_engine::{self, RequestEngine};
-use crate::serving::{Hub as WireHub, tcp as serving_tcp};
-use crate::{ais_decoded, json, nmea0183};
+use crate::n2kd::nmea_filter::NmeaFilter;
+use crate::n2kd::request_engine::{self, RequestEngine};
+use crate::n2kd::serving::{Hub as WireHub, tcp as serving_tcp};
+use crate::n2kd::{ais_decoded, json, nmea0183};
 
 use std::io::{self, BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream, ToSocketAddrs, UdpSocket};
@@ -45,7 +45,7 @@ use canboat_core::format::parse_plain;
 use canboat_core::output::{CamelCase, JsonOptions, write_json};
 use canboat_core::snapshot::SnapshotStore;
 
-use crate::nmea0183::RateLimiter;
+use crate::n2kd::nmea0183::RateLimiter;
 
 /// Default TCP base port.
 const DEFAULT_PORT: u16 = 2597;
@@ -402,7 +402,7 @@ fn run_raw_input_client(stream: TcpStream, copy_to_stdout: bool, hub: Arc<Hub>) 
         if intercept {
             let trimmed = line.trim_end_matches(['\r', '\n']);
             if let Ok(frame) = parse_plain(trimmed)
-                && crate::nmea_filter::is_set_frame(&frame)
+                && crate::n2kd::nmea_filter::is_set_frame(&frame)
             {
                 if let Some(f) = hub.filter.lock().unwrap().as_mut() {
                     f.apply_set_frame(&frame.data);
@@ -526,7 +526,7 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         // input line rate (like the live pipeline's frame loop); a quiet
         // stream has no new state to report anyway.
         if hub.has_filter()
-            && last_filter_report.elapsed() >= crate::nmea_filter::FILTER_REPORT_INTERVAL
+            && last_filter_report.elapsed() >= crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL
         {
             hub.emit_filter_report();
             last_filter_report = Instant::now();

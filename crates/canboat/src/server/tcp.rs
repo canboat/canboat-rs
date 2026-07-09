@@ -3,7 +3,7 @@
 //! Device-pipeline-specific TCP listeners.
 //!
 //! The read-only broadcast + snapshot ports are shared with `n2kd` and
-//! live in [`n2kd::serving::tcp`]. What stays here needs the device
+//! live in [`crate::n2kd::serving::tcp`]. What stays here needs the device
 //! writer and the wire protocol, so only the `server` pipeline uses it:
 //!
 //! * **Write server** (WO) — accepts PLAIN/FAST lines and injects them
@@ -45,7 +45,7 @@ pub struct InjectPoint {
     pub claim_addr: Option<Arc<AtomicU8>>,
 }
 
-use n2kd::serving::BinHub;
+use crate::n2kd::serving::BinHub;
 
 // Nagle's algorithm is deliberately left ENABLED on every client
 // socket (no `set_nodelay`). These are telemetry streams, not
@@ -166,7 +166,7 @@ fn forward_plain_line(line: &str, inject: &InjectPoint) -> bool {
             // message, never a bus frame: loop it into the pipeline
             // (which owns the filter state) but do not transmit it on
             // the N2K bus or rewrite its source.
-            if frame.pgn == n2kd::nmea_filter::PGN_NMEA0183_FILTER {
+            if frame.pgn == crate::n2kd::nmea_filter::PGN_NMEA0183_FILTER {
                 return inject.loopback.send(frame).is_ok();
             }
             // Rewrite a default / broadcast `src` to our gateway's

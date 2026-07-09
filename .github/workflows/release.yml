@@ -25,7 +25,8 @@ on:
 env:
   CARGO_TERM_COLOR: always
   # Real binaries built and packaged. `canboat` is the unified front end;
-  # `replay` and `n2kd` are the last standalone tools not yet folded in.
+  # every former standalone tool (n2kd, replay, analyzer, the *-serial
+  # interfaces) is folded in and reached via an argv[0] shim.
   BINS: >-
     canboat
   # Retired tool names that now resolve into `canboat` via argv[0].

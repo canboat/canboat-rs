@@ -140,7 +140,6 @@ dependencies = [
  "futures",
  "indexmap",
  "log",
- "n2kd",
  "ratatui",
  "serde",
  "serde_json",
@@ -886,20 +885,6 @@ dependencies = [
  "nix 0.29.0",
  "serialport",
  "winapi",
-]
-
-[[package]]
-name = "n2kd"
-version = "0.5.0"
-dependencies = [
- "anyhow",
- "canboat-cli",
- "canboat-core",
- "clap",
- "env_logger",
- "log",
- "serde",
- "serde_json",
 ]
 
 [[package]]

@@ -55,6 +55,7 @@ use std::thread;
 
 use anyhow::{Result, bail};
 
+use crate::n2kd::request_engine::{self, RequestEngine};
 use canboat_core::format::{
     InputFormat, detect, header_implies_coalesced, parse_format_header, parse_with,
 };
@@ -62,12 +63,11 @@ use canboat_core::output::{CamelCase, JsonOptions};
 use canboat_core::{PgnDatabase, RawFrame};
 use canboat_io::device::{self, FrameSender, Supervisor};
 use canboat_io::open_serial_rw;
-use n2kd::request_engine::{self, RequestEngine};
 
+use crate::n2kd::serving::tcp as serving_tcp;
+use crate::n2kd::serving::{BinHub, Hub};
 use crate::server::pipeline::Hubs;
 use crate::server::snapshot::SnapshotStore;
-use n2kd::serving::tcp as serving_tcp;
-use n2kd::serving::{BinHub, Hub};
 
 /// Single-process device-reader → analyzer → n2kd pipeline server.
 #[derive(Debug, clap::Args)]
@@ -513,7 +513,7 @@ pub fn run(cli: Args) -> Result<()> {
 
     let nmea_filter = match cli.nmea0183_filter.as_deref() {
         Some(path) => {
-            let f = n2kd::nmea_filter::NmeaFilter::load(path)?;
+            let f = crate::n2kd::nmea_filter::NmeaFilter::load(path)?;
             log::info!(
                 "NMEA 0183 per-device filter enabled from {}",
                 path.display()

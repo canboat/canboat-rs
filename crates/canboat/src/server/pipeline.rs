@@ -4,7 +4,7 @@
 //!
 //! Consumes `RawFrame`s off an `mpsc::Receiver`, runs them through
 //! the reassembler + PGN decoder, dispatches to the struct-based
-//! converters in `n2kd::decoded` / `n2kd::ais_decoded` (with a JSON
+//! converters in `crate::n2kd::decoded` / `crate::n2kd::ais_decoded` (with a JSON
 //! fallback for the long tail of PGNs the struct path hasn't covered
 //! yet), and writes NMEA 0183 sentences to stdout. Three side
 //! branches feed the optional TCP servers:
@@ -29,17 +29,17 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::Receiver;
 use std::time::{Duration, Instant};
 
+use crate::n2kd::request_engine::RequestEngine;
 use canboat_core::format::write_plain;
 use canboat_core::output::{JsonOptions, write_json};
 use canboat_core::{FramePacketType, PgnDatabase, RawFrame, Reassembled, Reassembler};
 use canboat_io::device::FrameSender;
-use n2kd::request_engine::RequestEngine;
 
 use canboat_wire::WirePgn;
 
+use crate::n2kd::serving::{BinHub, Hub};
 use crate::server::quirks::Quirks;
 use crate::server::snapshot::SnapshotStore;
-use n2kd::serving::{BinHub, Hub};
 
 thread_local! {
     static JSON_BUF: RefCell<String> = const { RefCell::new(String::new()) };
@@ -227,7 +227,7 @@ pub struct Nmea0183Options {
     /// Enable the 1 Hz per-`(src, quantity)` rate limit.
     pub rate_limit: bool,
     /// Per-device NAME filter; `None` disables it.
-    pub filter: Option<n2kd::nmea_filter::NmeaFilter>,
+    pub filter: Option<crate::n2kd::nmea_filter::NmeaFilter>,
 }
 
 /// Pipeline entry point. Returns when `frames_rx` is closed.
@@ -246,13 +246,13 @@ pub struct Nmea0183Options {
 ///   stays true. The stdin pump also flips it when it sees a
 ///   `# format=<NAME>` header declaring a coalesced format.
 /// * `nmea0183_rate_limit` gates the 1 Hz per-`(src, quantity)` NMEA
-///   0183 limiter (see [`n2kd::nmea0183::RateLimiter`]). `true` (the
+///   0183 limiter (see [`crate::n2kd::nmea0183::RateLimiter`]). `true` (the
 ///   deployed default) drops repeat sentences within 1 s so several
 ///   devices reporting the same measurement don't flood downstream
 ///   0183 consumers; AIS is emitted on a separate path and never
 ///   limited. `false` emits every converted sentence unthrottled.
 /// * `nmea_filter`, when `Some`, mutes NMEA 0183 sentences per device
-///   NAME (see [`n2kd::nmea_filter`]): it learns `src → NAME` from
+///   NAME (see [`crate::n2kd::nmea_filter`]): it learns `src → NAME` from
 ///   PGN 60928 and drops a converted sentence block when the source is
 ///   unknown or muted. `None` disables it (every converted sentence is
 ///   emitted). AIS is never routed through it.
@@ -285,9 +285,9 @@ pub fn run(
     let mut nmea_buf = String::with_capacity(256);
     let mut raw_line = String::with_capacity(256);
     let mut json_line = String::with_capacity(1024);
-    let mut rl = n2kd::nmea0183::RateLimiter::new(nmea0183_rate_limit);
+    let mut rl = crate::n2kd::nmea0183::RateLimiter::new(nmea0183_rate_limit);
     let mut ais_seq: u8 = 0;
-    let handles = n2kd::decoded::Handles::new(db);
+    let handles = crate::n2kd::decoded::Handles::new(db);
     let mut last_filter_report = Instant::now();
 
     // Quirk synthesisers can produce extra `RawFrame`s in response to
@@ -343,7 +343,7 @@ pub fn run(
         // bus. Report frames (Function == 0), including the ones this
         // loop synthesises below, fall through to normal broadcast so a
         // subscribed TUI reads current state as analyzer JSON.
-        if n2kd::nmea_filter::is_set_frame(&frame) {
+        if crate::n2kd::nmea_filter::is_set_frame(&frame) {
             if let Some(f) = nmea_filter.as_mut() {
                 f.apply_set_frame(&frame.data);
                 pending_synth.extend(f.report_frames());
@@ -353,7 +353,8 @@ pub fn run(
         // Periodically re-advertise the full filter state while a
         // reader is attached, so a late-connecting TUI catches up.
         if let Some(f) = nmea_filter.as_ref()
-            && now.duration_since(last_filter_report) >= n2kd::nmea_filter::FILTER_REPORT_INTERVAL
+            && now.duration_since(last_filter_report)
+                >= crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL
             && (analyzer_batch.has_subscribers() || raw_batch.has_subscribers())
         {
             pending_synth.extend(f.report_frames());
@@ -485,22 +486,22 @@ pub fn run(
         let want_nmea = emit_nmea_stdout || nmea_batch.has_subscribers() || nmea_filter.is_some();
         let converted = if !want_nmea {
             false
-        } else if n2kd::decoded::Handles::supports(pgn) {
-            n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles) > 0
+        } else if crate::n2kd::decoded::Handles::supports(pgn) {
+            crate::n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles) > 0
         } else if is_ais_pgn(pgn) {
             ais_branch = true;
-            n2kd::ais_decoded::convert(&mut nmea_buf, &decoded, &mut ais_seq) > 0
+            crate::n2kd::ais_decoded::convert(&mut nmea_buf, &decoded, &mut ais_seq) > 0
         } else if json_ok {
             // The analyzer JSON for this record is already in
             // `json_line` — feed the converter from there instead of
             // serializing the same record a second time.
-            n2kd::nmea0183::convert(&mut nmea_buf, &json_line, &mut rl) > 0
+            crate::n2kd::nmea0183::convert(&mut nmea_buf, &json_line, &mut rl) > 0
         } else {
             JSON_BUF.with(|c| {
                 let mut buf = c.borrow_mut();
                 buf.clear();
                 let _ = write_json(&mut *buf, &decoded, &json_opts);
-                n2kd::nmea0183::convert(&mut nmea_buf, &buf, &mut rl)
+                crate::n2kd::nmea0183::convert(&mut nmea_buf, &buf, &mut rl)
             }) > 0
         };
         // Per-device NMEA 0183 filter mutes redundant devices' `$`

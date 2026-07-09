@@ -89,7 +89,8 @@ impl RequestEngine {
     }
 
     /// Number of distinct source addresses we've recorded traffic
-    /// from. Used by `n2kd` for its status snapshot.
+    /// from. Retained as a test-only accessor for the device tracker.
+    #[cfg(test)]
     pub fn device_count(&self) -> usize {
         self.devices.lock().map(|m| m.len()).unwrap_or(0)
     }

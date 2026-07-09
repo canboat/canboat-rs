@@ -5,11 +5,11 @@
 //! This is now a thin input adapter: [`convert`] rebuilds each JSON
 //! line into a [`canboat_core::DecodedPgn`] (via
 //! [`canboat_core::json_to_decoded`]) and delegates to the shared
-//! struct-path converter [`crate::decoded::convert_nmea0183`] — the
+//! struct-path converter [`crate::n2kd::decoded::convert_nmea0183`] — the
 //! exact code the live `server` pipeline runs, so a JSON stream and a
 //! live device produce identical sentences. The per-PGN sentence
 //! coverage (RSA/HDG/VHW/DPT/VLW/VTG/GLL/RMC/GSA/MWV/MTW) therefore
-//! lives once, in [`crate::decoded`].
+//! lives once, in [`crate::n2kd::decoded`].
 //!
 //! What still lives here is [`RateLimiter`] — the per-(src, rate-type)
 //! 1 Hz gate and the SOG/COG cache — which both this path and the
@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 
 use canboat_core::{DecodedPgn, PgnDatabase};
 
-use crate::decoded::{self, Handles};
+use crate::n2kd::decoded::{self, Handles};
 
 /// Per-(src, rate-type) "this is the last time we let one through"
 /// timestamps. Mirrors canboat's `rateLimitPassed[256][RATE_COUNT]`.
@@ -42,7 +42,7 @@ pub struct RateLimiter {
 }
 
 /// Number of distinct rate-limited sentence classes — the width of the
-/// per-source `last_passed` table. Matches [`crate::decoded::Rate`],
+/// per-source `last_passed` table. Matches [`crate::n2kd::decoded::Rate`],
 /// which owns the PGN → slot mapping the struct-path converter uses.
 const RATE_COUNT: usize = 10;
 
@@ -64,7 +64,7 @@ impl RateLimiter {
         self.enabled
     }
 
-    /// Direct slot access for [`crate::decoded`]. `src` is bounds-
+    /// Direct slot access for [`crate::n2kd::decoded`]. `src` is bounds-
     /// checked to `< 256` by its `u8` type; `rate` is indexed against
     /// `RATE_COUNT` and the caller is expected to pass a valid one.
     #[inline]
@@ -99,7 +99,7 @@ impl RateLimiter {
 ///
 /// This is a thin input adapter: the line is rebuilt into a
 /// [`DecodedPgn`] and handed to the shared struct-path converter
-/// ([`crate::decoded::convert_nmea0183`]) — literally the same code the
+/// ([`crate::n2kd::decoded::convert_nmea0183`]) — literally the same code the
 /// live `server` pipeline runs. The only n2kd-specific step is the
 /// JSON → `DecodedPgn` parse.
 pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> usize {
@@ -111,7 +111,7 @@ pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> u
 
 /// Convert an already-rebuilt [`DecodedPgn`] — the daemon's parse-once
 /// path, and what [`convert`] delegates to after the JSON parse. Wraps
-/// [`crate::decoded::convert_nmea0183`] with the shared [`Handles`].
+/// [`crate::n2kd::decoded::convert_nmea0183`] with the shared [`Handles`].
 pub fn convert_decoded(
     out: &mut String,
     decoded: &DecodedPgn,

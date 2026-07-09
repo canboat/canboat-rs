@@ -42,7 +42,7 @@ impl SnapshotStore {
     }
 
     /// The shared core store this wraps. Handed to the read-only TCP
-    /// listeners in [`n2kd::serving::tcp`], which serve
+    /// listeners in [`crate::n2kd::serving::tcp`], which serve
     /// `snapshot()` / `ais_snapshot()` straight off it — the same store
     /// n2kd feeds directly.
     pub fn core(&self) -> Arc<canboat_core::snapshot::SnapshotStore> {

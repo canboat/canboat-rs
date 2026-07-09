@@ -1,6 +1,6 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
-//! Struct-path equivalent of [`crate::ais`] — converts AIS PGNs to
+//! Struct-path equivalent of [`crate::n2kd::ais`] — converts AIS PGNs to
 //! NMEA 0183 `!AIVDM` sentences by reading fields directly from a
 //! `DecodedPgn` instead of round-tripping through analyzer JSON.
 //!
@@ -18,14 +18,14 @@
 
 use canboat_core::{DecodedPgn, FieldValue};
 
-use crate::ais::{
+use crate::n2kd::ais::{
     AIS_TRANSCEIVER_NAMES, BitVector, POSITION_ACCURACY_NAMES, RAIM_NAMES, REPEAT_NAMES,
     emit_sentences,
 };
 
 /// Convert a decoded AIS PGN into one or more `!AIVDM,…` sentences.
-/// Returns the number of sentences emitted. Mirrors
-/// [`crate::ais::convert`].
+/// Returns the number of sentences emitted. Mirrors the string-input
+/// `ais::convert`.
 pub fn convert(out: &mut String, decoded: &DecodedPgn, seq_counter: &mut u8) -> usize {
     let pgn = decoded.pgn as i64;
     let msgid = match pgn_to_msgid(pgn, decoded) {
@@ -391,7 +391,7 @@ fn enum_or_name(d: &DecodedPgn, field: &str, names: &[(&str, i64)]) -> i64 {
 }
 
 /// `Rate of Turn` — non-linear AIS encoding. Identical math to
-/// [`crate::ais::rate_of_turn`].
+/// [`crate::n2kd::ais::rate_of_turn`].
 fn rate_of_turn(d: &DecodedPgn) -> i64 {
     let Some(rot) = num_field(d, "Rate of Turn") else {
         return -128;

@@ -20,7 +20,7 @@ use std::time::Instant;
 
 use canboat_core::{DecodedPgn, FieldHandle, FieldValue, PgnDatabase};
 
-use crate::nmea0183::RateLimiter;
+use crate::n2kd::nmea0183::RateLimiter;
 
 /// m/s → knots.
 const MS_TO_KNOTS: f64 = 1.943_84;

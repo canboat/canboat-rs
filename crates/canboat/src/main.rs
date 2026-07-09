@@ -24,6 +24,7 @@ use clap::{Parser, Subcommand};
 mod convert;
 mod interface;
 mod legacy;
+mod n2kd;
 mod replay;
 mod server;
 mod tui;
@@ -59,7 +60,7 @@ enum Command {
     Replay(replay::Args),
 
     /// Multiplex an analyzer-JSON stdin stream to TCP clients (the n2kd daemon).
-    N2kd(Box<n2kd::app::Args>),
+    N2kd(Box<crate::n2kd::app::Args>),
 
     /// Install symlinks for the retired tool names (analyzer, *-serial, …).
     InstallShims {
@@ -84,7 +85,7 @@ fn main() -> ExitCode {
         Command::Server(args) => server::run(*args),
         Command::Tui(args) => run_tui(args),
         Command::Replay(args) => replay::run(args),
-        Command::N2kd(args) => n2kd::app::run(*args),
+        Command::N2kd(args) => crate::n2kd::app::run(*args),
         Command::InstallShims { dir } => install_shims(dir),
     };
     finish(result)

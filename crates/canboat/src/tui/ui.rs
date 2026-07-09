@@ -426,6 +426,23 @@ impl App {
         }
     }
 
+    /// Drop and un-persist every override the bus NAKed (recorded in
+    /// [`AppState::nak_overrides`] by the stream reader). A device that
+    /// answers a rate-change Request with "not supported" would
+    /// otherwise be re-sent the same rejected Request on every
+    /// reconnect; forgetting it stops the churn. Best-effort: a save
+    /// failure surfaces as a toast but doesn't drop the in-memory
+    /// removal, so the silenced-row list stays consistent this session.
+    pub fn forget_overrides(&mut self, naked: &[(u8, u32)]) {
+        let mut removed = false;
+        for &(src, pgn) in naked {
+            removed |= self.overrides.remove(src, pgn);
+        }
+        if removed && let Err(e) = self.overrides.save(&self.overrides_path) {
+            self.toast = Some(format!("override save failed: {e:#}"));
+        }
+    }
+
     /// Build the menu bar for the current context. Rebuilt every frame
     /// and on every keystroke (cheap) so item enable/disable state
     /// always matches the active screen / mode.

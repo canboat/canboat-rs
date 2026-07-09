@@ -337,6 +337,13 @@ pub struct AppState {
     /// available (`DecodedPgn::data`); the live JSON stream carries no
     /// raw bytes, so this stays empty there.
     pub raw_lines: Vec<String>,
+    /// `(src, pgn)` pairs the bus NAKed one of our PGN 126208 Requests
+    /// for — a device answered "not supported" / errored. The stream
+    /// reader records them here; the UI thread (which owns the override
+    /// store) drains them, drops the matching persisted override, and
+    /// saves — so a rejected rate change isn't replayed on every
+    /// reconnect. See [`crate::tui::ui::App::forget_overrides`].
+    pub nak_overrides: Vec<(u8, u32)>,
 }
 
 impl AppState {
@@ -352,6 +359,16 @@ impl AppState {
             src_to_name: HashMap::new(),
             nmea0183: BTreeMap::new(),
             raw_lines: Vec::new(),
+            nak_overrides: Vec::new(),
+        }
+    }
+
+    /// Record that the bus NAKed our PGN 126208 Request for `(src, pgn)`
+    /// so the UI thread can drop the persisted override. Deduplicated —
+    /// a device that re-NAKs the same request only queues one removal.
+    pub fn record_nak_override(&mut self, src: u8, pgn: u32) {
+        if !self.nak_overrides.contains(&(src, pgn)) {
+            self.nak_overrides.push((src, pgn));
         }
     }
 

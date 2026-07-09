@@ -227,6 +227,14 @@ async fn run_loop(
         if app.alert.is_none() {
             app.alert = s.alerts.pop_front();
         }
+        // Forget any override the bus NAKed this iteration so it isn't
+        // replayed on the next reconnect. The reader records the pairs;
+        // the UI thread owns the override store, so removal + save
+        // happen here.
+        if !s.nak_overrides.is_empty() {
+            let naked = std::mem::take(&mut s.nak_overrides);
+            app.forget_overrides(&naked);
+        }
         // Surface a one-shot completion notice (load / save done) as a
         // toast the user can dismiss with any key.
         if let Some(notice) = s.notice.take() {

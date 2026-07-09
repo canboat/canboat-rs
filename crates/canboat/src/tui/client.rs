@@ -770,9 +770,16 @@ async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<Ap
             // — see device-scx20 memory) so reacting only to
             // failures is the right signal.
             if input.pgn == 126208
-                && let Some(alert) = nak_alert(input.src, &value)
+                && let Some(nak) = nak_alert(input.src, &value)
             {
-                s.push_alert(alert);
+                s.push_alert(nak.message);
+                // Forget the persisted override that drew this NAK so we
+                // stop replaying a rate change the device rejects. The
+                // ACK's `src` is the device we addressed the Request to,
+                // which is the override's `src`.
+                if nak.acked_pgn != 0 {
+                    s.record_nak_override(input.src, nak.acked_pgn);
+                }
             }
             s.upsert(
                 input.pgn,
@@ -798,14 +805,24 @@ fn strip_snapshot_banner(payload: &str) -> &str {
     }
 }
 
+/// A NAKed PGN 126208 Request, extracted from an inbound Acknowledge.
+struct Nak {
+    /// One-line summary for the UI alert slot.
+    message: String,
+    /// The PGN the acknowledging device errored on — matched against a
+    /// persisted override's `pgn` to forget it. `0` when the ACK had no
+    /// readable PGN, so the caller skips removal.
+    acked_pgn: u32,
+}
+
 /// If `line` is a PGN 126208 Acknowledge (Function Code = 2) carrying
-/// at least one non-zero error code, format a one-line summary
-/// suitable for the UI toast slot. Returns `None` for non-ACKs and
+/// at least one non-zero error code, return a [`Nak`] with a one-line
+/// summary and the acknowledged PGN. Returns `None` for non-ACKs and
 /// for ACKs whose error codes are all zero ("Acknowledge" — no
 /// error). The summary names both the acknowledging device
 /// (`src` of the inbound record) and the PGN the ACK references, so
 /// the user can match it back to whichever Request they just sent.
-fn nak_alert(ack_src: u8, line: &Value) -> Option<String> {
+fn nak_alert(ack_src: u8, line: &Value) -> Option<Nak> {
     use field::nmea_acknowledge_group_function as ack;
     let function_code = read_lookup_int(field_value(line, ack::FUNCTION_CODE))?;
     if function_code != 2 {
@@ -841,9 +858,12 @@ fn nak_alert(ack_src: u8, line: &Value) -> Option<String> {
     } else {
         format!("PGN {acked_pgn} ({acked_pgn_name})")
     };
-    Some(format!(
-        "⚠ src {ack_src} NAK {pgn_label} — PGN err {pgn_err} {pgn_err_name} / interval err {interval_err} {interval_err_name}"
-    ))
+    Some(Nak {
+        message: format!(
+            "⚠ src {ack_src} NAK {pgn_label} — PGN err {pgn_err} {pgn_err_name} / interval err {interval_err} {interval_err_name}"
+        ),
+        acked_pgn: u32::try_from(acked_pgn).unwrap_or(0),
+    })
 }
 
 /// Pull a numeric value out of a canboat lookup field — handles both
@@ -950,6 +970,38 @@ mod tests {
         );
         assert_eq!(cached.product_code, Some(419));
         assert_eq!(cached.model_id.as_deref(), Some("FUSION-MS"));
+    }
+
+    /// A NAKed PGN 126208 Acknowledge (function code 2, non-zero error)
+    /// yields a `Nak` naming the acked PGN so the UI can forget the
+    /// matching override; an all-OK Acknowledge (error codes 0) yields
+    /// `None`.
+    #[test]
+    fn nak_alert_reports_acked_pgn_for_errors_only() {
+        let nak = json!({
+            "pgn": 126208,
+            "description": "NMEA - Acknowledge group function",
+            "fields": {
+                "Function Code": {"value": 2, "name": "Acknowledge"},
+                "PGN": 127258,
+                "PGN error code": {"value": 4, "name": "Not supported"},
+                "Transmission interval/Priority error code": {"value": 4, "name": "Not supported"},
+            }
+        });
+        let got = nak_alert(48, &nak).expect("errored ACK is a NAK");
+        assert_eq!(got.acked_pgn, 127258);
+        assert!(got.message.contains("NAK PGN 127258"));
+
+        let ok = json!({
+            "pgn": 126208,
+            "fields": {
+                "Function Code": {"value": 2, "name": "Acknowledge"},
+                "PGN": 127258,
+                "PGN error code": {"value": 0, "name": "ACK"},
+                "Transmission interval/Priority error code": {"value": 0, "name": "ACK"},
+            }
+        });
+        assert!(nak_alert(48, &ok).is_none(), "all-OK ACK is not a NAK");
     }
 
     #[test]

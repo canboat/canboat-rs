@@ -100,6 +100,16 @@ impl Overrides {
         }
     }
 
+    /// Remove the override for `(src, pgn)`, if any. Returns whether an
+    /// entry was actually removed. Used to forget an override the bus
+    /// NAKed — a device that answers "not supported" shouldn't have the
+    /// rejected Request replayed on every reconnect.
+    pub fn remove(&mut self, src: u8, pgn: u32) -> bool {
+        let before = self.entries.len();
+        self.entries.retain(|e| !(e.src == src && e.pgn == pgn));
+        self.entries.len() != before
+    }
+
     /// Iterate over overrides that currently silence a PGN
     /// (`interval_ms == INTERVAL_OFF`). The DeviceDetail screen uses
     /// this to inject synthetic rows for PGNs that have stopped
@@ -143,4 +153,36 @@ pub fn is_writable(path: &PathBuf) -> bool {
         .truncate(false)
         .open(path)
         .is_ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn ov(src: u8, pgn: u32) -> Override {
+        Override {
+            src,
+            pgn,
+            interval_ms: 0,
+            manufacturer_code: None,
+            industry_code: None,
+            description: None,
+        }
+    }
+
+    #[test]
+    fn remove_drops_only_the_matching_entry() {
+        let mut o = Overrides::default();
+        o.set(ov(48, 127258));
+        o.set(ov(20, 127258));
+        o.set(ov(48, 130842));
+
+        assert!(o.remove(48, 127258), "matching entry removed");
+        assert_eq!(o.entries.len(), 2);
+        // Same src, different pgn and same pgn, different src both survive.
+        assert!(o.entries.iter().any(|e| e.src == 20 && e.pgn == 127258));
+        assert!(o.entries.iter().any(|e| e.src == 48 && e.pgn == 130842));
+
+        assert!(!o.remove(48, 127258), "already gone → no-op");
+    }
 }

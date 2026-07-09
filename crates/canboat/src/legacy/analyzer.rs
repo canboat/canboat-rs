@@ -113,7 +113,7 @@ pub fn run(argv: Vec<OsString>) -> Result<()> {
 }
 
 fn run_cli(cli: Cli) -> Result<()> {
-    let db = PgnDatabase::embedded();
+    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
 
     let camel_case = if cli.upper_camel {
         CamelCase::Upper

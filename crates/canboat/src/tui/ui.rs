@@ -2263,7 +2263,7 @@ fn robust_interval(e: &Entry, state: &AppState) -> Option<std::time::Duration> {
 /// PGN number (good enough; proprietary variants that share a number
 /// mostly agree, and the standard on-request PGNs are unambiguous).
 fn pgn_on_request(pgn: u32) -> bool {
-    canboat_core::PgnDatabase::embedded()
+    canboat_core::PgnDatabase::embedded(canboat_core::Units::Metric)
         .first_pgn(pgn)
         .and_then(|p| p.transmission_irregular)
         .unwrap_or(false)

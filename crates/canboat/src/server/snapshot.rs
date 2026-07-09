@@ -63,7 +63,8 @@ impl SnapshotStore {
     /// iteration's fields.
     pub fn store(&self, decoded: &Arc<DecodedPgn>, now: Instant) {
         let is_ais = is_ais_pgn(decoded.pgn);
-        let Some(info) = PgnDatabase::embedded().first_pgn(decoded.pgn) else {
+        let Some(info) = PgnDatabase::embedded(canboat_core::Units::Metric).first_pgn(decoded.pgn)
+        else {
             self.store_whole(decoded, None, is_ais, now);
             return;
         };
@@ -265,7 +266,7 @@ mod tests {
         // Borrow any existing FieldInfo from the schema; the test
         // doesn't care which one — only `repeat_set` / `repeat_index`
         // are inspected.
-        let info = canboat_core::PgnDatabase::embedded()
+        let info = canboat_core::PgnDatabase::embedded(canboat_core::Units::Metric)
             .first_pgn(130824)
             .expect("PGN 130824 in schema");
         let info_field = &info.fields[0];

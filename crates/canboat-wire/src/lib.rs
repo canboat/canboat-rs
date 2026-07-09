@@ -87,7 +87,7 @@ pub struct Hello {
 impl Hello {
     /// The handshake describing *this* build.
     pub fn current() -> Self {
-        let db = canboat_core::PgnDatabase::embedded();
+        let db = canboat_core::PgnDatabase::embedded(canboat_core::Units::Metric);
         Hello {
             magic: MAGIC,
             wire_version: WIRE_VERSION,
@@ -646,7 +646,7 @@ mod tests {
     fn wirepgn_rehydrates_to_equivalent_decoded() {
         use canboat_core::{FieldValue as FV, RawFrame};
 
-        let db = PgnDatabase::embedded();
+        let db = PgnDatabase::embedded(canboat_core::Units::Metric);
         let idx = PgnIndex::build(db);
 
         // PGN 127250 Vessel Heading: a SID, scaled Number fields, and a
@@ -708,7 +708,7 @@ mod tests {
     fn dynamic_field_key_lookup_reresolves_name() {
         use canboat_core::FieldValue as FV;
 
-        let db = PgnDatabase::embedded();
+        let db = PgnDatabase::embedded(canboat_core::Units::Metric);
         let info = db.first_pgn(130824).expect("PGN 130824 in schema");
         let key = info
             .fields
@@ -741,7 +741,7 @@ mod tests {
         use canboat_core::RawFrame;
         use canboat_core::output::{CamelCase, JsonOptions, write_json};
 
-        let db = PgnDatabase::embedded();
+        let db = PgnDatabase::embedded(canboat_core::Units::Metric);
         let idx = PgnIndex::build(db);
         // Same options canboat-pipeline's analyzer port uses.
         let opts = JsonOptions {

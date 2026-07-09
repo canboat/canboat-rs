@@ -103,7 +103,9 @@ impl RateLimiter {
 /// live `server` pipeline runs. The only n2kd-specific step is the
 /// JSON → `DecodedPgn` parse.
 pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> usize {
-    let Some(decoded) = canboat_core::json_to_decoded(msg, PgnDatabase::embedded()) else {
+    let Some(decoded) =
+        canboat_core::json_to_decoded(msg, PgnDatabase::embedded(canboat_core::Units::Metric))
+    else {
         return 0;
     };
     convert_decoded(out, &decoded, rate_limiter)
@@ -124,7 +126,7 @@ pub fn convert_decoded(
 /// once against the embedded schema.
 fn handles() -> &'static Handles {
     static HANDLES: OnceLock<Handles> = OnceLock::new();
-    HANDLES.get_or_init(|| Handles::new(PgnDatabase::embedded()))
+    HANDLES.get_or_init(|| Handles::new(PgnDatabase::embedded(canboat_core::Units::Metric)))
 }
 
 #[cfg(test)]

@@ -634,7 +634,8 @@ mod tests {
     /// Build a DecodedPgn from an analyzer name-value line for testing
     /// the struct-path field helpers.
     fn decode(line: &str) -> DecodedPgn {
-        json_to_decoded(line, PgnDatabase::embedded()).expect("known PGN")
+        json_to_decoded(line, PgnDatabase::embedded(canboat_core::Units::Metric))
+            .expect("known PGN")
     }
 
     #[test]

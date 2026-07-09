@@ -306,7 +306,7 @@ where
         .unwrap_or("")
         .to_string();
     let is_ais = is_ais_pgn(pgn);
-    let info = crate::PgnDatabase::embedded().first_pgn(pgn);
+    let info = crate::PgnDatabase::embedded(crate::Units::Metric).first_pgn(pgn);
     let repeat_set = info.and_then(repeating_pk_set);
 
     let Some(rs) = repeat_set else {
@@ -790,7 +790,7 @@ mod tests {
         // plus 129796 / 129816. PGN 130824 is the one driving this
         // feature (one cache entry per Key/Value pair instead of all
         // pairs collapsing into a single src-keyed entry).
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(130824)
             .expect("PGN 130824 present in embedded db");
         assert_eq!(repeating_pk_set(info), Some(1));
@@ -799,14 +799,14 @@ mod tests {
     #[test]
     fn repeating_pk_set_returns_none_for_top_level_pk() {
         // PGN 127251 (Rate of Turn) declares no primary key at all.
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(127251)
             .expect("PGN 127251 present in embedded db");
         assert_eq!(repeating_pk_set(info), None);
         // PGN 127509 (Inverter Status): composite top-level PK
         // (`Instance`, `AC Instance`, `DC Instance`), no repeating
         // set involved.
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(127509)
             .expect("PGN 127509 present in embedded db");
         assert_eq!(repeating_pk_set(info), None);
@@ -817,7 +817,7 @@ mod tests {
         // PGN 129796 (AIS Acknowledge): `Source ID` is top-level PK,
         // `Destination ID` lives in repeating set 1 — composite key
         // is `<Source ID>_<Destination ID>`.
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(129796)
             .expect("PGN 129796 present in embedded db");
         let set = repeating_pk_set(info).expect("129796 has repeating PK");

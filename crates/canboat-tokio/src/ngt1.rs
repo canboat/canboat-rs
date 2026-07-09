@@ -30,7 +30,7 @@ use tokio::sync::mpsc;
 /// use futures::StreamExt;
 /// use tokio_serial::SerialPortBuilderExt;
 ///
-/// let db = PgnDatabase::embedded();
+/// let db = PgnDatabase::embedded(canboat_core::Units::Metric);
 /// let port = tokio_serial::new("/dev/ttyUSB0", 115_200).open_native_async()?;
 /// let mut stream = Ngt1Stream::new(port, db);
 /// while let Some(decoded) = stream.next().await {

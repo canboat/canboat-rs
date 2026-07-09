@@ -487,7 +487,10 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         // table. The JSON-parsing `convert` wrappers are only the
         // .j2k-input adapters now; the daemon works on DecodedPgn.
         let mut nmea = String::new();
-        let decoded = canboat_core::json_to_decoded(trimmed, PgnDatabase::embedded());
+        let decoded = canboat_core::json_to_decoded(
+            trimmed,
+            PgnDatabase::embedded(canboat_core::Units::Metric),
+        );
         // Learn `src → NAME` for the per-device 0183 filter from ISO
         // Address Claims — `iso_name()` re-packs it from the decoded
         // fields (the same helper the live pipeline uses), returning
@@ -637,7 +640,7 @@ impl Hub {
             Some(f) => f.report_frames(),
             None => return,
         };
-        let db = PgnDatabase::embedded();
+        let db = PgnDatabase::embedded(canboat_core::Units::Metric);
         let mut json = String::new();
         for frame in &frames {
             let Ok(decoded) = db.decode(frame) else {
@@ -699,7 +702,7 @@ mod tests {
             255,
             [0u8, 35, b'V', b'H', b'W', 1, 0, 0],
         );
-        let db = PgnDatabase::embedded();
+        let db = PgnDatabase::embedded(canboat_core::Units::Metric);
         let decoded = db.decode(&frame).expect("262657 decodes via embedded db");
         let mut json = String::new();
         write_json(&mut json, &decoded, &FILTER_REPORT_JSON_OPTS).unwrap();

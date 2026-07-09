@@ -337,7 +337,7 @@ pub fn run(cli: Args) -> Result<()> {
     // path discovery, no synthetic-PGN merge — `canboat-core/build.rs`
     // already folded `data/synthetic-pgns.json` into the static
     // tables.
-    let db = PgnDatabase::embedded();
+    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
 
     let camel_case = if cli.upper_camel {
         CamelCase::Upper

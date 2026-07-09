@@ -114,7 +114,9 @@ impl Default for BitVector {
 // string-input wrapper is exercised only by the round-trip tests below.
 #[cfg(test)]
 pub fn convert(out: &mut String, msg: &str, seq_counter: &mut u8) -> usize {
-    let Some(decoded) = canboat_core::json_to_decoded(msg, PgnDatabase::embedded()) else {
+    let Some(decoded) =
+        canboat_core::json_to_decoded(msg, PgnDatabase::embedded(canboat_core::Units::Metric))
+    else {
         return 0;
     };
     crate::n2kd::ais_decoded::convert(out, &decoded, seq_counter)

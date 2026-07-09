@@ -15,4 +15,9 @@
 //! - [`COPYRIGHT_ID`] — the `(C) ...` line from canboat.json's
 //!   Copyright banner, for help text and verbose logging.
 
+// The SI schema carries canboat.json's raw radian ranges (±π), so the
+// generated literals legitimately sit near `f64::consts::PI`. They are
+// verbatim schema data, not an inexact use of the constant.
+#![allow(clippy::approx_constant)]
+
 include!(concat!(env!("OUT_DIR"), "/schema_generated.rs"));

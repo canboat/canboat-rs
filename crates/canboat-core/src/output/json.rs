@@ -962,7 +962,7 @@ mod tests {
         // before Phase 5 (when DecodedField duplicated id/name/unit
         // inline). Use a real &'static FieldInfo so the new shape
         // compiles without us standing up a parallel test schema.
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(128267)
             .expect("PGN 128267 present");
         let offset_field = &info.fields[2];

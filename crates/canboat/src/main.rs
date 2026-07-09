@@ -22,6 +22,7 @@ use std::process::ExitCode;
 use clap::{Parser, Subcommand};
 
 mod convert;
+mod format_message;
 mod interface;
 mod legacy;
 mod n2kd;
@@ -46,6 +47,9 @@ enum Command {
     /// Convert a capture between formats (any input → PLAIN / JSON / text).
     #[command(long_about = convert::LONG_ABOUT)]
     Convert(convert::Args),
+
+    /// Build one NMEA 2000 frame from field values (any PGN). See `--list` / `<PGN> --help`.
+    FormatMessage(format_message::Args),
 
     /// Bridge a live gateway (NGT-1 / iKonvert / Maretron / SocketCAN) to/from stdout.
     Interface(interface::Args),
@@ -81,6 +85,7 @@ fn main() -> ExitCode {
     let cli = Cli::parse_from(argv);
     let result = match cli.command {
         Command::Convert(args) => convert::run(args),
+        Command::FormatMessage(args) => format_message::run(args),
         Command::Interface(args) => interface::run(args),
         Command::Server(args) => server::run(*args),
         Command::Tui(args) => run_tui(args),

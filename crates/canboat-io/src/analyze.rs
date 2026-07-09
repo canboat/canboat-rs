@@ -82,7 +82,7 @@ pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
     cfg: &Config,
     mut sink: F,
 ) -> io::Result<()> {
-    let db = PgnDatabase::embedded();
+    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
     let mut reader = match cfg.forced_format {
         Some(fmt) => LineFrameReader::with_format(source, fmt),
         None => LineFrameReader::new(source),

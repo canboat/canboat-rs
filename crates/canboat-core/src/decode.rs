@@ -512,8 +512,12 @@ impl PgnDatabase {
         // (or the no-Match fallback for that PGN). Falls back to the
         // sparse cross-PGN `find_catchall` when no entry for this PGN
         // number exists at all.
-        crate::schema_data::dispatch(frame.pgn, &frame.data)
-            .or_else(|| crate::schema_data::find_catchall(frame.pgn))
+        // Dispatch returns a schema index (identical across the SI and
+        // Metric PGN arrays); map it through this db's own `pgns` so the
+        // returned PgnInfo carries the right units.
+        let idx = crate::schema_data::dispatch(frame.pgn, &frame.data)
+            .or_else(|| crate::schema_data::find_catchall(frame.pgn))?;
+        Some(&self.pgn_slice()[idx])
     }
 }
 
@@ -1741,7 +1745,7 @@ mod tests {
     use crate::PgnDatabase;
 
     fn db() -> &'static PgnDatabase {
-        PgnDatabase::embedded()
+        PgnDatabase::embedded(crate::Units::Metric)
     }
 
     #[test]

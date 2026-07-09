@@ -413,7 +413,7 @@ mod tests {
                 // PGN 60928 fields 1 and 2 are Unique Number + Manufacturer
                 // Code — the exact two records the legacy fixture
                 // hand-rolled before Phase 5.
-                let info = crate::PgnDatabase::embedded()
+                let info = crate::PgnDatabase::embedded(crate::Units::Metric)
                     .first_pgn(60928)
                     .expect("PGN 60928 present");
                 vec![
@@ -473,7 +473,7 @@ mod tests {
         // verify the text header + first three fields render in the
         // expected shape.
         use crate::{PgnDatabase, RawFrame};
-        let db = PgnDatabase::embedded();
+        let db = PgnDatabase::embedded(crate::Units::Metric);
         let frame = RawFrame {
             timestamp: Some("2022-09-10T12:10:16.614Z".into()),
             prio: 6,

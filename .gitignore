@@ -8,3 +8,6 @@ Makefile.local
 
 # canboat-tui default capture save artifacts
 canboat-capture.*
+
+# local scratch (captures, experiments) — never committed
+/scratchpad/

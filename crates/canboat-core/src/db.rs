@@ -58,6 +58,12 @@ pub struct PgnDatabase {
     /// see canboat-wire's handshake.
     pub schema_hash: u64,
 
+    /// Which unit system this database presents (see [`Units`]). The
+    /// schema hash is identical for both, so anything exchanging decoded
+    /// *values* (not raw bits) across processes must also agree on this —
+    /// see canboat-wire's `Hello`.
+    units: Units,
+
     pgns: &'static [PgnInfo],
     /// `(pgn_number, indices_into_pgns)`, sorted by `pgn_number` for
     /// O(log n) lookup. The variant list per PGN preserves canboat.json
@@ -90,11 +96,12 @@ pub enum Units {
 }
 
 macro_rules! embedded_db {
-    ($pgns:expr) => {
+    ($pgns:expr, $units:expr) => {
         PgnDatabase {
             schema_version: schema_data::SCHEMA_VERSION,
             version: schema_data::VERSION,
             schema_hash: schema_data::SCHEMA_HASH,
+            units: $units,
             pgns: $pgns,
             pgn_index: schema_data::PGN_INDEX,
             lookups: schema_data::LOOKUPS,
@@ -105,8 +112,8 @@ macro_rules! embedded_db {
     };
 }
 
-static EMBEDDED_SI: PgnDatabase = embedded_db!(schema_data::PGNS_SI);
-static EMBEDDED_METRIC: PgnDatabase = embedded_db!(schema_data::PGNS_METRIC);
+static EMBEDDED_SI: PgnDatabase = embedded_db!(schema_data::PGNS_SI, Units::Si);
+static EMBEDDED_METRIC: PgnDatabase = embedded_db!(schema_data::PGNS_METRIC, Units::Metric);
 
 impl PgnDatabase {
     /// The build-time embedded database in the requested [`Units`].
@@ -116,6 +123,12 @@ impl PgnDatabase {
             Units::Si => &EMBEDDED_SI,
             Units::Metric => &EMBEDDED_METRIC,
         }
+    }
+
+    /// The unit system this database decodes into.
+    #[inline]
+    pub fn units(&self) -> Units {
+        self.units
     }
 
     /// Total number of PGN definitions (including manufacturer variants).

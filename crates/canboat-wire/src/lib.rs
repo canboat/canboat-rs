@@ -48,7 +48,25 @@ pub const MAGIC: [u8; 4] = *b"CBW1";
 
 /// Version of *this* wire protocol (the shape of [`WirePgn`] /
 /// [`Hello`] and the framing), independent of the schema version.
-pub const WIRE_VERSION: u16 = 1;
+pub const WIRE_VERSION: u16 = 2;
+
+/// Encode a [`canboat_core::Units`] as the byte carried in [`Hello`].
+/// A dedicated byte (rather than serializing `Units`) keeps the core
+/// enum free of a serde dependency.
+fn units_code(u: canboat_core::Units) -> u8 {
+    match u {
+        canboat_core::Units::Si => 1,
+        _ => 0, // Metric — also the fallback for any future default.
+    }
+}
+
+/// Decode the [`Hello::units`] byte. Unknown values fall back to Metric.
+fn units_from_code(c: u8) -> canboat_core::Units {
+    match c {
+        1 => canboat_core::Units::Si,
+        _ => canboat_core::Units::Metric,
+    }
+}
 
 /// Hard cap on a single frame's postcard payload. A decoded PGN is at
 /// most a few kB; anything larger is a desync or a hostile peer, so we
@@ -82,19 +100,37 @@ pub struct Hello {
     pub schema_version: String,
     /// canboat.json `Version`, for human-readable diagnostics.
     pub canboat_version: String,
+    /// Unit system the producer decoded values in (`0` = Metric, `1` =
+    /// SI). The schema hash is identical for both, so this is the only
+    /// thing distinguishing a `deg` stream from a `rad` one; the consumer
+    /// reads it via [`Self::producer_units`] and passes it to
+    /// [`WirePgn::rehydrate`] to convert into its own units.
+    pub units: u8,
 }
 
 impl Hello {
-    /// The handshake describing *this* build.
-    pub fn current() -> Self {
-        let db = canboat_core::PgnDatabase::embedded(canboat_core::Units::Metric);
+    /// The handshake describing *this* build, for a producer decoding in
+    /// `units`. Use [`Self::current`] for the Metric default.
+    pub fn for_units(units: canboat_core::Units) -> Self {
+        let db = canboat_core::PgnDatabase::embedded(units);
         Hello {
             magic: MAGIC,
             wire_version: WIRE_VERSION,
             schema_hash: canboat_core::SCHEMA_HASH,
             schema_version: db.schema_version.to_string(),
             canboat_version: db.version.to_string(),
+            units: units_code(units),
         }
+    }
+
+    /// The handshake for a Metric-units producer (the default).
+    pub fn current() -> Self {
+        Self::for_units(canboat_core::Units::Metric)
+    }
+
+    /// The unit system the peer producer declared it decoded in.
+    pub fn producer_units(&self) -> canboat_core::Units {
+        units_from_code(self.units)
     }
 
     /// Verify a `Hello` received from a peer against this build. `Ok`
@@ -116,6 +152,13 @@ impl Hello {
                 ours: canboat_core::SCHEMA_HASH,
             });
         }
+        // Reject a units code we don't understand rather than silently
+        // treating it as Metric — scaled numbers on the wire would
+        // otherwise be mis-scaled. Known codes (0 Metric, 1 SI) are
+        // converted at rehydrate; see [`WirePgn::rehydrate`].
+        if self.units > 1 {
+            return Err(HelloError::UnknownUnits(self.units));
+        }
         Ok(())
     }
 }
@@ -124,8 +167,17 @@ impl Hello {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HelloError {
     BadMagic([u8; 4]),
-    WireVersion { theirs: u16, ours: u16 },
-    SchemaHash { theirs: u64, ours: u64 },
+    WireVersion {
+        theirs: u16,
+        ours: u16,
+    },
+    SchemaHash {
+        theirs: u64,
+        ours: u64,
+    },
+    /// The peer declared a [`Hello::units`] code this build can't map to
+    /// a known unit system, so its scaled numbers can't be trusted.
+    UnknownUnits(u8),
 }
 
 impl std::fmt::Display for HelloError {
@@ -146,6 +198,11 @@ impl std::fmt::Display for HelloError {
                 "schema mismatch: peer schema hash {theirs:#018x} != ours {ours:#018x} \
                  — the two builds were compiled from different canboat.json/synthetic-pgns.json; \
                  field indices cannot be trusted"
+            ),
+            HelloError::UnknownUnits(code) => write!(
+                f,
+                "peer declared unit-system code {code}, which this build does not understand; \
+                 its scaled values cannot be converted safely"
             ),
         }
     }
@@ -368,12 +425,25 @@ impl WirePgn {
     /// Returns `None` if the variant hash isn't in `idx`. The raw
     /// payload (`DecodedPgn::data`) is not carried on the wire, so it
     /// comes back empty; consumers that read field values never touch it.
-    pub fn rehydrate(&self, db: &'static PgnDatabase, idx: &PgnIndex) -> Option<DecodedPgn> {
+    pub fn rehydrate(
+        &self,
+        db: &'static PgnDatabase,
+        idx: &PgnIndex,
+        peer_units: canboat_core::Units,
+    ) -> Option<DecodedPgn> {
         let info = idx.get(self.pgn_id_hash)?;
+        // When the producer decoded in different units than `db`, the
+        // scaled `Number`s on the wire are in the producer's units. Look
+        // up the same variant in the producer's schema so each field's
+        // source unit is known; `rehydrate_value` then converts to `db`'s
+        // units. Same-units peers skip this entirely (the common path).
+        let peer_pgn: Option<&'static PgnInfo> = (peer_units != db.units())
+            .then(|| canboat_core::PgnDatabase::embedded(peer_units).pgn_by_id(info.id))
+            .flatten();
         let fields: Vec<DecodedField> = self
             .fields
             .iter()
-            .map(|wf| wf.rehydrate(info, db))
+            .map(|wf| wf.rehydrate(info, peer_pgn, db))
             .collect();
         // Rebuild the O(1) order→position accelerator the decoder emits.
         let mut index_by_order = [i8::MIN; 32];
@@ -404,7 +474,12 @@ impl WirePgn {
 }
 
 impl WireField {
-    fn rehydrate(&self, pgn_info: &'static PgnInfo, db: &'static PgnDatabase) -> DecodedField {
+    fn rehydrate(
+        &self,
+        pgn_info: &'static PgnInfo,
+        peer_pgn: Option<&'static PgnInfo>,
+        db: &'static PgnDatabase,
+    ) -> DecodedField {
         // The schema `order` is 1-based; the field array is 0-based.
         // Fall back to the first field if a peer sends an out-of-range
         // order (schema mismatch that slipped past the handshake) so we
@@ -413,9 +488,12 @@ impl WireField {
             .fields
             .get(self.order.wrapping_sub(1) as usize)
             .unwrap_or(&pgn_info.fields[0]);
+        // The same field in the producer's schema (for cross-units
+        // conversion); `None` when the peer decoded in `db`'s units.
+        let peer_field = peer_pgn.and_then(|pi| pi.fields.get(self.order.wrapping_sub(1) as usize));
         DecodedField {
             info,
-            value: rehydrate_value(&self.value, info, pgn_info, db),
+            value: rehydrate_value(&self.value, info, peer_field, pgn_info, db),
             bit_offset: None,
             bit_length: None,
             repeat_index: self.repeat_index,
@@ -447,11 +525,23 @@ fn static_unit(wire_unit: &str, info: &'static FieldInfo) -> Option<&'static str
 fn rehydrate_value(
     v: &WireValue,
     info: &'static FieldInfo,
+    peer_field: Option<&'static FieldInfo>,
     pgn_info: &'static PgnInfo,
     db: &'static PgnDatabase,
 ) -> FieldValue {
     match v {
-        WireValue::Number(x) => FieldValue::Number(*x),
+        // A scaled number is in the producer's units. Convert from the
+        // producer field's unit to this field's unit; a no-op when they
+        // match, and `peer_field` is `None` for same-units peers.
+        WireValue::Number(x) => {
+            let converted = match (peer_field.and_then(|pf| pf.unit), info.unit) {
+                (Some(from), Some(to)) => {
+                    canboat_core::units::convert_unit(*x, from, to).unwrap_or(*x)
+                }
+                _ => *x,
+            };
+            FieldValue::Number(converted)
+        }
         WireValue::Integer(x) => FieldValue::Integer(*x),
         WireValue::Float(x) => FieldValue::Float(*x),
         WireValue::Binary(b) => FieldValue::Binary(b.clone()),
@@ -513,7 +603,9 @@ fn rehydrate_value(
             // `value`.
             subfields: subfields
                 .iter()
-                .map(|wf| wf.rehydrate(pgn_info, db))
+                // ISO_NAME subfields are raw bit fields, not unit-scaled,
+                // so no cross-units conversion applies.
+                .map(|wf| wf.rehydrate(pgn_info, None, db))
                 .collect(),
         },
         WireValue::Reserved {
@@ -643,6 +735,61 @@ mod tests {
     }
 
     #[test]
+    fn rehydrate_converts_scaled_numbers_across_units() {
+        use canboat_core::RawFrame;
+
+        let metric = PgnDatabase::embedded(canboat_core::Units::Metric);
+        let si = PgnDatabase::embedded(canboat_core::Units::Si);
+
+        // Vessel Heading — "Heading" (order 2) is an angle field, so its
+        // scaled value differs between schemas (deg vs rad).
+        let frame = RawFrame::new(
+            Some("2026-06-30T23:30:33.151Z".into()),
+            2,
+            127250,
+            17,
+            255,
+            [0x00, 0xb8, 0x22, 0xff, 0x7f, 0xff, 0x7f, 0xfd],
+        );
+        // Producer decodes in Metric (degrees) → that's what's on the wire.
+        let decoded = metric.decode(&frame).expect("decode");
+        let heading_deg = decoded
+            .field_by_name("Heading")
+            .and_then(|f| f.value.as_f64())
+            .expect("heading");
+        let wire = WirePgn::from(&decoded);
+
+        // A consumer rehydrating against the SI schema, told the peer was
+        // Metric, must convert the degree value to radians.
+        let rehy = wire
+            .rehydrate(si, &PgnIndex::build(si), canboat_core::Units::Metric)
+            .expect("rehydrate");
+        let heading_rad = rehy
+            .field_by_name("Heading")
+            .and_then(|f| f.value.as_f64())
+            .expect("heading");
+        assert!(
+            (heading_rad - heading_deg.to_radians()).abs() < 1e-6,
+            "{heading_deg} deg should rehydrate as {} rad, got {heading_rad}",
+            heading_deg.to_radians()
+        );
+
+        // Same-units rehydrate leaves the value untouched (the fast path).
+        let same = wire
+            .rehydrate(
+                metric,
+                &PgnIndex::build(metric),
+                canboat_core::Units::Metric,
+            )
+            .expect("rehydrate");
+        let h = same
+            .field_by_name("Heading")
+            .and_then(|f| f.value.as_f64())
+            .unwrap();
+        assert!((h - heading_deg).abs() < 1e-9);
+    }
+
+    #[test]
     fn wirepgn_rehydrates_to_equivalent_decoded() {
         use canboat_core::{FieldValue as FV, RawFrame};
 
@@ -669,7 +816,7 @@ mod tests {
         assert_eq!(wire2, wire);
 
         // Rehydrating reproduces the decoded record field-for-field.
-        let rehy = wire.rehydrate(db, &idx).expect("rehydrate");
+        let rehy = wire.rehydrate(db, &idx, db.units()).expect("rehydrate");
         assert_eq!(rehy.pgn, decoded.pgn);
         assert_eq!(rehy.id, decoded.id);
         assert_eq!(rehy.src, decoded.src);
@@ -723,7 +870,7 @@ mod tests {
             value: WireValue::Lookup(124),
             overrides: None,
         };
-        let rehy = wf.rehydrate(info, db);
+        let rehy = wf.rehydrate(info, None, db);
         assert!(
             matches!(&rehy.value, FV::Lookup { name: Some(n), value: 124 } if *n == "Polar Performance"),
             "fieldtype-key 124 must re-resolve to \"Polar Performance\", got {:?}",
@@ -784,7 +931,7 @@ mod tests {
         for frame in frames {
             let decoded = db.decode(&frame).expect("decode");
             let wire = WirePgn::from(&decoded);
-            let rehy = wire.rehydrate(db, &idx).expect("rehydrate");
+            let rehy = wire.rehydrate(db, &idx, db.units()).expect("rehydrate");
 
             let mut json_direct = String::new();
             write_json(&mut json_direct, &decoded, &opts).unwrap();

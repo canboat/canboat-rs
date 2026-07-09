@@ -22,7 +22,6 @@ use anyhow::{Context, Result};
 use clap::Parser;
 
 use canboat_core::{
-    PgnDatabase,
     format::InputFormat,
     output::{CamelCase, GeoFormat, JsonOptions, TextOptions, write_json, write_text},
 };
@@ -53,6 +52,11 @@ struct Cli {
     /// JSON: emit lookup values as `{"value":N,"name":"..."}` (`-nv`).
     #[arg(long)]
     nv: bool,
+
+    /// Show values in strict SI units — radians, kelvin, pascals — rather
+    /// than the practical defaults (deg, °C, bar). Matches canboat's `-si`.
+    #[arg(long)]
+    si: bool,
 
     /// JSON: wrap every field with byte/bit diagnostics (`-debug`).
     #[arg(long)]
@@ -113,7 +117,11 @@ pub fn run(argv: Vec<OsString>) -> Result<()> {
 }
 
 fn run_cli(cli: Cli) -> Result<()> {
-    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
+    let units = if cli.si {
+        canboat_core::Units::Si
+    } else {
+        canboat_core::Units::Metric
+    };
 
     let camel_case = if cli.upper_camel {
         CamelCase::Upper
@@ -149,13 +157,8 @@ fn run_cli(cli: Cli) -> Result<()> {
     // "n2kd", in which case n2kd still wants the banner.
     let suppress_banner = cli.fixtime.as_deref().is_some_and(|s| !s.contains("n2kd"));
     if cli.json && !suppress_banner {
-        writeln!(
-            out,
-            "{{\"version\":\"{}\",\"units\":\"std\",\"showLookupValues\":{}}}",
-            db.version,
-            if cli.nv { "true" } else { "false" },
-        )
-        .context("writing JSON banner")?;
+        writeln!(out, "{}", crate::build_info::version_banner(cli.si, cli.nv))
+            .context("writing JSON banner")?;
     }
 
     let forced_format = cli.format.as_deref().map(parse_format_flag).transpose()?;
@@ -166,6 +169,7 @@ fn run_cli(cli: Cli) -> Result<()> {
         src_filter: cli.src,
         dst_filter: cli.dst,
         suppress_startup_record: cli.fixtime.as_deref().is_some_and(|s| !s.contains("n2kd")),
+        units,
     };
 
     let mut sink_err: Option<anyhow::Error> = None;

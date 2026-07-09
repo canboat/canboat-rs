@@ -45,6 +45,9 @@ pub struct Config {
     /// producer's build version doesn't leak into version-agnostic
     /// output.
     pub suppress_startup_record: bool,
+    /// Unit system to decode into — `Metric` (the default: deg/°C/bar,
+    /// matching `analyzer` without `-si`) or `Si` (rad/K/Pa, `-si`).
+    pub units: canboat_core::Units,
 }
 
 /// Open `path` and stream-decode it via [`decode_stream`]. Binary
@@ -82,7 +85,7 @@ pub fn decode_stream<R: BufRead, F: FnMut(&DecodedPgn)>(
     cfg: &Config,
     mut sink: F,
 ) -> io::Result<()> {
-    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
+    let db = PgnDatabase::embedded(cfg.units);
     let mut reader = match cfg.forced_format {
         Some(fmt) => LineFrameReader::with_format(source, fmt),
         None => LineFrameReader::new(source),

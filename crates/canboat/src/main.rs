@@ -21,6 +21,7 @@ use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
 
+mod build_info;
 mod convert;
 mod format_message;
 mod interface;

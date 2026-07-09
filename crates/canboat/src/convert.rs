@@ -285,6 +285,7 @@ fn convert_decoded<W: Write>(
         src_filter: args.src,
         dst_filter: args.dst,
         suppress_startup_record: false,
+        units: canboat_core::Units::Metric,
     };
 
     let mut line = String::with_capacity(512);

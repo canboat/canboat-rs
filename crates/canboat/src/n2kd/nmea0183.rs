@@ -157,6 +157,25 @@ mod tests {
     }
 
     #[test]
+    fn mwv_converts_from_si_radians() {
+        // An `analyzer -si` stream carries Wind Angle in radians. Decoded
+        // against the SI schema, the MWV sentence must still come out in
+        // degrees — the converter asks `as_f64_in("deg")` and the core
+        // converts. 1.5708 rad ≈ 90°.
+        let msg = r#"{"pgn":130306,"src":7,"fields":{"Wind Speed":5.0,"Wind Angle":1.5708,"Reference":{"value":2,"name":"Apparent"}}}"#;
+        let decoded =
+            canboat_core::json_to_decoded(msg, PgnDatabase::embedded(canboat_core::Units::Si))
+                .expect("decode");
+        let mut out = String::new();
+        let mut rl = RateLimiter::new(false);
+        convert_decoded(&mut out, &decoded, &mut rl);
+        assert!(
+            out.contains("MWV,90.0,R,"),
+            "SI radians should render as 90.0°, got {out}"
+        );
+    }
+
+    #[test]
     fn dpt_format() {
         let msg = r#"{"pgn":128267,"src":3,"fields":{"Depth":12.3,"Offset":0.5}}"#;
         let mut out = String::new();

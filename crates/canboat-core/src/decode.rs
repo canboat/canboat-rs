@@ -123,6 +123,24 @@ impl DecodedField {
         self.info.unit
     }
 
+    /// This field's numeric value expressed in `target` unit, converting
+    /// from the field's own [`unit`](Self::unit) when they differ (see
+    /// [`crate::units::convert_unit`]). A unitless field is returned
+    /// as-is; a numeric field whose unit has no known bridge to `target`
+    /// yields `None`.
+    ///
+    /// This lets a consumer that needs a fixed unit stay correct no
+    /// matter which schema ([`crate::Units`]) produced the field — e.g.
+    /// NMEA 0183 always asks angles for `"deg"` and temperatures for
+    /// `"C"`, and gets them whether the stream was SI or Metric.
+    pub fn as_f64_in(&self, target: &str) -> Option<f64> {
+        let v = self.value.as_f64()?;
+        match self.unit() {
+            Some(from) => crate::units::convert_unit(v, from, target),
+            None => Some(v),
+        }
+    }
+
     /// Display resolution.
     #[inline]
     pub fn resolution(&self) -> Option<f64> {

@@ -430,6 +430,14 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
     let mut lock = stdin.lock();
     let mut line = String::with_capacity(4096);
     let mut last_filter_report = Instant::now();
+    // Unit system of the incoming stream, learned from the analyzer
+    // version banner (`units:"si"` → true). Governs which schema we
+    // rebuild each DecodedPgn against, so `as_f64_in(...)` in the 0183 /
+    // AIS converters sees the right source unit. Defaults to Metric —
+    // the same assumption as a stream with no banner.
+    let mut unit_si = false;
+    let mut saw_banner = false;
+    let mut warned_no_banner = false;
     loop {
         line.clear();
         let n = lock.read_line(&mut line).context("reading stdin")?;
@@ -442,12 +450,36 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         }
         if trimmed.starts_with("{\"version\"") {
             // Analyzer banner — broadcast on JSON stream, skip cache.
+            // Learn the stream's unit system so the converters below
+            // request the units they need from the right schema.
+            saw_banner = true;
+            unit_si = trimmed.contains("\"units\":\"si\"");
+            log::info!(
+                "analyzer stream units: {}",
+                if unit_si {
+                    "SI (rad/K/Pa)"
+                } else {
+                    "Metric (deg/°C/bar)"
+                }
+            );
             hub.json_hub.broadcast(&line);
             continue;
         }
         if !trimmed.starts_with("{\"timestamp\"") {
             log::debug!("ignoring non-PGN line: {trimmed:.80}");
             continue;
+        }
+        // canboat C aborts here unless the first line was the banner; we
+        // are lenient (a bannerless stream is assumed Metric), but warn
+        // once so a misconfigured producer is visible. `-si` streams
+        // *must* carry the banner or their radians decode as degrees.
+        if !saw_banner && !warned_no_banner {
+            log::warn!(
+                "input has no analyzer version banner; assuming Metric units. \
+                 Pipe from `analyzer -json -nv` (add `-si` for SI units) so the \
+                 unit system is declared."
+            );
+            warned_no_banner = true;
         }
         // canboat C requires the line to end with `}}` (the closing
         // brace of `fields` plus the outer brace) — see
@@ -487,10 +519,16 @@ fn run_stdin_pump(hub: &Hub) -> Result<()> {
         // table. The JSON-parsing `convert` wrappers are only the
         // .j2k-input adapters now; the daemon works on DecodedPgn.
         let mut nmea = String::new();
-        let decoded = canboat_core::json_to_decoded(
-            trimmed,
-            PgnDatabase::embedded(canboat_core::Units::Metric),
-        );
+        // Rebuild against the schema matching the stream's declared units
+        // so each field's `info.unit` agrees with its value; the 0183 /
+        // AIS converters then ask `as_f64_in("deg")` etc. and the core
+        // converts from rad/K only when the stream is SI.
+        let units = if unit_si {
+            canboat_core::Units::Si
+        } else {
+            canboat_core::Units::Metric
+        };
+        let decoded = canboat_core::json_to_decoded(trimmed, PgnDatabase::embedded(units));
         // Learn `src → NAME` for the per-device 0183 filter from ISO
         // Address Claims — `iso_name()` re-packs it from the decoded
         // fields (the same helper the live pipeline uses), returning

@@ -231,7 +231,12 @@ impl RateLimiter {
 // =====================================================================
 
 fn vessel_heading(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
-    let Some(heading) = decoded.field(&h.vh_heading).and_then(|f| f.value.as_f64()) else {
+    // NMEA 0183 is defined in degrees; ask for degrees and let the core
+    // convert from the stream's schema unit (deg for Metric, rad for SI).
+    let Some(heading) = decoded
+        .field(&h.vh_heading)
+        .and_then(|f| f.as_f64_in("deg"))
+    else {
         return;
     };
     let reference = decoded
@@ -241,10 +246,10 @@ fn vessel_heading(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) 
         .unwrap_or(-1);
     let dev = decoded
         .field(&h.vh_deviation)
-        .and_then(|f| f.value.as_f64());
+        .and_then(|f| f.as_f64_in("deg"));
     let var = decoded
         .field(&h.vh_variation)
-        .and_then(|f| f.value.as_f64());
+        .and_then(|f| f.as_f64_in("deg"));
     if let (Some(d), Some(v)) = (dev, var)
         && reference == 1
     {
@@ -278,7 +283,7 @@ fn wind_data(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     };
     let Some(angle) = decoded
         .field(&h.wd_wind_angle)
-        .and_then(|f| f.value.as_f64())
+        .and_then(|f| f.as_f64_in("deg"))
     else {
         return;
     };
@@ -303,7 +308,7 @@ fn sog_cog(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles, rl: &mu
     let Some(sog) = decoded.field(&h.sc_sog).and_then(|f| f.value.as_f64()) else {
         return;
     };
-    let Some(cog) = decoded.field(&h.sc_cog).and_then(|f| f.value.as_f64()) else {
+    let Some(cog) = decoded.field(&h.sc_cog).and_then(|f| f.as_f64_in("deg")) else {
         return;
     };
     // Cache the last (sog, cog) for the position handler's RMC
@@ -322,7 +327,10 @@ fn sog_cog(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles, rl: &mu
 }
 
 fn rudder(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
-    let Some(pos) = decoded.field(&h.ru_position).and_then(|f| f.value.as_f64()) else {
+    let Some(pos) = decoded
+        .field(&h.ru_position)
+        .and_then(|f| f.as_f64_in("deg"))
+    else {
         return;
     };
     create(out, src, &format!("RSA,{:.1},A,,F", -pos));
@@ -380,12 +388,14 @@ fn environmental(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     if source != 0 {
         return;
     }
-    let Some(t) = decoded.field(&h.env_temp).and_then(|f| f.value.as_f64()) else {
+    // MTW is defined in Celsius; ask for it and let the core convert from
+    // the stream's schema unit (C for Metric, K for SI). This replaces
+    // canboat's `t < 173.15` magnitude heuristic, which only existed
+    // because the JSON path couldn't tell which unit the number was in —
+    // the declared stream units (via the analyzer banner) now settle it.
+    let Some(celsius) = decoded.field(&h.env_temp).and_then(|f| f.as_f64_in("C")) else {
         return;
     };
-    // canboat's `TEMP_K_TO_C`: if `t < 173.15` it's assumed already
-    // in Celsius (a hack accommodating one buggy device).
-    let celsius = if t < 173.15 { t } else { t - 273.15 };
     create(out, src, &format!("MTW,{celsius:.1},C"));
 }
 

@@ -353,6 +353,14 @@ fn num_field(d: &DecodedPgn, name: &str) -> Option<f64> {
     d.field_by_name(name).and_then(|f| f.value.as_f64())
 }
 
+/// Like [`num_field`] but in a requested unit — the AIS bit layouts are
+/// defined in degrees (COG/heading) and deg/s (rate of turn), so ask for
+/// those and let the core convert from the stream's schema unit (Metric
+/// or SI). See [`canboat_core::DecodedField::as_f64_in`].
+fn num_field_in(d: &DecodedPgn, name: &str, unit: &str) -> Option<f64> {
+    d.field_by_name(name).and_then(|f| f.as_f64_in(unit))
+}
+
 fn str_field<'a>(d: &'a DecodedPgn, name: &str) -> Option<&'a str> {
     d.field_by_name(name).and_then(|f| f.value.as_str())
 }
@@ -393,7 +401,7 @@ fn enum_or_name(d: &DecodedPgn, field: &str, names: &[(&str, i64)]) -> i64 {
 /// `Rate of Turn` — non-linear AIS encoding. Identical math to
 /// [`crate::n2kd::ais::rate_of_turn`].
 fn rate_of_turn(d: &DecodedPgn) -> i64 {
-    let Some(rot) = num_field(d, "Rate of Turn") else {
+    let Some(rot) = num_field_in(d, "Rate of Turn", "deg/s") else {
         return -128;
     };
     let v = rot * 60.0;
@@ -413,7 +421,7 @@ fn sog(d: &DecodedPgn, field: &str) -> i64 {
 }
 
 fn cog(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(v) = num_field(d, field) else {
+    let Some(v) = num_field_in(d, field, "deg") else {
         return 3600;
     };
     let n = (v * 10.0 + 0.5) as i64;
@@ -421,7 +429,7 @@ fn cog(d: &DecodedPgn, field: &str) -> i64 {
 }
 
 fn heading(d: &DecodedPgn, field: &str) -> i64 {
-    let Some(v) = num_field(d, field) else {
+    let Some(v) = num_field_in(d, field, "deg") else {
         return 511;
     };
     let n = (v + 0.5) as i64;

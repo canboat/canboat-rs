@@ -22,6 +22,7 @@ mod schema_data;
 pub mod snapshot;
 pub mod startup;
 pub mod types;
+pub mod units;
 
 pub use db::{FieldHandle, PgnDatabase, Units};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};

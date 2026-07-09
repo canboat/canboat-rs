@@ -305,6 +305,11 @@ where
     let description = crate::analyzer_json::value(line, "description")
         .unwrap_or("")
         .to_string();
+    // `-camel` lines key fields by their camelCase `id`; bare `-json` by
+    // human `name`. Pick the matching secondary-key field key so the
+    // snapshot stays correctly split per instance / function code.
+    let use_camel = crate::analyzer_json::camel_wrapper_id(line).is_some();
+    let field_key = move |f: &crate::FieldInfo| if use_camel { f.id } else { f.name };
     let is_ais = is_ais_pgn(pgn);
     let info = crate::PgnDatabase::embedded(crate::Units::Metric).first_pgn(pgn);
     let repeat_set = info.and_then(repeating_pk_set);
@@ -312,7 +317,7 @@ where
     let Some(rs) = repeat_set else {
         let secondary = info.and_then(|info| {
             composite_secondary(info, |f| {
-                crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string())
+                crate::analyzer_json::lookup_text(line, field_key(f)).map(|s| s.to_string())
             })
         });
         sink(SnapshotInput {
@@ -332,7 +337,7 @@ where
         // one record under the top-level PK alone.
         let secondary = info.and_then(|info| {
             composite_secondary(info, |f| {
-                crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string())
+                crate::analyzer_json::lookup_text(line, field_key(f)).map(|s| s.to_string())
             })
         });
         sink(SnapshotInput {
@@ -355,8 +360,8 @@ where
             pgn_info,
             rs,
             iter as u32,
-            |f| crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string()),
-            |f, _| crate::analyzer_json::lookup_text(elem, f.name).map(|s| s.to_string()),
+            |f| crate::analyzer_json::lookup_text(line, field_key(f)).map(|s| s.to_string()),
+            |f, _| crate::analyzer_json::lookup_text(elem, field_key(f)).map(|s| s.to_string()),
         );
         let mut spliced = String::with_capacity(line.len() - arr.len() + elem.len() + 2);
         spliced.push_str(&line[..arr_start]);
@@ -844,6 +849,21 @@ mod tests {
         assert_eq!(got[0].src, 17);
         assert_eq!(got[0].secondary.as_deref(), Some("0"));
         assert!(!got[0].is_ais);
+    }
+
+    #[test]
+    fn classify_json_line_keys_camel_secondary_by_field_id() {
+        // Same PGN 127501 from `analyzer -camel`: wrapped under the pgn
+        // id, `Instance` keyed as `instance`. The secondary must still
+        // resolve — reading `f.name` ("Instance") would miss the camel
+        // key and collapse every instance into one cache slot.
+        let line = r#"{"binarySwitchBankStatus":{"pgn":127501,"src":17,"description":"binarySwitchBankStatus","fields":{"instance":3}}}"#;
+        let mut got = Vec::new();
+        let n = classify_json_line(line, |input| got.push(input));
+        assert_eq!(n, 1);
+        assert_eq!(got[0].pgn, 127501);
+        assert_eq!(got[0].src, 17);
+        assert_eq!(got[0].secondary.as_deref(), Some("3"));
     }
 
     #[test]

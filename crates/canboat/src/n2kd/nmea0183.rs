@@ -1,17 +1,18 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
-//! NMEA 0183 conversion from analyzer name-value JSON lines.
+//! NMEA 0183 conversion entry points.
 //!
-//! This is now a thin input adapter: [`convert`] rebuilds each JSON
-//! line into a [`canboat_core::DecodedPgn`] (via
-//! [`canboat_core::json_to_decoded`]) and delegates to the shared
-//! struct-path converter [`crate::n2kd::decoded::convert_nmea0183`] — the
-//! exact code the live `server` pipeline runs, so a JSON stream and a
-//! live device produce identical sentences. The per-PGN sentence
-//! coverage (RSA/HDG/VHW/DPT/VLW/VTG/GLL/RMC/GSA/MWV/MTW) therefore
-//! lives once, in [`crate::n2kd::decoded`].
+//! [`convert_decoded`] takes an already-decoded [`canboat_core::DecodedPgn`]
+//! and delegates to the shared struct-path converter
+//! ([`crate::n2kd::decoded::convert_nmea0183`]) — the exact code the live
+//! `server` pipeline and `n2kd` run, so every producer emits identical
+//! sentences. The per-PGN sentence coverage
+//! (RSA/HDG/VHW/DPT/VLW/VTG/GLL/RMC/GSA/MWV/MTW) lives once, in
+//! [`crate::n2kd::decoded`]. There is no JSON round-trip on the live
+//! path; a test-only `convert` rebuilds a record from a JSON fixture for
+//! the unit tests below.
 //!
-//! What still lives here is [`RateLimiter`] — the per-(src, rate-type)
+//! What also lives here is [`RateLimiter`] — the per-(src, rate-type)
 //! 1 Hz gate and the SOG/COG cache — which both this path and the
 //! `decoded` converter share.
 
@@ -93,15 +94,14 @@ impl RateLimiter {
     }
 }
 
-/// Convert one analyzer name-value JSON line into zero or more NMEA
-/// 0183 sentences, appending each to `out`. Returns the number of
-/// sentences emitted.
-///
-/// This is a thin input adapter: the line is rebuilt into a
-/// [`DecodedPgn`] and handed to the shared struct-path converter
-/// ([`crate::n2kd::decoded::convert_nmea0183`]) — literally the same code the
-/// live `server` pipeline runs. The only n2kd-specific step is the
-/// JSON → `DecodedPgn` parse.
+/// **Test-only** JSON → sentence adapter: rebuild a [`DecodedPgn`] from
+/// one analyzer name-value JSON line and run the shared struct
+/// converter. Production paths (the `server` pipeline and `n2kd`) always
+/// start from an already-decoded record, so there is deliberately no
+/// JSON round-trip in the live 0183 path — that keeps the analyzer JSON
+/// options (`--camel`, SI) from ever affecting 0183. Kept here so the
+/// tests can drive the converter straight from a JSON fixture.
+#[cfg(test)]
 pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> usize {
     let Some(decoded) =
         canboat_core::json_to_decoded(msg, PgnDatabase::embedded(canboat_core::Units::Metric))
@@ -111,8 +111,8 @@ pub fn convert(out: &mut String, msg: &str, rate_limiter: &mut RateLimiter) -> u
     convert_decoded(out, &decoded, rate_limiter)
 }
 
-/// Convert an already-rebuilt [`DecodedPgn`] — the daemon's parse-once
-/// path, and what [`convert`] delegates to after the JSON parse. Wraps
+/// Convert an already-rebuilt [`DecodedPgn`] — the parse-once path both
+/// the `server` pipeline and `n2kd` use. Wraps
 /// [`crate::n2kd::decoded::convert_nmea0183`] with the shared [`Handles`].
 pub fn convert_decoded(
     out: &mut String,
@@ -150,6 +150,19 @@ mod tests {
     #[test]
     fn mwv_apparent_wind() {
         let msg = r#"{"pgn":130306,"src":7,"fields":{"Wind Speed":5.0,"Wind Angle":90.0,"Reference":{"value":2,"name":"Apparent"}}}"#;
+        let mut out = String::new();
+        let mut rl = RateLimiter::new(false);
+        convert(&mut out, msg, &mut rl);
+        assert!(out.contains("MWV,90.0,R,18.0,K,A*"), "got {out}");
+    }
+
+    #[test]
+    fn mwv_from_camel_json() {
+        // End-to-end: an `analyzer -json -nv -camel` line (record wrapped
+        // under the pgn id `windData`, fields keyed by camelCase id) must
+        // decode and still produce the MWV sentence — the whole point of
+        // n2kd consuming camel input.
+        let msg = r#"{"windData":{"pgn":130306,"src":7,"fields":{"windSpeed":5.0,"windAngle":90.0,"reference":{"value":2,"name":"Apparent"}}}}"#;
         let mut out = String::new();
         let mut rl = RateLimiter::new(false);
         convert(&mut out, msg, &mut rl);

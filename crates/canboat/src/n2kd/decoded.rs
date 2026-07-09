@@ -1,15 +1,17 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
-//! Struct-passing converters that take `&DecodedPgn` directly
-//! instead of re-parsing a JSON string. Lets `n2kd-inproc` skip the
-//! analyzer JSON → n2kd JSON-parse round trip when the two stages
-//! run in the same process.
+//! Struct-passing converters that take `&DecodedPgn` directly instead
+//! of re-parsing a JSON string. Both the live `server` pipeline and
+//! `n2kd` run these on an already-decoded record, so no analyzer JSON
+//! is involved in producing NMEA 0183 — which is why the analyzer JSON
+//! options (`-camel`, `-si`) can't affect the 0183 output.
 //!
-//! Phase 3 scope: the highest-volume non-AIS PGNs the canboat n2kd
-//! benchmark workload emits. Anything not listed in
-//! [`Handles::supports`] falls back through the existing
-//! `nmea0183::convert` JSON path so n2kd-inproc still produces a
-//! complete output stream.
+//! [`convert_nmea0183`] is the single source of truth for which PGNs
+//! produce NMEA 0183: it dispatches on the decoded variant's canboat
+//! **id** (e.g. `"windData"`), so adding a sentence means adding one
+//! match arm and nothing else — there is no parallel PGN list to keep
+//! in sync. A record whose id isn't listed simply isn't an NMEA 0183
+//! PGN and yields no sentence.
 //!
 //! The handler bodies mirror `nmea0183.rs` line-for-line — same
 //! sentences, same field formats — but pull values via
@@ -26,12 +28,6 @@ use crate::n2kd::nmea0183::RateLimiter;
 const MS_TO_KNOTS: f64 = 1.943_84;
 /// m/s → km/h.
 const MS_TO_KMH: f64 = 3.6;
-
-/// PGN ids the struct-path supports today. Anything else falls back
-/// to the JSON path.
-const SUPPORTED_PGNS: &[u32] = &[
-    127245, 127250, 128259, 128267, 128275, 129026, 129029, 129539, 130306, 130311,
-];
 
 /// All `FieldHandle`s the struct-path needs. Built once at startup
 /// from the same `PgnDatabase` the decoder uses, then shared
@@ -115,17 +111,20 @@ impl Handles {
             env_temp: f("environmentalParameters", "temperature"),
         }
     }
-
-    /// `true` if this module has a handler for `pgn`. n2kd-inproc
-    /// uses this to decide whether to serialize JSON.
-    #[inline]
-    pub fn supports(pgn: u32) -> bool {
-        SUPPORTED_PGNS.contains(&pgn)
-    }
 }
 
-/// Top-level dispatcher — mirrors `nmea0183::convert`'s match table.
-/// Returns the number of NMEA 0183 sentences appended to `out`.
+/// Top-level NMEA 0183 dispatcher, and the single source of truth for
+/// which PGNs produce a sentence. Returns the number of NMEA 0183
+/// sentences appended to `out` (0 or 1).
+///
+/// Dispatch keys on the decoded variant's canboat `id` (from
+/// canboat.json), not the numeric PGN: a PGN number can carry several
+/// variants with different field layouts, and each `id` names exactly
+/// one. So this is precise even when the analyzer identifies a specific
+/// variant (e.g. from `-camel` output). To add a sentence, add one arm
+/// here — its rate-limit class travels in the same arm, so there is no
+/// separate PGN or rate table to drift out of sync. An unlisted id
+/// isn't an NMEA 0183 PGN and yields nothing.
 pub fn convert_nmea0183(
     out: &mut String,
     decoded: &DecodedPgn,
@@ -133,26 +132,51 @@ pub fn convert_nmea0183(
     h: &Handles,
 ) -> usize {
     let src = decoded.src;
-    let pgn = decoded.pgn;
-    let rate = pgn_to_rate(pgn);
-    if let Some(rt) = rate
-        && rl.should_drop_fast(src, rt)
-    {
-        return 0;
-    }
     let before = out.len();
-    match pgn {
-        127245 => rudder(out, src, decoded, h),
-        127250 => vessel_heading(out, src, decoded, h),
-        128259 => water_speed(out, src, decoded, h),
-        128267 => water_depth(out, src, decoded, h),
-        128275 => distance_log(out, src, decoded, h),
-        129026 => sog_cog(out, src, decoded, h, rl),
-        129029 => position(out, src, decoded, h, rl),
-        129539 => gps_dop(out, src, decoded, h),
-        130306 => wind_data(out, src, decoded, h),
-        130311 => environmental(out, src, decoded, h),
-        _ => {}
+    // Each arm: rate-limit gate for that sentence class, then the
+    // converter. `rl`/`src` are passed in so the fragment stays hygienic.
+    macro_rules! emit {
+        ($rl:expr, $src:expr, $rate:expr, $call:expr) => {{
+            if $rl.should_drop_fast($src, $rate) {
+                return 0;
+            }
+            $call;
+        }};
+    }
+    match decoded.id {
+        "rudder" => emit!(rl, src, Rate::Rudder, rudder(out, src, decoded, h)),
+        "vesselHeading" => emit!(
+            rl,
+            src,
+            Rate::VesselHeading,
+            vessel_heading(out, src, decoded, h)
+        ),
+        "speed" => emit!(rl, src, Rate::WaterSpeed, water_speed(out, src, decoded, h)),
+        "waterDepth" => emit!(rl, src, Rate::WaterDepth, water_depth(out, src, decoded, h)),
+        "distanceLog" => emit!(
+            rl,
+            src,
+            Rate::DistanceLog,
+            distance_log(out, src, decoded, h)
+        ),
+        "cogSogRapidUpdate" => emit!(rl, src, Rate::GpsSpeed, sog_cog(out, src, decoded, h, rl)),
+        "gnssPositionData" => emit!(
+            rl,
+            src,
+            Rate::GpsPosition,
+            position(out, src, decoded, h, rl)
+        ),
+        "gnssDops" => emit!(rl, src, Rate::GpsDop, gps_dop(out, src, decoded, h)),
+        "windData" => emit!(rl, src, Rate::WindData, wind_data(out, src, decoded, h)),
+        "environmentalParameters" => {
+            emit!(
+                rl,
+                src,
+                Rate::Environmental,
+                environmental(out, src, decoded, h)
+            )
+        }
+        _ => return 0,
     }
     if out.len() > before { 1 } else { 0 }
 }
@@ -169,22 +193,6 @@ pub enum Rate {
     GpsPosition,
     Environmental,
     DistanceLog,
-}
-
-fn pgn_to_rate(pgn: u32) -> Option<Rate> {
-    Some(match pgn {
-        127250 => Rate::VesselHeading,
-        130306 => Rate::WindData,
-        128267 => Rate::WaterDepth,
-        128259 => Rate::WaterSpeed,
-        127245 => Rate::Rudder,
-        129026 => Rate::GpsSpeed,
-        129539 => Rate::GpsDop,
-        129029 => Rate::GpsPosition,
-        130311 => Rate::Environmental,
-        128275 => Rate::DistanceLog,
-        _ => return None,
-    })
 }
 
 /// `Rate` → index into `RateLimiter::last_passed_slot`. Must match

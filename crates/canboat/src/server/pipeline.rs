@@ -21,7 +21,6 @@
 //! serialization runs whenever either the analyzer hub has
 //! subscribers OR the snapshot store is configured.
 
-use std::cell::RefCell;
 use std::collections::VecDeque;
 use std::io::{self, LineWriter, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -40,10 +39,6 @@ use canboat_wire::WirePgn;
 use crate::n2kd::serving::{BinHub, Hub};
 use crate::server::quirks::Quirks;
 use crate::server::snapshot::SnapshotStore;
-
-thread_local! {
-    static JSON_BUF: RefCell<String> = const { RefCell::new(String::new()) };
-}
 
 /// Source-side output batcher for one broadcast hub.
 ///
@@ -475,23 +470,16 @@ pub fn run(
         let want_nmea = emit_nmea_stdout || nmea_batch.has_subscribers() || nmea_filter.is_some();
         let converted = if !want_nmea {
             false
-        } else if crate::n2kd::decoded::Handles::supports(pgn) {
-            crate::n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles) > 0
         } else if is_ais_pgn(pgn) {
             ais_branch = true;
             crate::n2kd::ais_decoded::convert(&mut nmea_buf, &decoded, &mut ais_seq) > 0
-        } else if json_ok {
-            // The analyzer JSON for this record is already in
-            // `json_line` — feed the converter from there instead of
-            // serializing the same record a second time.
-            crate::n2kd::nmea0183::convert(&mut nmea_buf, &json_line, &mut rl) > 0
         } else {
-            JSON_BUF.with(|c| {
-                let mut buf = c.borrow_mut();
-                buf.clear();
-                let _ = write_json(&mut *buf, &decoded, &json_opts);
-                crate::n2kd::nmea0183::convert(&mut nmea_buf, &buf, &mut rl)
-            }) > 0
+            // Struct path only — `convert_nmea0183` dispatches on the
+            // decoded variant id and yields nothing for non-NMEA PGNs.
+            // There is deliberately no JSON round-trip here, so the
+            // analyzer JSON options (`--camel`, SI) never reach the 0183
+            // output.
+            crate::n2kd::decoded::convert_nmea0183(&mut nmea_buf, &decoded, &mut rl, &handles) > 0
         };
         // Per-device NMEA 0183 filter mutes redundant devices' `$`
         // sentences; AIS (`!AI…`) is exempt and passes straight through.

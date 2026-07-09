@@ -29,9 +29,9 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
-use canboat_core::{FieldRef, field};
+use canboat_core::{FieldRef, PgnDatabase, PgnInfo, Units, field};
 use indexmap::IndexMap;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 use crate::tui::device_cache::{CachedInfo, NameKey};
 
@@ -374,6 +374,18 @@ impl AppState {
         description: String,
         line: Value,
     ) {
+        // Canonicalize `server --camel` records to bare `-json` shape so
+        // every reader below (all keyed by human field name) works
+        // unchanged. No-op on the default non-camel stream.
+        let line = normalize_camel(line);
+        // Prefer the canonical human description the normalizer wrote (the
+        // camel wrapper's `description` is the pgn id); fall back to the
+        // caller's for hand-built / bare records.
+        let description = line
+            .pointer("/description")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or(description);
         // PGN 262657 is the pipeline's NMEA 0183 filter control channel,
         // not a bus record — route its Report frames into the filter
         // view instead of the entry/device model.
@@ -807,6 +819,74 @@ pub(crate) fn field_value(line: &Value, f: FieldRef) -> Option<&Value> {
     line.pointer(&format!("/fields/{}", json_pointer_escape(f.field.name)))
 }
 
+/// Canonicalize a `server --camel` analyzer record back to bare `-json`
+/// shape. `-camel` wraps each record `{"<pgnId>":{…}}` and keys its fields
+/// by camelCase `id`; this strips the wrapper and renames every field key
+/// (recursing into `list`/`list2` repeat sets) to its human name via the
+/// schema, using the wrapper id to pick the exact PGN variant. A bare
+/// record has no single-key wrapper and is returned untouched — so this
+/// is a no-op on the default stream, and every reader downstream stays
+/// name-keyed and camel-oblivious.
+pub(crate) fn normalize_camel(line: Value) -> Value {
+    // The camel wrapper is the only shape that presents as a one-key
+    // object whose value is itself a record (`{"windData":{"pgn":…}}`);
+    // a bare record always has several top-level keys.
+    let is_wrapper = matches!(&line, Value::Object(o)
+        if o.len() == 1 && o.values().next().is_some_and(|v| v.get("pgn").is_some()));
+    if !is_wrapper {
+        return line;
+    }
+    let Value::Object(top) = line else {
+        unreachable!("checked Object above")
+    };
+    let (wrapper_id, mut record) = top.into_iter().next().expect("one entry");
+    let db = PgnDatabase::embedded(Units::Metric);
+    let pgn = record.get("pgn").and_then(Value::as_u64).unwrap_or(0) as u32;
+    if let Some(info) = db.pgn_by_id(&wrapper_id).or_else(|| db.first_pgn(pgn))
+        && let Value::Object(obj) = &mut record
+    {
+        // The camel `description` is just the pgn id — restore the human one.
+        obj.insert(
+            "description".to_string(),
+            Value::String(info.description.to_string()),
+        );
+        if let Some(Value::Object(fields)) = obj.get_mut("fields") {
+            rekey_fields(fields, info);
+        }
+    }
+    record
+}
+
+/// Rename each `id`-keyed field back to its human name, recursing into
+/// `list`/`list2` repeat-set element objects (whose keys are the same
+/// repeating fields' ids). Keys that aren't a schema field id (`list`,
+/// the `-nv` `{value,name}` sub-keys) are left untouched.
+fn rekey_fields(fields: &mut Map<String, Value>, info: &PgnInfo) {
+    let renames: Vec<(String, String)> = fields
+        .keys()
+        .filter_map(|k| {
+            info.fields
+                .iter()
+                .find(|f| f.id == k.as_str() && f.name != k.as_str())
+                .map(|f| (k.clone(), f.name.to_string()))
+        })
+        .collect();
+    for (old, new) in renames {
+        if let Some(v) = fields.remove(&old) {
+            fields.insert(new, v);
+        }
+    }
+    for list_key in ["list", "list2"] {
+        if let Some(Value::Array(arr)) = fields.get_mut(list_key) {
+            for elem in arr.iter_mut() {
+                if let Value::Object(elem_obj) = elem {
+                    rekey_fields(elem_obj, info);
+                }
+            }
+        }
+    }
+}
+
 /// Pull an integer out of `line.fields.<field>` (handles both the
 /// bare-integer JSON shape and the `-nv` `{value, name}` object).
 fn field_number(line: &Value, f: FieldRef) -> Option<i64> {
@@ -914,6 +994,77 @@ mod tests {
             "pgn": 262657,
             "fields": {"Function": 0, "Source": src, "Sentence": sentence, "Muted": muted}
         })
+    }
+
+    #[test]
+    fn camel_record_normalizes_to_bare_and_reads() {
+        // A `server --camel` Product Information record: wrapped under the
+        // pgn id, fields keyed by camelCase id. The TUI must read it the
+        // same as a bare `-json` record.
+        let mut s = state();
+        let camel = json!({
+            "productInformation": {
+                "prio": 6, "src": 10, "pgn": 126996,
+                "description": "productInformation",
+                "fields": {
+                    "modelId": "ACME Radar",
+                    "softwareVersionCode": "1.2.3",
+                    "certificationLevel": 2
+                }
+            }
+        });
+        s.upsert(126996, 10, None, "productInformation".into(), camel);
+
+        // Device view pulls model/software out via the human-name readers.
+        let devs = s.device_list();
+        let dev = devs.iter().find(|d| d.src == 10).expect("device src 10");
+        assert_eq!(dev.model, "ACME Radar");
+        assert_eq!(dev.software, "1.2.3");
+
+        // Stored line is unwrapped, name-keyed, and description restored.
+        let entry = s.entries.values().next().expect("one entry");
+        assert_eq!(entry.description, "Product Information");
+        assert_eq!(
+            entry
+                .line
+                .pointer("/fields/Model ID")
+                .and_then(Value::as_str),
+            Some("ACME Radar")
+        );
+        assert!(
+            entry.line.get("productInformation").is_none(),
+            "wrapper stripped"
+        );
+    }
+
+    #[test]
+    fn camel_repeat_set_element_keys_are_rekeyed() {
+        // PGN 126464 (pgnListTransmitAndReceive) with a camel `list`
+        // repeat: each element's `pgn` id must be renamed to `PGN` so the
+        // PGN-list reader finds it.
+        let mut s = state();
+        let camel = json!({
+            "pgnListTransmitAndReceive": {
+                "src": 9, "pgn": 126464, "description": "pgnListTransmitAndReceive",
+                "fields": {"functionCode": 0, "list": [{"pgn": 127250}, {"pgn": 128267}]}
+            }
+        });
+        s.upsert(126464, 9, None, "pgnListTransmitAndReceive".into(), camel);
+        let lists = s.pgn_lists_for_src(9);
+        assert_eq!(lists.tx, vec![127250, 128267]);
+    }
+
+    #[test]
+    fn bare_record_passes_through_untouched() {
+        // A normal `-json` record has no wrapper — normalization is a no-op.
+        let mut s = state();
+        let bare = json!({
+            "prio": 6, "src": 7, "pgn": 126996, "description": "Product Information",
+            "fields": {"Model ID": "Bare Model"}
+        });
+        s.upsert(126996, 7, None, "Product Information".into(), bare);
+        let dev = s.device_list().into_iter().find(|d| d.src == 7).unwrap();
+        assert_eq!(dev.model, "Bare Model");
     }
 
     #[test]

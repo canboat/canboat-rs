@@ -41,7 +41,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::tui::state::{AppState, Progress, field_value};
+use crate::tui::state::{AppState, Progress, field_value, normalize_camel};
 
 /// Per-connection timeout for the initial TCP connect. Without this
 /// the TUI sits black forever when the endpoint isn't reachable (the
@@ -723,8 +723,11 @@ async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<Ap
         for input in inputs {
             // Re-parse the (possibly spliced) line so the entry
             // carries a structured Value the UI can pointer-walk.
-            let value: Value = match serde_json::from_str(&input.line) {
-                Ok(v) => v,
+            // Canonicalize `server --camel` here too — `nak_alert` reads
+            // it below, before `upsert` would normalize it. `upsert`
+            // re-runs the same step (a no-op once unwrapped).
+            let value = match serde_json::from_str::<Value>(&input.line) {
+                Ok(v) => normalize_camel(v),
                 Err(_) => continue,
             };
             // Surface every non-OK PGN 126208 Acknowledge as a

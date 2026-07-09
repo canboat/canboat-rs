@@ -9,8 +9,8 @@
 
 use crate::schema_data;
 use crate::types::{
-    BitLookupTable, FieldInfo, IndirectLookupTable, LookupFieldTypeTable, LookupFieldTypeValue,
-    LookupTable, PgnInfo,
+    BitLookupTable, FieldInfo, FieldRef, IndirectLookupTable, LookupFieldTypeTable,
+    LookupFieldTypeValue, LookupTable, PgnInfo,
 };
 
 /// Pre-resolved (PGN, field) pointer that hands out the corresponding
@@ -222,6 +222,22 @@ impl PgnDatabase {
             field_order: f.order,
             pgn_id_hash: djb2_hash(pgn_id),
         })
+    }
+
+    /// Resolve a build-time [`FieldRef`] into an `O(1)` [`FieldHandle`].
+    ///
+    /// The infallible, compile-checked counterpart to [`Self::field`]:
+    /// the `FieldRef` (e.g. `canboat_core::field::wind_data::WIND_ANGLE`)
+    /// already names a real (PGN, field) pair, so there is no `Option`.
+    /// `order` and the PGN `id` are unit-invariant, so the handle is
+    /// valid against this db regardless of which [`Units`] the `FieldRef`
+    /// was generated from.
+    #[inline]
+    pub fn handle(&self, f: FieldRef) -> FieldHandle {
+        FieldHandle {
+            field_order: f.field.order,
+            pgn_id_hash: djb2_hash(f.pgn.id),
+        }
     }
 
     /// Find a catch-all "fallback" PGN definition for an unknown `pgn`.

@@ -29,6 +29,7 @@ use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
 use std::time::Instant;
 
+use canboat_core::{FieldRef, field};
 use indexmap::IndexMap;
 use serde_json::Value;
 
@@ -467,9 +468,18 @@ impl AppState {
                     self.src_to_name.insert(src, key);
                     let info = CachedInfo {
                         manufacturer_name: manufacturer_name_from_claim(&line),
-                        device_function: field_number(&line, "Device Function").map(|v| v as u32),
-                        device_class: field_number(&line, "Device Class").map(|v| v as u32),
-                        industry_group: field_number(&line, "Industry Group").map(|v| v as u32),
+                        device_function: field_number(
+                            &line,
+                            field::iso_address_claim::DEVICE_FUNCTION,
+                        )
+                        .map(|v| v as u32),
+                        device_class: field_number(&line, field::iso_address_claim::DEVICE_CLASS)
+                            .map(|v| v as u32),
+                        industry_group: field_number(
+                            &line,
+                            field::iso_address_claim::INDUSTRY_GROUP,
+                        )
+                        .map(|v| v as u32),
                         first_seen: now_stamp.clone(),
                         last_seen: now_stamp,
                         ..Default::default()
@@ -481,16 +491,21 @@ impl AppState {
                 let Some(key) = self.src_to_name.get(&src).copied() else {
                     return;
                 };
+                use field::product_information as pi;
                 let info = CachedInfo {
-                    product_code: field_number(&line, "Product Code").map(|v| v as u32),
-                    model_id: field_text(&line, "Model ID"),
-                    software_version: field_text(&line, "Software Version Code"),
-                    model_version: field_text(&line, "Model Version"),
-                    model_serial_code: field_text(&line, "Model Serial Code"),
-                    nmea_db_version: field_number(&line, "NMEA 2000 Version").map(|v| v as u32),
-                    certification_level: field_number(&line, "NMEA 2000 Certification Level")
+                    product_code: field_number(&line, pi::PRODUCT_CODE).map(|v| v as u32),
+                    model_id: field_text(&line, pi::MODEL_ID),
+                    software_version: field_text(&line, pi::SOFTWARE_VERSION_CODE),
+                    model_version: field_text(&line, pi::MODEL_VERSION),
+                    model_serial_code: field_text(&line, pi::MODEL_SERIAL_CODE),
+                    nmea_db_version: field_number(&line, pi::NMEA2000_VERSION).map(|v| v as u32),
+                    // Was `"NMEA 2000 Certification Level"` — no such field
+                    // exists (it's just `certificationLevel` / "Certification
+                    // Level"), so this silently read `None` until the constant
+                    // migration surfaced it.
+                    certification_level: field_number(&line, pi::CERTIFICATION_LEVEL)
                         .map(|v| v as u32),
-                    load_equivalency: field_number(&line, "Load Equivalency").map(|v| v as u32),
+                    load_equivalency: field_number(&line, pi::LOAD_EQUIVALENCY).map(|v| v as u32),
                     last_seen: now_stamp,
                     ..Default::default()
                 };
@@ -500,10 +515,11 @@ impl AppState {
                 let Some(key) = self.src_to_name.get(&src).copied() else {
                     return;
                 };
+                use field::configuration_information as ci;
                 let info = CachedInfo {
-                    installation_description_1: field_text(&line, "Installation Description #1"),
-                    installation_description_2: field_text(&line, "Installation Description #2"),
-                    manufacturer_information: field_text(&line, "Manufacturer Information"),
+                    installation_description_1: field_text(&line, ci::INSTALLATION_DESCRIPTION1),
+                    installation_description_2: field_text(&line, ci::INSTALLATION_DESCRIPTION2),
+                    manufacturer_information: field_text(&line, ci::MANUFACTURER_INFORMATION),
                     last_seen: now_stamp,
                     ..Default::default()
                 };
@@ -585,16 +601,17 @@ impl AppState {
     /// Only Report frames (Function 0) carry state; a stray Set
     /// (Function 1) echoed back is ignored.
     fn apply_nmea0183_report(&mut self, line: &Value) {
-        if field_number(line, "Function") != Some(0) {
+        use field::canboat_nmea0183_filter as fl;
+        if field_number(line, fl::FUNCTION) != Some(0) {
             return;
         }
-        let Some(src) = field_number(line, "Source") else {
+        let Some(src) = field_number(line, fl::SOURCE) else {
             return;
         };
-        let Some(sentence) = field_text(line, "Sentence") else {
+        let Some(sentence) = field_text(line, fl::SENTENCE) else {
             return;
         };
-        let muted = field_number(line, "Muted").unwrap_or(0) != 0;
+        let muted = field_number(line, fl::MUTED).unwrap_or(0) != 0;
         let dev = self.nmea0183.entry(src as u8).or_default();
         if sentence == NMEA0183_ALL {
             dev.muted = muted;
@@ -726,10 +743,10 @@ impl AppState {
             if entry.pgn != 126464 || entry.src != src {
                 continue;
             }
-            let direction = entry
-                .line
-                .pointer("/fields/Function Code")
-                .and_then(field_as_int);
+            let direction = field_number(
+                &entry.line,
+                field::pgn_list_transmit_and_receive::FUNCTION_CODE,
+            );
             let list = collect_pgn_list(&entry.line);
             match direction {
                 Some(0) => tx.extend(list),
@@ -763,8 +780,8 @@ impl PgnLists {
 /// field is absent — an incomplete Address Claim isn't useful as a
 /// cache key.
 fn name_key_from_claim(line: &Value) -> Option<NameKey> {
-    let mfr = field_number(line, "Manufacturer Code")?;
-    let uid = field_number(line, "Unique Number")?;
+    let mfr = field_number(line, field::iso_address_claim::MANUFACTURER_CODE)?;
+    let uid = field_number(line, field::iso_address_claim::UNIQUE_NUMBER)?;
     Some(NameKey {
         manufacturer_code: u16::try_from(mfr).ok()?,
         unique_number: u32::try_from(uid).ok()?,
@@ -775,45 +792,53 @@ fn name_key_from_claim(line: &Value) -> Option<NameKey> {
 /// of a PGN 60928 record. Falls back to the bare-integer path so
 /// non-`-nv` producers still populate the cache with *something*.
 fn manufacturer_name_from_claim(line: &Value) -> Option<String> {
-    let v = line.pointer("/fields/Manufacturer Code")?;
+    let v = field_value(line, field::iso_address_claim::MANUFACTURER_CODE)?;
     v.pointer("/name")
         .and_then(Value::as_str)
         .map(str::to_string)
 }
 
-/// Pull an integer out of `line.fields.<name>` (handles both the
+/// The JSON `Value` at `line.fields.<field>` for a build-time field
+/// constant (e.g. `field::product_information::MODEL_ID`). This is the
+/// single place a field's JSON key is derived — currently the human
+/// `name` (bare `-json`), so camel support later is a one-line change
+/// here (`f.field.name` → `f.field.id`).
+pub(crate) fn field_value(line: &Value, f: FieldRef) -> Option<&Value> {
+    line.pointer(&format!("/fields/{}", json_pointer_escape(f.field.name)))
+}
+
+/// Pull an integer out of `line.fields.<field>` (handles both the
 /// bare-integer JSON shape and the `-nv` `{value, name}` object).
-fn field_number(line: &Value, name: &str) -> Option<i64> {
-    let v = line.pointer(&format!("/fields/{}", json_pointer_escape(name)))?;
-    field_as_int(v)
+fn field_number(line: &Value, f: FieldRef) -> Option<i64> {
+    field_as_int(field_value(line, f)?)
 }
 
 fn fill_from_claim(dev: &mut DeviceInfo, line: &Value) {
     if dev.manufacturer.is_empty()
-        && let Some(name) = field_text(line, "Manufacturer Code")
+        && let Some(name) = field_text(line, field::iso_address_claim::MANUFACTURER_CODE)
     {
         dev.manufacturer = name;
     }
 }
 
 fn fill_from_product_info(dev: &mut DeviceInfo, line: &Value) {
-    if let Some(s) = field_text(line, "Model ID") {
+    if let Some(s) = field_text(line, field::product_information::MODEL_ID) {
         dev.model = s;
     }
-    if let Some(s) = field_text(line, "Software Version Code") {
+    if let Some(s) = field_text(line, field::product_information::SOFTWARE_VERSION_CODE) {
         dev.software = s;
     }
-    // Product Info also carries the manufacturer code as text; only
-    // backfill when the ISO Address Claim hasn't filled it in yet.
-    if dev.manufacturer.is_empty()
-        && let Some(s) = field_text(line, "Manufacturer")
-    {
-        dev.manufacturer = s;
-    }
+    // (Product Information has no manufacturer field — the old
+    // `field_text(line, "Manufacturer")` here always read `None`, so it's
+    // dropped rather than migrated. Manufacturer comes from the ISO
+    // Address Claim via `fill_from_claim`.)
 }
 
 fn fill_from_config_info(dev: &mut DeviceInfo, line: &Value) {
-    if let Some(s) = field_text(line, "Installation Description #1") {
+    if let Some(s) = field_text(
+        line,
+        field::configuration_information::INSTALLATION_DESCRIPTION1,
+    ) {
         dev.installation = s;
     }
 }
@@ -821,8 +846,8 @@ fn fill_from_config_info(dev: &mut DeviceInfo, line: &Value) {
 /// Pull a field's display text out of a parsed analyzer JSON line.
 /// Handles both bare values and the `-nv` `{value, name}` lookup
 /// object shape.
-fn field_text(line: &Value, name: &str) -> Option<String> {
-    let v = line.pointer(&format!("/fields/{}", json_pointer_escape(name)))?;
+fn field_text(line: &Value, f: FieldRef) -> Option<String> {
+    let v = field_value(line, f)?;
     if let Some(s) = v.as_str() {
         return Some(s.trim().to_string());
     }

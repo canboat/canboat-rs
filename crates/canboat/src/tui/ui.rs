@@ -1734,6 +1734,12 @@ impl App {
 /// Read manufacturer + industry codes off a cached proprietary-PGN
 /// record, so the override dialog can pre-fill them. Returns
 /// `(None, None)` for non-proprietary PGNs.
+///
+/// These stay string-keyed on purpose: `"Manufacturer Code"` /
+/// `"Industry Code"` are the standard proprietary-header field names
+/// shared by every PGN in the proprietary ranges, so this reads them
+/// generically across all of them — there is no single per-PGN
+/// `field::…` constant that would apply.
 fn proprietary_codes(entry: &Entry) -> (Option<u16>, Option<u8>) {
     if !is_proprietary_pgn(entry.pgn) {
         return (None, None);

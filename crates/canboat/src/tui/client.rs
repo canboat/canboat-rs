@@ -32,6 +32,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use canboat_core::field;
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::TcpStream;
@@ -40,7 +41,7 @@ use tokio::sync::{Mutex, mpsc};
 use tokio::task::JoinHandle;
 use tokio::time::timeout;
 
-use crate::tui::state::{AppState, Progress};
+use crate::tui::state::{AppState, Progress, field_value};
 
 /// Per-connection timeout for the initial TCP connect. Without this
 /// the TUI sits black forever when the endpoint isn't reachable (the
@@ -757,23 +758,33 @@ async fn reader_task(reader: tokio::net::tcp::OwnedReadHalf, state: Arc<Mutex<Ap
 /// (`src` of the inbound record) and the PGN the ACK references, so
 /// the user can match it back to whichever Request they just sent.
 fn nak_alert(ack_src: u8, line: &Value) -> Option<String> {
-    let function_code = read_lookup_int(line.pointer("/fields/Function Code"))?;
+    use field::nmea_acknowledge_group_function as ack;
+    let function_code = read_lookup_int(field_value(line, ack::FUNCTION_CODE))?;
     if function_code != 2 {
         return None;
     }
-    let pgn_field = line.pointer("/fields/PGN");
+    let pgn_field = field_value(line, ack::PGN);
     let acked_pgn = read_lookup_int(pgn_field).unwrap_or(0);
     let acked_pgn_name = pgn_field
         .and_then(|v| v.pointer("/name").and_then(Value::as_str))
         .unwrap_or("");
-    let pgn_err = read_lookup_int(line.pointer("/fields/PGN error code")).unwrap_or(0);
-    let pgn_err_name = read_lookup_name(line.pointer("/fields/PGN error code")).unwrap_or_default();
-    let interval_err =
-        read_lookup_int(line.pointer("/fields/Transmission interval/Priority error code"))
-            .unwrap_or(0);
-    let interval_err_name =
-        read_lookup_name(line.pointer("/fields/Transmission interval/Priority error code"))
-            .unwrap_or_default();
+    let pgn_err = read_lookup_int(field_value(line, ack::PGN_ERROR_CODE)).unwrap_or(0);
+    let pgn_err_name = read_lookup_name(field_value(line, ack::PGN_ERROR_CODE)).unwrap_or_default();
+    // The field name is literally `Transmission interval/Priority error
+    // code` — one field with a `/` in it. The old raw
+    // `line.pointer("/fields/Transmission interval/Priority error code")`
+    // mis-split on that slash and always read nothing; `field_value`
+    // escapes it (RFC 6901 `~1`), so this now actually resolves.
+    let interval_err = read_lookup_int(field_value(
+        line,
+        ack::TRANSMISSION_INTERVAL_PRIORITY_ERROR_CODE,
+    ))
+    .unwrap_or(0);
+    let interval_err_name = read_lookup_name(field_value(
+        line,
+        ack::TRANSMISSION_INTERVAL_PRIORITY_ERROR_CODE,
+    ))
+    .unwrap_or_default();
     if pgn_err == 0 && interval_err == 0 {
         return None;
     }

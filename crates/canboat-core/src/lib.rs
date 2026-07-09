@@ -31,10 +31,11 @@ pub use frame::{FASTPACKET_MAX_SIZE, RAWFRAME_MAX_SIZE, RawFrame};
 pub use from_json::json_to_decoded;
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
 pub use schema_data::{COPYRIGHT_ID, SCHEMA_HASH, VERSION as CANBOAT_JSON_VERSION};
+pub use schema_data::{field, pgn};
 pub use startup::{CANBOAT_BEM, format_iso_ms, parse_iso_ms, startup_record};
 pub use types::{
-    BitLookupTable, BitLookupValue, FieldInfo, FieldType, IndirectLookupTable, IndirectLookupValue,
-    LookupTable, LookupValue, PacketType, PgnInfo,
+    BitLookupTable, BitLookupValue, FieldInfo, FieldRef, FieldType, IndirectLookupTable,
+    IndirectLookupValue, LookupTable, LookupValue, PacketType, PgnInfo,
 };
 
 #[cfg(test)]

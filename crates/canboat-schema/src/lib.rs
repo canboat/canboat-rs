@@ -131,6 +131,26 @@ pub struct PgnInfo {
     pub id_is_pinned: bool,
 }
 
+/// A compile-time reference to one field within a specific PGN
+/// definition: the field descriptor plus the PGN it lives in.
+///
+/// `canboat-core`'s build script generates one `static` of this type per
+/// (PGN, field) under `canboat_core::field::<pgn_id>::<FIELD_ID>`, so
+/// call sites use a compile-checked symbol
+/// (`field::wind_data::WIND_ANGLE`) instead of a `("windData",
+/// "windAngle")` string pair — a rename in `canboat.json` then breaks the
+/// build instead of silently returning `None`. Because it carries its
+/// PGN, one value is enough to both resolve an `O(1)` handle
+/// (`PgnDatabase::handle`) and read the field's `id`/`name` for JSON key
+/// selection. It points at the SI schema arrays; `id`/`name`/`order` are
+/// unit-invariant, so the same `FieldRef` is valid against either
+/// `Units`.
+#[derive(Debug, Clone, Copy)]
+pub struct FieldRef {
+    pub pgn: &'static PgnInfo,
+    pub field: &'static FieldInfo,
+}
+
 /// One (value, name) entry inside a LOOKUP enumeration.
 #[derive(Debug, Clone, Copy)]
 pub struct LookupValue {

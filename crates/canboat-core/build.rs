@@ -619,6 +619,130 @@ fn emit_pgn(out: &mut String, p: &RawPgn, fields_ident: &str, from_synthetic: bo
     .unwrap();
 }
 
+/// camelCase canboat id → `SCREAMING_SNAKE_CASE` (a static/const name).
+/// Breaks only at a lower/digit → upper boundary, so `cogSogRapidUpdate`
+/// → `COG_SOG_RAPID_UPDATE` and `windAngle` → `WIND_ANGLE`. Any non
+/// `[A-Za-z0-9]` byte becomes `_`, and a leading digit is `_`-prefixed so
+/// the result is always a valid identifier.
+fn screaming(id: &str) -> String {
+    let mut out = String::with_capacity(id.len() + 4);
+    let mut prev_lower_or_digit = false;
+    for c in id.chars() {
+        if c.is_ascii_uppercase() && prev_lower_or_digit {
+            out.push('_');
+        }
+        out.push(if c.is_ascii_alphanumeric() {
+            c.to_ascii_uppercase()
+        } else {
+            '_'
+        });
+        prev_lower_or_digit = c.is_ascii_lowercase() || c.is_ascii_digit();
+    }
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// camelCase canboat id → `snake_case` module name. Keyword collisions
+/// (none today, but pgn ids come from an external file) get a trailing
+/// `_` so the module name always parses.
+fn snake(id: &str) -> String {
+    let s = screaming(id).to_ascii_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
+        "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+        "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "union",
+        "unsafe", "use", "where", "while", "async", "await", "gen",
+    ];
+    if KEYWORDS.contains(&s.as_str()) {
+        format!("{s}_")
+    } else {
+        s
+    }
+}
+
+/// Emit the id-keyed constant references:
+///
+/// * `pub mod pgn` — one `pub static <ID>: &PgnInfo` per PGN definition.
+/// * `pub mod field` — a `pub mod <pgn_id>` per PGN, each with a
+///   `pub static <FIELD_ID>: FieldRef` per field.
+///
+/// Both index the SI arrays emitted above (`PGNS_SI`, `F{i}`), which is
+/// legal because a `static`'s initializer may reference another `static`
+/// by address; id/name/order are unit-invariant so these double for
+/// Metric. Duplicate ids (repeated `reserved`/`spare` fields, and the
+/// rare shared PGN id) keep the first occurrence, mirroring
+/// [`PgnDatabase::pgn_by_id`].
+fn emit_id_constants(out: &mut String, pgns: &[(RawPgn, Vec<RawField>)]) {
+    use std::collections::HashSet;
+
+    writeln!(
+        out,
+        "/// Compile-time `&'static PgnInfo` per PGN definition, keyed by canboat id.\n\
+         ///\n\
+         /// `pgn::WIND_DATA` is the SI-schema line for `windData`; the id,\n\
+         /// description, and field metadata are unit-invariant so it also\n\
+         /// describes the Metric schema.\n\
+         pub mod pgn {{\n\
+         use super::PGNS_SI;\n\
+         use canboat_schema::PgnInfo;"
+    )
+    .unwrap();
+    let mut used: HashSet<&str> = HashSet::new();
+    for (i, (p, _)) in pgns.iter().enumerate() {
+        let name = screaming(&p.id);
+        if name.is_empty() || !used.insert(p.id.as_str()) {
+            continue;
+        }
+        writeln!(out, "pub static {name}: &PgnInfo = &PGNS_SI[{i}];").unwrap();
+    }
+    writeln!(out, "}}").unwrap();
+
+    writeln!(
+        out,
+        "/// Compile-time [`FieldRef`] per (PGN, field), grouped by PGN id:\n\
+         /// `field::wind_data::WIND_ANGLE`.\n\
+         pub mod field {{"
+    )
+    .unwrap();
+    let mut used_mods: HashSet<String> = HashSet::new();
+    for (i, (p, fields)) in pgns.iter().enumerate() {
+        let module = snake(&p.id);
+        if module.is_empty() || !used_mods.insert(module.clone()) {
+            continue;
+        }
+        // Collect first so an empty (or fully-deduped) PGN emits no module
+        // and therefore no unused `use`.
+        let mut consts: Vec<(String, usize)> = Vec::with_capacity(fields.len());
+        let mut used_fields: HashSet<&str> = HashSet::new();
+        for (j, f) in fields.iter().enumerate() {
+            let name = screaming(&f.id);
+            if name.is_empty() || !used_fields.insert(f.id.as_str()) {
+                continue;
+            }
+            consts.push((name, j));
+        }
+        if consts.is_empty() {
+            continue;
+        }
+        writeln!(
+            out,
+            "pub mod {module} {{\nuse super::super::{{PGNS_SI, F{i}}};\nuse canboat_schema::FieldRef;"
+        )
+        .unwrap();
+        for (name, j) in consts {
+            writeln!(
+                out,
+                "pub static {name}: FieldRef = FieldRef {{ pgn: &PGNS_SI[{i}], field: &F{i}[{j}] }};"
+            )
+            .unwrap();
+        }
+        writeln!(out, "}}").unwrap();
+    }
+    writeln!(out, "}}").unwrap();
+}
+
 fn emit_lookup_value(out: &mut String, v: &RawLookupValue) {
     write!(
         out,
@@ -947,6 +1071,12 @@ fn main() {
         emit_pgn(&mut out, p, &ident, from_synthetic);
     }
     writeln!(out, "];").unwrap();
+
+    // Id-keyed constant references into the arrays above, so code can say
+    // `pgn::WIND_DATA` / `field::wind_data::WIND_ANGLE` instead of the
+    // stringly-typed `("windData","windAngle")` pair. They index the SI
+    // arrays (`PGNS_SI` / `F{i}`); id/name/order are unit-invariant.
+    emit_id_constants(&mut out, &pgn_with_fields);
 
     // PGN_INDEX — sorted by pgn number, value is &[u32] of indices.
     writeln!(out, "pub static PGN_INDEX: &[(u32, &[u32])] = &[").unwrap();

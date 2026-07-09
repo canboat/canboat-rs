@@ -75,40 +75,37 @@ pub struct Handles {
 }
 
 impl Handles {
-    /// Resolve every handle this module uses. Panics on missing
-    /// fields — those would only happen if the PGN database the
-    /// binary linked against differs from the canboat.json the
-    /// handler bodies were written for.
+    /// Resolve every handle this module uses from the generated field
+    /// constants. Infallible: each [`canboat_core::FieldRef`] is a
+    /// compile-checked (PGN, field) pair, so a `canboat.json` rename
+    /// breaks the build here instead of returning a runtime `None`.
     pub fn new(db: &PgnDatabase) -> Self {
-        let f = |pgn: &str, field: &str| {
-            db.field(pgn, field)
-                .unwrap_or_else(|| panic!("missing field {pgn:?}.{field:?} in PGN database"))
-        };
+        use canboat_core::field as f;
         Self {
-            vh_heading: f("vesselHeading", "heading"),
-            vh_deviation: f("vesselHeading", "deviation"),
-            vh_variation: f("vesselHeading", "variation"),
-            vh_reference: f("vesselHeading", "reference"),
-            wd_wind_speed: f("windData", "windSpeed"),
-            wd_wind_angle: f("windData", "windAngle"),
-            wd_reference: f("windData", "reference"),
-            sc_sog: f("cogSogRapidUpdate", "sog"),
-            sc_cog: f("cogSogRapidUpdate", "cog"),
-            ru_position: f("rudder", "position"),
-            sp_speed_water_referenced: f("speed", "speedWaterReferenced"),
-            wd_depth: f("waterDepth", "depth"),
-            wd_offset: f("waterDepth", "offset"),
-            dl_log: f("distanceLog", "log"),
-            dl_trip_log: f("distanceLog", "tripLog"),
-            gp_lat: f("gnssPositionData", "latitude"),
-            gp_lon: f("gnssPositionData", "longitude"),
-            gp_date: f("gnssPositionData", "date"),
-            gp_time: f("gnssPositionData", "time"),
-            dops_actual_mode: f("gnssDops", "actualMode"),
-            dops_hdop: f("gnssDops", "hdop"),
-            dops_vdop: f("gnssDops", "vdop"),
-            env_temp_source: f("environmentalParameters", "temperatureSource"),
-            env_temp: f("environmentalParameters", "temperature"),
+            vh_heading: db.handle(f::vessel_heading::HEADING),
+            vh_deviation: db.handle(f::vessel_heading::DEVIATION),
+            vh_variation: db.handle(f::vessel_heading::VARIATION),
+            vh_reference: db.handle(f::vessel_heading::REFERENCE),
+            wd_wind_speed: db.handle(f::wind_data::WIND_SPEED),
+            wd_wind_angle: db.handle(f::wind_data::WIND_ANGLE),
+            wd_reference: db.handle(f::wind_data::REFERENCE),
+            sc_sog: db.handle(f::cog_sog_rapid_update::SOG),
+            sc_cog: db.handle(f::cog_sog_rapid_update::COG),
+            ru_position: db.handle(f::rudder::POSITION),
+            sp_speed_water_referenced: db.handle(f::speed::SPEED_WATER_REFERENCED),
+            wd_depth: db.handle(f::water_depth::DEPTH),
+            wd_offset: db.handle(f::water_depth::OFFSET),
+            dl_log: db.handle(f::distance_log::LOG),
+            dl_trip_log: db.handle(f::distance_log::TRIP_LOG),
+            gp_lat: db.handle(f::gnss_position_data::LATITUDE),
+            gp_lon: db.handle(f::gnss_position_data::LONGITUDE),
+            gp_date: db.handle(f::gnss_position_data::DATE),
+            gp_time: db.handle(f::gnss_position_data::TIME),
+            dops_actual_mode: db.handle(f::gnss_dops::ACTUAL_MODE),
+            dops_hdop: db.handle(f::gnss_dops::HDOP),
+            dops_vdop: db.handle(f::gnss_dops::VDOP),
+            env_temp_source: db.handle(f::environmental_parameters::TEMPERATURE_SOURCE),
+            env_temp: db.handle(f::environmental_parameters::TEMPERATURE),
         }
     }
 }
@@ -121,19 +118,29 @@ impl Handles {
 /// canboat.json), not the numeric PGN: a PGN number can carry several
 /// variants with different field layouts, and each `id` names exactly
 /// one. So this is precise even when the analyzer identifies a specific
-/// variant (e.g. from `-camel` output). To add a sentence, add one arm
-/// here — its rate-limit class travels in the same arm, so there is no
-/// separate PGN or rate table to drift out of sync. An unlisted id
+/// variant (e.g. from `-camel` output). The keys are the generated
+/// [`canboat_core::pgn`] constants rather than string literals, so a
+/// renamed id in canboat.json deletes the symbol and breaks this build
+/// instead of silently never matching. To add a sentence, add one branch
+/// here — its rate-limit class travels in the same branch, so there is
+/// no separate PGN or rate table to drift out of sync. An unlisted id
 /// isn't an NMEA 0183 PGN and yields nothing.
+///
+/// This is an `if`/`else if` chain, not a `match`, because a `pgn::X.id`
+/// value is a `static`-backed expression, not a `const` pattern (a match
+/// pattern would need a `&str` *literal*, defeating the compile-time
+/// check). The comparison is exhaustive by the trailing `else`.
 pub fn convert_nmea0183(
     out: &mut String,
     decoded: &DecodedPgn,
     rl: &mut RateLimiter,
     h: &Handles,
 ) -> usize {
+    use canboat_core::pgn;
     let src = decoded.src;
+    let id = decoded.id;
     let before = out.len();
-    // Each arm: rate-limit gate for that sentence class, then the
+    // Each branch: rate-limit gate for that sentence class, then the
     // converter. `rl`/`src` are passed in so the fragment stays hygienic.
     macro_rules! emit {
         ($rl:expr, $src:expr, $rate:expr, $call:expr) => {{
@@ -143,40 +150,48 @@ pub fn convert_nmea0183(
             $call;
         }};
     }
-    match decoded.id {
-        "rudder" => emit!(rl, src, Rate::Rudder, rudder(out, src, decoded, h)),
-        "vesselHeading" => emit!(
+    if id == pgn::RUDDER.id {
+        emit!(rl, src, Rate::Rudder, rudder(out, src, decoded, h));
+    } else if id == pgn::VESSEL_HEADING.id {
+        emit!(
             rl,
             src,
             Rate::VesselHeading,
             vessel_heading(out, src, decoded, h)
-        ),
-        "speed" => emit!(rl, src, Rate::WaterSpeed, water_speed(out, src, decoded, h)),
-        "waterDepth" => emit!(rl, src, Rate::WaterDepth, water_depth(out, src, decoded, h)),
-        "distanceLog" => emit!(
+        );
+    } else if id == pgn::SPEED.id {
+        emit!(rl, src, Rate::WaterSpeed, water_speed(out, src, decoded, h));
+    } else if id == pgn::WATER_DEPTH.id {
+        emit!(rl, src, Rate::WaterDepth, water_depth(out, src, decoded, h));
+    } else if id == pgn::DISTANCE_LOG.id {
+        emit!(
             rl,
             src,
             Rate::DistanceLog,
             distance_log(out, src, decoded, h)
-        ),
-        "cogSogRapidUpdate" => emit!(rl, src, Rate::GpsSpeed, sog_cog(out, src, decoded, h, rl)),
-        "gnssPositionData" => emit!(
+        );
+    } else if id == pgn::COG_SOG_RAPID_UPDATE.id {
+        emit!(rl, src, Rate::GpsSpeed, sog_cog(out, src, decoded, h, rl));
+    } else if id == pgn::GNSS_POSITION_DATA.id {
+        emit!(
             rl,
             src,
             Rate::GpsPosition,
             position(out, src, decoded, h, rl)
-        ),
-        "gnssDops" => emit!(rl, src, Rate::GpsDop, gps_dop(out, src, decoded, h)),
-        "windData" => emit!(rl, src, Rate::WindData, wind_data(out, src, decoded, h)),
-        "environmentalParameters" => {
-            emit!(
-                rl,
-                src,
-                Rate::Environmental,
-                environmental(out, src, decoded, h)
-            )
-        }
-        _ => return 0,
+        );
+    } else if id == pgn::GNSS_DOPS.id {
+        emit!(rl, src, Rate::GpsDop, gps_dop(out, src, decoded, h));
+    } else if id == pgn::WIND_DATA.id {
+        emit!(rl, src, Rate::WindData, wind_data(out, src, decoded, h));
+    } else if id == pgn::ENVIRONMENTAL_PARAMETERS.id {
+        emit!(
+            rl,
+            src,
+            Rate::Environmental,
+            environmental(out, src, decoded, h)
+        );
+    } else {
+        return 0;
     }
     if out.len() > before { 1 } else { 0 }
 }

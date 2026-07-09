@@ -6,9 +6,7 @@
       "package-name": "canboat-rs",
       "include-component-in-tag": false,
       "extra-files": [
-        "Cargo.toml",
-        "crates/canboat-pipeline/Cargo.toml",
-        "crates/canboat-tui/Cargo.toml"
+        "Cargo.toml"
       ]
     }
   }

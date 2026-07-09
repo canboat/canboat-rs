@@ -9,6 +9,26 @@
 //! keys directly from an analyzer JSON line, and by the n2kd binary's
 //! NMEA-0183 / AIS converters.
 
+/// If `line` is a `-camel` analyzer record — `{"<pgnId>":{…}}`, where
+/// the record is wrapped under the PGN's camelCase id and every field
+/// key is a camelCase `id` — return that wrapper id. Bare `-json` opens
+/// with one of the record's own top-level keys (`timestamp`/`prio`/…),
+/// none of which is a PGN id, so it returns `None`.
+///
+/// Callers use this to decide whether to read field keys by `id`
+/// (camel) or human `name` (bare). The substring helpers below read
+/// `pgn`/`src`/etc. identically in either shape, since they scan the
+/// whole line.
+pub(crate) fn camel_wrapper_id(line: &str) -> Option<&str> {
+    let s = line.trim_start().strip_prefix('{')?;
+    let s = s.trim_start().strip_prefix('"')?;
+    let key = &s[..s.find('"')?];
+    match key {
+        "timestamp" | "prio" | "src" | "dst" | "pgn" | "description" | "fields" => None,
+        _ => Some(key),
+    }
+}
+
 /// Pull `"<field>":<value>` out of `msg`. Returns the value as a
 /// borrowed slice with any surrounding quotes stripped. Skips
 /// whitespace between `:` and the value. Returns `None` if the

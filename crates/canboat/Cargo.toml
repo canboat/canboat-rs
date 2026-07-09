@@ -1,0 +1,39 @@
+# (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
+
+[package]
+name        = "canboat"
+version     = { workspace = true }
+edition     = { workspace = true }
+license     = { workspace = true }
+authors     = { workspace = true }
+repository  = { workspace = true }
+rust-version = { workspace = true }
+description = "The canboat NMEA 2000 toolkit: one binary with convert / interface / server / tui subcommands."
+
+[[bin]]
+name = "canboat"
+path = "src/main.rs"
+
+[dependencies]
+canboat-core = { workspace = true }
+canboat-io   = { workspace = true }
+canboat-cli  = { workspace = true }
+canboat-wire = { workspace = true }
+anyhow       = { workspace = true }
+clap         = { workspace = true }
+serde        = { workspace = true }
+serde_json   = { workspace = true, features = ["preserve_order"] }
+env_logger   = { workspace = true }
+log          = { workspace = true }
+# Async runtime + terminal UI, used only by the `tui` subcommand.
+tokio        = { workspace = true, features = ["net", "time", "fs"] }
+crossterm    = { version = "0.28", features = ["event-stream"] }
+ratatui      = "0.29"
+indexmap     = { workspace = true }
+futures      = { workspace = true }
+# Local-time formatting for the tui file browser (cross-platform).
+chrono       = { version = "0.4", default-features = false, features = ["clock"] }
+
+[build-dependencies]
+# Capture the git short SHA (+ dirty flag) for the analyzer version banner.
+vergen-gitcl = { version = "1", default-features = false }

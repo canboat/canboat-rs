@@ -9,8 +9,8 @@
 
 use crate::schema_data;
 use crate::types::{
-    BitLookupTable, FieldInfo, IndirectLookupTable, LookupFieldTypeTable, LookupFieldTypeValue,
-    LookupTable, PgnInfo,
+    BitLookupTable, FieldInfo, FieldRef, IndirectLookupTable, LookupFieldTypeTable,
+    LookupFieldTypeValue, LookupTable, PgnInfo,
 };
 
 /// Pre-resolved (PGN, field) pointer that hands out the corresponding
@@ -58,6 +58,12 @@ pub struct PgnDatabase {
     /// see canboat-wire's handshake.
     pub schema_hash: u64,
 
+    /// Which unit system this database presents (see [`Units`]). The
+    /// schema hash is identical for both, so anything exchanging decoded
+    /// *values* (not raw bits) across processes must also agree on this —
+    /// see canboat-wire's `Hello`.
+    units: Units,
+
     pgns: &'static [PgnInfo],
     /// `(pgn_number, indices_into_pgns)`, sorted by `pgn_number` for
     /// O(log n) lookup. The variant list per PGN preserves canboat.json
@@ -70,23 +76,59 @@ pub struct PgnDatabase {
     field_type_lookups: &'static [LookupFieldTypeTable],
 }
 
-static EMBEDDED: PgnDatabase = PgnDatabase {
-    schema_version: schema_data::SCHEMA_VERSION,
-    version: schema_data::VERSION,
-    schema_hash: schema_data::SCHEMA_HASH,
-    pgns: schema_data::PGNS,
-    pgn_index: schema_data::PGN_INDEX,
-    lookups: schema_data::LOOKUPS,
-    bit_lookups: schema_data::BIT_LOOKUPS,
-    indirect_lookups: schema_data::INDIRECT_LOOKUPS,
-    field_type_lookups: schema_data::FIELD_TYPE_LOOKUPS,
-};
+/// Unit system a [`PgnDatabase`] presents its numeric fields in.
+///
+/// canboat's schema is generated in two forms at build time (they share
+/// everything but the ~150 fields whose unit differs, and all strings),
+/// so this is a zero-cost choice of which static table you decode /
+/// encode against — not a runtime conversion.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[non_exhaustive]
+pub enum Units {
+    /// Strict SI base units: `rad`, `K`, `Pa`, `C` (coulomb). What a
+    /// physics-facing consumer (Signal K, control code) wants. Matches
+    /// canboat C's `analyzer -si`.
+    Si,
+    /// canboat's practical humanized units: `deg`, `°C`, `bar`, `Ah`.
+    /// The default, matching canboat C's `analyzer` without `-si`.
+    #[default]
+    Metric,
+}
+
+macro_rules! embedded_db {
+    ($pgns:expr, $units:expr) => {
+        PgnDatabase {
+            schema_version: schema_data::SCHEMA_VERSION,
+            version: schema_data::VERSION,
+            schema_hash: schema_data::SCHEMA_HASH,
+            units: $units,
+            pgns: $pgns,
+            pgn_index: schema_data::PGN_INDEX,
+            lookups: schema_data::LOOKUPS,
+            bit_lookups: schema_data::BIT_LOOKUPS,
+            indirect_lookups: schema_data::INDIRECT_LOOKUPS,
+            field_type_lookups: schema_data::FIELD_TYPE_LOOKUPS,
+        }
+    };
+}
+
+static EMBEDDED_SI: PgnDatabase = embedded_db!(schema_data::PGNS_SI, Units::Si);
+static EMBEDDED_METRIC: PgnDatabase = embedded_db!(schema_data::PGNS_METRIC, Units::Metric);
 
 impl PgnDatabase {
-    /// The single, build-time embedded database.
+    /// The build-time embedded database in the requested [`Units`].
     #[inline]
-    pub fn embedded() -> &'static Self {
-        &EMBEDDED
+    pub fn embedded(units: Units) -> &'static Self {
+        match units {
+            Units::Si => &EMBEDDED_SI,
+            Units::Metric => &EMBEDDED_METRIC,
+        }
+    }
+
+    /// The unit system this database decodes into.
+    #[inline]
+    pub fn units(&self) -> Units {
+        self.units
     }
 
     /// Total number of PGN definitions (including manufacturer variants).
@@ -98,6 +140,13 @@ impl PgnDatabase {
     pub fn pgns(&self) -> std::slice::Iter<'static, PgnInfo> {
         let pgns: &'static [PgnInfo] = self.pgns;
         pgns.iter()
+    }
+
+    /// This db's `&'static` PGN slice — the SI or Metric array. Internal:
+    /// the schema-index dispatch resolves against it (see
+    /// [`crate::decode::PgnDatabase::pick_variant`]).
+    pub(crate) fn pgn_slice(&self) -> &'static [PgnInfo] {
+        self.pgns
     }
 
     /// Iterator over every definition for a given PGN number.
@@ -129,6 +178,49 @@ impl PgnDatabase {
         self.pgns.iter().find(|p| p.id == id)
     }
 
+    /// Start encoding a message for the PGN with this schema id (e.g.
+    /// `"isoRequest"`, `"windData"`). See [`crate::encode`].
+    pub fn message(
+        &'static self,
+        pgn_id: &str,
+    ) -> Result<crate::encode::MessageBuilder, crate::encode::EncodeError> {
+        let pgn = self
+            .pgn_by_id(pgn_id)
+            .ok_or_else(|| crate::encode::EncodeError::NoSuchPgnId(pgn_id.to_string()))?;
+        Ok(crate::encode::MessageBuilder::for_pgn(self, pgn))
+    }
+
+    /// Start encoding a message for a generated PGN constant
+    /// (`canboat_core::pgn::WIND_DATA`) — the compile-checked counterpart
+    /// to [`Self::message`]. The constant points at the SI schema array,
+    /// so this re-resolves it by `id` against this database's own arrays,
+    /// meaning field scaling happens in this db's [`Units`].
+    pub fn message_for(&'static self, pgn: &'static PgnInfo) -> crate::encode::MessageBuilder {
+        let resolved = self.pgn_by_id(pgn.id).unwrap_or(pgn);
+        crate::encode::MessageBuilder::for_pgn(self, resolved)
+    }
+
+    /// Start encoding a message by PGN number. Returns
+    /// [`crate::encode::EncodeError::AmbiguousPgn`] when the number has
+    /// more than one schema variant — use [`Self::message`] with the id.
+    pub fn message_by_pgn(
+        &'static self,
+        pgn: u32,
+    ) -> Result<crate::encode::MessageBuilder, crate::encode::EncodeError> {
+        let mut variants = self.pgn_variants(pgn);
+        let first = variants
+            .next()
+            .ok_or(crate::encode::EncodeError::NoSuchPgn(pgn))?;
+        let extra = variants.count();
+        if extra > 0 {
+            return Err(crate::encode::EncodeError::AmbiguousPgn {
+                pgn,
+                variants: extra + 1,
+            });
+        }
+        Ok(crate::encode::MessageBuilder::for_pgn(self, first))
+    }
+
     /// Resolve a (PGN id, field id) pair into a [`FieldHandle`] that
     /// later indexes into [`crate::DecodedPgn`] at `O(1)`. Both inputs
     /// are canboat-json `Id` values (camelCase machine identifiers,
@@ -142,12 +234,30 @@ impl PgnDatabase {
         })
     }
 
+    /// Resolve a build-time [`FieldRef`] into an `O(1)` [`FieldHandle`].
+    ///
+    /// The infallible, compile-checked counterpart to [`Self::field`]:
+    /// the `FieldRef` (e.g. `canboat_core::field::wind_data::WIND_ANGLE`)
+    /// already names a real (PGN, field) pair, so there is no `Option`.
+    /// `order` and the PGN `id` are unit-invariant, so the handle is
+    /// valid against this db regardless of which [`Units`] the `FieldRef`
+    /// was generated from.
+    #[inline]
+    pub fn handle(&self, f: FieldRef) -> FieldHandle {
+        FieldHandle {
+            field_order: f.field.order,
+            pgn_id_hash: djb2_hash(f.pgn.id),
+        }
+    }
+
     /// Find a catch-all "fallback" PGN definition for an unknown `pgn`.
     /// Mirrors canboat's `searchForUnknownPgn`: the largest entry with
     /// `Fallback: true` whose pgn number is `<= pgn`. O(log n) via the
     /// build-time sparse fallback table.
     pub fn fallback_pgn(&self, pgn: u32) -> Option<&'static PgnInfo> {
-        crate::schema_data::find_catchall(pgn)
+        // `find_catchall` returns a schema index shared by both unit
+        // arrays; resolve it against this db's own `pgns`.
+        Some(&self.pgns[crate::schema_data::find_catchall(pgn)?])
     }
 
     /// Look up an enum table by name (e.g. `"MANUFACTURER_CODE"`).

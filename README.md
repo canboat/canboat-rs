@@ -9,8 +9,8 @@ the CANboat database, built with modern tools: the PGN database is compiled
 into a sans-I/O core library, with thin sync and async adapters above it, so
 you can embed NMEA 2000 decoding in your own application instead of parsing
 another program's output. Second, more polished end-to-end solutions —
-`canboat-pipeline` runs the whole device-to-services chain in one process,
-and `canboat-tui` puts an interactive monitor on top of it.
+`canboat server` runs the whole device-to-services chain in one process,
+and `canboat tui` puts an interactive monitor on top of it.
 
 ## The library side
 
@@ -30,25 +30,39 @@ crate structure is better. This is still v0.x, so expect breakage!
 
 ## The tool side
 
-`canboat-pipeline` is the flagship: a single process that reads a device
-(iKonvert, Actisense, SocketCAN, Maretron IPG, or a log file), decodes, and
-serves snapshot / analyzer-JSON / NMEA 0183 / CSV over TCP, with
-supervisor-based device reconnect.
+`canboat` is the single front-end binary. Its subcommands cover what used to
+be a fistful of separate tools:
 
-`canboat-tui` is a text user interface à la `top` that allows you to view
-messages either live or from a log file, in various ways. It will improve
-over time to become the go-to way of reading log files, monitoring
-interesting situations on a live bus, and configuring devices.
+- `canboat server` — the flagship: one process that reads a device
+  (iKonvert, Actisense, SocketCAN, Maretron IPG, or a log file), decodes, and
+  serves snapshot / analyzer-JSON / NMEA 0183 / CSV over TCP, with
+  supervisor-based device reconnect.
+- `canboat tui` — a text user interface à la `top` for viewing messages live
+  or from a log file. The go-to way of reading log files, monitoring a live
+  bus, and configuring devices.
+- `canboat convert` — decode/convert any capture (PLAIN/FAST/Actisense/
+  YDWG02/iKonvert, and `.pcap`/`.pcap.gz`/`.nif` containers unwrapped
+  automatically) to PLAIN, JSON, or text. Drop-in for the C `analyzer` and
+  the old `candump2analyzer` / `pcap2candump` / `nif2analyzer` shunts.
+- `canboat interface` — bridge a live gateway (NGT-1 / iKonvert / SocketCAN /
+  Maretron IPG) to and from stdout.
+- `canboat replay` — pace a captured PLAIN/FAST stream at its original
+  wall-clock rhythm.
+- `canboat n2kd` — multiplex an analyzer-JSON stdin stream to TCP clients
+  (snapshot / stream / NMEA 0183 / AIS / status ports).
 
-The rest are canboat-compatible building blocks: `analyzer` (drop-in for the
-C analyzer, PLAIN/FAST/Actisense/YDWG02/iKonvert input, text or JSON out),
-`n2kd`, the device bridges (`actisense-serial`, `ikonvert-serial`,
-`maretron-ipg`, `socketcan-serial`, `socketcan-writer`), and the small
-utilities (`replay`, `candump2analyzer`, `pcap2candump`).
+The retired standalone names still work: `canboat` inspects `argv[0]`, so a
+symlink named `analyzer`, `actisense-serial`, `ikonvert-serial`,
+`socketcan-serial`, `maretron-ipg`, `replay`, `n2kd`, `canboat-pipeline`, or
+`canboat-tui` dispatches into the right subcommand. `canboat install-shims`
+creates them. (`socketcan-writer` is gone too: its stdin-PLAIN → CAN-bus job
+is `canboat interface --kind socketcan -w`.)
 
-`analyzer`, `ikonvert-serial`, `n2kd`, `canboat-pipeline`, and
-`socketcan-serial` are exercised against real hardware and pass a
-byte-for-byte golden-test suite against canboat C's output.
+Everything is now one binary — `canboat` — plus those compatibility shims.
+
+The decode path, the device bridges, `n2kd`, and the `server` pipeline are
+exercised against real hardware and pass a byte-for-byte golden-test suite
+against canboat C's output.
 
 ## Installation
 
@@ -90,17 +104,17 @@ Same decode work — `-json -nv` over 1.26 M PGN frames (canboat's
 |------------------------|----------:|--------------:|
 | canboatjs (Node 25)    |  27.8 s   |   **8.1 ×**   |
 | canboat C              |   9.1 s   |   **2.6 ×**   |
-| canboat-rs `analyzer`  |   3.4 s   |       1.0 ×   |
+| canboat-rs `canboat convert` |   3.4 s   |       1.0 ×   |
 
-`canboat-pipeline` goes one step further and collapses the
-`analyzer | n2kd` pipeline into a single process with no JSON text
-serialisation between stages:
+`canboat server` goes one step further and collapses the
+`canboat convert | canboat n2kd` pipeline into a single process with no
+JSON text serialisation between stages:
 
-| Pipeline                                | Wall time | Throughput            |
-|-----------------------------------------|----------:|-----------------------|
-| `analyzer` alone (PGN decode only)      |   3.3 s   | 380 k frames / s      |
-| `analyzer \| n2kd` (piped, two procs)   |   6.5 s   | 194 k sentences / s   |
-| `canboat-pipeline` (single proc)        |   3.5 s   | 360 k sentences / s   |
+| Pipeline                                          | Wall time | Throughput          |
+|---------------------------------------------------|----------:|---------------------|
+| `canboat convert` alone (PGN decode only)         |   3.3 s   | 380 k frames / s    |
+| `canboat convert \| canboat n2kd` (piped, 2 proc) |   6.5 s   | 194 k sentences / s |
+| `canboat server` (single proc)                    |   3.5 s   | 360 k sentences / s |
 
 That's 46 % less wall time than the piped setup while doing strictly more
 work (it's a long-running service with TCP fan-out); on CPU time the ratio

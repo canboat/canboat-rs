@@ -108,22 +108,24 @@ thread_local! {
 }
 
 pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions) -> fmt::Result {
-    // canboat 7.1.0: wrap the record in `{"<id>":{...}}` when the
-    // PGN's `Id` was explicitly pinned in the canboat C source. Today
-    // only PGN 130846 fires this — the Id was preserved across a
-    // Description rename. The trailing `}` is balanced after the body
-    // closes. See `analyzer/analyzer.c::printPgn` and
-    // `analyzer/pgn.c::camelCase` (PR canboat#705 / canboat-rs #9).
-    if pgn.id_is_pinned {
+    // In camelCase mode (`-camel` / `-upper-camel`) every record is
+    // wrapped in `{"<camelId>":{...}}`, keyed on the PGN's camelCase
+    // identifier; the trailing `}` is balanced after the body closes.
+    // Plain `-json` never wraps. canboat C originally keyed this on the
+    // presence of a pinned `camelDescription` (so PGN 130846 wrapped
+    // even in plain `-json`); canboat#746 corrected it to key on the
+    // `-camel` flag instead. See `analyzer/analyzer.c::printPgn`.
+    let wrap = opts.camel_case != CamelCase::Off;
+    if wrap {
         w.write_char('{')?;
         w.write_str("\"")?;
-        w.write_str(pgn.id)?;
+        w.write_str(pgn_display_description(pgn, opts.camel_case).as_ref())?;
         w.write_str("\":")?;
     }
     w.write_char('{')?;
     if let Some(ts) = &pgn.timestamp {
         w.write_str("\"timestamp\":")?;
-        write_json_string(w, ts)?;
+        write_json_string(w, &crate::format::normalize_timestamp(ts))?;
         w.write_char(',')?;
     }
     write!(
@@ -147,7 +149,7 @@ pub fn write_json<W: fmt::Write>(w: &mut W, pgn: &DecodedPgn, opts: &JsonOptions
     let result = write_json_inner(w, pgn, opts, &mut fields_buf);
     FIELDS_BUF.with(|c| *c.borrow_mut() = fields_buf);
     result?;
-    if pgn.id_is_pinned {
+    if wrap {
         w.write_char('}')?;
     }
     Ok(())
@@ -960,7 +962,7 @@ mod tests {
         // before Phase 5 (when DecodedField duplicated id/name/unit
         // inline). Use a real &'static FieldInfo so the new shape
         // compiles without us standing up a parallel test schema.
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(128267)
             .expect("PGN 128267 present");
         let offset_field = &info.fields[2];
@@ -993,9 +995,11 @@ mod tests {
         let pgn = sample_pgn();
         let mut out = String::new();
         write_json(&mut out, &pgn, &JsonOptions::default()).unwrap();
+        // The sample timestamp lacks a trailing `Z`; the formatter
+        // canonicalises it to ISO-8601 UTC on emit.
         assert_eq!(
             out,
-            r#"{"timestamp":"2018-10-16T22:25:25.166","prio":3,"src":35,"dst":255,"pgn":128267,"description":"Water Depth","fields":{"Offset":0.000}}"#
+            r#"{"timestamp":"2018-10-16T22:25:25.166Z","prio":3,"src":35,"dst":255,"pgn":128267,"description":"Water Depth","fields":{"Offset":0.000}}"#
         );
     }
 

@@ -35,8 +35,11 @@ pub const RAWFRAME_MAX_SIZE: usize = 255 * 7;
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RawFrame {
     /// Free-form timestamp string as captured on the input line (or `None`
-    /// if the source did not carry one). Preserved verbatim so emitted
-    /// output round-trips.
+    /// if the source did not carry one). Kept verbatim in the frame; the
+    /// output formatters canonicalise it to
+    /// [`normalize_timestamp`](crate::format::normalize_timestamp) on
+    /// emit (comma millis → dot, ISO-8601 UTC `T…Z` for date-bearing
+    /// values).
     pub timestamp: Option<String>,
     pub prio: u8,
     pub pgn: u32,

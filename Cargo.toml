@@ -6,20 +6,8 @@ members = [
     "crates/canboat-io",
     "crates/canboat-tokio",
     "crates/canboat-cli",
-    "crates/analyzer",
-    "crates/actisense-serial",
-    "crates/ikonvert-serial",
-    "crates/maretron-ipg",
-    "crates/replay",
-    "crates/candump2analyzer",
-    "crates/pcap2candump",
-    "crates/nif2analyzer",
-    "crates/socketcan-writer",
-    "crates/socketcan-serial",
-    "crates/n2kd",
+    "crates/canboat",
     "crates/canboat-wire",
-    "crates/canboat-pipeline",
-    "crates/canboat-tui",
 ]
 
 [workspace.package]

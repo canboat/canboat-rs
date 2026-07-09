@@ -44,7 +44,7 @@ mod config {
         /// Preferred source address to claim. Defaults to 0.
         pub address: u8,
         /// Unique number for the ISO NAME's identity field. 0 = derive
-        /// from the process id.
+        /// from the machine id (stable per-host across restarts).
         pub unique: u32,
         /// Manufacturer code for the ISO NAME. Defaults to 999 (Signal K).
         pub manufacturer: u16,
@@ -103,6 +103,7 @@ mod imp {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     use canboat_core::format::ikonvert::{NetworkStatus, build_network_status};
+    use canboat_core::format::{days_to_ymd, iso11783_compose, iso11783_decompose};
     use canboat_core::frame::RawFrame;
     use canboat_core::{FramePacketType, Reassembled, Reassembler};
     use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Socket};
@@ -229,54 +230,6 @@ mod imp {
         format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
     }
 
-    fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-        let z = days + 719_468;
-        let era = z.div_euclid(146_097);
-        let doe = z - era * 146_097;
-        let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-        let y = yoe + era * 400;
-        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-        let mp = (5 * doy + 2) / 153;
-        let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-        let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-        ((y + i64::from(m <= 2)) as i32, m, d)
-    }
-
-    /// Decompose a 29-bit ISO 11783 CAN id into (prio, pgn, src, dst).
-    /// Matches `getISO11783BitsFromCanId` in canboat/common/common.c.
-    fn iso_decompose(id: u32) -> (u8, u32, u8, u8) {
-        let prio = ((id >> 26) & 0x7) as u8;
-        let rdp = (id >> 24) & 0x3;
-        let pf = ((id >> 16) & 0xff) as u8;
-        let ps = ((id >> 8) & 0xff) as u8;
-        let src = (id & 0xff) as u8;
-        if pf < 240 {
-            (prio, (rdp << 16) | ((pf as u32) << 8), src, ps)
-        } else {
-            (
-                prio,
-                (rdp << 16) | ((pf as u32) << 8) | ps as u32,
-                src,
-                0xff,
-            )
-        }
-    }
-
-    /// Build the 29-bit ISO 11783 CAN id (without the EFF flag) from N2K
-    /// fields. Mirrors `getCanIdFromISO11783Bits`.
-    fn iso_compose(prio: u8, pgn: u32, src: u8, dst: u8) -> u32 {
-        let mut id = src as u32;
-        let pf = (pgn >> 8) & 0xff;
-        if pf < 240 {
-            id |= (dst as u32) << 8;
-            id |= pgn << 8;
-        } else {
-            id |= pgn << 8;
-        }
-        id |= (prio as u32) << 26;
-        id
-    }
-
     /// Build the 64-bit ISO NAME from a [`Config`].
     fn build_name(config: &Config) -> u64 {
         let unique = if config.unique != 0 {
@@ -383,7 +336,7 @@ mod imp {
         /// is true the consumer also sees one coalesced `RawFrame` on
         /// `frames_tx` (same contract as inbound — never split).
         fn send_pgn(&mut self, prio: u8, pgn: u32, src: u8, dst: u8, data: &[u8], emit: bool) {
-            let can_id = iso_compose(prio, pgn, src, dst);
+            let can_id = iso11783_compose(prio, pgn, src, dst);
             // Single vs fast-packet is decided strictly from the PGN
             // type table generated at build time from canboat.json.
             // **Never** infer from `data.len()` alone: a single-frame
@@ -1083,7 +1036,7 @@ mod imp {
         data: &[u8],
         when: u64,
     ) {
-        let (prio, pgn, src, dst) = iso_decompose(can_id);
+        let (prio, pgn, src, dst) = iso11783_decompose(can_id);
         let single_frame = RawFrame::new(
             Some(format_iso(when)),
             prio,

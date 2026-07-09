@@ -229,101 +229,105 @@ struct RawFieldTypeValue {
 
 const RAD_TO_DEG: f64 = 180.0 / std::f64::consts::PI;
 
-/// Computed-at-codegen fields not present in canboat.json — returned
-/// alongside the raw record so the emitter can populate the `Copy`
-/// schema struct.
-#[derive(Default, Clone, Copy)]
-struct Computed {
+/// Which unit system a generated schema presents. `Si` keeps
+/// canboat.json's base units (`rad`, `K`, `Pa`, `C`); `Metric` applies
+/// canboat's practical `fixupUnit` (`deg`, `°C`, `bar`, `Ah`).
+#[derive(PartialEq, Eq, Clone, Copy)]
+enum Units {
+    Si,
+    Metric,
+}
+
+/// `(absolute_idx_into_PGNS, parsed PGN record, parsed fields)` — the
+/// unit the Phase 3 dispatcher emitter walks.
+type VariantEntry<'a> = (usize, &'a RawPgn, &'a Vec<RawField>);
+
+/// The units-dependent presentation of a field: everything `fixupUnit`
+/// touches, plus the two codegen-derived display fields. Computed
+/// per-`Units` at emit time so the same [`RawField`] can back both the
+/// SI and Metric schemas.
+struct FieldView {
+    resolution: Option<f64>,
+    unit: Option<String>,
+    range_min: Option<f64>,
+    range_max: Option<f64>,
     unit_offset: f64,
     precision: u8,
     is_dynamic_length_marker: bool,
 }
 
-/// `(absolute_idx_into_PGNS, parsed PGN record, parsed fields + codegen
-/// scratch)` — the unit the Phase 3 dispatcher emitter walks.
-type VariantEntry<'a> = (usize, &'a RawPgn, &'a Vec<(RawField, Computed)>);
+/// True when `f`'s unit is one canboat's `fixupUnit` rewrites, i.e. the
+/// SI and Metric views of the field differ. A PGN with no such field
+/// can share one `FieldInfo` slice between both schemas.
+fn field_converts(f: &RawField) -> bool {
+    match f.unit.as_deref() {
+        Some("rad") | Some("rad/s") | Some("Pa") | Some("C") => true,
+        Some("K") => !f.signed.unwrap_or(false),
+        _ => false,
+    }
+}
 
-fn compute_field(f: &mut RawField) -> Computed {
-    let mut c = Computed {
+fn field_view(f: &RawField, units: Units) -> FieldView {
+    let mut v = FieldView {
+        resolution: f.resolution,
+        unit: f.unit.clone(),
+        range_min: f.range_min,
+        range_max: f.range_max,
+        unit_offset: 0.0,
+        precision: 0,
         is_dynamic_length_marker: f.name == "Length",
-        ..Computed::default()
     };
 
-    // canboat hard-codes 7-decimal display precision for lat/lon.
-    if let Some(pq) = f.physical_quantity.as_deref()
-        && (pq == "GEOGRAPHICAL_LATITUDE" || pq == "GEOGRAPHICAL_LONGITUDE")
-    {
-        c.precision = 7;
+    // canboat hard-codes 7-decimal display precision for lat/lon
+    // (units-independent).
+    if matches!(
+        f.physical_quantity.as_deref(),
+        Some("GEOGRAPHICAL_LATITUDE") | Some("GEOGRAPHICAL_LONGITUDE")
+    ) {
+        v.precision = 7;
     }
 
-    let Some(unit) = f.unit.clone() else {
-        return c;
-    };
-    match unit.as_str() {
-        "rad" => {
-            if let Some(r) = f.resolution.as_mut() {
-                *r *= RAD_TO_DEG;
-            }
-            if let Some(v) = f.range_min.as_mut() {
-                *v *= RAD_TO_DEG;
-            }
-            if let Some(v) = f.range_max.as_mut() {
-                *v = (*v * RAD_TO_DEG).max(360.0);
-            }
-            f.unit = Some("deg".to_string());
-            c.precision = 1;
+    if units == Units::Si {
+        return v; // strict SI base units — no fixupUnit
+    }
+
+    match f.unit.as_deref() {
+        Some("rad") => {
+            v.resolution = f.resolution.map(|r| r * RAD_TO_DEG);
+            v.range_min = f.range_min.map(|x| x * RAD_TO_DEG);
+            v.range_max = f.range_max.map(|x| (x * RAD_TO_DEG).max(360.0));
+            v.unit = Some("deg".to_string());
+            v.precision = 1;
         }
-        "rad/s" => {
-            if let Some(r) = f.resolution.as_mut() {
-                *r *= RAD_TO_DEG;
-            }
-            if let Some(v) = f.range_min.as_mut() {
-                *v *= RAD_TO_DEG;
-            }
-            if let Some(v) = f.range_max.as_mut() {
-                *v *= RAD_TO_DEG;
-            }
-            f.unit = Some("deg/s".to_string());
+        Some("rad/s") => {
+            v.resolution = f.resolution.map(|r| r * RAD_TO_DEG);
+            v.range_min = f.range_min.map(|x| x * RAD_TO_DEG);
+            v.range_max = f.range_max.map(|x| x * RAD_TO_DEG);
+            v.unit = Some("deg/s".to_string());
         }
-        "K" if !f.signed.unwrap_or(false) => {
-            c.unit_offset = -273.15;
-            if let Some(v) = f.range_min.as_mut() {
-                *v += -273.15;
-            }
-            if let Some(v) = f.range_max.as_mut() {
-                // Match canboat's faithfully-quirky 275.15 subtraction.
-                *v += -275.15;
-            }
-            f.unit = Some("C".to_string());
+        Some("K") if !f.signed.unwrap_or(false) => {
+            v.unit_offset = -273.15;
+            v.range_min = f.range_min.map(|x| x - 273.15);
+            // Match canboat's faithfully-quirky 275.15 subtraction.
+            v.range_max = f.range_max.map(|x| x - 275.15);
+            v.unit = Some("C".to_string());
         }
-        "Pa" => {
-            if let Some(r) = f.resolution.as_mut() {
-                *r /= 100_000.0;
-            }
-            if let Some(v) = f.range_min.as_mut() {
-                *v /= 100_000.0;
-            }
-            if let Some(v) = f.range_max.as_mut() {
-                *v /= 100_000.0;
-            }
-            f.unit = Some("bar".to_string());
-            c.precision = 3;
+        Some("Pa") => {
+            v.resolution = f.resolution.map(|r| r / 100_000.0);
+            v.range_min = f.range_min.map(|x| x / 100_000.0);
+            v.range_max = f.range_max.map(|x| x / 100_000.0);
+            v.unit = Some("bar".to_string());
+            v.precision = 3;
         }
-        "C" => {
-            if let Some(r) = f.resolution.as_mut() {
-                *r /= 3600.0;
-            }
-            if let Some(v) = f.range_min.as_mut() {
-                *v /= 3600.0;
-            }
-            if let Some(v) = f.range_max.as_mut() {
-                *v /= 3600.0;
-            }
-            f.unit = Some("Ah".to_string());
+        Some("C") => {
+            v.resolution = f.resolution.map(|r| r / 3600.0);
+            v.range_min = f.range_min.map(|x| x / 3600.0);
+            v.range_max = f.range_max.map(|x| x / 3600.0);
+            v.unit = Some("Ah".to_string());
         }
         _ => {}
     }
-    c
+    v
 }
 
 #[derive(Default, Clone, Copy)]
@@ -510,7 +514,7 @@ fn missing_arr(m: &Option<Vec<String>>) -> String {
     out
 }
 
-fn emit_field(out: &mut String, f: &RawField, c: Computed) {
+fn emit_field(out: &mut String, f: &RawField, v: &FieldView) {
     write!(
         out,
         "FieldInfo{{order:{order},id:{id},name:{name},description:{description},\
@@ -532,15 +536,16 @@ fn emit_field(out: &mut String, f: &RawField, c: Computed) {
         blv = opt_bool(&f.bit_length_variable),
         bit_offset = opt_int(&f.bit_offset),
         bit_start = opt_int(&f.bit_start),
-        resolution = opt_float(&f.resolution),
+        // Units-dependent presentation comes from the FieldView.
+        resolution = opt_float(&v.resolution),
         signed = opt_bool(&f.signed),
         offset = opt_int(&f.offset),
-        range_min = opt_float(&f.range_min),
-        range_max = opt_float(&f.range_max),
+        range_min = opt_float(&v.range_min),
+        range_max = opt_float(&v.range_max),
         uv = opt_int(&f.unknown_value),
         orv = opt_int(&f.out_of_range_value),
         rv = opt_int(&f.reserved_value),
-        unit = opt_str(&f.unit),
+        unit = opt_str(&v.unit),
         pq = opt_str(&f.physical_quantity),
         ft = opt_field_type(&f.field_type),
         le = opt_str(&f.lookup_enumeration),
@@ -551,26 +556,43 @@ fn emit_field(out: &mut String, f: &RawField, c: Computed) {
         mv = opt_int(&f.match_value),
         popk = opt_bool(&f.part_of_primary_key),
         cond = opt_str(&f.condition),
-        unit_offset = float(c.unit_offset),
-        precision = c.precision,
-        dlm = c.is_dynamic_length_marker,
+        unit_offset = float(v.unit_offset),
+        precision = v.precision,
+        dlm = v.is_dynamic_length_marker,
     )
     .unwrap();
 }
 
-fn emit_pgn(
-    out: &mut String,
-    p: &RawPgn,
-    fields_with_computed: &[(RawField, Computed)],
-    from_synthetic: bool,
-) {
+/// Emit `static {ident}: &[FieldInfo] = &[ … ];` — one PGN's fields in
+/// the given unit system. Shared between both schemas when the PGN has
+/// no convertible field.
+fn emit_field_array(out: &mut String, ident: &str, fields: &[RawField], units: Units) {
+    write!(out, "static {ident}:&[FieldInfo]=&[").unwrap();
+    for f in fields {
+        emit_field(out, f, &field_view(f, units));
+    }
+    writeln!(out, "];").unwrap();
+}
+
+/// Emit one `PgnInfo` literal that references its fields by the named
+/// static `fields_ident` (so SI and Metric can share the same slice).
+fn emit_pgn(out: &mut String, p: &RawPgn, fields_ident: &str, from_synthetic: bool) {
+    // Synthetic PGNs (post-canboat.json list) never wrap — they're
+    // not in canboat C's PGN list, so the camelDescription contract
+    // doesn't apply. Otherwise: pinned iff the natural camelize of
+    // the description doesn't yield the declared Id.
+    let id_is_pinned = !from_synthetic && camelize_lower(&p.description) != p.id;
     writeln!(
         out,
         "PgnInfo{{pgn:{pgn},id:{id},description:{description},explanation:{explanation},\
          url:{url},packet_type:{packet_type},complete:{complete},fallback:{fallback},\
          missing:{missing},priority:{priority},transmission_interval:{ti},\
          transmission_irregular:{tirr},field_count:{fc},length:{length},min_length:{ml},\
-         fields:&[",
+         fields:{fields_ident},\
+         repeating_field_set1_size:{r1s},repeating_field_set1_start_field:{r1sf},\
+         repeating_field_set1_count_field:{r1cf},repeating_field_set2_size:{r2s},\
+         repeating_field_set2_start_field:{r2sf},repeating_field_set2_count_field:{r2cf},\
+         id_is_pinned:{pinned}}},",
         pgn = p.pgn,
         id = quote(&p.id),
         description = quote(&p.description),
@@ -586,22 +608,6 @@ fn emit_pgn(
         fc = p.field_count,
         length = opt_int(&p.length),
         ml = opt_int(&p.min_length),
-    )
-    .unwrap();
-    for (f, c) in fields_with_computed {
-        emit_field(out, f, *c);
-    }
-    // Synthetic PGNs (post-canboat.json list) never wrap — they're
-    // not in canboat C's PGN list, so the camelDescription contract
-    // doesn't apply. Otherwise: pinned iff the natural camelize of
-    // the description doesn't yield the declared Id.
-    let id_is_pinned = !from_synthetic && camelize_lower(&p.description) != p.id;
-    writeln!(
-        out,
-        "],repeating_field_set1_size:{r1s},repeating_field_set1_start_field:{r1sf},\
-         repeating_field_set1_count_field:{r1cf},repeating_field_set2_size:{r2s},\
-         repeating_field_set2_start_field:{r2sf},repeating_field_set2_count_field:{r2cf},\
-         id_is_pinned:{pinned}}},",
         r1s = opt_int(&p.repeating_field_set1_size),
         r1sf = opt_int(&p.repeating_field_set1_start_field),
         r1cf = opt_int(&p.repeating_field_set1_count_field),
@@ -611,6 +617,130 @@ fn emit_pgn(
         pinned = id_is_pinned,
     )
     .unwrap();
+}
+
+/// camelCase canboat id → `SCREAMING_SNAKE_CASE` (a static/const name).
+/// Breaks only at a lower/digit → upper boundary, so `cogSogRapidUpdate`
+/// → `COG_SOG_RAPID_UPDATE` and `windAngle` → `WIND_ANGLE`. Any non
+/// `[A-Za-z0-9]` byte becomes `_`, and a leading digit is `_`-prefixed so
+/// the result is always a valid identifier.
+fn screaming(id: &str) -> String {
+    let mut out = String::with_capacity(id.len() + 4);
+    let mut prev_lower_or_digit = false;
+    for c in id.chars() {
+        if c.is_ascii_uppercase() && prev_lower_or_digit {
+            out.push('_');
+        }
+        out.push(if c.is_ascii_alphanumeric() {
+            c.to_ascii_uppercase()
+        } else {
+            '_'
+        });
+        prev_lower_or_digit = c.is_ascii_lowercase() || c.is_ascii_digit();
+    }
+    if out.starts_with(|c: char| c.is_ascii_digit()) {
+        out.insert(0, '_');
+    }
+    out
+}
+
+/// camelCase canboat id → `snake_case` module name. Keyword collisions
+/// (none today, but pgn ids come from an external file) get a trailing
+/// `_` so the module name always parses.
+fn snake(id: &str) -> String {
+    let s = screaming(id).to_ascii_lowercase();
+    const KEYWORDS: &[&str] = &[
+        "as", "break", "const", "continue", "crate", "dyn", "else", "enum", "extern", "false",
+        "fn", "for", "if", "impl", "in", "let", "loop", "match", "mod", "move", "mut", "pub",
+        "ref", "return", "self", "static", "struct", "super", "trait", "true", "type", "union",
+        "unsafe", "use", "where", "while", "async", "await", "gen",
+    ];
+    if KEYWORDS.contains(&s.as_str()) {
+        format!("{s}_")
+    } else {
+        s
+    }
+}
+
+/// Emit the id-keyed constant references:
+///
+/// * `pub mod pgn` — one `pub static <ID>: &PgnInfo` per PGN definition.
+/// * `pub mod field` — a `pub mod <pgn_id>` per PGN, each with a
+///   `pub static <FIELD_ID>: FieldRef` per field.
+///
+/// Both index the SI arrays emitted above (`PGNS_SI`, `F{i}`), which is
+/// legal because a `static`'s initializer may reference another `static`
+/// by address; id/name/order are unit-invariant so these double for
+/// Metric. Duplicate ids (repeated `reserved`/`spare` fields, and the
+/// rare shared PGN id) keep the first occurrence, mirroring
+/// [`PgnDatabase::pgn_by_id`].
+fn emit_id_constants(out: &mut String, pgns: &[(RawPgn, Vec<RawField>)]) {
+    use std::collections::HashSet;
+
+    writeln!(
+        out,
+        "/// Compile-time `&'static PgnInfo` per PGN definition, keyed by canboat id.\n\
+         ///\n\
+         /// `pgn::WIND_DATA` is the SI-schema line for `windData`; the id,\n\
+         /// description, and field metadata are unit-invariant so it also\n\
+         /// describes the Metric schema.\n\
+         pub mod pgn {{\n\
+         use super::PGNS_SI;\n\
+         use canboat_schema::PgnInfo;"
+    )
+    .unwrap();
+    let mut used: HashSet<&str> = HashSet::new();
+    for (i, (p, _)) in pgns.iter().enumerate() {
+        let name = screaming(&p.id);
+        if name.is_empty() || !used.insert(p.id.as_str()) {
+            continue;
+        }
+        writeln!(out, "pub static {name}: &PgnInfo = &PGNS_SI[{i}];").unwrap();
+    }
+    writeln!(out, "}}").unwrap();
+
+    writeln!(
+        out,
+        "/// Compile-time [`FieldRef`] per (PGN, field), grouped by PGN id:\n\
+         /// `field::wind_data::WIND_ANGLE`.\n\
+         pub mod field {{"
+    )
+    .unwrap();
+    let mut used_mods: HashSet<String> = HashSet::new();
+    for (i, (p, fields)) in pgns.iter().enumerate() {
+        let module = snake(&p.id);
+        if module.is_empty() || !used_mods.insert(module.clone()) {
+            continue;
+        }
+        // Collect first so an empty (or fully-deduped) PGN emits no module
+        // and therefore no unused `use`.
+        let mut consts: Vec<(String, usize)> = Vec::with_capacity(fields.len());
+        let mut used_fields: HashSet<&str> = HashSet::new();
+        for (j, f) in fields.iter().enumerate() {
+            let name = screaming(&f.id);
+            if name.is_empty() || !used_fields.insert(f.id.as_str()) {
+                continue;
+            }
+            consts.push((name, j));
+        }
+        if consts.is_empty() {
+            continue;
+        }
+        writeln!(
+            out,
+            "pub mod {module} {{\nuse super::super::{{PGNS_SI, F{i}}};\nuse canboat_schema::FieldRef;"
+        )
+        .unwrap();
+        for (name, j) in consts {
+            writeln!(
+                out,
+                "pub static {name}: FieldRef = FieldRef {{ pgn: &PGNS_SI[{i}], field: &F{i}[{j}] }};"
+            )
+            .unwrap();
+        }
+        writeln!(out, "}}").unwrap();
+    }
+    writeln!(out, "}}").unwrap();
 }
 
 fn emit_lookup_value(out: &mut String, v: &RawLookupValue) {
@@ -802,16 +932,13 @@ fn main() {
 
     // Apply non-SI fix-up to every field, capturing the derived
     // unit_offset / precision / is_dynamic_length_marker.
-    let pgn_with_fields: Vec<(RawPgn, Vec<(RawField, Computed)>)> = pgns
+    // Fields are kept in canboat.json (SI) form; the SI/Metric
+    // presentation is computed per-`Units` at emit time by `field_view`.
+    let pgn_with_fields: Vec<(RawPgn, Vec<RawField>)> = pgns
         .into_iter()
         .map(|mut p| {
             let fields = std::mem::take(&mut p.fields);
-            let mut out = Vec::with_capacity(fields.len());
-            for mut f in fields {
-                let c = compute_field(&mut f);
-                out.push((f, c));
-            }
-            (p, out)
+            (p, fields)
         })
         .collect();
 
@@ -908,16 +1035,48 @@ fn main() {
     )
     .unwrap();
 
-    // PGNS array. Entries past `canboat_pgn_count` come from
-    // synthetic-pgns.json — canboat C doesn't know about those, so
-    // their Ids shouldn't trigger the camelDescription wrapping
-    // even when they happen to differ from camelize(description).
-    writeln!(out, "pub static PGNS: &[PgnInfo] = &[").unwrap();
-    for (i, (p, fields)) in pgn_with_fields.iter().enumerate() {
+    // Field arrays, one (or two) per PGN. `F{i}` is the SI/base slice;
+    // a `F{i}M` Metric slice is emitted only when the PGN actually
+    // contains a convertible field — otherwise both schemas share `F{i}`.
+    // Strings inside the FieldInfo literals dedupe across both via the
+    // linker's `.rodata` string merging, so only the ~74 differing PGNs
+    // cost extra struct bytes.
+    for (i, (_p, fields)) in pgn_with_fields.iter().enumerate() {
+        emit_field_array(&mut out, &format!("F{i}"), fields, Units::Si);
+        if fields.iter().any(field_converts) {
+            emit_field_array(&mut out, &format!("F{i}M"), fields, Units::Metric);
+        }
+    }
+
+    // PGNS_SI / PGNS_METRIC. Entries past `canboat_pgn_count` come from
+    // synthetic-pgns.json — canboat C doesn't know about those, so their
+    // Ids shouldn't trigger the camelDescription wrapping even when they
+    // happen to differ from camelize(description). The two arrays differ
+    // only in which field slice each PgnInfo points at.
+    writeln!(out, "pub static PGNS_SI: &[PgnInfo] = &[").unwrap();
+    for (i, (p, _fields)) in pgn_with_fields.iter().enumerate() {
         let from_synthetic = i >= canboat_pgn_count;
-        emit_pgn(&mut out, p, fields, from_synthetic);
+        emit_pgn(&mut out, p, &format!("F{i}"), from_synthetic);
     }
     writeln!(out, "];").unwrap();
+
+    writeln!(out, "pub static PGNS_METRIC: &[PgnInfo] = &[").unwrap();
+    for (i, (p, fields)) in pgn_with_fields.iter().enumerate() {
+        let from_synthetic = i >= canboat_pgn_count;
+        let ident = if fields.iter().any(field_converts) {
+            format!("F{i}M")
+        } else {
+            format!("F{i}")
+        };
+        emit_pgn(&mut out, p, &ident, from_synthetic);
+    }
+    writeln!(out, "];").unwrap();
+
+    // Id-keyed constant references into the arrays above, so code can say
+    // `pgn::WIND_DATA` / `field::wind_data::WIND_ANGLE` instead of the
+    // stringly-typed `("windData","windAngle")` pair. They index the SI
+    // arrays (`PGNS_SI` / `F{i}`); id/name/order are unit-invariant.
+    emit_id_constants(&mut out, &pgn_with_fields);
 
     // PGN_INDEX — sorted by pgn number, value is &[u32] of indices.
     writeln!(out, "pub static PGN_INDEX: &[(u32, &[u32])] = &[").unwrap();
@@ -969,7 +1128,7 @@ fn main() {
     // --- Phase 3 codegen: per-PGN dispatch on Match fields. ---
     //
     // For each PGN number we know about, emit either:
-    //   * `pub fn dispatch_<pgn>(payload: &[u8]) -> Option<&'static PgnInfo>`
+    //   * `pub fn dispatch_<pgn>(payload: &[u8]) -> Option<usize>`
     //     when at least one variant carries Match fields, or
     //   * nothing (the top-level `dispatch` returns the single variant
     //     directly).
@@ -1013,7 +1172,7 @@ fn main() {
     .unwrap();
     writeln!(
         out,
-        "pub fn dispatch(pgn: u32, payload: &[u8]) -> Option<&'static PgnInfo> {{"
+        "pub fn dispatch(pgn: u32, payload: &[u8]) -> Option<usize> {{"
     )
     .unwrap();
     writeln!(out, "    match pgn {{").unwrap();
@@ -1023,7 +1182,7 @@ fn main() {
         } else {
             // Single variant, no Match fields — direct return.
             let idx = variants[0].0;
-            writeln!(out, "        {pgn_num} => Some(&PGNS[{idx}]),").unwrap();
+            writeln!(out, "        {pgn_num} => Some({idx}),").unwrap();
         }
     }
     writeln!(out, "        _ => None,").unwrap();
@@ -1056,11 +1215,7 @@ fn main() {
          /// Mirrors canboat's `searchForUnknownPgn`."
     )
     .unwrap();
-    writeln!(
-        out,
-        "pub fn find_catchall(pgn: u32) -> Option<&'static PgnInfo> {{"
-    )
-    .unwrap();
+    writeln!(out, "pub fn find_catchall(pgn: u32) -> Option<usize> {{").unwrap();
     writeln!(
         out,
         "    let i = FALLBACKS.partition_point(|&(p, _)| p <= pgn);"
@@ -1068,7 +1223,7 @@ fn main() {
     .unwrap();
     writeln!(
         out,
-        "    if i == 0 {{ None }} else {{ Some(&PGNS[FALLBACKS[i - 1].1 as usize]) }}"
+        "    if i == 0 {{ None }} else {{ Some(FALLBACKS[i - 1].1 as usize) }}"
     )
     .unwrap();
     writeln!(out, "}}").unwrap();
@@ -1085,10 +1240,10 @@ fn needs_dispatch_fn(variants: &[VariantEntry<'_>]) -> bool {
     if variants.len() > 1 {
         return true;
     }
-    variants[0].2.iter().any(|(f, _)| f.match_value.is_some())
+    variants[0].2.iter().any(|f| f.match_value.is_some())
 }
 
-/// Emit `fn dispatch_<pgn>(payload: &[u8]) -> Option<&'static PgnInfo>`.
+/// Emit `fn dispatch_<pgn>(payload: &[u8]) -> Option<usize>`.
 fn emit_per_pgn_dispatch(out: &mut String, pgn_num: u32, variants: &[VariantEntry<'_>]) {
     use std::collections::BTreeSet;
 
@@ -1098,7 +1253,7 @@ fn emit_per_pgn_dispatch(out: &mut String, pgn_num: u32, variants: &[VariantEntr
     // subsequent per-variant arms turn into integer comparisons.
     let mut ranges: BTreeSet<(u32, u32, bool, i64)> = BTreeSet::new();
     for (_, _, fields) in variants {
-        for (f, _) in *fields {
+        for f in *fields {
             if f.match_value.is_none() {
                 continue;
             }
@@ -1121,7 +1276,7 @@ fn emit_per_pgn_dispatch(out: &mut String, pgn_num: u32, variants: &[VariantEntr
 
     writeln!(
         out,
-        "fn dispatch_{pgn_num}(payload: &[u8]) -> Option<&'static PgnInfo> {{"
+        "fn dispatch_{pgn_num}(payload: &[u8]) -> Option<usize> {{"
     )
     .unwrap();
     // `let _ = payload;` keeps the parameter named (clearer at call sites)
@@ -1157,10 +1312,8 @@ fn emit_per_pgn_dispatch(out: &mut String, pgn_num: u32, variants: &[VariantEntr
     let mut specific_no_match: Option<usize> = None;
     let mut catchall_no_match: Option<usize> = None;
     for (idx, p, fields) in variants {
-        let match_fields: Vec<&(RawField, Computed)> = fields
-            .iter()
-            .filter(|(f, _)| f.match_value.is_some())
-            .collect();
+        let match_fields: Vec<&RawField> =
+            fields.iter().filter(|f| f.match_value.is_some()).collect();
         if match_fields.is_empty() {
             if p.fallback == Some(true) {
                 if catchall_no_match.is_none() {
@@ -1174,7 +1327,7 @@ fn emit_per_pgn_dispatch(out: &mut String, pgn_num: u32, variants: &[VariantEntr
         write!(out, "    if ").unwrap();
         let mut first = true;
         let mut emitted_anything = false;
-        for (f, _) in &match_fields {
+        for f in &match_fields {
             let (Some(off), Some(len)) = (f.bit_offset, f.bit_length) else {
                 if !first {
                     write!(out, " && ").unwrap();
@@ -1197,10 +1350,10 @@ fn emit_per_pgn_dispatch(out: &mut String, pgn_num: u32, variants: &[VariantEntr
             writeln!(out, "false {{}}").unwrap();
             continue;
         }
-        writeln!(out, " {{ return Some(&PGNS[{idx}]); }}").unwrap();
+        writeln!(out, " {{ return Some({idx}); }}").unwrap();
     }
     match specific_no_match.or(catchall_no_match) {
-        Some(idx) => writeln!(out, "    Some(&PGNS[{idx}])").unwrap(),
+        Some(idx) => writeln!(out, "    Some({idx})").unwrap(),
         None => writeln!(out, "    None").unwrap(),
     }
     writeln!(out, "}}").unwrap();

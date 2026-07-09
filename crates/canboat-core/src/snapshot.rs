@@ -305,14 +305,19 @@ where
     let description = crate::analyzer_json::value(line, "description")
         .unwrap_or("")
         .to_string();
+    // `-camel` lines key fields by their camelCase `id`; bare `-json` by
+    // human `name`. Pick the matching secondary-key field key so the
+    // snapshot stays correctly split per instance / function code.
+    let use_camel = crate::analyzer_json::camel_wrapper_id(line).is_some();
+    let field_key = move |f: &crate::FieldInfo| if use_camel { f.id } else { f.name };
     let is_ais = is_ais_pgn(pgn);
-    let info = crate::PgnDatabase::embedded().first_pgn(pgn);
+    let info = crate::PgnDatabase::embedded(crate::Units::Metric).first_pgn(pgn);
     let repeat_set = info.and_then(repeating_pk_set);
 
     let Some(rs) = repeat_set else {
         let secondary = info.and_then(|info| {
             composite_secondary(info, |f| {
-                crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string())
+                crate::analyzer_json::lookup_text(line, field_key(f)).map(|s| s.to_string())
             })
         });
         sink(SnapshotInput {
@@ -332,7 +337,7 @@ where
         // one record under the top-level PK alone.
         let secondary = info.and_then(|info| {
             composite_secondary(info, |f| {
-                crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string())
+                crate::analyzer_json::lookup_text(line, field_key(f)).map(|s| s.to_string())
             })
         });
         sink(SnapshotInput {
@@ -355,8 +360,8 @@ where
             pgn_info,
             rs,
             iter as u32,
-            |f| crate::analyzer_json::lookup_text(line, f.name).map(|s| s.to_string()),
-            |f, _| crate::analyzer_json::lookup_text(elem, f.name).map(|s| s.to_string()),
+            |f| crate::analyzer_json::lookup_text(line, field_key(f)).map(|s| s.to_string()),
+            |f, _| crate::analyzer_json::lookup_text(elem, field_key(f)).map(|s| s.to_string()),
         );
         let mut spliced = String::with_capacity(line.len() - arr.len() + elem.len() + 2);
         spliced.push_str(&line[..arr_start]);
@@ -633,19 +638,38 @@ impl SnapshotStore {
             by_pgn.entry(*pgn).or_default().push(((*src, sec), entry));
         }
 
+        let db = crate::PgnDatabase::embedded(crate::Units::Metric);
         let mut out = String::with_capacity(2048);
         let mut first_pgn = true;
         for (pgn, entries) in by_pgn.iter() {
             let desc = &entries[0].1.pgn_short_description;
+            // Render each stored line once; `-camel` records are wrapped
+            // `{"<pgnId>":{…}}`, bare `-json` is not. When they're camel,
+            // key the group by the pgn's camelCase id (which we already
+            // have — no need to repeat the numeric PGN as we descend) and
+            // unwrap each record; otherwise keep canboat C's numeric-key
+            // layout verbatim.
+            let rendered: Vec<Cow<'_, str>> =
+                entries.iter().map(|(_, e)| e.payload.render()).collect();
+            let camel_id = crate::analyzer_json::camel_wrapper_id(&rendered[0]);
+            let full_desc = camel_id
+                .and_then(|id| db.pgn_by_id(id))
+                .map_or(desc.as_str(), |info| info.description);
             if first_pgn {
                 out.push_str("{\"");
                 first_pgn = false;
             } else {
                 out.push_str("\n,\"");
             }
-            let _ = write!(out, "{pgn}\":\n  {{\"description\":");
+            match camel_id {
+                Some(id) => out.push_str(id),
+                None => {
+                    let _ = write!(out, "{pgn}");
+                }
+            }
+            out.push_str("\":\n  {\"description\":");
             write_json_string(&mut out, desc);
-            for ((src, sec), entry) in entries {
+            for (((src, sec), _), payload) in entries.iter().zip(rendered.iter()) {
                 out.push_str("\n  ,\"");
                 let _ = write!(out, "{src}");
                 if let Some(s) = sec.as_deref() {
@@ -653,7 +677,10 @@ impl SnapshotStore {
                     out.push_str(s);
                 }
                 out.push_str("\":");
-                out.push_str(&entry.payload.render());
+                match camel_id {
+                    Some(id) => out.push_str(&unwrap_camel_record(payload, id, full_desc)),
+                    None => out.push_str(payload),
+                }
             }
             out.push_str("\n  }");
         }
@@ -759,6 +786,27 @@ pub fn short_description(desc: &str) -> String {
     }
 }
 
+/// Turn a `-camel` analyzer payload (`{"<id>":{…}}`) into the logical
+/// snapshot record shape: strip the redundant `{"<id>":…}` wrapper (the
+/// id is already the snapshot's group key) and replace the record's
+/// `"description":"<id>"` — which `-camel` sets to the pgn id — with the
+/// human-readable `full_desc`. Field keys stay camelCase.
+///
+/// Falls back to the payload verbatim if it doesn't have the expected
+/// wrapper (defensive; every camel line the store holds does).
+fn unwrap_camel_record(payload: &str, camel_id: &str, full_desc: &str) -> String {
+    let prefix = format!("{{\"{camel_id}\":");
+    let Some(inner) = payload.trim().strip_prefix(&prefix) else {
+        return payload.to_string();
+    };
+    // Drop the wrapper's balancing `}` to expose the bare record object.
+    let inner = inner.strip_suffix('}').unwrap_or(inner);
+    let needle = format!("\"description\":\"{camel_id}\"");
+    let mut desc_json = String::new();
+    write_json_string(&mut desc_json, full_desc);
+    inner.replacen(&needle, &format!("\"description\":{desc_json}"), 1)
+}
+
 /// Write `s` as a JSON string literal (`"`, `\`, and control chars
 /// escaped; the rest goes verbatim).
 fn write_json_string(out: &mut String, s: &str) {
@@ -790,7 +838,7 @@ mod tests {
         // plus 129796 / 129816. PGN 130824 is the one driving this
         // feature (one cache entry per Key/Value pair instead of all
         // pairs collapsing into a single src-keyed entry).
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(130824)
             .expect("PGN 130824 present in embedded db");
         assert_eq!(repeating_pk_set(info), Some(1));
@@ -799,14 +847,14 @@ mod tests {
     #[test]
     fn repeating_pk_set_returns_none_for_top_level_pk() {
         // PGN 127251 (Rate of Turn) declares no primary key at all.
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(127251)
             .expect("PGN 127251 present in embedded db");
         assert_eq!(repeating_pk_set(info), None);
         // PGN 127509 (Inverter Status): composite top-level PK
         // (`Instance`, `AC Instance`, `DC Instance`), no repeating
         // set involved.
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(127509)
             .expect("PGN 127509 present in embedded db");
         assert_eq!(repeating_pk_set(info), None);
@@ -817,7 +865,7 @@ mod tests {
         // PGN 129796 (AIS Acknowledge): `Source ID` is top-level PK,
         // `Destination ID` lives in repeating set 1 — composite key
         // is `<Source ID>_<Destination ID>`.
-        let info = crate::PgnDatabase::embedded()
+        let info = crate::PgnDatabase::embedded(crate::Units::Metric)
             .first_pgn(129796)
             .expect("PGN 129796 present in embedded db");
         let set = repeating_pk_set(info).expect("129796 has repeating PK");
@@ -844,6 +892,21 @@ mod tests {
         assert_eq!(got[0].src, 17);
         assert_eq!(got[0].secondary.as_deref(), Some("0"));
         assert!(!got[0].is_ais);
+    }
+
+    #[test]
+    fn classify_json_line_keys_camel_secondary_by_field_id() {
+        // Same PGN 127501 from `analyzer -camel`: wrapped under the pgn
+        // id, `Instance` keyed as `instance`. The secondary must still
+        // resolve — reading `f.name` ("Instance") would miss the camel
+        // key and collapse every instance into one cache slot.
+        let line = r#"{"binarySwitchBankStatus":{"pgn":127501,"src":17,"description":"binarySwitchBankStatus","fields":{"instance":3}}}"#;
+        let mut got = Vec::new();
+        let n = classify_json_line(line, |input| got.push(input));
+        assert_eq!(n, 1);
+        assert_eq!(got[0].pgn, 127501);
+        assert_eq!(got[0].src, 17);
+        assert_eq!(got[0].secondary.as_deref(), Some("3"));
     }
 
     #[test]
@@ -972,6 +1035,101 @@ mod tests {
         assert!(dump.starts_with("{\"127251\":\n  {\"description\":\"Rate of Turn\""));
         assert!(dump.contains("\"7\":{\"pgn\":127251,\"src\":7,\"fields\":{\"Rate\":0}}"));
         assert!(dump.ends_with("}\n"));
+    }
+
+    /// `server --camel` stores `{"<pgnId>":{…}}` lines. The snapshot
+    /// keys the group by that camelCase id (not the numeric PGN), unwraps
+    /// each record, and restores the human `description` (which `-camel`
+    /// otherwise renders as the id). Field keys stay camelCase.
+    #[test]
+    fn snapshot_camel_keys_by_id_and_unwraps_record() {
+        let s = SnapshotStore::new();
+        s.store(SnapshotInput {
+            pgn: 60928,
+            src: 51,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "ISO Address Claim".to_string(),
+            line: r#"{"isoAddressClaim":{"prio":6,"src":51,"dst":255,"pgn":60928,"description":"isoAddressClaim","fields":{"uniqueNumber":1605586}}}"#.to_string(),
+        });
+        let expected = r#"{"isoAddressClaim":
+  {"description":"ISO Address Claim"
+  ,"51":{"prio":6,"src":51,"dst":255,"pgn":60928,"description":"ISO Address Claim","fields":{"uniqueNumber":1605586}}
+  }
+}
+"#;
+        assert_eq!(s.snapshot(), expected);
+    }
+
+    /// The two producer models the daemons feed one store with must
+    /// coexist and render together: n2kd hands over an already-
+    /// serialized line via [`SnapshotStore::store`] (`Ready`), while the
+    /// pipeline defers `write_json` of a `DecodedPgn` via
+    /// [`SnapshotStore::store_lazy`] (`Lazy`). This is the contract the
+    /// serving convergence stands on — so it is worth pinning:
+    ///
+    /// * the `Ready` line is served **byte-identically** (n2kd's
+    ///   JSON-port parity depends on the input line passing through
+    ///   untouched — not a re-serialization);
+    /// * the `Lazy` closure runs **only when a reader asks**, and then
+    ///   exactly once per read;
+    /// * both keys appear in the same `snapshot()` dump.
+    #[test]
+    fn ready_and_lazy_producers_share_one_store() {
+        use std::sync::Arc;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let s = SnapshotStore::new();
+
+        // n2kd path: the exact JSON line, stored verbatim.
+        let ready_line = r#"{"pgn":127251,"src":7,"fields":{"Rate":0}}"#;
+        s.store(SnapshotInput {
+            pgn: 127251,
+            src: 7,
+            secondary: None,
+            is_ais: false,
+            pgn_description: "Rate of Turn".to_string(),
+            line: ready_line.to_string(),
+        });
+
+        // pipeline path: serialization deferred to read time.
+        let renders = Arc::new(AtomicUsize::new(0));
+        let lazy_line = r#"{"pgn":127245,"src":9,"fields":{"Position":1.5}}"#;
+        let r = Arc::clone(&renders);
+        s.store_lazy(
+            127245,
+            9,
+            None,
+            false,
+            "Rudder",
+            Box::new(move || {
+                r.fetch_add(1, Ordering::Relaxed);
+                lazy_line.to_string()
+            }),
+            Instant::now(),
+        );
+
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            0,
+            "Lazy payload must not serialize before a reader connects"
+        );
+
+        let dump = s.snapshot();
+
+        assert!(
+            dump.contains(ready_line),
+            "Ready line must be served byte-for-byte:\n{dump}"
+        );
+        assert!(
+            dump.contains(lazy_line),
+            "Lazy record must render into the same dump:\n{dump}"
+        );
+        assert_eq!(
+            renders.load(Ordering::Relaxed),
+            1,
+            "Lazy payload renders exactly once, on read"
+        );
     }
 
     #[test]

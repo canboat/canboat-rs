@@ -35,7 +35,7 @@ async fn main() -> Result<()> {
     env_logger::init();
     let cli = Cli::parse();
 
-    let db = PgnDatabase::embedded();
+    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
 
     let port = tokio_serial::new(&cli.serial, cli.baud)
         .timeout(Duration::from_millis(250))

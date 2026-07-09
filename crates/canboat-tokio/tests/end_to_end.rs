@@ -9,7 +9,7 @@ use canboat_tokio::{IkonvertStream, Ngt1Stream};
 use futures::StreamExt;
 
 fn db() -> &'static PgnDatabase {
-    PgnDatabase::embedded()
+    PgnDatabase::embedded(canboat_core::Units::Metric)
 }
 
 /// Build the same NGT-1 wire bytes the actisense-serial replay test

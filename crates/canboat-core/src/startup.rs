@@ -9,6 +9,7 @@
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use crate::format::timestamp::{days_since_epoch, days_to_ymd};
 use crate::frame::RawFrame;
 
 /// CANboat tool-specific fake-PGN base; also the startup record's PGN.
@@ -127,37 +128,8 @@ pub fn parse_iso_ms(s: &str) -> Option<i64> {
     if hms_parts.next().is_some() {
         return None;
     }
-    let days = ymd_to_days(y, mo, d)?;
+    let days = days_since_epoch(i64::from(y), i64::from(mo), i64::from(d))?;
     Some((days * 86_400 + h * 3600 + mi * 60 + s) * 1000 + millis)
-}
-
-/// Inverse of [`days_to_ymd`]: days since 1970-01-01 for
-/// `(year, month, day)`. Returns `None` when the arguments are out
-/// of range (month 1..=12, day 1..=31).
-fn ymd_to_days(y: i32, m: u32, d: u32) -> Option<i64> {
-    if !(1..=12).contains(&m) || !(1..=31).contains(&d) {
-        return None;
-    }
-    let y = i64::from(y) - i64::from(m <= 2);
-    let era = if y >= 0 { y } else { y - 399 }.div_euclid(400);
-    let yoe = y - era * 400;
-    let m_shifted = i64::from(if m > 2 { m - 3 } else { m + 9 });
-    let doy = (153 * m_shifted + 2) / 5 + i64::from(d) - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    Some(era * 146_097 + doe - 719_468)
-}
-
-fn days_to_ymd(days: i64) -> (i32, u32, u32) {
-    let z = days + 719_468;
-    let era = z.div_euclid(146_097);
-    let doe = z - era * 146_097;
-    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
-    let y = yoe + era * 400;
-    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
-    let mp = (5 * doy + 2) / 153;
-    let d = (doy - (153 * mp + 2) / 5 + 1) as u32;
-    let m = if mp < 10 { mp + 3 } else { mp - 9 } as u32;
-    ((y + i64::from(m <= 2)) as i32, m, d)
 }
 
 #[cfg(test)]

@@ -26,7 +26,9 @@ fn decode_iso_address_claim() -> canboat_core::DecodedPgn {
         dst: 255,
         data: smallvec![0xfb, 0x9b, 0x70, 0x22, 0x00, 0x9b, 0x50, 0xc0],
     };
-    PgnDatabase::embedded().decode(&frame).expect("decode")
+    PgnDatabase::embedded(canboat_core::Units::Metric)
+        .decode(&frame)
+        .expect("decode")
 }
 
 #[test]
@@ -129,7 +131,7 @@ fn iterate_all_top_level_fields() {
 #[test]
 fn field_handle_indexed_access() {
     // "Resolve a handle once, reuse for millions of records" pattern.
-    let db = PgnDatabase::embedded();
+    let db = PgnDatabase::embedded(canboat_core::Units::Metric);
     let handle = db.field("isoAddressClaim", "uniqueNumber").expect("handle");
     let pgn = decode_iso_address_claim();
     let f = pgn.field(&handle).expect("field present");

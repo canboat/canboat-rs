@@ -46,9 +46,9 @@ pub enum QuirkKind {
     /// PGN 127258 (~1 Hz), asking older-WMM sources to stop. Needs any
     /// writable backend.
     Wmm,
-    /// Impersonate a B&G H5000 Motion Sensor (PGN 126996 Product Code
-    /// 0x53F0) and relay a bus attitude source's PGN 127257 under that
-    /// identity, so a Navico Hercules accepts it. Needs a writable backend.
+    /// Impersonate a B&G H5000 Motion Sensor when a Furuno SCX-20 is
+    /// present, so a Navico Hercules accepts it. Needs to claim a new
+    /// device, so needs socketcan.
     Motion,
 }
 

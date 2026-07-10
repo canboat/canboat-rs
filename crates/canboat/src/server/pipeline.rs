@@ -211,6 +211,11 @@ pub struct Hubs {
     /// external consumers (e.g. an NGT-1 on the same bus) see it.
     /// `None` in stdin-only mode where there's no device writer.
     pub device_sender: Option<FrameSender>,
+    /// canboat's live claimed source address (SocketCAN exposes it; other
+    /// backends leave it `None`). Used to stamp a quirk's "own-address"
+    /// emission (src `ADDR_GLOBAL`) with the real address, so it reaches
+    /// the bus and the local streams as canboat's own node.
+    pub claim_addr: Option<Arc<std::sync::atomic::AtomicU8>>,
     /// Server-owned PGN-rate overrides. Shared behind a mutex with the
     /// dedicated control-port server; the pipeline replays a device's
     /// overrides on first sight (PGN 60928) and forgets one the bus NAKs
@@ -349,19 +354,6 @@ pub fn run(
         // never reaches the bus. The pipeline only reads through the
         // shared filter below (learn NAME, mute sentences).
 
-        // Quirk shim: inspect the inbound bus frame, maybe synthesise.
-        // Each synthetic is written to the bus (so external consumers
-        // see it with the impersonated src) and queued back into this
-        // loop (so the local pipeline indexes / broadcasts it too).
-        if hubs.quirks.is_enabled() {
-            for synth in hubs.quirks.process_inbound(&frame) {
-                if let Some(sender) = hubs.device_sender.as_ref() {
-                    let _ = sender.send_frame(synth.clone());
-                }
-                pending_synth.push_back(synth);
-            }
-        }
-
         // When the source already coalesces fast-packets (NGT-1,
         // iKonvert, Maretron, FAST-format stdin), the reassembler
         // must be skipped entirely. A coalesced fast-packet whose
@@ -422,6 +414,40 @@ pub fn run(
         // JSON, NMEA, binary) via `Arc`. The snapshot's lazy cache can
         // then hold a refcount bump instead of a deep clone.
         let decoded = Arc::new(decoded);
+
+        // Quirk shim: inspect the decoded PGN, maybe synthesise. Working
+        // from the decoded record (rather than a raw pre-reassembly frame)
+        // lets quirks read typed, named fields and act on fast-packet PGNs
+        // too. Each synthetic is written to the bus (so external consumers
+        // see it, with the impersonated src where applicable) and queued
+        // back into this loop (so the local pipeline indexes / broadcasts
+        // it too).
+        if hubs.quirks.is_enabled() {
+            // canboat's live claimed address, if it holds a valid unicast
+            // one — used to resolve a quirk's "own-address" emission.
+            let own_addr = hubs
+                .claim_addr
+                .as_ref()
+                .map(|a| a.load(Ordering::Relaxed))
+                .filter(|&a| a != canboat_core::ADDR_GLOBAL && a != canboat_core::ADDR_NULL);
+            for mut synth in hubs.quirks.process_decoded(&decoded) {
+                // A quirk that emits from src 0 / ADDR_GLOBAL ("send as my
+                // own node", e.g. the WMM quirk) gets canboat's real
+                // claimed address stamped here — the one place that knows
+                // the server's identity — so the bus write and the local
+                // feedback below carry the same real src. An explicit src
+                // (the SCX-20 impersonation) passes through untouched.
+                if (synth.src == 0 || synth.src == canboat_core::ADDR_GLOBAL)
+                    && let Some(addr) = own_addr
+                {
+                    synth.src = addr;
+                }
+                if let Some(sender) = hubs.device_sender.as_ref() {
+                    let _ = sender.send_frame(synth.clone());
+                }
+                pending_synth.push_back(synth);
+            }
+        }
 
         // Feed the periodic claim/product-info request engine.
         // Updates "last received" stamps for PGN 60928 and 126996.

@@ -27,7 +27,7 @@ pub mod units;
 pub use db::{FieldHandle, PgnDatabase, Units};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use encode::{EncodeError, EncodeValue, MessageBuilder};
-pub use frame::{FASTPACKET_MAX_SIZE, RAWFRAME_MAX_SIZE, RawFrame};
+pub use frame::{ADDR_GLOBAL, ADDR_NULL, FASTPACKET_MAX_SIZE, RAWFRAME_MAX_SIZE, RawFrame};
 pub use from_json::json_to_decoded;
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
 pub use schema_data::{COPYRIGHT_ID, SCHEMA_HASH, VERSION as CANBOAT_JSON_VERSION};

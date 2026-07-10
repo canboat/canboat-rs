@@ -1,35 +1,28 @@
 // (C) 2009-2026, Kees Verruijt, Harlingen, The Netherlands.
 
-//! Device-specific firmware-quirk workarounds.
+//! Furuno SCX-20 Product-Information impersonation.
 //!
-//! Each variant of [`QuirkKind`] is a known piece of misbehaviour we
-//! actively cover for: when [`Quirks::process_inbound`] sees a frame
-//! that matches the quirk's trigger, it returns one or more synthetic
-//! `RawFrame`s for the pipeline to (1) write to the bus on behalf of
-//! the misbehaving device, and (2) feed back through its own
-//! processing path so the local analyzer / snapshot / JSON streams
-//! reflect the impersonation too.
+//! The SCX-20 satellite compass sometimes "forgets" to answer a PGN 59904
+//! ISO Request for its PGN 126996 Product Information, which breaks the
+//! Furuno Setting Tool's device discovery. With `--quirk scx20` canboat
+//! learns each SCX-20's source address from its Address Claims and, when
+//! the bus asks for 126996, fabricates the reply *from that unit's source
+//! address* on its behalf (see [[device-scx20]] /
+//! `samples/scx20-setting-tool-*.raw`).
 //!
-//! Currently only `Scx20` is recognised — see [[device-scx20]] /
-//! `samples/scx20-setting-tool-*.raw` for the captured payload and
-//! firmware quirk this works around.
-//!
-//! The workaround is gated to `--socketcan` at the CLI layer because
-//! every other device backend rewrites the source address on
-//! outbound, which would defeat the impersonation.
+//! This is impersonation — the emitted frame keeps the SCX-20's `src`, so
+//! it is gated to `--socketcan` at the CLI layer (every other backend
+//! rewrites the outbound source address).
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use canboat_core::RawFrame;
-use canboat_core::format::days_to_ymd;
+use canboat_core::{ADDR_GLOBAL, DecodedPgn, RawFrame, field};
 
 /// NMEA 2000 PGN numbers the matcher cares about.
 const PGN_ISO_REQUEST: u32 = 59904;
 const PGN_ISO_ADDRESS_CLAIM: u32 = 60928;
 const PGN_PRODUCT_INFO: u32 = 126996;
-
-const ADDR_GLOBAL: u8 = 255;
 
 /// ISO 11783-5 NAME fields that identify the SCX-20 specifically (not
 /// just any Furuno device). All three must match.
@@ -41,7 +34,7 @@ const SCX20_FUNCTION: u8 = 140;
 /// per second per known SCX-20, matching canboat C `socketcan-serial`'s
 /// product-info rate limit. The Setting Tool only needs one response
 /// per discovery sweep; bursts would just spam the bus.
-const SCX20_MIN_SYNTH_GAP: Duration = Duration::from_secs(1);
+const MIN_SYNTH_GAP: Duration = Duration::from_secs(1);
 
 /// PGN 126996 "Product Information" payload captured from a real
 /// SCX-20 (`canboat/samples/scx20-setting-tool-start.raw` and friends).
@@ -85,97 +78,66 @@ const fn copy_into<const N: usize>(dst: &mut [u8; N], offset: usize, s: &[u8]) {
     }
 }
 
-/// Single-variant for now; clap derives `ValueEnum` so the user types
-/// `--quirk scx20`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-#[clap(rename_all = "kebab-case")]
-pub enum QuirkKind {
-    /// Furuno SCX-20: respond on its behalf when something on the bus
-    /// asks for PGN 126996 — the SCX-20's firmware sometimes "forgets"
-    /// how to answer the request, breaking Setting-Tool discovery.
-    Scx20,
+/// Stateful SCX-20 impersonation. One entry per learned SCX-20 unit,
+/// keyed by its currently claimed source address; the value is the last
+/// time we synthesised a response on its behalf (for [`MIN_SYNTH_GAP`]).
+pub struct Scx20 {
+    learned: HashMap<u8, Instant>,
 }
 
-/// Stateful side of the quirk machinery. Owned by the pipeline; lives
-/// inside [`crate::server::pipeline::Hubs`] for the lifetime of `pipeline::run`.
-pub struct Quirks {
-    kinds: Vec<QuirkKind>,
-    /// One entry per learned SCX-20 unit, keyed by its currently
-    /// claimed source address. Value is the last time we synthesised
-    /// a response on its behalf (for [`SCX20_MIN_SYNTH_GAP`]).
-    scx20: HashMap<u8, Instant>,
+impl Default for Scx20 {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
-impl Quirks {
-    pub fn new(kinds: Vec<QuirkKind>) -> Self {
+impl Scx20 {
+    pub fn new() -> Self {
         Self {
-            kinds,
-            scx20: HashMap::new(),
+            learned: HashMap::new(),
         }
     }
 
-    /// `true` iff at least one quirk is enabled — lets the pipeline
-    /// skip the per-frame call entirely on the common path.
-    pub fn is_enabled(&self) -> bool {
-        !self.kinds.is_empty()
-    }
-
-    /// Inspect one inbound bus frame and produce zero or more
-    /// synthetic responses. The pipeline pushes each returned
-    /// `RawFrame` to the device writer (so it lands on the wire with
-    /// the impersonated `src` intact) and through its own processing
-    /// path (so the local n2kd / snapshot / JSON / NMEA 0183 view
-    /// reflects the synthetic frame too).
-    pub fn process_inbound(&mut self, frame: &RawFrame) -> Vec<RawFrame> {
-        if !self.is_enabled() {
-            return Vec::new();
-        }
-        if self.kinds.contains(&QuirkKind::Scx20) {
-            return self.handle_scx20(frame, Instant::now());
-        }
-        Vec::new()
-    }
-
-    /// Address-Claim learning + Product-Info impersonation for SCX-20.
-    /// `now` is injectable so the rate-limit branch is unit-testable
-    /// without `thread::sleep`.
-    fn handle_scx20(&mut self, frame: &RawFrame, now: Instant) -> Vec<RawFrame> {
-        // 1. Learn / refresh the unit's source address from Address
-        //    Claim broadcasts. Address Claim is NOT a synthesis
-        //    trigger — only a discovery channel.
-        if frame.pgn == PGN_ISO_ADDRESS_CLAIM && frame.data.len() >= 8 {
-            let name_bytes: [u8; 8] = frame.data[..8].try_into().unwrap();
-            let name = u64::from_le_bytes(name_bytes);
-            if is_scx20_name(name) {
+    /// Address-Claim learning + Product-Info impersonation. `now` is
+    /// injectable so the rate-limit branch is unit-testable without
+    /// `thread::sleep`.
+    pub fn process(&mut self, d: &DecodedPgn, now: Instant) -> Vec<RawFrame> {
+        // 1. Learn / refresh a unit's source address from its Address
+        //    Claim broadcasts. Address Claim is NOT a synthesis trigger —
+        //    only a discovery channel.
+        if d.pgn == PGN_ISO_ADDRESS_CLAIM {
+            if let Some(name) = d.iso_name()
+                && is_scx20_name(name)
+            {
                 // Stamp newly-discovered units with a "never-synthesised"
-                // sentinel so the first matching request fires
-                // immediately rather than waiting out the gap.
-                self.scx20
-                    .entry(frame.src)
-                    .or_insert_with(|| now - SCX20_MIN_SYNTH_GAP);
+                // sentinel so the first matching request fires immediately
+                // rather than waiting out the gap.
+                self.learned
+                    .entry(d.src)
+                    .or_insert_with(|| now - MIN_SYNTH_GAP);
             }
             return Vec::new();
         }
 
-        // 2. The real trigger: an ISO Request whose target PGN is
-        //    126996, addressed to either broadcast or a known SCX-20.
-        if frame.pgn != PGN_ISO_REQUEST || frame.data.len() < 3 {
+        // 2. The real trigger: an ISO Request whose target PGN is 126996,
+        //    addressed to either broadcast or a known SCX-20.
+        if d.pgn != PGN_ISO_REQUEST {
             return Vec::new();
         }
-        let target = u32::from(frame.data[0])
-            | (u32::from(frame.data[1]) << 8)
-            | (u32::from(frame.data[2]) << 16);
-        if target != PGN_PRODUCT_INFO {
+        let target = d
+            .field_ref(field::iso_request::PGN)
+            .and_then(|f| f.value.as_i64());
+        if target != Some(i64::from(PGN_PRODUCT_INFO)) {
             return Vec::new();
         }
 
-        // 3. Decide which learned SCX-20 unit(s) the request reaches.
-        //    A directed request hits at most one; broadcast hits every
-        //    known unit on the bus.
-        let mut targets: Vec<u8> = if frame.dst == ADDR_GLOBAL {
-            self.scx20.keys().copied().collect()
-        } else if self.scx20.contains_key(&frame.dst) {
-            vec![frame.dst]
+        // 3. Decide which learned SCX-20 unit(s) the request reaches. A
+        //    directed request hits at most one; broadcast hits every known
+        //    unit on the bus.
+        let mut targets: Vec<u8> = if d.dst == ADDR_GLOBAL {
+            self.learned.keys().copied().collect()
+        } else if self.learned.contains_key(&d.dst) {
+            vec![d.dst]
         } else {
             return Vec::new();
         };
@@ -185,24 +147,23 @@ impl Quirks {
         let mut out = Vec::with_capacity(targets.len());
         for src in targets {
             let last = self
-                .scx20
+                .learned
                 .get_mut(&src)
-                .expect("targets came from self.scx20");
-            if now.duration_since(*last) < SCX20_MIN_SYNTH_GAP {
+                .expect("targets came from self.learned");
+            if now.duration_since(*last) < MIN_SYNTH_GAP {
                 continue;
             }
             *last = now;
             // Loud so it never becomes an invisible default: we are
             // impersonating another node on the bus, which is unusual
-            // enough that an operator scanning the log should always
-            // see it happening. `frame.src`/`dst` identify the
-            // requester so the user can correlate with their tool of
-            // choice.
+            // enough that an operator scanning the log should always see
+            // it happening. `d.src`/`d.dst` identify the requester so the
+            // user can correlate with their tool of choice.
             log::warn!(
                 "quirk(scx20): fabricating PGN 126996 from src={src} \
                  in response to PGN 59904 request {}->{}",
-                frame.src,
-                frame.dst,
+                d.src,
+                d.dst,
             );
             out.push(build_scx20_product_info(src));
         }
@@ -210,10 +171,10 @@ impl Quirks {
     }
 }
 
-/// `true` iff `name` (LE u64 from the wire) identifies a Furuno
-/// Navigation device with the SCX-20's specific Device Function.
-/// All three NAME fields must match — manufacturer alone is too coarse,
-/// it would also accept a Furuno GPS or compass.
+/// `true` iff `name` (the ISO 11783-5 NAME) identifies a Furuno
+/// Navigation device with the SCX-20's specific Device Function. All
+/// three NAME fields must match — manufacturer alone is too coarse, it
+/// would also accept a Furuno GPS or compass.
 fn is_scx20_name(name: u64) -> bool {
     let mfg = ((name >> 21) & 0x7FF) as u16;
     let function = ((name >> 40) & 0xFF) as u8;
@@ -235,22 +196,17 @@ fn build_scx20_product_info(src: u8) -> RawFrame {
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ` from the host clock — same shape canboat
 /// C's `fmtTimestamp` emits.
 fn now_iso() -> String {
-    let dur = SystemTime::now()
+    let ms = SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap_or_default();
-    let ms = dur.as_millis() as u64;
-    let secs = (ms / 1000) as i64;
-    let millis = ms % 1000;
-    let days = secs.div_euclid(86_400);
-    let tod = secs.rem_euclid(86_400);
-    let (y, mo, d) = days_to_ymd(days);
-    let (h, mi, s) = (tod / 3600, (tod % 3600) / 60, tod % 60);
-    format!("{y:04}-{mo:02}-{d:02}T{h:02}:{mi:02}:{s:02}.{millis:03}Z")
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0);
+    canboat_core::format_iso_ms(ms)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use canboat_core::{PgnDatabase, Units};
 
     /// The captured SCX-20 NAME from `samples/scx20-setting-tool-start.all`.
     /// LE byte order on the wire, decodes to manufacturer=1855, class=60,
@@ -261,25 +217,40 @@ mod tests {
         u64::from_le_bytes(bytes)
     }
 
-    fn claim_frame(src: u8, name: [u8; 8]) -> RawFrame {
-        RawFrame::new(None, 6, PGN_ISO_ADDRESS_CLAIM, src, ADDR_GLOBAL, name)
+    fn db() -> &'static PgnDatabase {
+        PgnDatabase::embedded(Units::Si)
     }
 
-    /// PGN 59904 ISO Request for `target_pgn` (LE 3 bytes), addressed
-    /// from `src` to `dst`.
-    fn iso_request(src: u8, dst: u8, target_pgn: u32) -> RawFrame {
+    /// Decode a raw frame into the `DecodedPgn` the quirk now consumes.
+    fn decode(frame: &RawFrame) -> DecodedPgn {
+        db().decode(frame).expect("decodes")
+    }
+
+    fn claim(src: u8, name: [u8; 8]) -> DecodedPgn {
+        decode(&RawFrame::new(
+            None,
+            6,
+            PGN_ISO_ADDRESS_CLAIM,
+            src,
+            ADDR_GLOBAL,
+            name,
+        ))
+    }
+
+    /// A decoded PGN 59904 ISO Request for `target_pgn`, from `src` to `dst`.
+    fn iso_request(src: u8, dst: u8, target_pgn: u32) -> DecodedPgn {
         let data = [
             target_pgn as u8,
             (target_pgn >> 8) as u8,
             (target_pgn >> 16) as u8,
         ];
-        RawFrame::new(None, 6, PGN_ISO_REQUEST, src, dst, data)
+        decode(&RawFrame::new(None, 6, PGN_ISO_REQUEST, src, dst, data))
     }
 
     #[test]
     fn product_info_payload_matches_captured_layout() {
-        // Spot-check the parts the Setting Tool keys on; if any byte
-        // here drifts, the discovery workaround silently breaks.
+        // Spot-check the parts the Setting Tool keys on; if any byte here
+        // drifts, the discovery workaround silently breaks.
         assert_eq!(PRODUCT_INFO_SCX20.len(), 134);
         assert_eq!(&PRODUCT_INFO_SCX20[0..2], &[0x34, 0x08]); // DB version 2100
         assert_eq!(&PRODUCT_INFO_SCX20[2..4], &[0x4b, 0x29]); // Product Code 10571
@@ -299,14 +270,13 @@ mod tests {
     #[test]
     fn name_match_rejects_non_scx20() {
         // Furuno-Navigation but different function (the same class/mfg
-        // hosts non-SCX-20 Furuno devices, so function-only narrowing
-        // is required).
+        // hosts non-SCX-20 Furuno devices, so function-only narrowing is
+        // required).
         let mut other = SCX20_NAME_BYTES;
         other[5] = 0x8b; // function 139 instead of 140
         assert!(!is_scx20_name(name_le(other)));
 
         // Same function/class but Navico manufacturer (275).
-        // 275 = 0x113; bits 21-31 of NAME. Easier to build via shift.
         let navico_navigation_140: u64 = (17252_u64)
             | (275_u64 << 21)
             | (140_u64 << 40)
@@ -337,22 +307,9 @@ mod tests {
     }
 
     #[test]
-    fn disabled_quirks_produce_nothing() {
-        let mut q = Quirks::new(vec![]);
-        assert!(
-            q.process_inbound(&claim_frame(52, SCX20_NAME_BYTES))
-                .is_empty()
-        );
-        assert!(
-            q.process_inbound(&iso_request(7, ADDR_GLOBAL, PGN_PRODUCT_INFO))
-                .is_empty()
-        );
-    }
-
-    #[test]
     fn address_claim_alone_does_not_synthesise() {
-        let mut q = Quirks::new(vec![QuirkKind::Scx20]);
-        let out = q.handle_scx20(&claim_frame(52, SCX20_NAME_BYTES), Instant::now());
+        let mut q = Scx20::new();
+        let out = q.process(&claim(52, SCX20_NAME_BYTES), Instant::now());
         assert!(
             out.is_empty(),
             "Address Claim is a discovery channel, not a trigger"
@@ -361,9 +318,9 @@ mod tests {
 
     #[test]
     fn request_before_any_claim_is_ignored() {
-        let mut q = Quirks::new(vec![QuirkKind::Scx20]);
+        let mut q = Scx20::new();
         // No SCX-20 learned yet, broadcast request → nothing.
-        let out = q.handle_scx20(
+        let out = q.process(
             &iso_request(7, ADDR_GLOBAL, PGN_PRODUCT_INFO),
             Instant::now(),
         );
@@ -372,13 +329,13 @@ mod tests {
 
     #[test]
     fn broadcast_request_after_claim_synthesises_one_per_unit() {
-        let mut q = Quirks::new(vec![QuirkKind::Scx20]);
+        let mut q = Scx20::new();
         // Learn two units, e.g. on a multi-SCX-20 bus.
         let t0 = Instant::now();
-        q.handle_scx20(&claim_frame(52, SCX20_NAME_BYTES), t0);
-        q.handle_scx20(&claim_frame(99, SCX20_NAME_BYTES), t0);
+        q.process(&claim(52, SCX20_NAME_BYTES), t0);
+        q.process(&claim(99, SCX20_NAME_BYTES), t0);
         // Broadcast request for 126996 — both should answer.
-        let out = q.handle_scx20(&iso_request(7, ADDR_GLOBAL, PGN_PRODUCT_INFO), t0);
+        let out = q.process(&iso_request(7, ADDR_GLOBAL, PGN_PRODUCT_INFO), t0);
         let srcs: Vec<u8> = out.iter().map(|f| f.src).collect();
         assert_eq!(srcs, vec![52, 99]);
         assert!(out.iter().all(|f| f.pgn == PGN_PRODUCT_INFO));
@@ -387,56 +344,56 @@ mod tests {
 
     #[test]
     fn directed_request_to_unknown_dst_is_ignored() {
-        let mut q = Quirks::new(vec![QuirkKind::Scx20]);
+        let mut q = Scx20::new();
         let t0 = Instant::now();
-        q.handle_scx20(&claim_frame(52, SCX20_NAME_BYTES), t0);
+        q.process(&claim(52, SCX20_NAME_BYTES), t0);
         // Directed at some other device on the bus.
-        let out = q.handle_scx20(&iso_request(7, 99, PGN_PRODUCT_INFO), t0);
+        let out = q.process(&iso_request(7, 99, PGN_PRODUCT_INFO), t0);
         assert!(out.is_empty());
     }
 
     #[test]
     fn directed_request_to_known_dst_synthesises() {
-        let mut q = Quirks::new(vec![QuirkKind::Scx20]);
+        let mut q = Scx20::new();
         let t0 = Instant::now();
-        q.handle_scx20(&claim_frame(52, SCX20_NAME_BYTES), t0);
-        let out = q.handle_scx20(&iso_request(7, 52, PGN_PRODUCT_INFO), t0);
+        q.process(&claim(52, SCX20_NAME_BYTES), t0);
+        let out = q.process(&iso_request(7, 52, PGN_PRODUCT_INFO), t0);
         assert_eq!(out.len(), 1);
         assert_eq!(out[0].src, 52);
     }
 
     #[test]
     fn rate_limited_within_one_second() {
-        let mut q = Quirks::new(vec![QuirkKind::Scx20]);
+        let mut q = Scx20::new();
         let t0 = Instant::now();
-        q.handle_scx20(&claim_frame(52, SCX20_NAME_BYTES), t0);
+        q.process(&claim(52, SCX20_NAME_BYTES), t0);
         // First request fires.
-        let out = q.handle_scx20(&iso_request(7, 52, PGN_PRODUCT_INFO), t0);
+        let out = q.process(&iso_request(7, 52, PGN_PRODUCT_INFO), t0);
         assert_eq!(out.len(), 1);
         // Second request 500 ms later: throttled out.
-        let out = q.handle_scx20(
+        let out = q.process(
             &iso_request(7, 52, PGN_PRODUCT_INFO),
             t0 + Duration::from_millis(500),
         );
         assert!(
             out.is_empty(),
-            "two requests within {SCX20_MIN_SYNTH_GAP:?} must collapse"
+            "two requests within {MIN_SYNTH_GAP:?} must collapse"
         );
         // After the gap fully elapses, the next one fires again.
-        let out = q.handle_scx20(
+        let out = q.process(
             &iso_request(7, 52, PGN_PRODUCT_INFO),
-            t0 + SCX20_MIN_SYNTH_GAP + Duration::from_millis(1),
+            t0 + MIN_SYNTH_GAP + Duration::from_millis(1),
         );
         assert_eq!(out.len(), 1);
     }
 
     #[test]
     fn request_for_other_pgn_is_ignored() {
-        let mut q = Quirks::new(vec![QuirkKind::Scx20]);
+        let mut q = Scx20::new();
         let t0 = Instant::now();
-        q.handle_scx20(&claim_frame(52, SCX20_NAME_BYTES), t0);
+        q.process(&claim(52, SCX20_NAME_BYTES), t0);
         // Request for PGN 60928 (Address Claim) targeted at SCX-20.
-        let out = q.handle_scx20(&iso_request(7, 52, PGN_ISO_ADDRESS_CLAIM), t0);
+        let out = q.process(&iso_request(7, 52, PGN_ISO_ADDRESS_CLAIM), t0);
         assert!(out.is_empty());
     }
 }

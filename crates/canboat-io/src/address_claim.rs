@@ -137,6 +137,14 @@ impl AddressClaim {
         if src > ADDR_MAX || self.state == ClaimState::Disabled {
             return Vec::new();
         }
+        // Our own claim, echoed back to us (e.g. a synthetic node whose
+        // frames the pipeline feeds back through its own processing path).
+        // ISO NAMEs are globally unique, so an identical NAME is never a
+        // real peer — treating it as a conflict would make us "lose" to
+        // ourselves and walk through every address. Ignore it.
+        if their_name == self.name {
+            return Vec::new();
+        }
         // While scanning we own no address yet — just learn what's in use.
         if self.state == ClaimState::Scanning || src != self.address {
             self.used[src as usize] = true;
@@ -330,6 +338,22 @@ mod tests {
         let f = c.respond_to_claim_request().unwrap();
         assert_eq!(f.pgn, PGN_ISO_ADDRESS_CLAIM);
         assert_eq!(f.src, 42);
+    }
+
+    #[test]
+    fn ignores_its_own_claim_echoed_back() {
+        // A synthetic node's own 60928 claim is fed back to it (via the
+        // pipeline). It must NOT be read as a conflict — otherwise the node
+        // "loses" to itself and walks through every address.
+        let mut c = AddressClaim::new(LOW, 42, true);
+        c.start(0);
+        c.tick(SCAN_TIMEOUT_MS); // claim 42
+        c.tick(SCAN_TIMEOUT_MS + CLAIM_TIMEOUT_MS); // owned
+        assert_eq!(c.address(), Some(42));
+        // Our own claim (same NAME, our address) comes back: no-op.
+        let out = c.on_address_claim(5000, 42, LOW);
+        assert!(out.is_empty());
+        assert_eq!(c.address(), Some(42), "still owns 42, did not move");
     }
 
     #[test]

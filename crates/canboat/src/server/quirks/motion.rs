@@ -111,8 +111,14 @@ impl Motion {
         let mut out = Vec::new();
         if !self.started {
             self.started = true;
+            log::info!(
+                "quirk(motion): starting H5000 Motion Sensor impersonation \
+                 (claiming address, preferred {PREFERRED_ADDRESS})"
+            );
             out.extend(self.claim.start(now_ms));
         }
+
+        let was_claimed = self.claim.is_claimed();
 
         match d.pgn {
             // Learn/arbitrate addresses; drive our own claim.
@@ -135,6 +141,19 @@ impl Motion {
         // Deadline-driven transitions (scan → claim → owned).
         out.extend(self.claim.tick(now_ms));
 
+        // The moment we take ownership: log it and announce ourselves with
+        // an unsolicited Product Information (as the real sensor does), so
+        // the twin is discoverable — and visible in the log — without
+        // waiting for a poll. PGN lists stay request-driven.
+        if !was_claimed && let Some(addr) = self.claim.address() {
+            log::info!(
+                "quirk(motion): claimed address {addr} as the H5000 Motion Sensor \
+                 (PGN 126996 product code 0x53F0); announcing product info, waiting \
+                 for an attitude source to relay"
+            );
+            out.extend(self.product_info());
+        }
+
         stamp(&mut out);
         out
     }
@@ -155,8 +174,21 @@ impl Motion {
         }
         match requested {
             PGN_ISO_ADDRESS_CLAIM => self.claim.respond_to_claim_request().into_iter().collect(),
-            PGN_PRODUCT_INFO => self.product_info().into_iter().collect(),
-            PGN_PGN_LIST => self.pgn_lists(),
+            PGN_PRODUCT_INFO => {
+                log::debug!(
+                    "quirk(motion): answering PGN 126996 request from src {} (the Hercules \
+                     acceptance gate)",
+                    d.src
+                );
+                self.product_info().into_iter().collect()
+            }
+            PGN_PGN_LIST => {
+                log::debug!(
+                    "quirk(motion): answering PGN 126464 list request from src {}",
+                    d.src
+                );
+                self.pgn_lists()
+            }
             _ => Vec::new(),
         }
     }
@@ -170,8 +202,15 @@ impl Motion {
             return None; // our own re-emitted frame fed back — never loop
         }
         // Latch the first attitude source we see once claimed.
-        let source = *self.source.get_or_insert(d.src);
-        if d.src != source {
+        if self.source.is_none() {
+            self.source = Some(d.src);
+            log::info!(
+                "quirk(motion): relaying PGN 127257 attitude from src {} under the \
+                 Motion Sensor identity (addr {addr})",
+                d.src
+            );
+        }
+        if self.source != Some(d.src) {
             return None;
         }
         Some(RawFrame::new(

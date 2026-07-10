@@ -13,25 +13,28 @@
 //! With `--quirk motion` canboat presents itself as that Motion Sensor —
 //! a distinct virtual node with its own ISO 11783-5 address claim (via the
 //! shared [`canboat_io::address_claim::AddressClaim`]) — answering 126996
-//! with product code `0x53F0`, and **relaying** an existing bus attitude
-//! source's PGN 127257 under this identity so Hercules accepts it.
+//! with product code `0x53F0` and emitting the **B&G proprietary PGN 130824**
+//! gyro **rate** feed (roll/pitch/yaw rate) that the CPU reads for its
+//! stabilization loop. We synthesize that 130824 by transcoding a **Furuno
+//! SCX-20 PGN 130842 "Six Degrees Of Freedom Movement"** off the bus — the
+//! only source of real roll/pitch rate (no standard PGN carries them). Only
+//! emitted while a fresh 130842 is seen.
 //!
-//! Relaying 127257 alone was not enough for Hercules to file the source as
-//! *valid motion data*: the real unit also emits **B&G proprietary PGN
-//! 130824** carrying a 3-axis gyro **rate** feed (roll/pitch/yaw rate), which
-//! the CPU reads for its stabilization loop. We synthesize that 130824 by
-//! transcoding a **Furuno SCX-20 PGN 130842 "Six Degrees Of Freedom
-//! Movement"** off the bus — the only source of real roll/pitch rate (no
-//! standard PGN carries them). Only emitted while a fresh 130842 is seen.
+//! **Attitude (127257) is deliberately *not* emitted.** Hardware testing on a
+//! live Hercules showed the rate feed alone keeps Motion "green" and
+//! stabilizes apparent wind through hard rolling — the mast-tip correction is
+//! driven by angular *rate*, not absolute heel. Relaying attitude under our
+//! identity was also redundant: the SCX-20's own 127257 is already on the bus
+//! for any attitude consumer. Dropping it halves this quirk's synthetic load.
 //!
 //! Both proprietary layouts were reverse-engineered by correlation against
 //! PGN 127251 Rate of Turn; see `n2k_research/navico/motion/
 //! rate-pgns-130824-130842.md` for the byte maps, resolutions, and evidence,
 //! plus `hercules-acceptance.md` (recognition gate) and `digital-twin-spec.md`.
 //!
-//! Scope: address claim, 126996 Product Info, 126464 TX/RX PGN lists, the
-//! 127257 relay, and the 130842→130824 rate transcode. The Simnet
-//! source-selection handshake (65323 / 130840) is not implemented yet.
+//! Scope: address claim, 126996 Product Info, 126464 TX/RX PGN lists, and the
+//! 130842→130824 rate transcode. The Simnet source-selection handshake
+//! (65323 / 130840) is not implemented yet.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -43,7 +46,6 @@ const PGN_ISO_REQUEST: u32 = 59904;
 const PGN_ISO_ADDRESS_CLAIM: u32 = 60928;
 const PGN_PGN_LIST: u32 = 126464;
 const PGN_PRODUCT_INFO: u32 = 126996;
-const PGN_ATTITUDE: u32 = 127257;
 /// B&G proprietary key-value data — we emit the roll/pitch/yaw **rate** feed
 /// the Hercules CPU reads (keys 60/158/68). Priority 3 as the real unit.
 const PGN_BG_RATES: u32 = 130824;
@@ -93,11 +95,10 @@ const CERTIFICATION_LEVEL: i64 = 2;
 const LOAD_EQUIVALENCY: i64 = 1;
 
 /// PGNs the twin transmits / receives, reported via PGN 126464 on request.
-const TX_PGN_LIST: [u32; 5] = [
+const TX_PGN_LIST: [u32; 4] = [
     PGN_ISO_ADDRESS_CLAIM,
     PGN_PRODUCT_INFO,
     PGN_PGN_LIST,
-    PGN_ATTITUDE,
     PGN_BG_RATES,
 ];
 const RX_PGN_LIST: [u32; 3] = [PGN_ISO_REQUEST, PGN_ISO_ADDRESS_CLAIM, PGN_SCX_6DOF];
@@ -111,12 +112,10 @@ pub struct Motion {
     base: Option<Instant>,
     /// False until the claim handshake has been kicked off.
     started: bool,
-    /// The bus source whose 127257 we relay. Latched to the first attitude
-    /// source seen once we own an address (never ourselves), so we don't
-    /// flip between sources or loop on our own re-emission.
-    source: Option<u8>,
     /// The bus source whose Furuno 130842 we transcode into 130824. Latched
-    /// like `source`; typically the same SCX-20 that provides the attitude.
+    /// to the first Furuno 6DOF source seen once we own an address (never
+    /// ourselves), so we don't flip between sources or loop on our own
+    /// re-emission.
     rate_source: Option<u8>,
 }
 
@@ -132,7 +131,6 @@ impl Motion {
             claim: AddressClaim::new(build_name(), PREFERRED_ADDRESS, true),
             base: None,
             started: false,
-            source: None,
             rate_source: None,
         }
     }
@@ -164,12 +162,6 @@ impl Motion {
             }
             // Answer requests addressed to us (or broadcast).
             PGN_ISO_REQUEST => out.extend(self.handle_request(d)),
-            // Relay a chosen source's attitude under our identity.
-            PGN_ATTITUDE => {
-                if let Some(f) = self.maybe_relay(d) {
-                    out.push(f);
-                }
-            }
             // Transcode a Furuno SCX-20 6DOF frame's gyro rates into the
             // B&G 130824 the Hercules CPU wants.
             PGN_SCX_6DOF => {
@@ -191,7 +183,7 @@ impl Motion {
             log::info!(
                 "quirk(motion): claimed address {addr} as the H5000 Motion Sensor \
                  (PGN 126996 product code 0x53F0); announcing product info, waiting \
-                 for an attitude source to relay"
+                 for a Furuno 130842 source to transcode into 130824 rates"
             );
             out.extend(self.product_info());
         }
@@ -233,36 +225,6 @@ impl Motion {
             }
             _ => Vec::new(),
         }
-    }
-
-    /// Re-emit `d` (a PGN 127257 from the latched attitude source) from our
-    /// claimed address. `None` until we own an address, or for frames from
-    /// any source other than the latched one (including our own re-emits).
-    fn maybe_relay(&mut self, d: &DecodedPgn) -> Option<RawFrame> {
-        let addr = self.claim.address()?;
-        if d.src == addr {
-            return None; // our own re-emitted frame fed back — never loop
-        }
-        // Latch the first attitude source we see once claimed.
-        if self.source.is_none() {
-            self.source = Some(d.src);
-            log::info!(
-                "quirk(motion): relaying PGN 127257 attitude from src {} under the \
-                 Motion Sensor identity (addr {addr})",
-                d.src
-            );
-        }
-        if self.source != Some(d.src) {
-            return None;
-        }
-        Some(RawFrame::new(
-            None,
-            d.prio,
-            PGN_ATTITUDE,
-            addr,
-            ADDR_GLOBAL,
-            d.data.iter().copied(),
-        ))
     }
 
     /// Transcode a Furuno SCX-20 PGN 130842 "Six Degrees Of Freedom
@@ -429,17 +391,12 @@ mod tests {
         dec(&RawFrame::new(None, 6, PGN_ISO_REQUEST, src, dst, data))
     }
 
-    /// A decoded PGN 127257 Attitude from `src` (roll/pitch payload).
+    /// A decoded PGN 127257 Attitude from `src`. The quirk no longer acts on
+    /// 127257, so this is just a spare, unmatched frame used to advance the
+    /// claim clock in [`drive_to_claimed`].
     fn attitude(src: u8) -> DecodedPgn {
         let data = [0x00, 0xff, 0x7f, 0xcd, 0x00, 0x01, 0xfc, 0xff];
-        dec(&RawFrame::new(
-            None,
-            3,
-            PGN_ATTITUDE,
-            src,
-            ADDR_GLOBAL,
-            data,
-        ))
+        dec(&RawFrame::new(None, 3, 127257, src, ADDR_GLOBAL, data))
     }
 
     /// A decoded Furuno SCX-20 PGN 130842 6DOF frame from `src`, using the
@@ -507,36 +464,6 @@ mod tests {
                 .and_then(|f| f.value.as_str()),
             Some(MODEL_ID)
         );
-    }
-
-    #[test]
-    fn relays_latched_source_attitude_under_our_address() {
-        let mut m = Motion::new();
-        let t0 = Instant::now();
-        let addr = drive_to_claimed(&mut m, t0);
-        // A third-party attitude source at src 40.
-        let out = m.process(&attitude(40), t0 + Duration::from_millis(1400));
-        let relayed: Vec<_> = out
-            .iter()
-            .filter(|f| f.pgn == PGN_ATTITUDE && f.src == addr)
-            .collect();
-        assert_eq!(relayed.len(), 1, "relayed once, from our address");
-        assert_eq!(relayed[0].data.len(), 8);
-        // A different source is ignored once one is latched.
-        let out = m.process(&attitude(41), t0 + Duration::from_millis(1500));
-        assert!(out.iter().all(|f| f.pgn != PGN_ATTITUDE || f.src != addr));
-    }
-
-    #[test]
-    fn does_not_relay_its_own_reemission() {
-        let mut m = Motion::new();
-        let t0 = Instant::now();
-        let addr = drive_to_claimed(&mut m, t0);
-        // Our own re-emitted frame (src == our address) fed back must not
-        // latch as the source nor loop.
-        let out = m.process(&attitude(addr), t0 + Duration::from_millis(1400));
-        assert!(out.iter().all(|f| f.pgn != PGN_ATTITUDE || f.src != addr));
-        assert_eq!(m.source, None, "own frame never latches as the source");
     }
 
     #[test]

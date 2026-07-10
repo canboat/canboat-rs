@@ -450,6 +450,16 @@ pub fn run(cli: Args) -> Result<()> {
         );
     }
 
+    // The motion quirk claims its own virtual address and emits PGN 126996 /
+    // 127257 onto the bus, so it too needs a writable device backend.
+    if cli.quirk.contains(&quirks::QuirkKind::Motion) && device_sender.is_none() {
+        anyhow::bail!(
+            "--quirk motion needs a writable device backend (e.g. --socketcan or an \
+             NGT-1/iKonvert gateway) to claim an address and relay PGN 127257; there \
+             is no bus to write to in stdin/log-only mode"
+        );
+    }
+
     // Quirks (e.g. SCX-20 PGN 126996 fabrication, WMM 127258 emission)
     // write synthetics onto the wire — they grab their own clone of the
     // device sender and live inside `Hubs`. A quirk that emits as canboat's

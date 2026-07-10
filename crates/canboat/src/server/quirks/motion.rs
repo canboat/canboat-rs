@@ -16,12 +16,22 @@
 //! with product code `0x53F0`, and **relaying** an existing bus attitude
 //! source's PGN 127257 under this identity so Hercules accepts it.
 //!
-//! Research: `n2k_research/navico/motion/hercules-acceptance.md` (recognition
-//! gate, byte-proven against a real unit) and `digital-twin-spec.md`.
+//! Relaying 127257 alone was not enough for Hercules to file the source as
+//! *valid motion data*: the real unit also emits **B&G proprietary PGN
+//! 130824** carrying a 3-axis gyro **rate** feed (roll/pitch/yaw rate), which
+//! the CPU reads for its stabilization loop. We synthesize that 130824 by
+//! transcoding a **Furuno SCX-20 PGN 130842 "Six Degrees Of Freedom
+//! Movement"** off the bus — the only source of real roll/pitch rate (no
+//! standard PGN carries them). Only emitted while a fresh 130842 is seen.
 //!
-//! Scope (deliberately minimal): address claim, 126996 Product Info, 126464
-//! TX/RX PGN lists, and the 127257 relay. The Simnet source-selection
-//! handshake (65323 / 130840) is not implemented yet.
+//! Both proprietary layouts were reverse-engineered by correlation against
+//! PGN 127251 Rate of Turn; see `n2k_research/navico/motion/
+//! rate-pgns-130824-130842.md` for the byte maps, resolutions, and evidence,
+//! plus `hercules-acceptance.md` (recognition gate) and `digital-twin-spec.md`.
+//!
+//! Scope: address claim, 126996 Product Info, 126464 TX/RX PGN lists, the
+//! 127257 relay, and the 130842→130824 rate transcode. The Simnet
+//! source-selection handshake (65323 / 130840) is not implemented yet.
 
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
@@ -34,6 +44,26 @@ const PGN_ISO_ADDRESS_CLAIM: u32 = 60928;
 const PGN_PGN_LIST: u32 = 126464;
 const PGN_PRODUCT_INFO: u32 = 126996;
 const PGN_ATTITUDE: u32 = 127257;
+/// B&G proprietary key-value data — we emit the roll/pitch/yaw **rate** feed
+/// the Hercules CPU reads (keys 60/158/68). Priority 3 as the real unit.
+const PGN_BG_RATES: u32 = 130824;
+const PGN_BG_RATES_PRIO: u8 = 3;
+/// Furuno SCX-20 "Six Degrees Of Freedom Movement" — our rate source.
+const PGN_SCX_6DOF: u32 = 130842;
+const MFG_FURUNO: u16 = 1855;
+
+/// B&G 130824 key IDs for the three rate axes (see `rate-pgns-130824-130842.md`).
+const KEY_ROLL_RATE: u16 = 60;
+const KEY_PITCH_RATE: u16 = 158; // canboat mislabels this "Pitch Angle"
+const KEY_YAW_RATE: u16 = 68; // canboat leaves this key unnamed
+
+/// Rate LSBs, both expressed in rad/s. The SCX-20 130842 rate fields carry
+/// 0.001 rad/s per count (field g nails 127251 ROT at r=1.00); the B&G
+/// 130824 rate keys carry 0.0001 °/s per count (key 68 nails 127251 at
+/// r=0.96, LSB 1.745e-6 rad/s). The transcode is one multiply by their ratio
+/// (≈572.96).
+const SCX_RATE_LSB_RAD_S: f64 = 0.001;
+const BG_RATE_LSB_RAD_S: f64 = 0.0001 * std::f64::consts::PI / 180.0;
 
 /// ISO NAME fields identifying the H5000 Motion Sensor personality. The
 /// class/function are *not* the Hercules acceptance gate (that is the
@@ -63,13 +93,14 @@ const CERTIFICATION_LEVEL: i64 = 2;
 const LOAD_EQUIVALENCY: i64 = 1;
 
 /// PGNs the twin transmits / receives, reported via PGN 126464 on request.
-const TX_PGN_LIST: [u32; 4] = [
+const TX_PGN_LIST: [u32; 5] = [
     PGN_ISO_ADDRESS_CLAIM,
     PGN_PRODUCT_INFO,
     PGN_PGN_LIST,
     PGN_ATTITUDE,
+    PGN_BG_RATES,
 ];
-const RX_PGN_LIST: [u32; 2] = [PGN_ISO_REQUEST, PGN_ISO_ADDRESS_CLAIM];
+const RX_PGN_LIST: [u32; 3] = [PGN_ISO_REQUEST, PGN_ISO_ADDRESS_CLAIM, PGN_SCX_6DOF];
 
 /// Stateful Motion Sensor impersonation.
 pub struct Motion {
@@ -84,6 +115,9 @@ pub struct Motion {
     /// source seen once we own an address (never ourselves), so we don't
     /// flip between sources or loop on our own re-emission.
     source: Option<u8>,
+    /// The bus source whose Furuno 130842 we transcode into 130824. Latched
+    /// like `source`; typically the same SCX-20 that provides the attitude.
+    rate_source: Option<u8>,
 }
 
 impl Default for Motion {
@@ -99,6 +133,7 @@ impl Motion {
             base: None,
             started: false,
             source: None,
+            rate_source: None,
         }
     }
 
@@ -132,6 +167,13 @@ impl Motion {
             // Relay a chosen source's attitude under our identity.
             PGN_ATTITUDE => {
                 if let Some(f) = self.maybe_relay(d) {
+                    out.push(f);
+                }
+            }
+            // Transcode a Furuno SCX-20 6DOF frame's gyro rates into the
+            // B&G 130824 the Hercules CPU wants.
+            PGN_SCX_6DOF => {
+                if let Some(f) = self.maybe_emit_rates(d) {
                     out.push(f);
                 }
             }
@@ -223,6 +265,43 @@ impl Motion {
         ))
     }
 
+    /// Transcode a Furuno SCX-20 PGN 130842 "Six Degrees Of Freedom
+    /// Movement" (`d`) into a B&G PGN 130824 rate frame emitted from our
+    /// claimed address. `None` until we own an address, for a non-Furuno
+    /// 130842, or for any source other than the latched rate source.
+    fn maybe_emit_rates(&mut self, d: &DecodedPgn) -> Option<RawFrame> {
+        let addr = self.claim.address()?;
+        if d.src == addr {
+            return None; // never consume our own emissions
+        }
+        // Only the Furuno 6DOF layout has the roll/pitch/yaw-rate fields at
+        // the byte offsets we read; guard on the manufacturer in the header.
+        if header_manufacturer(&d.data) != Some(MFG_FURUNO) {
+            return None;
+        }
+        let (roll, pitch, yaw) = scx_6dof_rates(&d.data)?;
+        // Latch the first Furuno 6DOF source we see once claimed.
+        if self.rate_source.is_none() {
+            self.rate_source = Some(d.src);
+            log::info!(
+                "quirk(motion): transcoding SCX-20 PGN 130842 gyro rates from src {} \
+                 into B&G PGN 130824 (roll/pitch/yaw rate) under addr {addr}",
+                d.src
+            );
+        }
+        if self.rate_source != Some(d.src) {
+            return None;
+        }
+        Some(RawFrame::new(
+            None,
+            PGN_BG_RATES_PRIO,
+            PGN_BG_RATES,
+            addr,
+            ADDR_GLOBAL,
+            build_130824_payload(roll, pitch, yaw),
+        ))
+    }
+
     /// Encode PGN 126996 with the Motion Sensor's product code — **the
     /// Hercules acceptance gate** — via the shared responder builder.
     fn product_info(&self) -> Option<RawFrame> {
@@ -263,6 +342,55 @@ fn build_name() -> u64 {
         | (DEVICE_CLASS << 49)
         | (INDUSTRY_MARINE << 60)
         | (arbitrary << 63)
+}
+
+/// The 11-bit manufacturer code from a proprietary PGN's first two header
+/// bytes (`manufacturerCode(11) | reserved(2) | industryCode(3)`, LE).
+/// `None` if the payload is too short to hold the header.
+fn header_manufacturer(data: &[u8]) -> Option<u16> {
+    let hdr = u16::from_le_bytes([*data.first()?, *data.get(1)?]);
+    Some(hdr & 0x07ff)
+}
+
+/// Read the roll/pitch/yaw **rate** fields (e, f, g) out of a Furuno SCX-20
+/// PGN 130842 payload, in the source's raw 0.001-rad/s counts. Byte offsets
+/// are fixed by the RE'd layout (`rate-pgns-130824-130842.md`): e = i32 @15,
+/// f = i32 @19, g = i16 @23. `None` if the payload is short.
+fn scx_6dof_rates(data: &[u8]) -> Option<(i32, i32, i32)> {
+    let roll = i32::from_le_bytes(data.get(15..19)?.try_into().ok()?);
+    let pitch = i32::from_le_bytes(data.get(19..23)?.try_into().ok()?);
+    let yaw = i16::from_le_bytes(data.get(23..25)?.try_into().ok()?) as i32;
+    Some((roll, pitch, yaw))
+}
+
+/// Convert one SCX-20 rate count (0.001 rad/s) to a B&G 130824 rate count
+/// (0.0001 °/s), saturating to the i32 the wire field holds.
+fn transcode_rate(scx_count: i32) -> i32 {
+    let rad_s = scx_count as f64 * SCX_RATE_LSB_RAD_S;
+    (rad_s / BG_RATE_LSB_RAD_S)
+        .round()
+        .clamp(i32::MIN as f64, i32::MAX as f64) as i32
+}
+
+/// Hand-pack a B&G PGN 130824 "bGKeyValueData" payload carrying the three
+/// gyro rates. The schema-driven [`canboat_core::encode`] builder cannot
+/// emit this — its fields are `DYNAMIC_FIELD_KEY/LENGTH/VALUE` — so it is
+/// laid out by hand: a 2-byte mfr/industry header, then three
+/// `{ key|len<<12 (u16 LE), value (i32 LE) }` entries (len 4 bytes each).
+fn build_130824_payload(roll: i32, pitch: i32, yaw: i32) -> Vec<u8> {
+    let header: u16 = (MFG_BANDG as u16) | (0b11 << 11) | ((INDUSTRY_MARINE as u16) << 13);
+    let mut v = Vec::with_capacity(2 + 3 * 6);
+    v.extend_from_slice(&header.to_le_bytes());
+    for (key, count) in [
+        (KEY_ROLL_RATE, roll),
+        (KEY_PITCH_RATE, pitch),
+        (KEY_YAW_RATE, yaw),
+    ] {
+        let key_len: u16 = (key & 0x0fff) | (4 << 12); // 4-byte value
+        v.extend_from_slice(&key_len.to_le_bytes());
+        v.extend_from_slice(&transcode_rate(count).to_le_bytes());
+    }
+    v
 }
 
 /// Stamp a host-clock timestamp on any frame that lacks one, so the local
@@ -308,6 +436,26 @@ mod tests {
             None,
             3,
             PGN_ATTITUDE,
+            src,
+            ADDR_GLOBAL,
+            data,
+        ))
+    }
+
+    /// A decoded Furuno SCX-20 PGN 130842 6DOF frame from `src`, using the
+    /// exact 29 bytes captured from a real SCX-20 (`scx20-setting-tool-start
+    /// .raw`): roll-rate field e = -2184, pitch-rate f = 1467, yaw-rate g =
+    /// 774 (raw 0.001-rad/s counts).
+    fn six_dof(src: u8) -> DecodedPgn {
+        let data = [
+            0x3f, 0x9f, 0x54, 0xff, 0xff, 0xff, 0xd4, 0xff, 0xff, 0xff, 0x2d, 0x03, 0x00, 0x00,
+            0x00, 0x78, 0xf7, 0xff, 0xff, 0xbb, 0x05, 0x00, 0x00, 0x06, 0x03, 0x00, 0x00, 0x00,
+            0x00,
+        ];
+        dec(&RawFrame::new(
+            None,
+            7,
+            PGN_SCX_6DOF,
             src,
             ADDR_GLOBAL,
             data,
@@ -389,6 +537,60 @@ mod tests {
         let out = m.process(&attitude(addr), t0 + Duration::from_millis(1400));
         assert!(out.iter().all(|f| f.pgn != PGN_ATTITUDE || f.src != addr));
         assert_eq!(m.source, None, "own frame never latches as the source");
+    }
+
+    #[test]
+    fn transcode_rate_scales_and_saturates() {
+        // 1000 counts * 0.001 rad/s = 1 rad/s; ÷ (0.0001 °/s in rad/s).
+        assert_eq!(transcode_rate(1000), 572_958);
+        assert_eq!(transcode_rate(-1000), -572_958);
+        assert_eq!(transcode_rate(0), 0);
+        // A full-scale i32 input saturates rather than wrapping/panicking.
+        assert_eq!(transcode_rate(i32::MAX), i32::MAX);
+        assert_eq!(transcode_rate(i32::MIN), i32::MIN);
+    }
+
+    #[test]
+    fn builds_130824_with_the_three_rate_keys() {
+        // e=-2184, f=1467, g=774 (the captured six_dof values).
+        let p = build_130824_payload(-2184, 1467, 774);
+        assert_eq!(p.len(), 20);
+        assert_eq!(&p[0..2], &[0x7d, 0x99], "B&G mfr 381 + marine header");
+        // Parse the three key/len + value entries.
+        let entry = |off: usize| -> (u16, u8, i32) {
+            let kl = u16::from_le_bytes([p[off], p[off + 1]]);
+            let val = i32::from_le_bytes(p[off + 2..off + 6].try_into().unwrap());
+            (kl & 0x0fff, (kl >> 12) as u8, val)
+        };
+        assert_eq!(entry(2), (KEY_ROLL_RATE, 4, transcode_rate(-2184)));
+        assert_eq!(entry(8), (KEY_PITCH_RATE, 4, transcode_rate(1467)));
+        assert_eq!(entry(14), (KEY_YAW_RATE, 4, transcode_rate(774)));
+    }
+
+    #[test]
+    fn transcodes_furuno_6dof_into_bg_rates() {
+        let mut m = Motion::new();
+        let t0 = Instant::now();
+        let addr = drive_to_claimed(&mut m, t0);
+        let out = m.process(&six_dof(52), t0 + Duration::from_millis(1400));
+        let f = out
+            .iter()
+            .find(|f| f.pgn == PGN_BG_RATES)
+            .expect("130824 emitted");
+        assert_eq!(f.src, addr);
+        assert_eq!(f.prio, PGN_BG_RATES_PRIO);
+        assert_eq!(f.data.as_slice(), build_130824_payload(-2184, 1467, 774));
+        // A second Furuno source is ignored once one is latched.
+        let out = m.process(&six_dof(60), t0 + Duration::from_millis(1500));
+        assert!(out.iter().all(|f| f.pgn != PGN_BG_RATES));
+    }
+
+    #[test]
+    fn ignores_non_furuno_6dof() {
+        // header_manufacturer guards the fixed-offset field read.
+        assert_eq!(header_manufacturer(&[0x3f, 0x9f]), Some(MFG_FURUNO));
+        assert_eq!(header_manufacturer(&[0x7d, 0x99]), Some(MFG_BANDG as u16));
+        assert_eq!(header_manufacturer(&[0x00]), None);
     }
 
     #[test]

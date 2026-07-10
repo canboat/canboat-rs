@@ -1,5 +1,53 @@
 # Changelog
 
+## [0.6.0](https://github.com/canboat/canboat-rs/compare/v0.5.0...v0.6.0) (2026-07-10)
+
+
+### Features
+
+* **analyzer:** version banner with commit + units, and -si flag ([57c6872](https://github.com/canboat/canboat-rs/commit/57c6872f5e75b12d40b8346e746cb0f0adbe73dc))
+* **canboat:** add `canboat` binary with the `convert` subcommand ([f3a1f78](https://github.com/canboat/canboat-rs/commit/f3a1f78c224d48f06af689666916d7d47fb5800c))
+* **canboat:** add `interface` subcommand over the unified device layer ([85eacb0](https://github.com/canboat/canboat-rs/commit/85eacb04d06b8ee1282f1a0eae0a5d9fa887dd74))
+* **canboat:** add `replay` subcommand + shim, retire the replay crate ([1b23267](https://github.com/canboat/canboat-rs/commit/1b232677cb90fece7c7a4688b9f4be9f98f74ff1))
+* **canboat:** argv[0] shims + install-shims for the retired tool names ([95eb414](https://github.com/canboat/canboat-rs/commit/95eb414c2b106e5b8f6b96dbb236c7e561803557))
+* **canboat:** close convert/interface flag gaps for legacy shims ([d9d81f3](https://github.com/canboat/canboat-rs/commit/d9d81f375d836b3fc16ffe58151c60fdad516733))
+* **canboat:** drop the nif2analyzer shim ([ef3a0e9](https://github.com/canboat/canboat-rs/commit/ef3a0e9d2e492f507323d864f74cca258b2e284c))
+* **canboat:** fold n2kd into `canboat`, retire the standalone bin ([0fabfa5](https://github.com/canboat/canboat-rs/commit/0fabfa562145fa5c1b3a57dc9f8b25875922445b))
+* **canboat:** move canboat-pipeline in as the `server` subcommand ([f2b2d99](https://github.com/canboat/canboat-rs/commit/f2b2d99e0ef2f9b1382b92d7ace8e1f66e3deefa))
+* **canboat:** move canboat-tui in as the `tui` subcommand ([c81b912](https://github.com/canboat/canboat-rs/commit/c81b912480b04cef556e39e9466325ec62e15f4c))
+* **convert:** add YDWG02, Actisense ASCII, and Actisense EBL output ([2cc390d](https://github.com/canboat/canboat-rs/commit/2cc390d78d9d9fab836aa65ac1e2d5d9589d45c8))
+* **convert:** default --to to json instead of plain ([5d616a9](https://github.com/canboat/canboat-rs/commit/5d616a94bbd0f389a534c4b83c67c5d52c3be41f))
+* **convert:** surface supported input/output formats in --help ([6feb9ba](https://github.com/canboat/canboat-rs/commit/6feb9ba097f76ae943677d2dea0287ead5f148eb))
+* **core:** accept PGN/field constants in the encoder ([429a040](https://github.com/canboat/canboat-rs/commit/429a0409fb168929a5b28fce4ae2a027794eb814))
+* **core:** consume camelCase analyzer JSON; dispatch NMEA 0183 by variant id ([df4d901](https://github.com/canboat/canboat-rs/commit/df4d901e53632ef61b440dbaeb8449bbe30e255c))
+* **core:** DecodedPgn::iso_name — the ISO NAME from decoded fields ([52eca80](https://github.com/canboat/canboat-rs/commit/52eca80bdbb267ba0a1231cead2ad1bc0aa32e8d))
+* **core:** encode all self-contained field datatypes ([87dd92b](https://github.com/canboat/canboat-rs/commit/87dd92b2c969076e1b0286459eeaec700d40ec11))
+* **core:** generate compile-time PGN/field id constants ([6b35420](https://github.com/canboat/canboat-rs/commit/6b354209a972b038d44f6b6e19838e7e69041bd5))
+* **core:** normalize emitted timestamps to canonical ISO-8601 UTC ([30c9e46](https://github.com/canboat/canboat-rs/commit/30c9e46cd81e9fc21b904f344e369d8476c91029))
+* **core:** SI/Metric unit schemas, message encoder, and format-message ([4f89109](https://github.com/canboat/canboat-rs/commit/4f89109a2e05930011b383140d2cb76378fd3297))
+* **io:** read Actisense .ebl captures as input ([08f08eb](https://github.com/canboat/canboat-rs/commit/08f08eb3dacdd21cf5f06a373c53eace4461ab15))
+* **n2kd:** apply the per-NAME NMEA 0183 filter in the daemon ([919e6d9](https://github.com/canboat/canboat-rs/commit/919e6d9ecc8b3db0fe252489b63ae4316974955a))
+* **n2kd:** consume the analyzer units banner; convert per requested unit ([8b2588f](https://github.com/canboat/canboat-rs/commit/8b2588fc238e4f3e17e3220077318941dbf2adca))
+* **n2kd:** filter control channel — apply Set frames, emit Reports ([8f26e29](https://github.com/canboat/canboat-rs/commit/8f26e29f89f09c3955986a812b842d828e751d34))
+* **server:** add --quirk wmm and encode all self-contained field datatypes ([4822779](https://github.com/canboat/canboat-rs/commit/4822779553d438e142c9dd3f8d3fe38d60912cf8))
+* **server:** add --quirk wmm, process quirks from decoded PGNs ([d3bdbab](https://github.com/canboat/canboat-rs/commit/d3bdbab18e3028dd315e885524d6ffdbe4f06dd3))
+* **server:** add --si to decode JSON ports in SI base units ([80eac72](https://github.com/canboat/canboat-rs/commit/80eac72b4f0f007dca6d47e28f2a4b47b04efce1))
+* **server:** dedicated bidirectional NMEA 0183 filter control port ([60d89cd](https://github.com/canboat/canboat-rs/commit/60d89cdc1b5b9e19c405c21286b60257fc368795))
+* **server:** emit version/units banner on snapshot + analyzer ports ([59b34c5](https://github.com/canboat/canboat-rs/commit/59b34c50c5fca7e2f8a10dbba6736d5690c1e187))
+* **server:** key camelCase snapshot by pgn id, unwrap records ([131a6b6](https://github.com/canboat/canboat-rs/commit/131a6b609bbc4d0721995b5c5c51f017713e3610))
+* **server:** own PGN-rate overrides; add TUI Overrides view ([326a90c](https://github.com/canboat/canboat-rs/commit/326a90ce204e34f0b7dd87fcfe51f1a8602d8590))
+* **server:** own PGN-rate overrides; add TUI Overrides view ([54de770](https://github.com/canboat/canboat-rs/commit/54de7709b40ce7ba7d0daac9801ddcbfbb5be8cf))
+* **tui:** consume server --camel by canonicalizing records at ingestion ([b2781e5](https://github.com/canboat/canboat-rs/commit/b2781e54766ecc1a160c1eb9dd89eea68cefd261))
+* **tui:** forget persisted overrides the bus NAKs ([7e7ad16](https://github.com/canboat/canboat-rs/commit/7e7ad16a0d3b480bd37263b063da6944d9f08af3))
+* **wire:** declare + convert units across the handshake ([fd5f16d](https://github.com/canboat/canboat-rs/commit/fd5f16d383b1966497244be3ba4d82eadb0813d6))
+
+
+### Bug Fixes
+
+* **core:** key JSON message wrapper on -camel mode, drop timestamp bridge ([333987a](https://github.com/canboat/canboat-rs/commit/333987a5dc3619edfbb3d5478ad3ecb893c08a2b))
+* **io:** only warn on FAST-mislabel when no PGN variant fits in 8 bytes ([838fd40](https://github.com/canboat/canboat-rs/commit/838fd40f669c93bcbe0f3a3ba25d5917de88fa28))
+* **server:** emit coalesced messages on the raw port, not fragments ([69cd3f8](https://github.com/canboat/canboat-rs/commit/69cd3f85db0944a460f4ff104a975ea918d65cd7))
+
 ## [0.5.0](https://github.com/canboat/canboat-rs/compare/v0.4.0...v0.5.0) (2026-07-06)
 
 

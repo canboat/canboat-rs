@@ -33,6 +33,7 @@ indexmap     = { workspace = true }
 futures      = { workspace = true }
 # Local-time formatting for the tui file browser (cross-platform).
 chrono       = { version = "0.4", default-features = false, features = ["clock"] }
+world_magnetic_model = "0.4.0"
 
 [build-dependencies]
 # Capture the git short SHA (+ dirty flag) for the analyzer version banner.

@@ -27,6 +27,16 @@ pub const FASTPACKET_MAX_SIZE: usize = 223;
 /// its scope (any coalesced payload, not just fast-packet).
 pub const RAWFRAME_MAX_SIZE: usize = 255 * 7;
 
+/// The NMEA 2000 / J1939 **global (broadcast) address**, 255. Valid as a
+/// destination for broadcast PGNs, never as a *source* on the bus — so it
+/// also serves as the "unset: fill in my own claimed address" sentinel on
+/// outbound sends (the device / pipeline substitutes the real address).
+pub const ADDR_GLOBAL: u8 = 255;
+
+/// The **null address**, 254 — a node that has not (yet) claimed an
+/// address. The SocketCAN adapter reports this until its ISO claim wins.
+pub const ADDR_NULL: u8 = 254;
+
 /// A CAN/N2K frame.
 ///
 /// Single-frame: `data.len() <= 8`. Coalesced fast-packet:

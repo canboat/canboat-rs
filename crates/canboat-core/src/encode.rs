@@ -22,10 +22,13 @@
 //! `Spare` field gets zero; everything else gets its "not available"
 //! sentinel (the schema `unknown_value`, else all-ones).
 //!
-//! Scope: this phase encodes fixed-length fields — the numeric,
-//! enum/lookup, and PGN/MMSI families that make up the large majority
-//! of PGNs. Strings, `BINARY`/`VARIABLE`, and repeating field sets
-//! return [`EncodeError::NotFixedLength`] for now.
+//! Scope: every self-contained field type encodes — the numeric,
+//! enum/lookup, PGN/MMSI, `FLOAT`, `ISO_NAME`, `BINARY` and all four
+//! string families (`STRING_FIX`/`LZ`/`LAU`). The only fields left are
+//! the PGN 126208 group-function *dynamic* types (`VARIABLE`,
+//! `DYNAMIC_FIELD_KEY`/`LENGTH`/`VALUE`), whose width/shape is set by
+//! sibling fields at decode time and so can't be defaulted in isolation;
+//! an unset one returns [`EncodeError::NotFixedLength`].
 
 use std::error::Error;
 use std::fmt;
@@ -49,9 +52,9 @@ pub enum EncodeValue {
     Int(i64),
     /// A `LOOKUP` / `BITLOOKUP` selected by its label (e.g. `"Apparent"`).
     Lookup(String),
-    /// Text for a `STRING_*` field. (Phase 2 — currently unsupported.)
+    /// Text for a `STRING_FIX` / `STRING_LZ` / `STRING_LAU` field.
     Text(String),
-    /// Raw bytes for a `BINARY` / `VARIABLE` field. (Phase 2.)
+    /// Raw bytes for a `BINARY` field.
     Bytes(Vec<u8>),
     /// A PGN number for a `PGN`-type field (packed as its bit-width,
     /// LSB-first → little-endian bytes).
@@ -80,6 +83,33 @@ impl From<u32> for EncodeValue {
         EncodeValue::Int(v as i64)
     }
 }
+impl From<&str> for EncodeValue {
+    fn from(v: &str) -> Self {
+        EncodeValue::Text(v.to_string())
+    }
+}
+impl From<String> for EncodeValue {
+    fn from(v: String) -> Self {
+        EncodeValue::Text(v)
+    }
+}
+impl From<u64> for EncodeValue {
+    /// A raw 64-bit pattern (e.g. an ISO NAME). Reinterpreted as `Int`;
+    /// the field width masks it back, so the full `u64` range survives.
+    fn from(v: u64) -> Self {
+        EncodeValue::Int(v as i64)
+    }
+}
+impl From<Vec<u8>> for EncodeValue {
+    fn from(v: Vec<u8>) -> Self {
+        EncodeValue::Bytes(v)
+    }
+}
+impl From<&[u8]> for EncodeValue {
+    fn from(v: &[u8]) -> Self {
+        EncodeValue::Bytes(v.to_vec())
+    }
+}
 
 /// Why a message could not be encoded.
 #[derive(Debug, Clone, PartialEq)]
@@ -97,8 +127,9 @@ pub enum EncodeError {
     UnknownLookupLabel { field: &'static str, label: String },
     /// A value doesn't fit the field's bit width / range.
     ValueOutOfRange { field: &'static str, value: f64 },
-    /// The field isn't fixed-length (string / binary / variable), which
-    /// this phase can't encode yet.
+    /// A group-function *dynamic* field (`VARIABLE` /
+    /// `DYNAMIC_FIELD_KEY`/`LENGTH`/`VALUE`) was left unset — its width is
+    /// determined by sibling fields, so it can't be defaulted in isolation.
     NotFixedLength(&'static str),
     /// The field type can't accept the [`EncodeValue`] variant given.
     TypeMismatch {
@@ -131,7 +162,7 @@ impl fmt::Display for EncodeError {
             EncodeError::NotFixedLength(field) => {
                 write!(
                     f,
-                    "field '{field}': variable-length encoding not yet supported"
+                    "field '{field}': dynamic group-function field must be set explicitly"
                 )
             }
             EncodeError::TypeMismatch { field, expected } => {
@@ -155,9 +186,19 @@ pub struct MessageBuilder {
     src: u8,
     dst: u8,
     timestamp: Option<String>,
-    /// Staged raw bit patterns per field, indexed by `order - 1`.
-    /// `None` → fill with the field default at build time.
-    staged: Vec<Option<u64>>,
+    /// Staged values per field, indexed by `order - 1`. `None` → fill
+    /// with the field default at build time.
+    staged: Vec<Option<Staged>>,
+}
+
+/// A staged field value: either a scalar bit pattern (numbers, lookups,
+/// PGN references) or already-packed bytes (a fixed-length string).
+#[derive(Clone)]
+enum Staged {
+    /// Raw bits, LSB-first, of the field's declared width.
+    Scalar(u64),
+    /// Byte-aligned payload of exactly `bit_length / 8` bytes.
+    Bytes(Vec<u8>),
 }
 
 impl MessageBuilder {
@@ -204,8 +245,8 @@ impl MessageBuilder {
         value: impl Into<EncodeValue>,
     ) -> Result<&mut Self, EncodeError> {
         let idx = self.find_field(field)?;
-        let raw = self.value_to_raw(&self.pgn.fields[idx], value.into())?;
-        self.staged[idx] = Some(raw);
+        let staged = self.stage_value(&self.pgn.fields[idx], value.into())?;
+        self.staged[idx] = Some(staged);
         Ok(self)
     }
 
@@ -228,8 +269,8 @@ impl MessageBuilder {
         let idx = self.find_field(field)?;
         let f = &self.pgn.fields[idx];
         let ev = coerce_arg(f, value)?;
-        let raw = self.value_to_raw(f, ev)?;
-        self.staged[idx] = Some(raw);
+        let staged = self.stage_value(f, ev)?;
+        self.staged[idx] = Some(staged);
         Ok(self)
     }
 
@@ -240,12 +281,22 @@ impl MessageBuilder {
         let mut buf: Vec<u8> = Vec::new();
         let mut next_bit = 0usize;
         for (idx, f) in self.pgn.fields.iter().enumerate() {
-            let bl = f.bit_length.ok_or(EncodeError::NotFixedLength(f.name))? as usize;
-            let raw = match self.staged[idx] {
-                Some(v) => v,
-                None => default_raw(f),
-            };
-            write_bits(&mut buf, &mut next_bit, bl, raw);
+            match &self.staged[idx] {
+                // A string / binary: its packed bytes are written verbatim
+                // (byte-aligned — every string/binary field is).
+                Some(Staged::Bytes(bytes)) => {
+                    for &b in bytes {
+                        write_bits(&mut buf, &mut next_bit, 8, u64::from(b));
+                    }
+                }
+                // A fixed-width scalar (number, lookup, PGN, float, …).
+                Some(Staged::Scalar(v)) => {
+                    let bl = f.bit_length.ok_or(EncodeError::NotFixedLength(f.name))? as usize;
+                    write_bits(&mut buf, &mut next_bit, bl, *v);
+                }
+                // Unset — fill the field's "not available" default.
+                None => write_unset(&mut buf, &mut next_bit, f)?,
+            }
         }
         // Flush a trailing partial byte (LSB-first packing already grew
         // the buffer as it went, so this is only defensive).
@@ -289,6 +340,19 @@ impl MessageBuilder {
             })
     }
 
+    /// Stage a value for field `f`: strings and binary become byte
+    /// payloads (self-describing or fixed-width), everything else a
+    /// scalar bit pattern.
+    fn stage_value(&self, f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
+        match f.field_type {
+            Some(FieldType::StringFix) => stage_string_fix(f, v),
+            Some(FieldType::StringLz) => stage_string_lz(f, v),
+            Some(FieldType::StringLau) => stage_string_lau(f, v),
+            Some(FieldType::Binary) => stage_binary(f, v),
+            _ => Ok(Staged::Scalar(self.value_to_raw(f, v)?)),
+        }
+    }
+
     /// Convert an [`EncodeValue`] to the raw bit pattern for `f`,
     /// masked/two's-complemented into the field width.
     fn value_to_raw(&self, f: &FieldInfo, v: EncodeValue) -> Result<u64, EncodeError> {
@@ -311,9 +375,22 @@ impl MessageBuilder {
             (Some(FieldType::Pgn), EncodeValue::Pgn(p)) => p as i64,
             (Some(FieldType::Pgn), EncodeValue::Int(n)) => n,
 
-            // Text / binary — not yet.
+            // FLOAT: IEEE-754 32-bit — the raw bit pattern, not a scaled
+            // integer. (The only non-integer scalar wire form.)
+            (Some(FieldType::Float), EncodeValue::Number(x)) => {
+                return Ok(u64::from((x as f32).to_bits()));
+            }
+            (Some(FieldType::Float), EncodeValue::Int(n)) => {
+                return Ok(u64::from((n as f32).to_bits()));
+            }
+
+            // Text / binary reach `value_to_raw` only on a scalar field
+            // (e.g. a string value handed to a NUMBER) — a type error.
             (_, EncodeValue::Text(_)) | (_, EncodeValue::Bytes(_)) => {
-                return Err(EncodeError::NotFixedLength(f.name));
+                return Err(EncodeError::TypeMismatch {
+                    field: f.name,
+                    expected: "a numeric value",
+                });
             }
 
             // A PGN number on any field is just a raw integer.
@@ -372,6 +449,119 @@ fn scaled_to_raw(f: &FieldInfo, scaled: f64) -> Result<i64, EncodeError> {
 }
 
 /// The default raw bit pattern for a field the caller left unset.
+/// Stage a `STRING_FIX` field: the ASCII bytes right-padded with `0x00`
+/// to the field's fixed byte width. Zero padding is what real devices
+/// (e.g. the Furuno SCX-20) emit and round-trips through the decoder,
+/// which trims trailing NUL / `0xff` / `@` / space.
+fn stage_string_fix(f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
+    let text = match v {
+        EncodeValue::Text(s) => s,
+        EncodeValue::NotAvailable => String::new(),
+        _ => {
+            return Err(EncodeError::TypeMismatch {
+                field: f.name,
+                expected: "text",
+            });
+        }
+    };
+    let byte_len = f.bit_length.ok_or(EncodeError::NotFixedLength(f.name))? as usize / 8;
+    let bytes = text.as_bytes();
+    if bytes.len() > byte_len {
+        return Err(EncodeError::ValueOutOfRange {
+            field: f.name,
+            value: bytes.len() as f64,
+        });
+    }
+    let mut buf = vec![0u8; byte_len];
+    buf[..bytes.len()].copy_from_slice(bytes);
+    Ok(Staged::Bytes(buf))
+}
+
+/// The text of a string [`EncodeValue`], or an error for the wrong variant.
+fn text_of(f: &FieldInfo, v: EncodeValue) -> Result<String, EncodeError> {
+    match v {
+        EncodeValue::Text(s) => Ok(s),
+        EncodeValue::NotAvailable => Ok(String::new()),
+        _ => Err(EncodeError::TypeMismatch {
+            field: f.name,
+            expected: "text",
+        }),
+    }
+}
+
+/// Stage a `STRING_LZ` field: a `[length][content]` run (canboat's
+/// `fieldPrintStringLZ` — one length byte then that many content bytes).
+/// A fixed-width field is `0x00`-padded to its declared byte width.
+fn stage_string_lz(f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
+    let text = text_of(f, v)?;
+    let content = text.as_bytes();
+    if content.len() > u8::MAX as usize {
+        return Err(EncodeError::ValueOutOfRange {
+            field: f.name,
+            value: content.len() as f64,
+        });
+    }
+    let mut buf = Vec::with_capacity(content.len() + 1);
+    buf.push(content.len() as u8);
+    buf.extend_from_slice(content);
+    if let Some(bl) = f.bit_length {
+        let want = bl as usize / 8;
+        if buf.len() > want {
+            return Err(EncodeError::ValueOutOfRange {
+                field: f.name,
+                value: content.len() as f64,
+            });
+        }
+        buf.resize(want, 0);
+    }
+    Ok(Staged::Bytes(buf))
+}
+
+/// Stage a `STRING_LAU` field: `[total_len][encoding=1][content]`, where
+/// `total_len` counts the two header bytes (canboat's `fieldPrintStringLAU`).
+/// Encoding `1` is ASCII/UTF-8. Always variable-length (no padding).
+fn stage_string_lau(f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
+    let text = text_of(f, v)?;
+    let content = text.as_bytes();
+    if content.len() + 2 > u8::MAX as usize {
+        return Err(EncodeError::ValueOutOfRange {
+            field: f.name,
+            value: content.len() as f64,
+        });
+    }
+    let mut buf = Vec::with_capacity(content.len() + 2);
+    buf.push((content.len() + 2) as u8);
+    buf.push(1); // 1 = ASCII / UTF-8
+    buf.extend_from_slice(content);
+    Ok(Staged::Bytes(buf))
+}
+
+/// Stage a `BINARY` field: raw bytes, `0x00`-padded to the declared byte
+/// width when the field is fixed-length.
+fn stage_binary(f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
+    let mut bytes = match v {
+        EncodeValue::Bytes(b) => b,
+        EncodeValue::NotAvailable => Vec::new(),
+        _ => {
+            return Err(EncodeError::TypeMismatch {
+                field: f.name,
+                expected: "bytes",
+            });
+        }
+    };
+    if let Some(bl) = f.bit_length {
+        let want = bl as usize / 8;
+        if bytes.len() > want {
+            return Err(EncodeError::ValueOutOfRange {
+                field: f.name,
+                value: bytes.len() as f64,
+            });
+        }
+        bytes.resize(want, 0);
+    }
+    Ok(Staged::Bytes(bytes))
+}
+
 fn default_raw(f: &FieldInfo) -> u64 {
     let bl = f.bit_length.unwrap_or(0);
     // A variant-selector field: emit the value that identifies this PGN.
@@ -382,6 +572,43 @@ fn default_raw(f: &FieldInfo) -> u64 {
         Some(FieldType::Spare) => 0,
         _ => f.unknown_value.unwrap_or_else(|| all_ones(bl)),
     }
+}
+
+/// Write the "not available" default for a field left unset by the caller.
+fn write_unset(buf: &mut Vec<u8>, next_bit: &mut usize, f: &FieldInfo) -> Result<(), EncodeError> {
+    match f.field_type {
+        // Fixed string / binary: all-1s (the decoder trims the 0xff run to
+        // an empty string; binary fields are whole bytes).
+        Some(FieldType::StringFix) | Some(FieldType::Binary) if f.bit_length.is_some() => {
+            for _ in 0..f.bit_length.unwrap() as usize / 8 {
+                write_bits(buf, next_bit, 8, 0xff);
+            }
+        }
+        // Variable-length binary: nothing to emit.
+        Some(FieldType::Binary) => {}
+        // Self-describing strings: the minimal empty form.
+        Some(FieldType::StringLz) => write_bits(buf, next_bit, 8, 0), // length 0
+        Some(FieldType::StringLau) => {
+            write_bits(buf, next_bit, 8, 2); // total_len = 2 (header only)
+            write_bits(buf, next_bit, 8, 1); // encoding = ASCII/UTF-8
+        }
+        // The group-function dynamic types take their width/shape from
+        // sibling fields at decode time, so they can't be defaulted in
+        // isolation — set them explicitly (or use a purpose-built 126208
+        // frame).
+        Some(FieldType::Variable)
+        | Some(FieldType::DynamicFieldKey)
+        | Some(FieldType::DynamicFieldLength)
+        | Some(FieldType::DynamicFieldValue) => {
+            return Err(EncodeError::NotFixedLength(f.name));
+        }
+        // Every fixed-width scalar: its default at the field's bit width.
+        _ => {
+            let bl = f.bit_length.ok_or(EncodeError::NotFixedLength(f.name))? as usize;
+            write_bits(buf, next_bit, bl, default_raw(f));
+        }
+    }
+    Ok(())
 }
 
 /// Two's-complement / mask `value` into `bits` low bits.
@@ -579,5 +806,126 @@ mod tests {
             db().message("notAPgnId"),
             Err(EncodeError::NoSuchPgnId(_))
         ));
+    }
+
+    #[test]
+    fn string_fix_round_trips() {
+        use crate::field::product_information::MODEL_ID;
+        let frame = db()
+            .message("productInformation")
+            .unwrap()
+            .set(MODEL_ID, "SCX-20")
+            .unwrap()
+            .build()
+            .unwrap();
+        let d = db().decode(&frame).unwrap();
+        assert_eq!(
+            d.field_ref(MODEL_ID).and_then(|f| f.value.as_str()),
+            Some("SCX-20")
+        );
+    }
+
+    #[test]
+    fn string_lau_round_trips() {
+        use crate::field::configuration_information::INSTALLATION_DESCRIPTION1 as DESC1;
+        let frame = db()
+            .message("configurationInformation")
+            .unwrap()
+            .set(DESC1, "Helm Station")
+            .unwrap()
+            .build()
+            .unwrap();
+        let d = db().decode(&frame).unwrap();
+        assert_eq!(
+            d.field_ref(DESC1).and_then(|f| f.value.as_str()),
+            Some("Helm Station")
+        );
+    }
+
+    #[test]
+    fn string_lz_round_trips() {
+        use crate::field::navico_ascii_identifier::IDENTIFIER;
+        let frame = db()
+            .message("navicoAsciiIdentifier")
+            .unwrap()
+            .set(IDENTIFIER, "BOW")
+            .unwrap()
+            .build()
+            .unwrap();
+        let d = db().decode(&frame).unwrap();
+        assert_eq!(
+            d.field_ref(IDENTIFIER).and_then(|f| f.value.as_str()),
+            Some("BOW")
+        );
+    }
+
+    #[test]
+    fn binary_round_trips() {
+        // A fixed-width (7-byte) BINARY field: a full-width payload round-
+        // trips exactly (a shorter one would be 0x00-padded to the width).
+        use crate::field::iso_transport_protocol_data_transfer::DATA;
+        let payload = vec![0xde_u8, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
+        let frame = db()
+            .message("isoTransportProtocolDataTransfer")
+            .unwrap()
+            .set(DATA, payload.clone())
+            .unwrap()
+            .build()
+            .unwrap();
+        let d = db().decode(&frame).unwrap();
+        match d.field_ref(DATA).map(|f| &f.value) {
+            Some(crate::FieldValue::Binary(v)) => assert_eq!(v, &payload),
+            other => panic!("expected binary, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn float_round_trips() {
+        // FLOAT is written as raw IEEE-754 bits (no resolution scaling),
+        // so it survives a round-trip within f32 precision.
+        use crate::field::garmin_autopilot_heading_to_steer::HEADING_TO_STEER as HTS;
+        let frame = db()
+            .message("garminAutopilotHeadingToSteer")
+            .unwrap()
+            .set(HTS, 1.5)
+            .unwrap()
+            .build()
+            .unwrap();
+        let d = db().decode(&frame).unwrap();
+        let got = d.field_ref(HTS).and_then(|f| f.value.as_f64()).unwrap();
+        assert!((got - 1.5).abs() < 1e-6, "got {got}");
+    }
+
+    #[test]
+    fn iso_name_round_trips() {
+        // A NAME with the top (arbitrary-address-capable) bit set exercises
+        // the full u64 range that an i64 alone couldn't express.
+        use crate::field::simnet_data_source_selection::SOURCE;
+        let name: u64 = 0xC078_8C00_E7E0_4364;
+        let frame = db()
+            .message("simnetDataSourceSelection")
+            .unwrap()
+            .set(SOURCE, name)
+            .unwrap()
+            .build()
+            .unwrap();
+        let d = db().decode(&frame).unwrap();
+        match d.field_ref(SOURCE).map(|f| &f.value) {
+            Some(crate::FieldValue::IsoName { value, .. }) => assert_eq!(*value, name),
+            other => panic!("expected iso name, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn dynamic_group_function_field_is_a_clear_error() {
+        // The 126208 group-function dynamic types can't be defaulted in
+        // isolation; an unset one is a descriptive error, not wrong bytes.
+        let err = db()
+            .message("nmeaRequestGroupFunction")
+            .and_then(|b| b.build());
+        assert!(
+            matches!(err, Err(EncodeError::NotFixedLength(_))),
+            "got {err:?}"
+        );
     }
 }

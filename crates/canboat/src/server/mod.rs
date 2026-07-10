@@ -184,18 +184,15 @@ pub struct Args {
     #[arg(long)]
     no_request_claims: bool,
 
-    /// Apply a device-specific firmware-quirk workaround on the bus.
-    /// Currently only `scx20` is recognised: when something on the bus
-    /// asks for PGN 126996 Product Information, fabricate the response
-    /// on behalf of a known SCX-20 (it sometimes "forgets" how to
-    /// answer). The single-value form accepted today is expected to
-    /// grow into a repeatable flag once more quirks land.
+    /// Apply a quirk / value-add on the bus (see the possible values).
+    /// Repeatable — pass `--quirk` once per quirk you want, e.g.
+    /// `--quirk scx20 --quirk wmm`.
     ///
-    /// Only works with `--socketcan` — every other device backend
-    /// rewrites the source address on outbound, which would defeat the
-    /// impersonation.
+    /// `scx20` is impersonation and needs `--socketcan`; `wmm` emits
+    /// canboat's own PGN and works with any writable backend (socketcan /
+    /// NGT-1 / iKonvert).
     #[arg(long, value_enum, value_name = "NAME")]
-    quirk: Option<quirks::QuirkKind>,
+    quirk: Vec<quirks::QuirkKind>,
 
     /// Bind address for all TCP listeners. Defaults to `0.0.0.0` so
     /// clients on the LAN (chartplotters, OpenCPN, etc.) can
@@ -354,12 +351,13 @@ pub struct Args {
 }
 
 pub fn run(cli: Args) -> Result<()> {
-    // Refuse --quirk without --socketcan up front: every other device
-    // backend rewrites the source address on outbound, which makes the
-    // quirk's impersonation a no-op on the wire.
-    if cli.quirk.is_some() && cli.socketcan.is_none() {
+    // The scx20 quirk impersonates a device, so it needs --socketcan
+    // (the one backend that preserves a frame's src on outbound). The
+    // wmm quirk emits canboat's own PGN 127258, so it only needs *some*
+    // writable backend — that check happens below once one is known.
+    if cli.quirk.contains(&quirks::QuirkKind::Scx20) && cli.socketcan.is_none() {
         anyhow::bail!(
-            "--quirk only works with --socketcan; other device backends \
+            "--quirk scx20 only works with --socketcan; other device backends \
              rewrite src on outbound writes so an impersonated frame \
              cannot reach the bus with the original source address"
         );
@@ -441,10 +439,23 @@ pub fn run(cli: Args) -> Result<()> {
     } = open_source(&cli)?;
     let device_sender = supervisor.as_ref().map(|s| s.frame_sender());
 
-    // Quirks (e.g. SCX-20 PGN 126996 fabrication) need to write the
-    // synthetic onto the wire — they grab their own clone of the
-    // device sender and live inside `Hubs`.
-    let quirks_kinds = cli.quirk.into_iter().collect();
+    // The wmm quirk emits PGN 127258 onto the bus, so it needs a writable
+    // device backend (any of socketcan / NGT-1 / iKonvert). Refuse it in
+    // stdin- or log-only mode where there is no bus to write to.
+    if cli.quirk.contains(&quirks::QuirkKind::Wmm) && device_sender.is_none() {
+        anyhow::bail!(
+            "--quirk wmm needs a writable device backend (e.g. --socketcan or an \
+             NGT-1/iKonvert gateway) to emit PGN 127258; there is no bus to write \
+             to in stdin/log-only mode"
+        );
+    }
+
+    // Quirks (e.g. SCX-20 PGN 126996 fabrication, WMM 127258 emission)
+    // write synthetics onto the wire — they grab their own clone of the
+    // device sender and live inside `Hubs`. A quirk that emits as canboat's
+    // own node sends from `ADDR_GLOBAL`; the pipeline stamps the live
+    // `claim_addr` onto it (see `Hubs::claim_addr`).
+    let quirks_kinds = cli.quirk;
     let hubs = Hubs {
         raw: Arc::new(Hub::new()),
         nmea: Arc::new(Hub::new()),
@@ -454,6 +465,7 @@ pub fn run(cli: Args) -> Result<()> {
         engine: Arc::clone(&engine),
         quirks: quirks::Quirks::new(quirks_kinds),
         device_sender: device_sender.clone(),
+        claim_addr: device_claim_addr.clone(),
         // Filled in below once the config dir is resolved.
         overrides: None,
     };

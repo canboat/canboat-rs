@@ -20,17 +20,20 @@
 //! only source of real roll/pitch rate (no standard PGN carries them). Only
 //! emitted while a fresh 130842 is seen.
 //!
-//! **Attitude (127257) is deliberately *not* emitted.** Hardware testing on a
-//! live Hercules showed the rate feed alone keeps Motion "green" and
-//! stabilizes apparent wind through hard rolling — the mast-tip correction is
-//! driven by angular *rate*, not absolute heel. Relaying attitude under our
-//! identity was also redundant: the SCX-20's own 127257 is already on the bus
-//! for any attitude consumer. Dropping it halves this quirk's synthetic load.
+//! **Attitude (127257) is deliberately *not* emitted.** A live-Hercules test
+//! (2026-07-10, recorded) indicated the rate feed alone keeps Motion "green"
+//! and stabilizes apparent wind through hard rolling — the mast-tip correction
+//! appears driven by angular *rate*, not absolute heel. Relaying attitude under
+//! our identity was also redundant: the SCX-20's own 127257 is already on the
+//! bus for any attitude consumer. Dropping it halves this quirk's synthetic
+//! load. (This is a coarse, qualitative observation, not an instrumented one.)
 //!
-//! Both proprietary layouts were reverse-engineered by correlation against
-//! PGN 127251 Rate of Turn; see `n2k_research/navico/motion/
-//! rate-pgns-130824-130842.md` for the byte maps, resolutions, and evidence,
-//! plus `hercules-acceptance.md` (recognition gate) and `digital-twin-spec.md`.
+//! Both proprietary layouts were reverse-engineered by correlation against a
+//! known rate reference; see `n2k_research/navico/motion/
+//! rate-pgns-130824-130842.md` for the byte maps and evidence, plus
+//! `hercules-acceptance.md` (recognition gate) and `digital-twin-spec.md`. The
+//! Furuno 130842 rate fields (E/F/G, 32-bit signed, **0.001 °/s**) follow the
+//! corrected canboat schema — issue #756 / commit 8a258b9.
 //!
 //! Scope: address claim, 126996 Product Info, 126464 TX/RX PGN lists, and the
 //! 130842→130824 rate transcode. The Simnet source-selection handshake
@@ -59,13 +62,35 @@ const KEY_ROLL_RATE: u16 = 60;
 const KEY_PITCH_RATE: u16 = 158; // canboat mislabels this "Pitch Angle"
 const KEY_YAW_RATE: u16 = 68; // canboat leaves this key unnamed
 
-/// Rate LSBs, both expressed in rad/s. The SCX-20 130842 rate fields carry
-/// 0.001 rad/s per count (field g nails 127251 ROT at r=1.00); the B&G
-/// 130824 rate keys carry 0.0001 °/s per count (key 68 nails 127251 at
-/// r=0.96, LSB 1.745e-6 rad/s). The transcode is one multiply by their ratio
-/// (≈572.96).
-const SCX_RATE_LSB_RAD_S: f64 = 0.001;
-const BG_RATE_LSB_RAD_S: f64 = 0.0001 * std::f64::consts::PI / 180.0;
+/// Rate LSBs, both in **rad/s**. The transcode multiplies each count by their
+/// ratio `SCX_RATE_LSB_RAD_S / BG_RATE_LSB_RAD_S` ≈ **×558**.
+///
+/// **Input (Furuno 130842): 0.001 °/s = 1.7453e-5 rad/s** per count — solid
+/// (canboat issue #756 / commit 8a258b9, `ROTATION_FIX32_MDEG_S`: integrating
+/// field G against the SCX-20's own unwrapped 127257 yaw gives r=0.9996 at
+/// 1.75e-5 rad/s, cross-checked vs an independent Precision-9).
+///
+/// **Output (B&G 130824): the NMEA-2000 127251 Rate-of-Turn resolution,
+/// 3.125e-8 rad/s** (= 1e-6/32). The genuine Motion Sensor reuses that standard
+/// gyro-rate LSB: integrating its own 130824 key-60 count against its 127257
+/// roll (BnG_Zeus capture) measures 3.05–3.54e-8 rad/s per count, which brackets
+/// 3.125e-8. ±1e6 raw counts then read ±1.79 °/s (real swell); i32 full-scale is
+/// ±3843 °/s of headroom. The old "0.0001 °/s" (a ×10 gain) came from correlating
+/// against the SCX-20's *damped* 127251 ROT — the flaw #756 fixed on the input
+/// side — and is dead by the physical-range check (±1e6 would read ±100 °/s).
+///
+/// NB on the ~558 gain: it is a ratio of two *same-dimension* LSBs, hence
+/// **unit-invariant** (identical computed in rad or in deg), so it is NOT a
+/// rad↔deg artifact — despite its resemblance to 10·(180/π)=572.96. That number
+/// was the *old* buggy code, which divided a rad-labelled SCX LSB by a
+/// deg-labelled BG LSB; it happened to land near the true ratio, which is why it
+/// accidentally worked. Value confirmed against a genuine unit; a Hercules
+/// CPUApp teardown corroborated the architecture (rate → mast-tip `v = ω·h` wind
+/// correction) but holds no single scale literal. Tunable if hardware disagrees.
+/// See `n2k_research/navico/motion/rate-pgns-130824-130842.md`.
+const SCX_RATE_LSB_RAD_S: f64 = 0.001 * std::f64::consts::PI / 180.0;
+/// NMEA-2000 PGN 127251 "Rate of Turn" resolution (1e-6/32 rad/s).
+const BG_RATE_LSB_RAD_S: f64 = 3.125e-8;
 
 /// ISO NAME fields identifying the H5000 Motion Sensor personality. The
 /// class/function are *not* the Hercules acceptance gate (that is the
@@ -314,19 +339,22 @@ fn header_manufacturer(data: &[u8]) -> Option<u16> {
     Some(hdr & 0x07ff)
 }
 
-/// Read the roll/pitch/yaw **rate** fields (e, f, g) out of a Furuno SCX-20
-/// PGN 130842 payload, in the source's raw 0.001-rad/s counts. Byte offsets
-/// are fixed by the RE'd layout (`rate-pgns-130824-130842.md`): e = i32 @15,
-/// f = i32 @19, g = i16 @23. `None` if the payload is short.
+/// Read the roll/pitch/yaw **rate** fields (E, F, G) out of a Furuno SCX-20
+/// PGN 130842 payload, in the source's raw 0.001-°/s counts. Byte offsets are
+/// fixed by the canboat schema (issue #756): E = i32 @15, F = i32 @19,
+/// G = i32 @23. G is the full 32-bit signed value — the layout's old 16-bit G
+/// plus field H are one field, H having been G's sign extension. `None` if the
+/// payload is short.
 fn scx_6dof_rates(data: &[u8]) -> Option<(i32, i32, i32)> {
     let roll = i32::from_le_bytes(data.get(15..19)?.try_into().ok()?);
     let pitch = i32::from_le_bytes(data.get(19..23)?.try_into().ok()?);
-    let yaw = i16::from_le_bytes(data.get(23..25)?.try_into().ok()?) as i32;
+    let yaw = i32::from_le_bytes(data.get(23..27)?.try_into().ok()?);
     Some((roll, pitch, yaw))
 }
 
-/// Convert one SCX-20 rate count (0.001 rad/s) to a B&G 130824 rate count
-/// (0.0001 °/s), saturating to the i32 the wire field holds.
+/// Convert one SCX-20 130842 rate count to a B&G 130824 rate count by the LSB
+/// ratio [`SCX_RATE_LSB_RAD_S`] / [`BG_RATE_LSB_RAD_S`] (≈×558), saturating to
+/// the i32 the wire field holds.
 fn transcode_rate(scx_count: i32) -> i32 {
     let rad_s = scx_count as f64 * SCX_RATE_LSB_RAD_S;
     (rad_s / BG_RATE_LSB_RAD_S)
@@ -401,8 +429,9 @@ mod tests {
 
     /// A decoded Furuno SCX-20 PGN 130842 6DOF frame from `src`, using the
     /// exact 29 bytes captured from a real SCX-20 (`scx20-setting-tool-start
-    /// .raw`): roll-rate field e = -2184, pitch-rate f = 1467, yaw-rate g =
-    /// 774 (raw 0.001-rad/s counts).
+    /// .raw`): roll-rate field E = -2184, pitch-rate F = 1467, yaw-rate G =
+    /// 774 (raw 0.001-°/s counts; G read as the full 32-bit field, its high
+    /// two bytes 0x0000 being the sign extension — see canboat issue #756).
     fn six_dof(src: u8) -> DecodedPgn {
         let data = [
             0x3f, 0x9f, 0x54, 0xff, 0xff, 0xff, 0xd4, 0xff, 0xff, 0xff, 0x2d, 0x03, 0x00, 0x00,
@@ -468,9 +497,14 @@ mod tests {
 
     #[test]
     fn transcode_rate_scales_and_saturates() {
-        // 1000 counts * 0.001 rad/s = 1 rad/s; ÷ (0.0001 °/s in rad/s).
-        assert_eq!(transcode_rate(1000), 572_958);
-        assert_eq!(transcode_rate(-1000), -572_958);
+        // Gain is the LSB ratio (≈558) — assert against the constants, not a
+        // baked-in number, so tuning BG_RATE_LSB_RAD_S never breaks this test.
+        // (The earlier "clean ×10", from a 57× too-coarse B&G LSB, undershot the
+        // CPU rate feed.)
+        let gain = SCX_RATE_LSB_RAD_S / BG_RATE_LSB_RAD_S;
+        assert_eq!(transcode_rate(1000), (1000.0 * gain).round() as i32);
+        assert_eq!(transcode_rate(-1000), -(1000.0 * gain).round() as i32);
+        assert!(gain > 100.0, "sanity: a mid-hundreds gain, never the ×10 trap");
         assert_eq!(transcode_rate(0), 0);
         // A full-scale i32 input saturates rather than wrapping/panicking.
         assert_eq!(transcode_rate(i32::MAX), i32::MAX);

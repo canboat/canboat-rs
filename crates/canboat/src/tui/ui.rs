@@ -388,12 +388,34 @@ impl App {
     /// visible and labelled.
     pub fn detail_rows(&self, src: u8, state: &AppState) -> Vec<Entry> {
         let mut rows: Vec<Entry> = state.entries_for_src(src).into_iter().cloned().collect();
-        let live_pgns: std::collections::HashSet<u32> = rows.iter().map(|e| e.pgn).collect();
+        let mut present: std::collections::HashSet<u32> = rows.iter().map(|e| e.pgn).collect();
         for ov in state.override_rows() {
-            if ov.interval_ms != INTERVAL_OFF || ov.src != src || live_pgns.contains(&ov.pgn) {
+            if ov.interval_ms != INTERVAL_OFF || ov.src != src || present.contains(&ov.pgn) {
                 continue;
             }
             rows.push(synthesize_silenced_entry(&ov));
+            present.insert(ov.pgn);
+        }
+        // A device's PGN 126464 Transmit list names PGNs by *number* only,
+        // but a proprietary number is shared across manufacturers — so each
+        // is resolved to the variant matching this device's ISO-claim
+        // manufacturer (see [`crate::tui::state::variant_for`]). Surface each
+        // advertised variant we don't already show as a count==0 row so an
+        // override can be built for it — with the *correct* manufacturer
+        // header, without which the device ignores the 126208 request. Dedup
+        // by (pgn, manufacturer) so a variant still appears when a different
+        // manufacturer's definition of the same number is live.
+        let device_mfr = device_manufacturer(src, state);
+        let mut shown: std::collections::HashSet<(u32, Option<u16>)> = rows
+            .iter()
+            .map(|e| (e.pgn, proprietary_codes(e).0))
+            .collect();
+        for pgn in state.pgn_lists_for_src(src).tx {
+            if let Some(v) = advertised_variant(pgn, device_mfr)
+                && shown.insert((pgn, variant_manufacturer(v)))
+            {
+                rows.push(synthesize_advertised_entry(v, src));
+            }
         }
         rows.sort_by(|a, b| {
             a.pgn
@@ -789,18 +811,14 @@ impl App {
     fn open_override_modal(&mut self, src: u8, state: &AppState) {
         let rows = self.detail_rows(src, state);
         if let Some(row) = self.detail_state.selected().and_then(|i| rows.get(i)) {
-            let (mfr, ind, desc) = if row.count == 0 {
-                let ov = state.overrides.get(&(row.src, row.pgn));
-                (
-                    ov.and_then(|o| o.manufacturer_code),
-                    ov.and_then(|o| o.industry_code),
-                    ov.map(|o| o.description.clone()).filter(|d| !d.is_empty()),
-                )
-            } else {
-                let (m, i) = proprietary_codes(row);
-                let d = (!row.description.is_empty()).then(|| row.description.clone());
-                (m, i, d)
-            };
+            // Live entries, silenced placeholders, and advertised (126464)
+            // rows all carry the proprietary manufacturer / industry header
+            // in their real or synthetic `line`, so one path reads the codes
+            // for every kind of row. Getting the manufacturer right is what
+            // makes the 126208 override target the correct proprietary PGN —
+            // a wrong manufacturer is silently ignored by the device.
+            let (mfr, ind) = proprietary_codes(row);
+            let desc = (!row.description.is_empty()).then(|| row.description.clone());
             self.modal = Some(OverrideModal {
                 src,
                 pgn: row.pgn,
@@ -2314,24 +2332,44 @@ fn pgn_on_request(pgn: u32) -> bool {
 
 fn format_entry_row(e: &Entry, state: &AppState) -> Line<'static> {
     let mode = state.status.mode;
-    // `count == 0` is the sentinel for a synthetic silenced-override
-    // row — no live data, no measured interval, no meaningful age.
-    // Render it as an OFF row in dim grey so the user can see at a
-    // glance which PGNs they've silenced.
+    // `count == 0` is the sentinel for a synthetic row carrying no live
+    // data (no measured interval, no meaningful age). Two kinds:
+    //  * a *silenced* override — null `line` — drawn OFF in red;
+    //  * an *advertised* PGN from a 126464 Transmit list — non-null
+    //    synthetic `line` — drawn as a dim "advertised" row the user can
+    //    still set an override on.
     if e.count == 0 {
-        let description = if e.description.is_empty() {
+        // Silenced (a live override set it OFF) vs advertised (named in a
+        // 126464 list, never observed). Both are count==0; the live
+        // override, not the synthetic line, tells them apart.
+        let silenced = state
+            .overrides
+            .get(&(e.src, e.pgn))
+            .is_some_and(|o| o.interval_ms == INTERVAL_OFF);
+        let advertised = !silenced;
+        let fallback = if advertised {
+            "(advertised)"
+        } else {
             "(disabled)"
+        };
+        let description = if e.description.is_empty() {
+            fallback
         } else {
             e.description.as_str()
         };
         let dim = Style::default().fg(Color::DarkGray);
+        let (state_label, state_style, note) = if advertised {
+            ("—", dim, "(advertised)")
+        } else {
+            ("OFF", Style::default().fg(Color::Red), "(silenced)")
+        };
         return Line::from(vec![
             Span::styled(format!(" {:6} ", e.pgn), Style::default().fg(Color::Yellow)),
             Span::styled(format!("{:14.14}", ""), dim),
             Span::styled(format!(" {description:30.30}"), dim),
-            Span::styled(format!(" {:>13}", "OFF"), Style::default().fg(Color::Red)),
+            Span::styled(format!(" {state_label:>13}"), state_style),
             Span::styled(format!(" {:>10}", ""), dim),
-            Span::styled(format!(" {:>13}", "(silenced)"), dim),
+            Span::styled(format!(" {note:>13}"), dim),
         ]);
     }
     let sec = e
@@ -2372,12 +2410,25 @@ fn format_entry_row(e: &Entry, state: &AppState) -> Line<'static> {
 /// than the (null) `line`.
 fn synthesize_silenced_entry(ov: &OverrideRow) -> Entry {
     let now = std::time::Instant::now();
+    // Carry the override's own proprietary header in a synthetic line so
+    // `proprietary_codes` (advertised-row dedup + the override modal) reads
+    // the manufacturer / industry back. A silenced vs advertised count==0
+    // row is told apart by the live override, not by the line, so this is
+    // free to be populated.
+    let line = if is_proprietary_pgn(ov.pgn) {
+        serde_json::json!({ "fields": {
+            "Manufacturer Code": ov.manufacturer_code,
+            "Industry Code": ov.industry_code,
+        }})
+    } else {
+        serde_json::Value::Null
+    };
     Entry {
         pgn: ov.pgn,
         src: ov.src,
         secondary: None,
         description: ov.description.clone(),
-        line: serde_json::Value::Null,
+        line,
         last_update: now,
         count: 0,
         first_seen: now,
@@ -2386,6 +2437,86 @@ fn synthesize_silenced_entry(ov: &OverrideRow) -> Entry {
         // Silenced placeholders carry no observations — `count == 0`
         // is the sentinel that tells the row renderer to draw OFF
         // and the EntryDetail handler to skip drill-in.
+        history_indices: Vec::new(),
+    }
+}
+
+/// A proprietary PGN variant's manufacturer code — the `Match` on its first
+/// field (`None` for a standard variant, which carries no such match).
+fn variant_manufacturer(v: &canboat_core::PgnInfo) -> Option<u16> {
+    v.fields
+        .first()
+        .and_then(|f| f.match_value)
+        .and_then(|m| u16::try_from(m).ok())
+}
+
+/// A proprietary PGN variant's industry code — the `Match` on its third
+/// field (the second is the reserved field between manufacturer and industry).
+fn variant_industry(v: &canboat_core::PgnInfo) -> Option<u8> {
+    v.fields
+        .get(2)
+        .and_then(|f| f.match_value)
+        .and_then(|i| u8::try_from(i).ok())
+}
+
+/// The variant of a PGN a device *advertised* (in its 126464 Transmit list,
+/// which names PGNs by number only) that applies to this device: for a
+/// proprietary number, the variant whose manufacturer matches the device's
+/// ISO-claim `device_mfr` (`None` when that manufacturer is unknown or the
+/// device owns no variant of it, so a wrong manufacturer is never guessed);
+/// for a standard number, its single definition.
+fn advertised_variant(pgn: u32, device_mfr: Option<u16>) -> Option<&'static canboat_core::PgnInfo> {
+    let db = canboat_core::PgnDatabase::embedded(canboat_core::Units::Metric);
+    if !is_proprietary_pgn(pgn) {
+        return db.first_pgn(pgn);
+    }
+    let mfr = device_mfr?;
+    db.pgn_variants(pgn)
+        .find(|v| variant_manufacturer(v) == Some(mfr))
+}
+
+/// The device's manufacturer code, for disambiguating a proprietary PGN a
+/// 126464 list advertises by number only. Prefer its ISO-claim NAME; fall
+/// back to the manufacturer decoded off any proprietary PGN it already
+/// transmits (the NAME map needs the Unique Number, which some streams omit).
+fn device_manufacturer(src: u8, state: &AppState) -> Option<u16> {
+    if let Some(k) = state.src_to_name.get(&src) {
+        return Some(k.manufacturer_code);
+    }
+    state
+        .entries_for_src(src)
+        .into_iter()
+        .find_map(|e| proprietary_codes(e).0)
+}
+
+/// Build a placeholder `Entry` for a PGN a device advertised in its PGN
+/// 126464 Transmit list but that we've never observed as live traffic.
+/// Like [`synthesize_silenced_entry`] it uses the `count == 0` sentinel,
+/// but carries a **non-null** synthetic `line` — which both distinguishes it
+/// from a silenced row (null line) at render time and lets
+/// [`proprietary_codes`] recover the manufacturer / industry so an override
+/// can be built for a proprietary PGN we've only seen named, never decoded.
+fn synthesize_advertised_entry(variant: &canboat_core::PgnInfo, src: u8) -> Entry {
+    let now = std::time::Instant::now();
+    let line = if is_proprietary_pgn(variant.pgn) {
+        serde_json::json!({ "fields": {
+            "Manufacturer Code": variant_manufacturer(variant),
+            "Industry Code": variant_industry(variant),
+        }})
+    } else {
+        serde_json::json!({ "fields": {} })
+    };
+    Entry {
+        pgn: variant.pgn,
+        src,
+        secondary: None,
+        description: variant.description.to_string(),
+        line,
+        last_update: now,
+        count: 0,
+        first_seen: now,
+        first_stamp_ms: None,
+        last_stamp_ms: None,
         history_indices: Vec::new(),
     }
 }
@@ -3526,6 +3657,72 @@ mod tests {
             json!({"pgn": 129025, "fields": {"Latitude": 53.2}}),
         );
         s
+    }
+
+    #[test]
+    fn advertised_tx_pgns_become_overridable_rows() {
+        let mut s = AppState::new(Status::new_log("cap.log".into()), HashMap::new());
+        // A Furuno device that claims an address (so its NAME manufacturer
+        // is known, disambiguating proprietary PGN variants) ...
+        s.upsert(
+            60928,
+            52,
+            None,
+            "ISO Address Claim".into(),
+            json!({"pgn":60928,"fields":{"Manufacturer Code":1855,"Unique Number":42}}),
+        );
+        // ... emits one live PGN ...
+        s.upsert(
+            127250,
+            52,
+            None,
+            "Vessel Heading".into(),
+            json!({"pgn":127250,"fields":{"Heading":1.0}}),
+        );
+        // ... and advertises a Transmit list (126464) naming a proprietary
+        // Furuno PGN (130842) it isn't currently sending, plus the live one.
+        s.upsert(
+            126464,
+            52,
+            None,
+            "PGN List".into(),
+            json!({"pgn":126464,"fields":{"Function Code":0,
+                "list":[{"PGN":130842},{"PGN":127250}]}}),
+        );
+
+        let rows = ui_app().detail_rows(52, &s);
+        // The advertised 130842 appears as a count==0 row with a non-null
+        // synthetic line; the already-live 127250 is not duplicated.
+        let advertised: Vec<_> = rows.iter().filter(|e| e.count == 0).collect();
+        assert_eq!(advertised.len(), 1);
+        let row = advertised[0];
+        assert_eq!(row.pgn, 130842);
+        assert!(
+            !row.line.is_null(),
+            "advertised rows carry a synthetic line"
+        );
+        assert_eq!(
+            rows.iter().filter(|e| e.pgn == 127250).count(),
+            1,
+            "the live PGN is not re-advertised"
+        );
+        // Its proprietary codes resolve from the schema (Furuno / marine)
+        // so an override can target it even though it was never decoded.
+        assert_eq!(proprietary_codes(row), (Some(1855), Some(4)));
+    }
+
+    #[test]
+    fn advertised_variant_picks_the_device_manufacturer() {
+        // 130842 has several manufacturer variants; the Furuno NAME selects
+        // Furuno (1855) / marine (4), not whichever variant is listed first.
+        let v = advertised_variant(130842, Some(1855)).expect("furuno variant");
+        assert_eq!(variant_manufacturer(v), Some(1855));
+        assert_eq!(variant_industry(v), Some(4));
+        assert!(v.description.contains("Furuno"));
+        // An unknown manufacturer must not guess a variant.
+        assert!(advertised_variant(130842, None).is_none());
+        // A standard PGN resolves to its single definition regardless.
+        assert!(advertised_variant(127250, None).is_some());
     }
 
     /// An `App` in the settled post-startup state — most tests want the

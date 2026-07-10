@@ -188,9 +188,9 @@ pub struct Args {
     /// Repeatable — pass `--quirk` once per quirk you want, e.g.
     /// `--quirk scx20 --quirk wmm`.
     ///
-    /// `scx20` is impersonation and needs `--socketcan`; `wmm` emits
-    /// canboat's own PGN and works with any writable backend (socketcan /
-    /// NGT-1 / iKonvert).
+    /// `scx20` and `motion` impersonate/claim a device and need
+    /// `--socketcan`; `wmm` emits canboat's own PGN and works with any
+    /// writable backend (socketcan / NGT-1 / iKonvert).
     #[arg(long, value_enum, value_name = "NAME")]
     quirk: Vec<quirks::QuirkKind>,
 
@@ -351,16 +351,24 @@ pub struct Args {
 }
 
 pub fn run(cli: Args) -> Result<()> {
-    // The scx20 quirk impersonates a device, so it needs --socketcan
-    // (the one backend that preserves a frame's src on outbound). The
-    // wmm quirk emits canboat's own PGN 127258, so it only needs *some*
-    // writable backend — that check happens below once one is known.
-    if cli.quirk.contains(&quirks::QuirkKind::Scx20) && cli.socketcan.is_none() {
-        anyhow::bail!(
-            "--quirk scx20 only works with --socketcan; other device backends \
-             rewrite src on outbound writes so an impersonated frame \
-             cannot reach the bus with the original source address"
-        );
+    // The scx20 and motion quirks impersonate a device (motion claims a
+    // whole new virtual node), so they need --socketcan — the one backend
+    // that preserves a frame's src on outbound. The wmm quirk emits
+    // canboat's own PGN 127258, so it only needs *some* writable backend —
+    // that check happens below once one is known.
+    for kind in [quirks::QuirkKind::Scx20, quirks::QuirkKind::Motion] {
+        if cli.quirk.contains(&kind) && cli.socketcan.is_none() {
+            let name = match kind {
+                quirks::QuirkKind::Scx20 => "scx20",
+                quirks::QuirkKind::Motion => "motion",
+                quirks::QuirkKind::Wmm => unreachable!(),
+            };
+            anyhow::bail!(
+                "--quirk {name} only works with --socketcan; it claims/impersonates \
+                 a device, and other backends rewrite src on outbound writes so the \
+                 frame cannot reach the bus with the claimed source address"
+            );
+        }
     }
 
     let level = if cli.quiet {
@@ -449,6 +457,9 @@ pub fn run(cli: Args) -> Result<()> {
              to in stdin/log-only mode"
         );
     }
+
+    // (motion is already gated to --socketcan above, which guarantees a
+    // writable backend, so it needs no separate device_sender check here.)
 
     // Quirks (e.g. SCX-20 PGN 126996 fabrication, WMM 127258 emission)
     // write synthetics onto the wire — they grab their own clone of the

@@ -668,8 +668,11 @@ impl AppState {
         let industry_code = field_number(line, ov::INDUSTRY_CODE)
             .filter(|v| *v != 0xff)
             .map(|v| v as u8);
-        let description = PgnDatabase::embedded(Units::Metric)
-            .first_pgn(pgn)
+        // Resolve the description via the manufacturer the override itself
+        // carries, so a proprietary PGN shared across manufacturers is
+        // labelled with *this* device's variant (e.g. Furuno, not whichever
+        // manufacturer's definition happens to be listed first).
+        let description = variant_for(pgn, manufacturer_code)
             .map(|p| p.description.to_string())
             .unwrap_or_default();
         self.overrides.insert(
@@ -1037,6 +1040,25 @@ fn field_as_int(v: &Value) -> Option<i64> {
     None
 }
 
+/// Pick the schema variant of `pgn` whose proprietary manufacturer `Match`
+/// equals `mfr`. Proprietary PGN *numbers* are shared across manufacturers
+/// (e.g. 130845 is Maretron **and** Furuno **and** Simnet), and only the
+/// manufacturer — from the device's ISO Address Claim NAME, or an override's
+/// own proprietary header — says which definition actually applies. The
+/// manufacturer is a `Match` on the PGN's first field. Falls back to the
+/// first definition when `mfr` is absent or unmatched.
+pub fn variant_for(pgn: u32, mfr: Option<u16>) -> Option<&'static PgnInfo> {
+    let db = PgnDatabase::embedded(Units::Metric);
+    if let Some(m) = mfr
+        && let Some(v) = db
+            .pgn_variants(pgn)
+            .find(|v| v.fields.first().and_then(|f| f.match_value) == Some(m as i64))
+    {
+        return Some(v);
+    }
+    db.first_pgn(pgn)
+}
+
 /// Walk the `"PGN"` list inside a PGN 126464 record — canboat
 /// renders it as `fields.list: [{ "PGN": <n> }, ...]`.
 fn collect_pgn_list(line: &Value) -> Vec<u32> {
@@ -1112,6 +1134,27 @@ mod tests {
             entry.line.get("productInformation").is_none(),
             "wrapper stripped"
         );
+    }
+
+    #[test]
+    fn variant_for_resolves_by_manufacturer() {
+        // 130845 is shared: Maretron (137) / Furuno (1855) / Simnet (1857).
+        // The manufacturer selects the definition — not first-listed.
+        assert!(
+            variant_for(130845, Some(1855))
+                .unwrap()
+                .description
+                .contains("Furuno")
+        );
+        assert!(
+            variant_for(130845, Some(137))
+                .unwrap()
+                .description
+                .contains("Maretron")
+        );
+        // Unknown / unmatched manufacturer falls back to the first definition.
+        assert!(variant_for(130845, None).is_some());
+        assert!(variant_for(130845, Some(9999)).is_some());
     }
 
     #[test]

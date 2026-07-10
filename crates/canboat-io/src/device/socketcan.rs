@@ -105,12 +105,14 @@ mod imp {
     use canboat_core::format::ikonvert::{NetworkStatus, build_network_status};
     use canboat_core::format::{days_to_ymd, iso11783_compose, iso11783_decompose};
     use canboat_core::frame::RawFrame;
-    use canboat_core::{FramePacketType, Reassembled, Reassembler};
+    use canboat_core::{ADDR_GLOBAL, ADDR_NULL, FramePacketType, Reassembled, Reassembler};
     use socketcan::{CanSocket, EmbeddedFrame, ExtendedId, Socket};
 
     use super::config::Config;
+    use crate::address_claim::{AddressClaim, ClaimState};
     use crate::device::{DeviceHandle, WriterCmd, from_parts};
     use crate::fastpacket;
+    use crate::nmea_responder::{self, ProductInfo};
 
     const CAN_EFF_MASK: u32 = 0x1FFF_FFFF;
     const CAN_ERR_FLAG: u32 = 0x2000_0000;
@@ -193,12 +195,6 @@ mod imp {
     ];
     const RX_PGN_LIST: [u32; 3] = [PGN_ISO_REQUEST, PGN_ISO_ADDRESS_CLAIM, PGN_GROUP_FUNCTION];
 
-    const ADDR_GLOBAL: u8 = 255;
-    const ADDR_NULL: u8 = 254;
-    const ADDR_MAX: u8 = 253;
-    const CLAIM_TIMEOUT_MS: u64 = 250;
-    const SCAN_TIMEOUT_MS: u64 = 1000;
-
     /// Hold outbound frames until the kernel CAN qdisc has room. The
     /// worker thread drains one frame per POLLOUT wakeup so a single
     /// fast-packet burst never starves RX or the claim timers. ~1 s of
@@ -256,11 +252,6 @@ mod imp {
             | ((system_instance & 0x0f) << 56)
             | ((industry_group & 0x07) << 60)
             | (arbitrary << 63)
-    }
-
-    fn put_string_fix(dst: &mut [u8], s: &str) {
-        let n = s.len().min(dst.len());
-        dst[..n].copy_from_slice(&s.as_bytes()[..n]);
     }
 
     /// Outbound ring drained one frame per writability wakeup. Lives on
@@ -324,7 +315,7 @@ mod imp {
     /// Bundles the resources every send-path needs: the socket, the TX
     /// ring, and the consumer-side channel that receives a `RawFrame`
     /// echo of every self-generated outbound. Passed by `&mut` through
-    /// the Claimer's methods so they stay free-functions in spirit.
+    /// the NmeaDevice methods so they stay free-functions in spirit.
     struct Bus<'a> {
         tx_buf: &'a mut TxBuffer,
         frames_tx: &'a mpsc::Sender<RawFrame>,
@@ -397,27 +388,20 @@ mod imp {
         }
     }
 
-    #[derive(PartialEq)]
-    enum ClaimState {
-        Disabled,
-        Scanning,
-        Pending,
-        Claimed,
-        Failed,
-    }
-
-    struct Claimer {
-        name: u64,
-        address: u8,
-        preferred: u8,
-        state: ClaimState,
-        deadline: u64,
-        arbitrary: bool,
+    /// A full NMEA 2000 bus participant: the ISO 11783-5 address-claim
+    /// state machine ([`AddressClaim`]) plus this gateway's device-
+    /// specific responders — Product Information, PGN lists, heartbeat,
+    /// Group Function, and the synthetic network-status PGN. The claim
+    /// handshake itself lives in [`crate::address_claim`] and is shared
+    /// with the server's Motion-Sensor impersonation quirk.
+    struct NmeaDevice {
+        /// The shared address-claim state machine (owns NAME, address,
+        /// state, and the used-address table).
+        claim: AddressClaim,
         heartbeat_interval: u64, // ms, 0 disables
         heartbeat_seq: u8,
         next_heartbeat: u64,    // ms
         last_product_info: u64, // ms; rate-limit broadcast bursts
-        used: [bool; 256],
         model_version: &'static str,
         // -- NMEA 2000 gateway: network status (PGN 262400) emission --
         /// Interface name passed to `socketcan::CanSocket::open`, kept
@@ -431,10 +415,10 @@ mod imp {
         /// Set on first claim; reset on each emission.
         next_network_status: u64,
         /// Distinct N2K source addresses we have ever received a
-        /// (non-error, extended) frame from. Strictly bigger than
-        /// `self.used`, which is only updated on PGN 60928 claims —
-        /// many real devices never re-announce, so the claim table
-        /// undercounts the bus.
+        /// (non-error, extended) frame from. Strictly bigger than the
+        /// claim state machine's used-address table, which is only
+        /// updated on PGN 60928 claims — many real devices never
+        /// re-announce, so the claim table undercounts the bus.
         seen_addrs: [bool; 256],
         /// Bus bitrate (bits/s), read once at construction from
         /// `/sys/class/net/<iface>/can_bittiming/bitrate`. NMEA 2000
@@ -448,24 +432,30 @@ mod imp {
         prev_load_sample: Option<LoadSample>,
     }
 
-    impl Claimer {
+    /// Send each frame the address-claim state machine produced onto the
+    /// bus (with a local echo — same contract as `send_pgn(..., true)`).
+    fn emit(bus: &mut Bus<'_>, frames: Vec<RawFrame>) {
+        for f in frames {
+            bus.send_pgn(f.prio, f.pgn, f.src, f.dst, &f.data, true);
+        }
+    }
+
+    impl NmeaDevice {
         fn new(config: &Config, iface: &str) -> Self {
+            let name = build_name(config);
+            let claim = if config.no_claim {
+                AddressClaim::disabled(name)
+            } else {
+                // Our NAME is arbitrary-address-capable (`build_name` sets
+                // the bit), so we yield and move on a lost conflict.
+                AddressClaim::new(name, config.address, true)
+            };
             Self {
-                name: build_name(config),
-                address: config.address,
-                preferred: config.address,
-                state: if config.no_claim {
-                    ClaimState::Disabled
-                } else {
-                    ClaimState::Pending
-                },
-                deadline: 0,
-                arbitrary: true,
+                claim,
                 heartbeat_interval: config.heartbeat_ms,
                 heartbeat_seq: 0,
                 next_heartbeat: 0,
                 last_product_info: 0,
-                used: [false; 256],
                 model_version: config.model_version.unwrap_or(DEFAULT_MODEL_VERSION),
                 iface: iface.to_string(),
                 start_ms: now_ms(),
@@ -476,117 +466,30 @@ mod imp {
             }
         }
 
-        fn name_to_bytes(&self) -> [u8; 8] {
-            self.name.to_le_bytes()
+        /// Our claimed source address, or [`ADDR_NULL`] before we own one.
+        /// Device responders below only run once claimed, so this resolves
+        /// to the real address for them.
+        fn addr(&self) -> u8 {
+            self.claim.address().unwrap_or(ADDR_NULL)
         }
 
+        /// Our 64-bit ISO NAME.
+        fn name(&self) -> u64 {
+            self.claim.name()
+        }
+
+        /// Kick off the claim handshake (scan → claim).
         fn start(&mut self, bus: &mut Bus<'_>) {
-            self.state = ClaimState::Scanning;
-            self.deadline = now_ms() + SCAN_TIMEOUT_MS;
-            // Ask every node to (re)announce its address claim so we
-            // learn which addresses are taken before we pick one. Sent
-            // from the null address since we have not claimed yet.
-            self.send_request(bus, ADDR_NULL, ADDR_GLOBAL, PGN_ISO_ADDRESS_CLAIM);
-            log::debug!(
-                "Scanning bus {SCAN_TIMEOUT_MS} ms before claiming (NAME {:#018x})",
-                self.name
-            );
+            emit(bus, self.claim.start(now_ms()));
         }
 
-        fn begin_claim(&mut self, bus: &mut Bus<'_>) {
-            if self.used[self.preferred as usize] {
-                match self.pick_free() {
-                    Some(next) => {
-                        log::debug!(
-                            "Preferred address {} is taken, using {next}",
-                            self.preferred
-                        );
-                        self.address = next;
-                    }
-                    None => {
-                        log::error!("No free address available; cannot claim");
-                        self.address = ADDR_NULL;
-                        self.state = ClaimState::Failed;
-                        self.send_claim(bus, ADDR_GLOBAL);
-                        return;
-                    }
-                }
-            } else {
-                self.address = self.preferred;
-            }
-            self.state = ClaimState::Pending;
-            self.deadline = now_ms() + CLAIM_TIMEOUT_MS;
-            self.send_claim(bus, ADDR_GLOBAL);
-            log::debug!(
-                "Claiming address {} with NAME {:#018x}",
-                self.address,
-                self.name
-            );
-        }
-
-        fn send_claim(&self, bus: &mut Bus<'_>, dst: u8) {
-            let data = self.name_to_bytes();
-            bus.send_pgn(6, PGN_ISO_ADDRESS_CLAIM, self.address, dst, &data, true);
-        }
-
-        fn send_request(&self, bus: &mut Bus<'_>, src: u8, dst: u8, pgn: u32) {
-            let data = [pgn as u8, (pgn >> 8) as u8, (pgn >> 16) as u8];
-            bus.send_pgn(6, PGN_ISO_REQUEST, src, dst, &data, true);
-        }
-
-        fn pick_free(&self) -> Option<u8> {
-            (0..=ADDR_MAX).find(|a| !self.used[*a as usize])
-        }
-
+        /// Feed an inbound PGN 60928 Address Claim to the state machine.
         fn on_claim(&mut self, bus: &mut Bus<'_>, src: u8, data: &[u8]) {
-            if data.len() < 8 || src > ADDR_MAX {
+            if data.len() < 8 {
                 return;
             }
             let their_name = u64::from_le_bytes(data[..8].try_into().unwrap());
-            // While scanning we own no address yet — just learn what is in use.
-            if self.state == ClaimState::Scanning {
-                self.used[src as usize] = true;
-                return;
-            }
-            if src != self.address {
-                self.used[src as usize] = true;
-                return;
-            }
-            // Someone is claiming our address. Lowest NAME wins.
-            if self.name < their_name {
-                log::debug!(
-                    "Won address {} conflict (our NAME lower), re-claiming",
-                    self.address
-                );
-                self.state = ClaimState::Pending;
-                self.deadline = now_ms() + CLAIM_TIMEOUT_MS;
-                self.send_claim(bus, ADDR_GLOBAL);
-                return;
-            }
-            // We lost.
-            self.used[src as usize] = true;
-            if self.arbitrary {
-                if let Some(next) = self.pick_free() {
-                    log::debug!("Lost address {} conflict, moving to {next}", self.address);
-                    self.address = next;
-                    self.state = ClaimState::Pending;
-                    self.deadline = now_ms() + CLAIM_TIMEOUT_MS;
-                    self.send_claim(bus, ADDR_GLOBAL);
-                    return;
-                }
-                log::error!(
-                    "Lost address {} and no free address left; cannot claim",
-                    self.address
-                );
-            } else {
-                log::error!(
-                    "Lost address {} conflict and not arbitrary-address-capable; cannot claim",
-                    self.address
-                );
-            }
-            self.address = ADDR_NULL;
-            self.state = ClaimState::Failed;
-            self.send_claim(bus, ADDR_GLOBAL);
+            emit(bus, self.claim.on_address_claim(now_ms(), src, their_name));
         }
 
         fn on_request(&mut self, bus: &mut Bus<'_>, src: u8, dst: u8, data: &[u8]) {
@@ -594,20 +497,20 @@ mod imp {
                 return;
             }
             let requested = data[0] as u32 | (data[1] as u32) << 8 | (data[2] as u32) << 16;
-            let addressed = dst == self.address;
+            let addressed = dst == self.addr();
             if !addressed && dst != ADDR_GLOBAL {
                 return; // request is for some other node
             }
 
             // The address claim must be answerable even before fully claimed.
             if requested == PGN_ISO_ADDRESS_CLAIM {
-                if matches!(self.state, ClaimState::Claimed | ClaimState::Pending) {
-                    self.send_claim(bus, ADDR_GLOBAL);
+                if let Some(f) = self.claim.respond_to_claim_request() {
+                    emit(bus, vec![f]);
                 }
                 return;
             }
 
-            if self.state != ClaimState::Claimed {
+            if !self.claim.is_claimed() {
                 return; // need a claimed address to answer from
             }
 
@@ -634,35 +537,39 @@ mod imp {
             }
             self.last_product_info = now;
 
-            let mut data = [0u8; 134];
-            data[0..2].copy_from_slice(&N2K_DB_VERSION.to_le_bytes());
-            data[2..4].copy_from_slice(&PRODUCT_CODE.to_le_bytes());
-            put_string_fix(&mut data[4..36], MODEL_ID);
-            put_string_fix(&mut data[36..68], env!("CARGO_PKG_VERSION"));
-            put_string_fix(&mut data[68..100], self.model_version);
-            put_string_fix(&mut data[100..132], &(self.name & 0x1fffff).to_string());
-            data[132] = CERTIFICATION_LEVEL;
-            data[133] = LOAD_EQUIVALENCY;
-            bus.send_pgn(6, PGN_PRODUCT_INFO, self.address, ADDR_GLOBAL, &data, true);
+            let serial = (self.name() & 0x1fffff).to_string();
+            let pi = ProductInfo {
+                db_version: i64::from(N2K_DB_VERSION),
+                product_code: i64::from(PRODUCT_CODE),
+                model_id: MODEL_ID,
+                software_version: env!("CARGO_PKG_VERSION"),
+                model_version: self.model_version,
+                model_serial: &serial,
+                certification_level: i64::from(CERTIFICATION_LEVEL),
+                load_equivalency: i64::from(LOAD_EQUIVALENCY),
+            };
+            emit(bus, pi.frame(self.addr()).into_iter().collect());
         }
 
         // PGN List (Transmit and Receive), PGN 126464: one message per list.
         fn send_pgn_list(&self, bus: &mut Bus<'_>, dst: u8) {
-            for (func, list) in [(0u8, &TX_PGN_LIST[..]), (1u8, &RX_PGN_LIST[..])] {
-                let mut data = Vec::with_capacity(1 + 3 * list.len());
-                data.push(func);
-                for pgn in list {
-                    data.extend_from_slice(&pgn.to_le_bytes()[..3]);
-                }
-                bus.send_pgn(6, PGN_PGN_LIST, self.address, dst, &data, true);
-            }
+            emit(
+                bus,
+                nmea_responder::pgn_list_frames(self.addr(), dst, &TX_PGN_LIST, &RX_PGN_LIST),
+            );
         }
 
         // ISO Acknowledgement, PGN 59392.
         fn send_iso_ack(&self, bus: &mut Bus<'_>, dst: u8, control: u8, pgn: u32) {
-            let p = pgn.to_le_bytes();
-            let data = [control, 0xff, 0xff, 0xff, 0xff, p[0], p[1], p[2]];
-            bus.send_pgn(6, PGN_ISO_ACK, self.address, dst, &data, true);
+            emit(
+                bus,
+                vec![nmea_responder::iso_ack_frame(
+                    self.addr(),
+                    dst,
+                    control,
+                    pgn,
+                )],
+            );
         }
 
         // Acknowledge Group Function, PGN 126208 function 2.
@@ -683,17 +590,14 @@ mod imp {
                 (pgn_err & 0x0f) | ((param_err & 0x0f) << 4),
                 0, // number of parameters
             ];
-            bus.send_pgn(6, PGN_GROUP_FUNCTION, self.address, dst, &data, true);
+            bus.send_pgn(6, PGN_GROUP_FUNCTION, self.addr(), dst, &data, true);
         }
 
         // NMEA Request Group Function (PGN 126208, function 0). We act only on
         // a request targeting our Heartbeat (PGN 126993): it sets the transmit
         // interval (or disables it), then we reply with an Acknowledge.
         fn handle_group_function(&mut self, bus: &mut Bus<'_>, src: u8, data: &[u8]) {
-            if data.len() < 8
-                || data[0] != GROUP_FUNCTION_REQUEST
-                || self.state != ClaimState::Claimed
-            {
+            if data.len() < 8 || data[0] != GROUP_FUNCTION_REQUEST || !self.claim.is_claimed() {
                 return;
             }
             let target = data[1] as u32 | (data[2] as u32) << 8 | (data[3] as u32) << 16;
@@ -728,14 +632,15 @@ mod imp {
         }
 
         fn tick(&mut self, bus: &mut Bus<'_>, now: u64) {
-            if self.state == ClaimState::Scanning && now >= self.deadline {
-                self.begin_claim(bus);
-                return;
-            }
-            if self.state == ClaimState::Pending && now >= self.deadline {
-                self.state = ClaimState::Claimed;
-                log::info!("Address {} claimed", self.address);
-                self.send_product_info(bus); // announce ourselves once
+            // Advance the shared claim state machine and put any claim
+            // frames it produced on the wire.
+            let was_claimed = self.claim.is_claimed();
+            emit(bus, self.claim.tick(now));
+            // The moment we take ownership: announce ourselves once and
+            // arm the heartbeat / network-status timers.
+            if !was_claimed && self.claim.is_claimed() {
+                log::info!("Address {} claimed", self.addr());
+                self.send_product_info(bus);
                 if self.heartbeat_interval > 0 {
                     self.next_heartbeat = now + self.heartbeat_interval;
                 }
@@ -744,23 +649,22 @@ mod imp {
                 // before the first bus traffic.
                 self.next_network_status = now + NETWORK_STATUS_INTERVAL_MS;
             }
-            if self.state == ClaimState::Claimed
-                && self.heartbeat_interval > 0
-                && now >= self.next_heartbeat
+            if self.claim.is_claimed() && self.heartbeat_interval > 0 && now >= self.next_heartbeat
             {
                 self.send_heartbeat(bus);
                 self.next_heartbeat = now + self.heartbeat_interval;
             }
-            if self.state == ClaimState::Claimed && now >= self.next_network_status {
+            if self.claim.is_claimed() && now >= self.next_network_status {
                 self.emit_network_status(bus, now);
                 self.next_network_status = now + NETWORK_STATUS_INTERVAL_MS;
             }
         }
 
         /// Note that we received a frame from `src`. Used by the
-        /// network-status emitter's device-count field — `self.used`
-        /// only tracks PGN 60928 announcers (many real devices never
-        /// re-announce), so this captures everything the wire shows.
+        /// network-status emitter's device-count field — the claim
+        /// state machine's used-address table only tracks PGN 60928
+        /// announcers (many real devices never re-announce), so this
+        /// captures everything the wire shows.
         fn note_seen(&mut self, src: u8) {
             if (src as usize) < self.seen_addrs.len() {
                 self.seen_addrs[src as usize] = true;
@@ -800,7 +704,7 @@ mod imp {
                     errors,
                     device_count: Some(device_count),
                     uptime_s: Some(uptime_s),
-                    gateway_addr: self.address,
+                    gateway_addr: self.addr(),
                     rejected_tx,
                 },
                 Some(format_iso(now)),
@@ -811,20 +715,14 @@ mod imp {
         // NMEA 2000 Heartbeat, PGN 126993. Sent every heartbeat_interval ms
         // once we own an address so other nodes know we are alive.
         fn send_heartbeat(&mut self, bus: &mut Bus<'_>) {
-            let offset = (self.heartbeat_interval / 10) as u16; // field resolution 0.01 s
-            // Controller 1 State = Error Active (0), Controller 2 State = not
-            // available (3), Equipment Status = Operational (0), reserved = 1.
-            let data = [
-                offset as u8,
-                (offset >> 8) as u8,
-                self.heartbeat_seq,
-                0xCC,
-                0xff,
-                0xff,
-                0xff,
-                0xff,
-            ];
-            bus.send_pgn(7, PGN_HEARTBEAT, self.address, ADDR_GLOBAL, &data, true);
+            emit(
+                bus,
+                vec![nmea_responder::heartbeat_frame(
+                    self.addr(),
+                    self.heartbeat_seq,
+                    self.heartbeat_interval,
+                )],
+            );
             self.heartbeat_seq = if self.heartbeat_seq >= 252 {
                 0
             } else {
@@ -1030,7 +928,7 @@ mod imp {
     /// complete PGN, matching the NGT-1 / iKonvert adapter contract.
     fn handle_frame(
         bus: &mut Bus<'_>,
-        claimer: &mut Claimer,
+        claimer: &mut NmeaDevice,
         reasm: &mut Reassembler,
         can_id: u32,
         data: &[u8],
@@ -1046,7 +944,7 @@ mod imp {
             data.iter().copied(),
         );
 
-        if claimer.state != ClaimState::Disabled {
+        if claimer.claim.state() != ClaimState::Disabled {
             if pgn == PGN_ISO_ADDRESS_CLAIM {
                 claimer.on_claim(bus, src, data);
             } else if pgn == PGN_ISO_REQUEST {
@@ -1070,7 +968,7 @@ mod imp {
         let pt = fastpacket::packet_type(pgn);
         match reasm.push(single_frame, pt) {
             Reassembled::PassThrough(f) | Reassembled::Complete(f) => {
-                if claimer.state != ClaimState::Disabled && f.pgn == PGN_GROUP_FUNCTION {
+                if claimer.claim.state() != ClaimState::Disabled && f.pgn == PGN_GROUP_FUNCTION {
                     claimer.handle_group_function(bus, src, &f.data);
                 }
                 let _ = bus.frames_tx.send(f);
@@ -1086,14 +984,14 @@ mod imp {
     /// interpreted as "use my claim address"; any other value is
     /// forwarded unchanged so quirk synthesisers can impersonate other
     /// nodes on the wire (e.g. the SCX-20 quirk uses `src = 52`).
-    fn dispatch_cmd(bus: &mut Bus<'_>, claimer: &Claimer, cmd: WriterCmd) {
+    fn dispatch_cmd(bus: &mut Bus<'_>, claimer: &NmeaDevice, cmd: WriterCmd) {
         match cmd {
             WriterCmd::Frame(f) => {
                 if f.pgn >= CANBOAT_PGN_START {
                     return; // synthetic, never goes on the bus
                 }
                 let src = if f.src == 0 || f.src == ADDR_GLOBAL {
-                    claimer.address
+                    claimer.addr()
                 } else {
                     f.src
                 };
@@ -1178,7 +1076,7 @@ mod imp {
         cmd_rx: mpsc::Receiver<WriterCmd>,
         claim_addr: Arc<AtomicU8>,
     ) {
-        let mut claimer = Claimer::new(&config, &iface);
+        let mut claimer = NmeaDevice::new(&config, &iface);
         // Reset the claim atom to "unclaimed" so a reconnect resumes
         // with no stale value visible to consumers.
         claim_addr.store(super::CLAIM_UNCLAIMED, Ordering::Relaxed);
@@ -1195,7 +1093,7 @@ mod imp {
         let timeout_ms = config.timeout_secs.saturating_mul(1000);
 
         // Kick off the claim handshake if enabled.
-        if claimer.state != ClaimState::Disabled {
+        if claimer.claim.state() != ClaimState::Disabled {
             let mut bus = Bus {
                 tx_buf: &mut tx_buf,
                 frames_tx: &frames_tx,
@@ -1224,16 +1122,13 @@ mod imp {
             // 2. Pick a poll timeout: soonest of claim deadline,
             //    heartbeat, MAX_POLL_MS, and (when TX is backed up) 5 ms
             //    as a safety net in case POLLOUT lags qdisc availability.
-            let mut wait: u64 =
-                if matches!(claimer.state, ClaimState::Pending | ClaimState::Scanning)
-                    && claimer.deadline > now
-                {
-                    claimer.deadline - now
-                } else if claimer.state == ClaimState::Claimed && claimer.heartbeat_interval > 0 {
-                    claimer.next_heartbeat.saturating_sub(now)
-                } else {
-                    MAX_POLL_MS
-                };
+            let mut wait: u64 = if claimer.claim.is_timing() && claimer.claim.deadline() > now {
+                claimer.claim.deadline() - now
+            } else if claimer.claim.is_claimed() && claimer.heartbeat_interval > 0 {
+                claimer.next_heartbeat.saturating_sub(now)
+            } else {
+                MAX_POLL_MS
+            };
             if !tx_buf.is_empty() && wait > 5 {
                 wait = 5;
             }
@@ -1336,11 +1231,7 @@ mod imp {
             //    when actually claimed; while scanning/pending/failed
             //    leave it at CLAIM_UNCLAIMED so the caller knows not
             //    to rewrite yet.
-            let live = if claimer.state == ClaimState::Claimed {
-                claimer.address
-            } else {
-                super::CLAIM_UNCLAIMED
-            };
+            let live = claimer.claim.address().unwrap_or(super::CLAIM_UNCLAIMED);
             if live != last_published_addr {
                 claim_addr.store(live, Ordering::Relaxed);
                 last_published_addr = live;

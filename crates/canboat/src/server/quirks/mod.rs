@@ -26,6 +26,7 @@
 //!   canboat's *own* node (no impersonation), so it works with any
 //!   writable backend. Lives in [`wmm`].
 
+pub mod motion;
 pub mod scx20;
 pub mod wmm;
 
@@ -45,6 +46,10 @@ pub enum QuirkKind {
     /// PGN 127258 (~1 Hz), asking older-WMM sources to stop. Needs any
     /// writable backend.
     Wmm,
+    /// Impersonate a B&G H5000 Motion Sensor when a Furuno SCX-20 is
+    /// present, so a Navico Hercules accepts it. Needs to claim a new
+    /// device, so needs socketcan.
+    Motion,
 }
 
 /// Stateful side of the quirk machinery. Owned by the pipeline; lives
@@ -54,6 +59,8 @@ pub struct Quirks {
     scx20: Option<scx20::Scx20>,
     /// Present iff `--quirk wmm`. Owns the WMM state machine.
     wmm: Option<wmm::WmmQuirk>,
+    /// Present iff `--quirk motion`. Owns the Motion-Sensor impersonation.
+    motion: Option<motion::Motion>,
 }
 
 impl Quirks {
@@ -61,13 +68,14 @@ impl Quirks {
         Self {
             scx20: kinds.contains(&QuirkKind::Scx20).then(scx20::Scx20::new),
             wmm: kinds.contains(&QuirkKind::Wmm).then(wmm::WmmQuirk::new),
+            motion: kinds.contains(&QuirkKind::Motion).then(motion::Motion::new),
         }
     }
 
     /// `true` iff at least one quirk is enabled — lets the pipeline skip
     /// the per-frame call entirely on the common path.
     pub fn is_enabled(&self) -> bool {
-        self.scx20.is_some() || self.wmm.is_some()
+        self.scx20.is_some() || self.wmm.is_some() || self.motion.is_some()
     }
 
     /// Inspect one decoded bus PGN and produce zero or more synthetic
@@ -83,6 +91,9 @@ impl Quirks {
         }
         if let Some(wmm) = self.wmm.as_mut() {
             out.extend(wmm.process(decoded, now));
+        }
+        if let Some(motion) = self.motion.as_mut() {
+            out.extend(motion.process(decoded, now));
         }
         out
     }

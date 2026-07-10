@@ -17,7 +17,8 @@
 use std::collections::HashMap;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use canboat_core::{ADDR_GLOBAL, DecodedPgn, RawFrame, field};
+use canboat_core::encode::EncodeError;
+use canboat_core::{ADDR_GLOBAL, DecodedPgn, PgnDatabase, RawFrame, Units, field};
 
 /// NMEA 2000 PGN numbers the matcher cares about.
 const PGN_ISO_REQUEST: u32 = 59904;
@@ -36,47 +37,23 @@ const SCX20_FUNCTION: u8 = 140;
 /// per discovery sweep; bursts would just spam the bus.
 const MIN_SYNTH_GAP: Duration = Duration::from_secs(1);
 
-/// PGN 126996 "Product Information" payload captured from a real
+/// PGN 126996 "Product Information" field values captured from a real
 /// SCX-20 (`canboat/samples/scx20-setting-tool-start.raw` and friends).
 /// The Setting Tool keys its device-list entry on Model ID and Cert
-/// Level, so a single captured payload covers every unit's discovery
-/// needs even though Model Serial Code would naturally differ.
+/// Level, so this single captured set covers every unit's discovery
+/// needs even though Model Serial Code would naturally differ. They are
+/// encoded through the schema-driven [`canboat_core::encode::MessageBuilder`]
+/// (see [`build_scx20_product_info`]).
 ///
-/// Layout:
-///   bytes 0..2   NMEA 2000 DB Version (LE u16) = 2100 → 2.100
-///   bytes 2..4   Product Code (LE u16) = 10571
-///   bytes 4..36  Model ID                "SCX-20"
-///   bytes 36..68 Software Version Code   "2051601-01.04"
-///   bytes 68..100  Model Version         "20P8235-00"
-///   bytes 100..132 Model Serial Code     "100118101056"
-///   byte  132    Certification Level = 2
-///   byte  133    Load Equivalency Number = 4
-pub(crate) const PRODUCT_INFO_SCX20: [u8; 134] = scx20_product_info();
-
-const fn scx20_product_info() -> [u8; 134] {
-    let mut data = [0u8; 134];
-    // DB Version (LE u16) = 2100 = 0x0834.
-    data[0] = 0x34;
-    data[1] = 0x08;
-    // Product Code (LE u16) = 10571 = 0x294B.
-    data[2] = 0x4b;
-    data[3] = 0x29;
-    copy_into(&mut data, 4, b"SCX-20");
-    copy_into(&mut data, 36, b"2051601-01.04");
-    copy_into(&mut data, 68, b"20P8235-00");
-    copy_into(&mut data, 100, b"100118101056");
-    data[132] = 0x02;
-    data[133] = 0x04;
-    data
-}
-
-const fn copy_into<const N: usize>(dst: &mut [u8; N], offset: usize, s: &[u8]) {
-    let mut i = 0;
-    while i < s.len() {
-        dst[offset + i] = s[i];
-        i += 1;
-    }
-}
+/// The DB Version is the raw field value (`res 0.001` → 2100 = "2.100").
+const SCX20_DB_VERSION: i64 = 2100;
+const SCX20_PRODUCT_CODE: i64 = 10571;
+const SCX20_MODEL_ID: &str = "SCX-20";
+const SCX20_SOFTWARE_VERSION: &str = "2051601-01.04";
+const SCX20_MODEL_VERSION: &str = "20P8235-00";
+const SCX20_MODEL_SERIAL: &str = "100118101056";
+const SCX20_CERTIFICATION_LEVEL: i64 = 2;
+const SCX20_LOAD_EQUIVALENCY: i64 = 4;
 
 /// Stateful SCX-20 impersonation. One entry per learned SCX-20 unit,
 /// keyed by its currently claimed source address; the value is the last
@@ -165,7 +142,9 @@ impl Scx20 {
                 d.src,
                 d.dst,
             );
-            out.push(build_scx20_product_info(src));
+            if let Some(frame) = build_scx20_product_info(src) {
+                out.push(frame);
+            }
         }
         out
     }
@@ -182,15 +161,36 @@ fn is_scx20_name(name: u64) -> bool {
     mfg == FURUNO_MFG && class == NAV_CLASS && function == SCX20_FUNCTION
 }
 
-fn build_scx20_product_info(src: u8) -> RawFrame {
-    RawFrame::new(
-        Some(now_iso()),
-        6,
-        PGN_PRODUCT_INFO,
-        src,
-        ADDR_GLOBAL,
-        PRODUCT_INFO_SCX20.iter().copied(),
-    )
+/// Encode PGN 126996 for source `src` via the schema-driven message
+/// encoder. Returns `None` only on an encoder error, which would be a
+/// schema/library bug (logged loudly).
+fn build_scx20_product_info(src: u8) -> Option<RawFrame> {
+    let db = PgnDatabase::embedded(Units::Si);
+    let build = || -> Result<RawFrame, EncodeError> {
+        let mut b = db
+            .message("productInformation")?
+            .priority(6)
+            .source(src)
+            .destination(ADDR_GLOBAL)
+            .timestamp(now_iso());
+        use field::product_information as pi;
+        b.set(pi::NMEA2000_VERSION, SCX20_DB_VERSION)?;
+        b.set(pi::PRODUCT_CODE, SCX20_PRODUCT_CODE)?;
+        b.set(pi::MODEL_ID, SCX20_MODEL_ID)?;
+        b.set(pi::SOFTWARE_VERSION_CODE, SCX20_SOFTWARE_VERSION)?;
+        b.set(pi::MODEL_VERSION, SCX20_MODEL_VERSION)?;
+        b.set(pi::MODEL_SERIAL_CODE, SCX20_MODEL_SERIAL)?;
+        b.set(pi::CERTIFICATION_LEVEL, SCX20_CERTIFICATION_LEVEL)?;
+        b.set(pi::LOAD_EQUIVALENCY, SCX20_LOAD_EQUIVALENCY)?;
+        b.build()
+    };
+    match build() {
+        Ok(frame) => Some(frame),
+        Err(e) => {
+            log::error!("quirk(scx20): failed to encode PGN 126996: {e}");
+            None
+        }
+    }
 }
 
 /// `YYYY-MM-DDTHH:MM:SS.mmmZ` from the host clock — same shape canboat
@@ -247,19 +247,43 @@ mod tests {
         decode(&RawFrame::new(None, 6, PGN_ISO_REQUEST, src, dst, data))
     }
 
+    /// The exact 134-byte PGN 126996 payload captured from a real SCX-20
+    /// (`samples/scx20-setting-tool-start.raw`). The MessageBuilder output
+    /// must reproduce this byte-for-byte or the impersonation drifts from
+    /// what the Setting Tool recorded — string fields NUL-padded and all.
+    const CAPTURED_PRODUCT_INFO: [u8; 134] = captured_product_info();
+
+    const fn captured_product_info() -> [u8; 134] {
+        let mut d = [0u8; 134];
+        d[0] = 0x34; // DB Version LE u16 = 2100
+        d[1] = 0x08;
+        d[2] = 0x4b; // Product Code LE u16 = 10571
+        d[3] = 0x29;
+        copy_bytes(&mut d, 4, b"SCX-20");
+        copy_bytes(&mut d, 36, b"2051601-01.04");
+        copy_bytes(&mut d, 68, b"20P8235-00");
+        copy_bytes(&mut d, 100, b"100118101056");
+        d[132] = 0x02; // Certification Level
+        d[133] = 0x04; // Load Equivalency Number
+        d
+    }
+
+    const fn copy_bytes(dst: &mut [u8; 134], off: usize, s: &[u8]) {
+        let mut i = 0;
+        while i < s.len() {
+            dst[off + i] = s[i];
+            i += 1;
+        }
+    }
+
     #[test]
-    fn product_info_payload_matches_captured_layout() {
-        // Spot-check the parts the Setting Tool keys on; if any byte here
-        // drifts, the discovery workaround silently breaks.
-        assert_eq!(PRODUCT_INFO_SCX20.len(), 134);
-        assert_eq!(&PRODUCT_INFO_SCX20[0..2], &[0x34, 0x08]); // DB version 2100
-        assert_eq!(&PRODUCT_INFO_SCX20[2..4], &[0x4b, 0x29]); // Product Code 10571
-        assert_eq!(&PRODUCT_INFO_SCX20[4..10], b"SCX-20"); // Model ID
-        assert_eq!(&PRODUCT_INFO_SCX20[36..49], b"2051601-01.04"); // SW Code
-        assert_eq!(&PRODUCT_INFO_SCX20[68..78], b"20P8235-00"); // Model Version
-        assert_eq!(&PRODUCT_INFO_SCX20[100..112], b"100118101056"); // Serial
-        assert_eq!(PRODUCT_INFO_SCX20[132], 0x02); // Cert Level
-        assert_eq!(PRODUCT_INFO_SCX20[133], 0x04); // LEN
+    fn built_product_info_matches_captured_payload() {
+        // The whole point of routing through MessageBuilder: it must still
+        // reproduce the captured payload exactly. If any byte drifts (a
+        // schema change, a padding change), the discovery workaround
+        // silently breaks — this catches it.
+        let f = build_scx20_product_info(52).expect("encodes");
+        assert_eq!(f.data.as_slice(), &CAPTURED_PRODUCT_INFO);
     }
 
     #[test]
@@ -297,7 +321,7 @@ mod tests {
 
     #[test]
     fn product_info_frame_header_is_correct() {
-        let f = build_scx20_product_info(52);
+        let f = build_scx20_product_info(52).expect("encodes");
         assert_eq!(f.prio, 6);
         assert_eq!(f.pgn, PGN_PRODUCT_INFO);
         assert_eq!(f.src, 52);

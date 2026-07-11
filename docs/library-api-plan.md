@@ -208,8 +208,13 @@ facade compiles on `decode` alone (no threads/socket deps) and `cargo public-api
 > accessor; `PgnDatabase::field()` returns `FieldId`; the n2kd struct-path (`decoded.rs`)
 > retyped to hold the generated constants directly. Snapshots blessed for all three
 > library feature-sets. All tests green except one **pre-existing** golden failure
-> (`mixed_format_text_debug`, fails identically on `main` — stale 130824-rate fixture,
-> unrelated).
+> (`mixed_format_text_debug`, fails identically on `main`). Root cause: a **schema-pin
+> skew**, not a code bug — the golden fixtures come from the sibling `../canboat` at HEAD,
+> which is ahead of the vendored `CANBOAT_REF` pin, so the 130824 B&G roll/pitch/yaw-rate
+> key definitions (canboat commits `8f737e9`/`c34bd38`, after the pin) exist in the fixture
+> but not in the Rust schema. CI aligns the two and is green; a local `../canboat` at HEAD
+> is not. Fix when wanted: bump `CANBOAT_REF`. See the `project-golden-130824-schema-skew`
+> memory.
 >
 > **Deferred to Phase 5:** demoting `canboat-core`'s 15 wide-open `pub mod`s to
 > `pub(crate)`. They can't shrink while the bin modules (`server`/`n2kd`/`tui`) and the
@@ -311,10 +316,31 @@ green).
 >   `env_logger::init` moved out of `run` into the bin's `Server` handler (host owns
 >   logging). Verified: clap-free lib build, `canboat server --help` intact, clippy clean,
 >   tests green (bridge 72 lib / 81 with `cli`; only the pre-existing golden fails).
-> - **5c — split core / serving + the `Bridge` type**; wire the facade `bridge` module.
-> - **5d — `ServeHandle` / `shutdown`** replacing the leaked accept threads.
-> - **5e — remove in-lib `env_logger::init`; inject the config-dir.**
+> - **5c — split core / serving + the `Bridge` type** (NOT STARTED; the hard one). The
+>   tap point is known: in `server/pipeline.rs::run`, every decoded record passes through a
+>   single `let decoded = Arc::new(decoded);` right after `db.decode(&assembled)` — add an
+>   optional `decoded_tx: Option<mpsc::Sender<Arc<DecodedPgn>>>` to the pipeline (None =
+>   today's behaviour, zero cost) and send a clone there. Then `server::run` gets
+>   restructured into `Bridge`: `open_source` + build `Hubs` + spawn `pipeline::run` on a
+>   thread with the tap wired → `Bridge::decoded()` returns the `Receiver`; `transmit()`
+>   uses the existing `device_sender`; `serve(Ports)` spawns the TCP listeners (lifted out
+>   of the current inline block in `run`). `run(config)` then becomes a thin
+>   `Bridge::from(config).serve_all().wait()` so there is ONE code path. Finally the facade
+>   `bridge` feature depends on `canboat-bridge` (clap-free after 5b) and re-exports
+>   `Bridge`/`BridgeConfig`/`Input`/`Quirk`/`Ports`.
+> - **5d — `ServeHandle` / `shutdown`** replacing the leaked accept threads (today `run`
+>   deliberately leaks them and relies on process exit). Each TCP listener needs a stop
+>   signal; the `Bridge` returns a handle whose drop/`shutdown()` closes the listeners so
+>   ports can rebind.
+> - **5e — inject the config-dir** (the `/etc/default/canboat` write-probe in
+>   `resolve_config_dir`) instead of auto-discovering; the `env_logger::init` removal is
+>   already done in 5b.
 > Facade `bridge` module stays a stub until 5c so no half-built API is exposed.
+>
+> **Why 5c+ was NOT done in the overnight autonomous run:** it restructures the 340-line
+> `run()` on the hot pipeline path, and full correctness needs the **Pi n2kd parity
+> harness** (C-vs-Rust), which can't run here. A subtle break there wouldn't show in the
+> local test suite. Left at the clean, verified 5b state instead.
 
 **Phase 6 — Prove it with `merrimac-rs`.** See §5.
 

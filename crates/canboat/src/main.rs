@@ -88,7 +88,23 @@ fn main() -> ExitCode {
         Command::Convert(args) => convert::run(args),
         Command::FormatMessage(args) => format_message::run(args),
         Command::Interface(args) => interface::run(args),
-        Command::Server(args) => server::run(*args),
+        Command::Server(args) => {
+            // The pipeline library no longer initialises logging — the host
+            // (this binary) owns it. Convert the clap Args to the plain config,
+            // then set up env_logger from its verbosity before running.
+            let config: server::BridgeConfig = (*args).into();
+            let level = if config.quiet {
+                "error"
+            } else if config.verbose {
+                "debug"
+            } else {
+                "info"
+            };
+            env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level))
+                .init();
+            canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
+            server::run(config)
+        }
         Command::Tui(args) => run_tui(args),
         Command::Replay(args) => replay::run(args),
         Command::N2kd(args) => n2kd::app::run(*args),

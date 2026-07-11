@@ -302,8 +302,15 @@ green).
 >   clippy `-D warnings`, tests green (core 198 / io 44 / **bridge 81** / bin 54 + integration),
 >   `canboat server --help` works, facade public API unchanged (bridge module still a stub).
 >   The `canboat-bridge` crate still carries `clap` (the `Args`) — removed in 5b.
-> - **5b — `BridgeConfig`** (declap): plain config struct; clap `Args` becomes a `From` in
->   the bin. Removes `clap` from the bridge lib.
+> - **5b — `BridgeConfig` (DONE).** Plain 33-field `pub struct BridgeConfig` + `Default`
+>   (clap-free), and `run(BridgeConfig)`. The clap `Args` is kept **untouched** behind a
+>   `cli` feature with `impl From<Args> for BridgeConfig`, so clap parsing is 100%
+>   preserved. `QuirkKind`'s `ValueEnum` derive and the whole `n2kd::app` daemon CLI are
+>   also `cli`-gated; `clap`/`canboat-cli`/`env_logger` became optional. **canboat-bridge is
+>   now clap-free as a library** (verified: `cargo tree` shows no clap without `cli`). The
+>   `env_logger::init` moved out of `run` into the bin's `Server` handler (host owns
+>   logging). Verified: clap-free lib build, `canboat server --help` intact, clippy clean,
+>   tests green (bridge 72 lib / 81 with `cli`; only the pre-existing golden fails).
 > - **5c — split core / serving + the `Bridge` type**; wire the facade `bridge` module.
 > - **5d — `ServeHandle` / `shutdown`** replacing the leaked accept threads.
 > - **5e — remove in-lib `env_logger::init`; inject the config-dir.**

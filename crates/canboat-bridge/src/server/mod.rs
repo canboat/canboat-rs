@@ -75,7 +75,10 @@ use crate::n2kd::serving::{BinHub, Hub};
 use crate::server::pipeline::Hubs;
 use crate::server::snapshot::SnapshotStore;
 
-/// Single-process device-reader → analyzer → n2kd pipeline server.
+/// Clap front-end for the `canboat server` CLI. Gated behind the `cli` feature
+/// so the library path ([`BridgeConfig`] + [`run`]) stays clap-free; convert
+/// with [`BridgeConfig::from`].
+#[cfg(feature = "cli")]
 #[derive(Debug, clap::Args)]
 #[command(after_help = canboat_cli::help_footer())]
 pub struct Args {
@@ -350,14 +353,138 @@ pub struct Args {
     quiet: bool,
 }
 
-pub fn run(cli: Args) -> Result<()> {
+/// Plain, clap-free configuration for the pipeline [`run`]. Construct with
+/// [`BridgeConfig::default`] and set the fields you need — or, under the `cli`
+/// feature, `BridgeConfig::from(args)`. Field meanings mirror the `canboat
+/// server` flags one-for-one.
+#[derive(Debug, Clone)]
+pub struct BridgeConfig {
+    pub actisense: Option<String>,
+    pub ikonvert: Option<String>,
+    pub maretron: Option<String>,
+    pub socketcan: Option<String>,
+    pub socketcan_address: u8,
+    pub canboat_csv: Option<String>,
+    pub canboat_csv_write: Option<String>,
+    pub baud: Option<u32>,
+    pub maretron_password: String,
+    pub ikonvert_rx: Option<String>,
+    pub ikonvert_tx: Option<String>,
+    pub ikonvert_rate_limit_off: bool,
+    pub no_request_claims: bool,
+    pub quirk: Vec<quirks::QuirkKind>,
+    pub bind: Ipv4Addr,
+    pub snapshot_port: u16,
+    pub analyzer_port: u16,
+    pub nmea0183_port: u16,
+    pub input_port: u16,
+    pub raw_port: u16,
+    pub ais_port: u16,
+    pub analyzer_binary_port: u16,
+    pub nmea0183_stdout: bool,
+    pub no_nmea0183_rate_limit: bool,
+    pub nmea0183_filter: Option<PathBuf>,
+    pub config_dir: Option<PathBuf>,
+    pub nmea0183_filter_port: u16,
+    pub overrides_port: u16,
+    pub camel: bool,
+    pub upper_camel: bool,
+    pub si: bool,
+    pub verbose: bool,
+    pub quiet: bool,
+}
+
+impl Default for BridgeConfig {
+    fn default() -> Self {
+        Self {
+            actisense: None,
+            ikonvert: None,
+            maretron: None,
+            socketcan: None,
+            socketcan_address: 0,
+            canboat_csv: None,
+            canboat_csv_write: None,
+            baud: None,
+            maretron_password: String::new(),
+            ikonvert_rx: None,
+            ikonvert_tx: None,
+            ikonvert_rate_limit_off: false,
+            no_request_claims: false,
+            quirk: Vec::new(),
+            bind: Ipv4Addr::new(0, 0, 0, 0),
+            snapshot_port: 2597,
+            analyzer_port: 2598,
+            nmea0183_port: 2599,
+            input_port: 2600,
+            raw_port: 2603,
+            ais_port: 2601,
+            analyzer_binary_port: 2604,
+            nmea0183_stdout: false,
+            no_nmea0183_rate_limit: false,
+            nmea0183_filter: None,
+            config_dir: None,
+            nmea0183_filter_port: 2605,
+            overrides_port: 2606,
+            camel: false,
+            upper_camel: false,
+            si: false,
+            verbose: false,
+            quiet: false,
+        }
+    }
+}
+
+#[cfg(feature = "cli")]
+impl From<Args> for BridgeConfig {
+    fn from(a: Args) -> Self {
+        Self {
+            actisense: a.actisense,
+            ikonvert: a.ikonvert,
+            maretron: a.maretron,
+            socketcan: a.socketcan,
+            socketcan_address: a.socketcan_address,
+            canboat_csv: a.canboat_csv,
+            canboat_csv_write: a.canboat_csv_write,
+            baud: a.baud,
+            maretron_password: a.maretron_password,
+            ikonvert_rx: a.ikonvert_rx,
+            ikonvert_tx: a.ikonvert_tx,
+            ikonvert_rate_limit_off: a.ikonvert_rate_limit_off,
+            no_request_claims: a.no_request_claims,
+            quirk: a.quirk,
+            bind: a.bind,
+            snapshot_port: a.snapshot_port,
+            analyzer_port: a.analyzer_port,
+            nmea0183_port: a.nmea0183_port,
+            input_port: a.input_port,
+            raw_port: a.raw_port,
+            ais_port: a.ais_port,
+            analyzer_binary_port: a.analyzer_binary_port,
+            nmea0183_stdout: a.nmea0183_stdout,
+            no_nmea0183_rate_limit: a.no_nmea0183_rate_limit,
+            nmea0183_filter: a.nmea0183_filter,
+            config_dir: a.config_dir,
+            nmea0183_filter_port: a.nmea0183_filter_port,
+            overrides_port: a.overrides_port,
+            camel: a.camel,
+            upper_camel: a.upper_camel,
+            si: a.si,
+            verbose: a.verbose,
+            quiet: a.quiet,
+        }
+    }
+}
+
+/// Run the pipeline to completion (blocks until the frame source ends). The
+/// host owns logger setup — this no longer initialises `env_logger`.
+pub fn run(config: BridgeConfig) -> Result<()> {
     // The scx20 and motion quirks impersonate a device (motion claims a
     // whole new virtual node), so they need --socketcan — the one backend
     // that preserves a frame's src on outbound. The wmm quirk emits
     // canboat's own PGN 127258, so it only needs *some* writable backend —
     // that check happens below once one is known.
     for kind in [quirks::QuirkKind::Scx20, quirks::QuirkKind::Motion] {
-        if cli.quirk.contains(&kind) && cli.socketcan.is_none() {
+        if config.quirk.contains(&kind) && config.socketcan.is_none() {
             let name = match kind {
                 quirks::QuirkKind::Scx20 => "scx20",
                 quirks::QuirkKind::Motion => "motion",
@@ -371,30 +498,20 @@ pub fn run(cli: Args) -> Result<()> {
         }
     }
 
-    let level = if cli.quiet {
-        "error"
-    } else if cli.verbose {
-        "debug"
-    } else {
-        "info"
-    };
-    env_logger::Builder::from_env(env_logger::Env::default().default_filter_or(level)).init();
-    canboat_cli::log_startup(env!("CARGO_PKG_NAME"), env!("CARGO_PKG_VERSION"));
-
     // The schema is compiled into the binary; no JSON loading, no
     // path discovery, no synthetic-PGN merge — `canboat-core/build.rs`
     // already folded `data/synthetic-pgns.json` into the static
     // tables.
-    let units = if cli.si {
+    let units = if config.si {
         canboat_core::Units::Si
     } else {
         canboat_core::Units::Metric
     };
     let db = PgnDatabase::embedded(units);
 
-    let camel_case = if cli.upper_camel {
+    let camel_case = if config.upper_camel {
         CamelCase::Upper
-    } else if cli.camel {
+    } else if config.camel {
         CamelCase::Lower
     } else {
         CamelCase::Off
@@ -418,13 +535,13 @@ pub fn run(cli: Args) -> Result<()> {
     let banner: &'static [u8] = Box::leak(
         format!(
             "{}\n",
-            crate::build_info::version_banner(cli.si, json_opts.name_value)
+            crate::build_info::version_banner(config.si, json_opts.name_value)
         )
         .into_bytes()
         .into_boxed_slice(),
     );
 
-    let snapshot = if cli.snapshot_port != 0 {
+    let snapshot = if config.snapshot_port != 0 {
         Some(Arc::new(SnapshotStore::new(json_opts.clone())))
     } else {
         None
@@ -444,13 +561,13 @@ pub fn run(cli: Args) -> Result<()> {
         supervisor,
         pre_coalesced,
         claim_addr: device_claim_addr,
-    } = open_source(&cli)?;
+    } = open_source(&config)?;
     let device_sender = supervisor.as_ref().map(|s| s.frame_sender());
 
     // The wmm quirk emits PGN 127258 onto the bus, so it needs a writable
     // device backend (any of socketcan / NGT-1 / iKonvert). Refuse it in
     // stdin- or log-only mode where there is no bus to write to.
-    if cli.quirk.contains(&quirks::QuirkKind::Wmm) && device_sender.is_none() {
+    if config.quirk.contains(&quirks::QuirkKind::Wmm) && device_sender.is_none() {
         anyhow::bail!(
             "--quirk wmm needs a writable device backend (e.g. --socketcan or an \
              NGT-1/iKonvert gateway) to emit PGN 127258; there is no bus to write \
@@ -466,7 +583,7 @@ pub fn run(cli: Args) -> Result<()> {
     // device sender and live inside `Hubs`. A quirk that emits as canboat's
     // own node sends from `ADDR_GLOBAL`; the pipeline stamps the live
     // `claim_addr` onto it (see `Hubs::claim_addr`).
-    let quirks_kinds = cli.quirk;
+    let quirks_kinds = config.quirk;
     let hubs = Hubs {
         raw: Arc::new(Hub::new()),
         nmea: Arc::new(Hub::new()),
@@ -505,7 +622,7 @@ pub fn run(cli: Args) -> Result<()> {
     // put the requests on the bus; in stdin-only mode there is no
     // sink, so we skip the engine entirely. `--no-request-claims`
     // disables it explicitly (matches n2kd's flag).
-    if !cli.no_request_claims
+    if !config.no_request_claims
         && let Some(sender) = device_sender.clone()
     {
         request_engine::spawn(Arc::clone(&engine), move |dst, pgn| {
@@ -516,8 +633,8 @@ pub fn run(cli: Args) -> Result<()> {
     let mut tcp_joins: Vec<thread::JoinHandle<()>> = Vec::new();
     if let Some(store) = snapshot.as_ref() {
         tcp_joins.push(serving_tcp::spawn_snapshot(
-            cli.bind,
-            cli.snapshot_port,
+            config.bind,
+            config.snapshot_port,
             store.core(),
             Some(banner),
         )?);
@@ -528,11 +645,11 @@ pub fn run(cli: Args) -> Result<()> {
     // input, injection actually reaches the device; unlike the old
     // bidirectional raw port, nothing is streamed back, so it adds no
     // serialization cost — the cheap write path.
-    if cli.input_port != 0 {
+    if config.input_port != 0 {
         tcp_joins.push(tcp::spawn_input_server(
             "input",
-            cli.bind,
-            cli.input_port,
+            config.bind,
+            config.input_port,
             inject.clone(),
         )?);
     }
@@ -540,59 +657,59 @@ pub fn run(cli: Args) -> Result<()> {
     // `# format=FAST` header so downstream tools (canboat C analyzer,
     // canboatjs) know the stream is pre-coalesced. Read-only — writes
     // go to `--input-port`.
-    if cli.raw_port != 0 {
+    if config.raw_port != 0 {
         tcp_joins.push(serving_tcp::spawn_stream_server(
             "raw",
-            cli.bind,
-            cli.raw_port,
+            config.bind,
+            config.raw_port,
             hubs.raw.clone(),
             Some(serving_tcp::CANBOAT_FORMAT_FAST_HEADER),
         )?);
     }
-    if cli.nmea0183_port != 0 {
+    if config.nmea0183_port != 0 {
         // NMEA 0183 is strictly read-only — clients trying to write
         // get an immediate FIN on the read direction.
         tcp_joins.push(serving_tcp::spawn_stream_server(
             "nmea0183",
-            cli.bind,
-            cli.nmea0183_port,
+            config.bind,
+            config.nmea0183_port,
             hubs.nmea.clone(),
             None,
         )?);
     }
-    if cli.analyzer_port != 0 {
+    if config.analyzer_port != 0 {
         // Analyzer-JSON stream is read-only, matching canboat C
         // n2kd's `port+1` stream port. Injection lives on the
         // input port instead. (Kept free for a future "analyzed
         // write" feature that would accept JSON here.)
         tcp_joins.push(serving_tcp::spawn_stream_server(
             "analyzer",
-            cli.bind,
-            cli.analyzer_port,
+            config.bind,
+            config.analyzer_port,
             hubs.analyzer.clone(),
             Some(banner),
         )?);
     }
-    if cli.ais_port != 0 {
+    if config.ais_port != 0 {
         if let Some(store) = snapshot.as_ref() {
             tcp_joins.push(serving_tcp::spawn_ais_snapshot(
-                cli.bind,
-                cli.ais_port,
+                config.bind,
+                config.ais_port,
                 store.core(),
             )?);
         } else {
             log::warn!(
                 "--ais-port {} ignored: snapshot port is disabled, no AIS cache to dump",
-                cli.ais_port,
+                config.ais_port,
             );
         }
     }
-    if cli.analyzer_binary_port != 0 {
+    if config.analyzer_binary_port != 0 {
         // Read-only binary analyzer stream. Shares the decode with the
         // JSON/NMEA outputs; only the (lazy) WirePgn encode is extra.
         tcp_joins.push(tcp::spawn_binary_stream(
-            cli.bind,
-            cli.analyzer_binary_port,
+            config.bind,
+            config.analyzer_binary_port,
             hubs.bin.clone(),
         )?);
     }
@@ -602,8 +719,8 @@ pub fn run(cli: Args) -> Result<()> {
     // Persistent server state (0183 mute rules + PGN-rate overrides) lives
     // in a shared config dir, both features on by default. An empty/absent
     // file is a no-op, so this changes nothing for a default install.
-    let cfg_dir = resolve_config_dir(cli.config_dir.as_deref());
-    let filter_path = cli
+    let cfg_dir = resolve_config_dir(config.config_dir.as_deref());
+    let filter_path = config
         .nmea0183_filter
         .clone()
         .unwrap_or_else(|| cfg_dir.join("nmea0183-filter.json"));
@@ -640,11 +757,11 @@ pub fn run(cli: Args) -> Result<()> {
     // Dedicated bidirectional control port for the PGN 262657 filter
     // channel (always on now, like the filter itself).
     if let Some(filter) = nmea_filter.as_ref()
-        && cli.nmea0183_filter_port != 0
+        && config.nmea0183_filter_port != 0
     {
         tcp_joins.push(tcp::spawn_filter_control_server(
-            cli.bind,
-            cli.nmea0183_filter_port,
+            config.bind,
+            config.nmea0183_filter_port,
             filter.clone(),
             json_opts.clone(),
         )?);
@@ -653,11 +770,11 @@ pub fn run(cli: Args) -> Result<()> {
     // channel. The control server applies a `Set` immediately by injecting
     // the PGN 126208 Request through the device sender.
     if let Some(engine) = overrides.as_ref()
-        && cli.overrides_port != 0
+        && config.overrides_port != 0
     {
         tcp_joins.push(tcp::spawn_overrides_control_server(
-            cli.bind,
-            cli.overrides_port,
+            config.bind,
+            config.overrides_port,
             engine.clone(),
             device_sender.clone(),
             json_opts.clone(),
@@ -674,8 +791,8 @@ pub fn run(cli: Args) -> Result<()> {
         pre_coalesced,
         json_opts,
         pipeline::Nmea0183Options {
-            emit_stdout: cli.nmea0183_stdout,
-            rate_limit: !cli.no_nmea0183_rate_limit,
+            emit_stdout: config.nmea0183_stdout,
+            rate_limit: !config.no_nmea0183_rate_limit,
             filter: nmea_filter,
         },
     );
@@ -757,9 +874,9 @@ fn dir_is_writable(dir: &Path) -> bool {
     }
 }
 
-fn open_source(cli: &Args) -> Result<OpenedSource> {
-    if let Some(path) = cli.actisense.as_deref() {
-        let baud = cli.baud.unwrap_or(115_200);
+fn open_source(config: &BridgeConfig) -> Result<OpenedSource> {
+    if let Some(path) = config.actisense.as_deref() {
+        let baud = config.baud.unwrap_or(115_200);
         let path = path.to_string();
         let factory = NamedFactory::new("ngt1", move || {
             let (reader, writer) = open_serial_rw(&path, baud)?;
@@ -777,12 +894,12 @@ fn open_source(cli: &Args) -> Result<OpenedSource> {
             claim_addr: None,
         });
     }
-    if let Some(path) = cli.ikonvert.as_deref() {
-        let baud = cli.baud.unwrap_or(230_400);
+    if let Some(path) = config.ikonvert.as_deref() {
+        let baud = config.baud.unwrap_or(230_400);
         let path = path.to_string();
-        let rx_list = cli.ikonvert_rx.clone();
-        let tx_list = cli.ikonvert_tx.clone();
-        let rate_limit_off = cli.ikonvert_rate_limit_off;
+        let rx_list = config.ikonvert_rx.clone();
+        let tx_list = config.ikonvert_tx.clone();
+        let rate_limit_off = config.ikonvert_rate_limit_off;
         let factory = NamedFactory::new("ikonvert", move || {
             let (reader, writer) = open_serial_rw(&path, baud)?;
             let config = device::ikonvert::Config {
@@ -804,9 +921,9 @@ fn open_source(cli: &Args) -> Result<OpenedSource> {
             claim_addr: None,
         });
     }
-    if let Some(url) = cli.maretron.as_deref() {
+    if let Some(url) = config.maretron.as_deref() {
         let url = url.to_string();
-        let password = cli.maretron_password.clone();
+        let password = config.maretron_password.clone();
         let factory = NamedFactory::new("maretron", move || {
             let (reader, writer) = open_maretron_pair(&url)?;
             let cfg = device::maretron::Config {
@@ -825,9 +942,9 @@ fn open_source(cli: &Args) -> Result<OpenedSource> {
             claim_addr: None,
         });
     }
-    if let Some(read_url) = cli.canboat_csv.as_deref() {
+    if let Some(read_url) = config.canboat_csv.as_deref() {
         let read_url = read_url.to_string();
-        let write_url = cli.canboat_csv_write.clone();
+        let write_url = config.canboat_csv_write.clone();
         let factory = NamedFactory::new("canboat-csv", move || {
             let (reader, writer) = match &write_url {
                 Some(w) => open_canboat_csv_split(&read_url, w)?,
@@ -846,10 +963,10 @@ fn open_source(cli: &Args) -> Result<OpenedSource> {
             claim_addr: None,
         });
     }
-    if let Some(iface) = cli.socketcan.as_deref() {
+    if let Some(iface) = config.socketcan.as_deref() {
         let iface = iface.to_string();
         let config = device::socketcan::Config {
-            address: cli.socketcan_address,
+            address: config.socketcan_address,
             model_version: Some("canboat-pipeline-rs"),
             ..device::socketcan::Config::default()
         };

@@ -10,19 +10,28 @@ repository   = { workspace = true }
 rust-version = { workspace = true }
 description  = "The canboat live-bus pipeline (device → decode → quirks → serving); hosts the server and n2kd."
 
+# The `cli` feature adds the clap front-ends (server `Args`, the n2kd daemon
+# CLI) and logger wiring. Without it the crate is a clap-free library: plain
+# `BridgeConfig` + `run`.
+[features]
+default = []
+cli = ["dep:clap", "dep:canboat-cli", "dep:env_logger"]
+
 [dependencies]
 canboat-core = { workspace = true }
 canboat-io   = { workspace = true }
 canboat-wire = { workspace = true }
-canboat-cli  = { workspace = true }
 anyhow       = { workspace = true }
-clap         = { workspace = true }
 serde        = { workspace = true }
 serde_json   = { workspace = true, features = ["preserve_order"] }
 log          = { workspace = true }
-env_logger   = { workspace = true }
 # The WMM quirk computes magnetic variation locally.
 world_magnetic_model = "0.4.0"
+
+# CLI layer — optional, enabled only by the `cli` feature.
+canboat-cli  = { workspace = true, optional = true }
+clap         = { workspace = true, optional = true }
+env_logger   = { workspace = true, optional = true }
 
 [build-dependencies]
 # Capture the git short SHA (+ dirty flag) for the analyzer version banner.

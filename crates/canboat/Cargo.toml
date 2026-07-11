@@ -44,7 +44,7 @@ ais      = ["decode"]                      # output::write_ais
 # of this crate); the CLI dispatches into it.
 cli = [
     "decode", "io", "wire", "bridge", "nmea0183", "ais",
-    "dep:canboat-bridge",
+    "canboat-bridge/cli",
     "dep:canboat-cli", "dep:clap", "dep:env_logger", "dep:anyhow",
     "dep:serde", "dep:serde_json", "dep:tokio", "dep:crossterm",
     "dep:ratatui", "dep:futures", "dep:chrono", "dep:indexmap",

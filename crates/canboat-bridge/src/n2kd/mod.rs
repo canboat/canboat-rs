@@ -12,6 +12,8 @@
 
 pub mod ais;
 pub mod ais_decoded;
+// The standalone `n2kd` daemon CLI (clap + logger init) — a `cli`-only entry.
+#[cfg(feature = "cli")]
 pub mod app;
 pub mod decoded;
 pub mod json;

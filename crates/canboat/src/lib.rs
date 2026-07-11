@@ -77,7 +77,7 @@ pub mod ids {
 }
 
 /// Turn a [`DecodedPgn`] back into bytes/text. `write_nmea0183` / `write_ais`
-/// arrive with the `nmea0183` / `ais` features in Phase 2.
+/// land here when the `nmea0183` / `ais` features are wired.
 #[cfg(feature = "decode")]
 pub mod output {
     pub use canboat_core::output::{CamelCase, JsonOptions, write_json};
@@ -85,13 +85,39 @@ pub mod output {
 
 /// Inbound: turn a byte source into a stream of [`DecodedPgn`].
 ///
-/// The [`from_analyzer_json`] entry (already-decoded analyzer JSON → record)
-/// is available under `decode`. The `FrameSource` trait and the concrete
-/// `*Reader` byte-source implementations arrive with the `io` feature in
-/// Phase 2.
+/// [`FrameSource`] is the bring-your-own-transport seam — implement it over
+/// your own CAN driver, then feed it to [`Decoder`] to get decoded records.
+/// Ready-made readers for ASCII line formats, `.ebl` logs, and `.pcap`/`.nif`
+/// captures arrive with the `io` feature. [`from_analyzer_json`] rehydrates an
+/// already-decoded analyzer-JSON line.
 #[cfg(feature = "decode")]
 pub mod read {
     pub use canboat_core::json_to_decoded as from_analyzer_json;
+    pub use canboat_core::{Decoder, FrameSource};
+
+    /// A [`FrameSource`] over an Actisense `.ebl` binary log.
+    #[cfg(feature = "io")]
+    pub use canboat_io::EblReader;
+    /// A [`FrameSource`] over any canboat ASCII line format (PLAIN / FAST /
+    /// Actisense / YDWG-02 / iKonvert): honours `# format=` headers, otherwise
+    /// autodetects. Wrap a file, a stdin lock, or [`open_capture`].
+    #[cfg(feature = "io")]
+    pub use canboat_io::LineFrameReader as PlainReader;
+
+    /// Open a capture as a [`PlainReader`] ready for a [`Decoder`]: a plain
+    /// PLAIN/FAST text log, or a `.pcap` / `.pcap.gz` / `.nif` container
+    /// (auto-detected and unwrapped to its PLAIN payload).
+    #[cfg(feature = "io")]
+    pub fn open_capture(
+        path: &std::path::Path,
+    ) -> std::io::Result<PlainReader<Box<dyn std::io::BufRead>>> {
+        let br: Box<dyn std::io::BufRead> = if canboat_io::container::is_container(path) {
+            canboat_io::container::plain_reader(path, canboat_io::container::Options::default())?
+        } else {
+            Box::new(std::io::BufReader::new(std::fs::File::open(path)?))
+        };
+        Ok(PlainReader::new(br))
+    }
 }
 
 // ─────────────────────────────── wire ────────────────────────────────────

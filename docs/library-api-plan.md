@@ -217,10 +217,27 @@ facade compiles on `decode` alone (no threads/socket deps) and `cargo public-api
 > directly. That lockdown happens when those modules move into `canboat-bridge`. Until
 > then the *facade's* surface is the enforced contract (§3), and it is already minimal.
 
-**Phase 2 — `read` + BYO-transport (`io`).** Define `trait FrameSource` and the
-`Decoder` convenience. Wrap the existing scattered parsers (ngt1, ikonvert, maretron,
-container, plain-text) as `*Reader: FrameSource`. Document "bring your own CAN driver →
-implement `FrameSource`" as a first-class path. Hide the low-level byte helpers.
+**Phase 2 — `read` + BYO-transport.** Define `trait FrameSource` and the `Decoder`
+convenience. Document "bring your own CAN driver → implement `FrameSource`" as a
+first-class path. Expose the ready-made readers under `io`.
+
+> **Status (done):** `FrameSource` + `Decoder` live in **canboat-core** (under `decode`,
+> not `io`), so a BYO-transport consumer implements the trait and drives the decoder with
+> zero I/O deps — the one `std::io` touchpoint in core, documented as such. canboat-io's
+> old `FrameReader` trait is now a re-export alias of `canboat_core::FrameSource` (its
+> `mpsc::Receiver<RawFrame>` impl moved to core to satisfy the orphan rule; all 13 call
+> sites and the bins keep compiling). Facade `read` exposes `FrameSource`, `Decoder`,
+> `from_analyzer_json` (decode) and `PlainReader` (= `LineFrameReader`), `EblReader`,
+> `open_capture(path)` (io). Tests: a custom `FrameSource`, the `mpsc::Receiver` path, and
+> an `open_capture` PLAIN-file round-trip (which caught a real bug — `container::plain_reader`
+> only handles actual `.pcap`/`.nif`, so `open_capture` branches on `is_container`).
+> Snapshots re-blessed.
+>
+> **Deferred:** distinct `Ngt1Reader`/`IkonvertReader`/`MaretronReader` types are *not*
+> needed — live gateways flow through the device supervisor as an `mpsc::Receiver<RawFrame>`,
+> which already *is* a `FrameSource`. If a consumer ever wants a standalone push-decoder
+> wrapper for those, add it then. `output::write_nmea0183` / `write_ais` still pending the
+> `nmea0183`/`ais` feature wiring.
 
 **Phase 3 — `wire`.** Mostly re-export; `canboat-wire` is already clean. Rename into
 `wire::` namespace; hide anything not in §2.

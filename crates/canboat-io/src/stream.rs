@@ -20,7 +20,6 @@
 
 use std::collections::VecDeque;
 use std::io::{self, BufRead, Read, Write};
-use std::sync::mpsc;
 
 use canboat_core::RawFrame;
 use canboat_core::format::actisense_ascii::write_line as write_actisense;
@@ -32,17 +31,13 @@ use canboat_core::format::{
     InputFormat, detect, header_implies_coalesced, parse_format_header, parse_with,
 };
 
-/// Pull-based source of [`RawFrame`]s.
-///
-/// [`read_frame`](FrameReader::read_frame) blocks until the next
-/// frame is available and returns `Ok(None)` at end-of-stream (EOF on
-/// a file, a closed device channel). Malformed input is the reader's
-/// own problem: line readers log and skip bad lines rather than
-/// surfacing a parse error per frame, so a returned `Err` always
-/// means a genuine I/O failure that should stop the stream.
-pub trait FrameReader {
-    fn read_frame(&mut self) -> io::Result<Option<RawFrame>>;
-}
+/// Pull-based source of [`RawFrame`]s — the canboat-core
+/// [`FrameSource`](canboat_core::FrameSource) trait, re-exported here
+/// under its historical name. Concrete readers in this crate
+/// ([`LineFrameReader`], [`EblReader`]) implement it; an
+/// [`mpsc::Receiver<RawFrame>`](std::sync::mpsc::Receiver) does too (the
+/// impl lives in canboat-core).
+pub use canboat_core::FrameSource as FrameReader;
 
 /// Sink for [`RawFrame`]s.
 pub trait FrameWriter {
@@ -352,20 +347,6 @@ impl<R: Read> FrameReader for EblReader<R> {
 }
 
 /// The receiving end of a device's frame channel is a blocking
-/// [`FrameReader`]: `recv` waits for the next frame, and a
-/// disconnected channel (the device's reader thread dropped its
-/// sender on EOF / fatal error) is end-of-stream. This makes every
-/// [`DeviceHandle::frames_rx`](crate::device::DeviceHandle) usable
-/// anywhere a `FrameReader` is expected.
-impl FrameReader for mpsc::Receiver<RawFrame> {
-    fn read_frame(&mut self) -> io::Result<Option<RawFrame>> {
-        match self.recv() {
-            Ok(frame) => Ok(Some(frame)),
-            Err(mpsc::RecvError) => Ok(None),
-        }
-    }
-}
-
 /// A device's [`FrameSender`](crate::device::FrameSender) is a
 /// [`FrameWriter`]: each frame is queued to the device's writer
 /// thread, which encodes it for the wire. A gone writer thread

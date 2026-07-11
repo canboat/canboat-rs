@@ -39,7 +39,12 @@ pub use canboat::prelude::FieldValue
 pub use canboat::prelude::Frame
 pub use canboat::prelude::Units
 pub mod canboat::read
+pub use canboat::read::Decoder
+pub use canboat::read::EblReader
+pub use canboat::read::FrameSource
+pub use canboat::read::PlainReader
 pub use canboat::read::from_analyzer_json
+pub fn canboat::read::open_capture(&std::path::Path) -> core::io::error::Result<canboat_io::stream::LineFrameReader<alloc::boxed::Box<dyn std::io::BufRead>>>
 pub mod canboat::schema
 pub use canboat::schema::BitLookupTable
 pub use canboat::schema::BitLookupValue

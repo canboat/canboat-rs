@@ -37,6 +37,8 @@ pub use canboat::prelude::FieldValue
 pub use canboat::prelude::Frame
 pub use canboat::prelude::Units
 pub mod canboat::read
+pub use canboat::read::Decoder
+pub use canboat::read::FrameSource
 pub use canboat::read::from_analyzer_json
 pub mod canboat::schema
 pub use canboat::schema::BitLookupTable

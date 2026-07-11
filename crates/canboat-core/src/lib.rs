@@ -5,7 +5,9 @@
 //!
 //! This crate does no I/O. All functions are sync. Bytes go in, events
 //! and bytes come out. The caller drives the I/O — see `canboat-io`
-//! (sync) and `canboat-tokio` (async) for adapters.
+//! (sync) and `canboat-tokio` (async) for adapters. The sole `std::io`
+//! touchpoint is the [`FrameSource`] trait (the bring-your-own-transport
+//! seam): it names an `io::Result` but performs no I/O itself.
 
 pub mod analyzer_json;
 pub mod bits;
@@ -20,6 +22,7 @@ pub mod output;
 pub mod reassembly;
 mod schema_data;
 pub mod snapshot;
+pub mod source;
 pub mod startup;
 pub mod types;
 pub mod units;
@@ -32,6 +35,7 @@ pub use from_json::json_to_decoded;
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};
 pub use schema_data::{COPYRIGHT_ID, SCHEMA_HASH, VERSION as CANBOAT_JSON_VERSION};
 pub use schema_data::{field, pgn};
+pub use source::{Decoder, FrameSource};
 pub use startup::{CANBOAT_BEM, format_iso_ms, parse_iso_ms, startup_record};
 pub use types::{
     BitLookupTable, BitLookupValue, FieldInfo, FieldRef, FieldType, IndirectLookupTable,

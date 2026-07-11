@@ -130,12 +130,12 @@ mod tests {
         assert_eq!(f.data.len(), 134);
         let d = PgnDatabase::embedded(Units::Si).decode(&f).unwrap();
         assert_eq!(
-            d.field_ref(field::product_information::PRODUCT_CODE)
+            d.field(field::product_information::PRODUCT_CODE)
                 .and_then(|x| x.value.as_i64()),
             Some(21488)
         );
         assert_eq!(
-            d.field_ref(field::product_information::MODEL_ID)
+            d.field(field::product_information::MODEL_ID)
                 .and_then(|x| x.value.as_str()),
             Some("H5000 Motion Sensor")
         );

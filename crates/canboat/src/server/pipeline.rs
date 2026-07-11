@@ -297,7 +297,7 @@ pub fn run(
     let mut raw_line = String::with_capacity(256);
     let mut json_line = String::with_capacity(1024);
     let mut rl = crate::n2kd::nmea0183::RateLimiter::new(nmea0183_rate_limit);
-    let handles = crate::n2kd::decoded::Handles::new(db);
+    let handles = crate::n2kd::decoded::Handles::new();
 
     // Quirk synthesisers can produce extra `RawFrame`s in response to
     // an inbound bus frame. We re-feed them through this same loop so
@@ -483,7 +483,7 @@ pub fn run(
                 }
             } else if decoded.pgn == 126208 {
                 use canboat_core::field::nmea_acknowledge_group_function as ack;
-                let field_int = |f| decoded.field_ref(f).and_then(|d| d.value.as_i64());
+                let field_int = |f| decoded.field(f).and_then(|d| d.value.as_i64());
                 if field_int(ack::FUNCTION_CODE) == Some(2) {
                     let pgn_err = field_int(ack::PGN_ERROR_CODE).unwrap_or(0);
                     let iv_err =

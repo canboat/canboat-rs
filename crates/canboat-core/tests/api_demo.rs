@@ -134,6 +134,6 @@ fn field_handle_indexed_access() {
     let db = PgnDatabase::embedded(canboat_core::Units::Metric);
     let handle = db.field("isoAddressClaim", "uniqueNumber").expect("handle");
     let pgn = decode_iso_address_claim();
-    let f = pgn.field(&handle).expect("field present");
+    let f = pgn.field(handle).expect("field present");
     assert_eq!(f.value.as_i64(), Some(1_088_507));
 }

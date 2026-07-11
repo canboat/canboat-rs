@@ -24,7 +24,7 @@ pub mod startup;
 pub mod types;
 pub mod units;
 
-pub use db::{FieldHandle, PgnDatabase, Units};
+pub use db::{PgnDatabase, Units};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
 pub use encode::{EncodeError, EncodeValue, MessageBuilder};
 pub use frame::{ADDR_GLOBAL, ADDR_NULL, FASTPACKET_MAX_SIZE, RAWFRAME_MAX_SIZE, RawFrame};
@@ -79,7 +79,7 @@ mod smoke {
         let h = db
             .field("isoAddressClaim", "uniqueNumber")
             .expect("unique number handle");
-        assert_eq!(h.field_order, 1);
+        assert_eq!(h.field.order, 1);
         assert!(db.field("isoAddressClaim", "noSuchField").is_none());
         assert!(db.field("noSuchPgn", "uniqueNumber").is_none());
     }
@@ -103,7 +103,7 @@ mod smoke {
         };
         let dec = db.decode(&frame).expect("decode");
         let h = db.field("isoAddressClaim", "uniqueNumber").expect("handle");
-        let f = dec.field(&h).expect("field present");
+        let f = dec.field(h).expect("field present");
         assert_eq!(f.value.as_i64(), Some(1_088_507));
     }
 
@@ -130,7 +130,7 @@ mod smoke {
             let db = PgnDatabase::embedded(units);
             let dec = db.decode(&frame).expect("decode");
             let h = db.field("windData", "windAngle").expect("handle");
-            dec.field(&h).expect("field").value.as_f64().expect("f64")
+            dec.field(h).expect("field").value.as_f64().expect("f64")
         };
 
         let si = angle(crate::Units::Si);

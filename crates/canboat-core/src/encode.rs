@@ -820,7 +820,7 @@ mod tests {
             .unwrap();
         let d = db().decode(&frame).unwrap();
         assert_eq!(
-            d.field_ref(MODEL_ID).and_then(|f| f.value.as_str()),
+            d.field(MODEL_ID).and_then(|f| f.value.as_str()),
             Some("SCX-20")
         );
     }
@@ -837,7 +837,7 @@ mod tests {
             .unwrap();
         let d = db().decode(&frame).unwrap();
         assert_eq!(
-            d.field_ref(DESC1).and_then(|f| f.value.as_str()),
+            d.field(DESC1).and_then(|f| f.value.as_str()),
             Some("Helm Station")
         );
     }
@@ -854,7 +854,7 @@ mod tests {
             .unwrap();
         let d = db().decode(&frame).unwrap();
         assert_eq!(
-            d.field_ref(IDENTIFIER).and_then(|f| f.value.as_str()),
+            d.field(IDENTIFIER).and_then(|f| f.value.as_str()),
             Some("BOW")
         );
     }
@@ -873,7 +873,7 @@ mod tests {
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
-        match d.field_ref(DATA).map(|f| &f.value) {
+        match d.field(DATA).map(|f| &f.value) {
             Some(crate::FieldValue::Binary(v)) => assert_eq!(v, &payload),
             other => panic!("expected binary, got {other:?}"),
         }
@@ -892,7 +892,7 @@ mod tests {
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
-        let got = d.field_ref(HTS).and_then(|f| f.value.as_f64()).unwrap();
+        let got = d.field(HTS).and_then(|f| f.value.as_f64()).unwrap();
         assert!((got - 1.5).abs() < 1e-6, "got {got}");
     }
 
@@ -910,7 +910,7 @@ mod tests {
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
-        match d.field_ref(SOURCE).map(|f| &f.value) {
+        match d.field(SOURCE).map(|f| &f.value) {
             Some(crate::FieldValue::IsoName { value, .. }) => assert_eq!(*value, name),
             other => panic!("expected iso name, got {other:?}"),
         }

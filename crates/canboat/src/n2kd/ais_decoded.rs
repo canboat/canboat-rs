@@ -422,11 +422,11 @@ fn encode_class_b_static(bv: &mut BitVector, msgid: i64, d: &DecodedPgn) {
 // ---------- helpers ----------
 
 fn int_field(d: &DecodedPgn, f: FieldRef) -> Option<i64> {
-    d.field_ref(f).and_then(|x| x.value.as_i64())
+    d.field(f).and_then(|x| x.value.as_i64())
 }
 
 fn num_field(d: &DecodedPgn, f: FieldRef) -> Option<f64> {
-    d.field_ref(f).and_then(|x| x.value.as_f64())
+    d.field(f).and_then(|x| x.value.as_f64())
 }
 
 /// Like [`num_field`] but in a requested unit — the AIS bit layouts are
@@ -434,11 +434,11 @@ fn num_field(d: &DecodedPgn, f: FieldRef) -> Option<f64> {
 /// those and let the core convert from the stream's schema unit (Metric
 /// or SI). See [`canboat_core::DecodedField::as_f64_in`].
 fn num_field_in(d: &DecodedPgn, f: FieldRef, unit: &str) -> Option<f64> {
-    d.field_ref(f).and_then(|x| x.as_f64_in(unit))
+    d.field(f).and_then(|x| x.as_f64_in(unit))
 }
 
 fn str_field(d: &DecodedPgn, f: FieldRef) -> Option<&str> {
-    d.field_ref(f).and_then(|x| x.value.as_str())
+    d.field(f).and_then(|x| x.value.as_str())
 }
 
 fn repeat_indicator(d: &DecodedPgn, f: FieldRef) -> i64 {
@@ -456,7 +456,7 @@ fn user_id(d: &DecodedPgn, f: FieldRef, default: i64) -> i64 {
 /// the decoder produced a bare string we still need to map. `-1` when
 /// the field is absent from the record.
 fn enum_field(d: &DecodedPgn, f: FieldRef, names: &[(&str, i64)]) -> i64 {
-    enum_of(d.field_ref(f), names)
+    enum_of(d.field(f), names)
 }
 
 /// Same as [`enum_field`] but keyed by field *name* — used only for the
@@ -569,7 +569,7 @@ fn draft(d: &DecodedPgn, f: FieldRef) -> i64 {
 /// directly; binary path packs the first 3 bytes little-endian into
 /// the 19-bit slot, matching canboat C's text-form parser.
 fn comm_state(d: &DecodedPgn, f: FieldRef) -> i64 {
-    let Some(f) = d.field_ref(f) else {
+    let Some(f) = d.field(f) else {
         return 393_222;
     };
     if let Some(n) = f.value.as_i64() {
@@ -602,7 +602,7 @@ fn comm_state(d: &DecodedPgn, f: FieldRef) -> i64 {
 /// 10-byte buffer in canboat's canonical date string form. Returns
 /// `None` if the field is missing or not a date.
 fn date_string(d: &DecodedPgn, f: FieldRef) -> Option<String> {
-    let f = d.field_ref(f)?;
+    let f = d.field(f)?;
     let FieldValue::Date(days) = f.value else {
         return None;
     };
@@ -628,7 +628,7 @@ fn ais_date(d: &DecodedPgn, f: FieldRef) -> i64 {
 
 /// A TIME-typed field packed as `(hour << 12) | (minute << 6) | second`.
 fn ais_time(d: &DecodedPgn, f: FieldRef) -> i64 {
-    let Some(f) = d.field_ref(f) else {
+    let Some(f) = d.field(f) else {
         return 0;
     };
     let FieldValue::Time { seconds, .. } = f.value else {
@@ -668,7 +668,7 @@ fn ais_eta(d: &DecodedPgn, eta_date: FieldRef, eta_time: FieldRef) -> i64 {
         }
     }
     let (mut hour, mut minute) = (24u32, 60u32);
-    if let Some(f) = d.field_ref(eta_time)
+    if let Some(f) = d.field(eta_time)
         && let FieldValue::Time { seconds, .. } = f.value
         && seconds.is_finite()
         && seconds >= 0.0

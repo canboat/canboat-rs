@@ -94,7 +94,7 @@ canboat
 │   Reassembler, Reassembled   // fast-packet; ReassemblyError, FramePacketType
 │
 │   // decode (inbound) — persona #1/#2, the DecodedPgn seam
-│   DecodedPgn             // .get(FieldId) [O(1)], .field_by_name,
+│   DecodedPgn             // .field(FieldId) [O(1)], .field_by_name,
 │                          //   .pgn/.src/.dst/.prio/.timestamp/.id/.description
 │   DecodedField           // .value, .name(), .as_f64_in(Units)
 │   FieldValue { Number, Integer, Float, String, Lookup, BitField, Mmsi, … }
@@ -168,7 +168,7 @@ socketcan plumbing, the address-claim internals — is **private**.
 
 - **Field addressing is ONE type (`FieldId`).** `FieldHandle` is demoted to a private
   impl detail. The current per-access `djb2_hash_str(pgn.id)` in `field_ref` is removed by
-  baking the id-hash into `PgnInfo` at build time, so `DecodedPgn::get(FieldId)` is a pure
+  baking the id-hash into `PgnInfo` at build time, so `DecodedPgn::field(FieldId)` is a pure
   O(1) array index in release — equal-or-faster than today, never slower.
 - **`snapshot`** (current-value cache) is *not* top-level. It rides inside `bridge` (a
   `Bridge::snapshot()` accessor) and stays out of the sans-I/O core surface until a
@@ -196,11 +196,26 @@ socketcan plumbing, the address-claim internals — is **private**.
 (`decode` default, `io`, `wire`, `node`, `bridge`, `nmea0183`, `ais`). Empty re-export
 modules. Wire up the `cargo public-api` snapshot test. No behaviour change.
 
-**Phase 1 — Curate the core (`decode`).** This is the big *subtractive* pass. Demote
-`canboat-core`'s 15 `pub mod`s to private; re-export the curated set from the facade
-under the names in §2 (rename as needed). Move introspection types under `schema::`,
-id constants under `ids::`. Land the prelude. Verify: the facade compiles with only
-`decode`, pulls no threads/socket deps, and `cargo public-api` matches §2's core block.
+**Phase 1 — Curate the core (`decode`).** The big *subtractive* pass. Re-export the
+curated set from the facade under the names in §2; introspection under `schema::`, id
+constants under `ids::`, the prelude landed. Collapse `FieldHandle` into `FieldId` (one
+public field-addressing type) and drop the per-access `djb2` hashing — decode access is
+now a pure `O(1)` array index by schema order with a debug-only `&str` PGN check. Verify:
+facade compiles on `decode` alone (no threads/socket deps) and `cargo public-api` matches
+§2's core block.
+
+> **Status (done):** `FieldHandle`/`djb2` removed; `DecodedPgn::field(FieldId)` is the sole
+> accessor; `PgnDatabase::field()` returns `FieldId`; the n2kd struct-path (`decoded.rs`)
+> retyped to hold the generated constants directly. Snapshots blessed for all three
+> library feature-sets. All tests green except one **pre-existing** golden failure
+> (`mixed_format_text_debug`, fails identically on `main` — stale 130824-rate fixture,
+> unrelated).
+>
+> **Deferred to Phase 5:** demoting `canboat-core`'s 15 wide-open `pub mod`s to
+> `pub(crate)`. They can't shrink while the bin modules (`server`/`n2kd`/`tui`) and the
+> sibling crates import `canboat_core::{decode,encode,output,reassembly,frame,…}`
+> directly. That lockdown happens when those modules move into `canboat-bridge`. Until
+> then the *facade's* surface is the enforced contract (§3), and it is already minimal.
 
 **Phase 2 — `read` + BYO-transport (`io`).** Define `trait FrameSource` and the
 `Decoder` convenience. Wrap the existing scattered parsers (ngt1, ikonvert, maretron,

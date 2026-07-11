@@ -102,7 +102,7 @@ impl Scx20 {
             return Vec::new();
         }
         let target = d
-            .field_ref(field::iso_request::PGN)
+            .field(field::iso_request::PGN)
             .and_then(|f| f.value.as_i64());
         if target != Some(i64::from(PGN_PRODUCT_INFO)) {
             return Vec::new();

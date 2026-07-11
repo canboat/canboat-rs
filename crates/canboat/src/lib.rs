@@ -24,27 +24,39 @@
 
 // ─────────────────────────── decode (baseline) ───────────────────────────
 // Core types, re-exported at the crate root under their locked public names.
-// The renames are facade-level (`as` aliases) for now; Phase 1 pushes them
-// down into canboat-core and collapses FieldRef/FieldHandle into `FieldId`.
+// The internal canboat-core names (PgnDatabase, RawFrame, FieldRef) are mapped
+// to the public names here; FieldHandle was collapsed into FieldId in Phase 1.
 
 #[cfg(feature = "decode")]
 pub use canboat_core::{
+    ADDR_GLOBAL,
+    ADDR_NULL,
+    CANBOAT_JSON_VERSION as CANBOAT_VERSION,
+    DecodeError,
+    DecodedField,
+    // decode (inbound)
+    DecodedPgn,
+    EncodeError,
+    EncodeValue,
+    FASTPACKET_MAX_SIZE,
+    // the single field-addressing type (FieldHandle was removed in Phase 1)
+    FieldRef as FieldId,
+    FieldValue,
+    FramePacketType,
+    // encode (outbound)
+    MessageBuilder,
     // schema & database
     PgnDatabase as Database,
-    Units,
-    // the single field-addressing type (Phase 1 collapses FieldHandle away)
-    FieldRef as FieldId,
+    RAWFRAME_MAX_SIZE as FRAME_MAX_SIZE,
     // frames — the wire-side pivot
     RawFrame as Frame,
-    ADDR_GLOBAL, ADDR_NULL, FASTPACKET_MAX_SIZE, RAWFRAME_MAX_SIZE as FRAME_MAX_SIZE,
+    Reassembled,
     // fast-packet reassembly
-    Reassembler, Reassembled, ReassemblyError, FramePacketType,
-    // decode (inbound)
-    DecodedPgn, DecodedField, FieldValue, DecodeError,
-    // encode (outbound)
-    MessageBuilder, EncodeValue, EncodeError,
+    Reassembler,
+    ReassemblyError,
     // versions / identity
-    SCHEMA_HASH, CANBOAT_JSON_VERSION as CANBOAT_VERSION,
+    SCHEMA_HASH,
+    Units,
 };
 
 /// Schema introspection: the read-facing shape of the PGN/field definitions,
@@ -120,6 +132,6 @@ pub mod bridge {}
 #[cfg(feature = "decode")]
 pub mod prelude {
     pub use crate::{
-        DecodeError, DecodedField, DecodedPgn, Database, FieldId, FieldValue, Frame, Units,
+        Database, DecodeError, DecodedField, DecodedPgn, FieldId, FieldValue, Frame, Units,
     };
 }

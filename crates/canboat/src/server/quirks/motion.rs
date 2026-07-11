@@ -221,7 +221,7 @@ impl Motion {
     /// addressed to our claimed address or broadcast.
     fn handle_request(&self, d: &DecodedPgn) -> Vec<RawFrame> {
         let Some(requested) = d
-            .field_ref(field::iso_request::PGN)
+            .field(field::iso_request::PGN)
             .and_then(|f| f.value.as_i64())
         else {
             return Vec::new();
@@ -483,13 +483,13 @@ mod tests {
         assert_eq!(pi.src, addr);
         let d = si().decode(pi).unwrap();
         assert_eq!(
-            d.field_ref(field::product_information::PRODUCT_CODE)
+            d.field(field::product_information::PRODUCT_CODE)
                 .and_then(|f| f.value.as_i64()),
             Some(PRODUCT_CODE),
             "the Hercules acceptance gate"
         );
         assert_eq!(
-            d.field_ref(field::product_information::MODEL_ID)
+            d.field(field::product_information::MODEL_ID)
                 .and_then(|f| f.value.as_str()),
             Some(MODEL_ID)
         );

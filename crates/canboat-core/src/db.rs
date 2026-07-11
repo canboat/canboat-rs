@@ -13,37 +13,6 @@ use crate::types::{
     LookupFieldTypeValue, LookupTable, PgnInfo,
 };
 
-/// Pre-resolved (PGN, field) pointer that hands out the corresponding
-/// [`crate::DecodedField`] in `O(1)`. Built once at startup via
-/// [`PgnDatabase::field`] and reused for the life of the process.
-///
-/// Carries no borrow lifetime so it sits happily in a `static`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct FieldHandle {
-    /// 1-based schema position of the resolved field. Matches
-    /// `FieldInfo::order`.
-    pub field_order: u8,
-    /// Cheap stable hash of the PGN id the handle was minted for —
-    /// see [`crate::DecodedPgn::field`].
-    pub pgn_id_hash: u64,
-}
-
-/// Stable djb2-ish hash, mirrored from n2kd's secondary-key hash so
-/// debug-mode handle validation is one comparable u64.
-#[inline]
-fn djb2_hash(s: &str) -> u64 {
-    djb2_hash_str(s)
-}
-
-#[inline]
-pub(crate) fn djb2_hash_str(s: &str) -> u64 {
-    let mut h: u64 = 5381;
-    for b in s.bytes() {
-        h = h.wrapping_shl(5).wrapping_add(h).wrapping_add(b as u64);
-    }
-    h
-}
-
 /// The canboat PGN database — a thin wrapper around the build-time
 /// generated static schema tables.
 ///
@@ -173,7 +142,7 @@ impl PgnDatabase {
 
     /// First definition whose `Id` field matches `id` (e.g.
     /// `"cogSogRapidUpdate"`). O(n) linear scan — call once at startup
-    /// and cache the resulting [`FieldHandle`].
+    /// and cache the resulting `&'static PgnInfo`.
     pub fn pgn_by_id(&self, id: &str) -> Option<&'static PgnInfo> {
         self.pgns.iter().find(|p| p.id == id)
     }
@@ -221,33 +190,20 @@ impl PgnDatabase {
         Ok(crate::encode::MessageBuilder::for_pgn(self, first))
     }
 
-    /// Resolve a (PGN id, field id) pair into a [`FieldHandle`] that
-    /// later indexes into [`crate::DecodedPgn`] at `O(1)`. Both inputs
-    /// are canboat-json `Id` values (camelCase machine identifiers,
-    /// e.g. `("isoAddressClaim", "uniqueNumber")`).
-    pub fn field(&self, pgn_id: &str, field_id: &str) -> Option<FieldHandle> {
+    /// Resolve a (PGN id, field id) pair into a [`FieldRef`] that later
+    /// indexes into [`crate::DecodedPgn`] at `O(1)` via
+    /// [`crate::DecodedPgn::field`]. Both inputs are canboat-json `Id`
+    /// values (camelCase machine identifiers, e.g.
+    /// `("isoAddressClaim", "uniqueNumber")`). The infallible,
+    /// compile-checked counterpart is the generated `field::…` constant,
+    /// which is itself a `FieldRef`.
+    pub fn field(&self, pgn_id: &str, field_id: &str) -> Option<FieldRef> {
         let info = self.pgn_by_id(pgn_id)?;
         let f = info.fields.iter().find(|f| f.id == field_id)?;
-        Some(FieldHandle {
-            field_order: f.order,
-            pgn_id_hash: djb2_hash(pgn_id),
+        Some(FieldRef {
+            pgn: info,
+            field: f,
         })
-    }
-
-    /// Resolve a build-time [`FieldRef`] into an `O(1)` [`FieldHandle`].
-    ///
-    /// The infallible, compile-checked counterpart to [`Self::field`]:
-    /// the `FieldRef` (e.g. `canboat_core::field::wind_data::WIND_ANGLE`)
-    /// already names a real (PGN, field) pair, so there is no `Option`.
-    /// `order` and the PGN `id` are unit-invariant, so the handle is
-    /// valid against this db regardless of which [`Units`] the `FieldRef`
-    /// was generated from.
-    #[inline]
-    pub fn handle(&self, f: FieldRef) -> FieldHandle {
-        FieldHandle {
-            field_order: f.field.order,
-            pgn_id_hash: djb2_hash(f.pgn.id),
-        }
     }
 
     /// Find a catch-all "fallback" PGN definition for an unknown `pgn`.

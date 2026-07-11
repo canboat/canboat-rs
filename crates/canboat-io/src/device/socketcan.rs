@@ -229,29 +229,20 @@ mod imp {
     /// Build the 64-bit ISO NAME from a [`Config`].
     fn build_name(config: &Config) -> u64 {
         let unique = if config.unique != 0 {
-            config.unique & 0x1fffff
+            config.unique
         } else {
             // Per-machine, stable across restarts. Two CANboat gateways
             // on the same host would collide; pass `--unique N` (or
             // `Config.unique`) to disambiguate.
-            (canboat_core::os::get_machine_id() as u32) & 0x1fffff
+            canboat_core::os::get_machine_id() as u32
         };
-        let manufacturer = config.manufacturer as u64 & 0x7ff;
-        let device_instance: u64 = 0;
-        let device_function: u64 = 130; // PC Gateway
-        let device_class: u64 = 25; // Inter/Intranetwork Device
-        let system_instance: u64 = config.system_instance as u64 & 0x0f;
-        let industry_group: u64 = 4; // Marine
-        let arbitrary: u64 = 1;
-        (unique as u64)
-            | (manufacturer << 21)
-            | ((device_instance & 0x07) << 32)
-            | ((device_instance >> 3 & 0x1f) << 35)
-            | ((device_function & 0xff) << 40)
-            | ((device_class & 0x7f) << 49)
-            | ((system_instance & 0x0f) << 56)
-            | ((industry_group & 0x07) << 60)
-            | (arbitrary << 63)
+        // PC Gateway (130) / Inter-Intranetwork Device (25); Marine industry
+        // group and arbitrary-address-capable are the builder's defaults.
+        crate::name::Name::new(config.manufacturer, unique)
+            .device_function(130)
+            .device_class(25)
+            .system_instance(config.system_instance)
+            .to_u64()
     }
 
     /// Outbound ring drained one frame per writability wakeup. Lives on

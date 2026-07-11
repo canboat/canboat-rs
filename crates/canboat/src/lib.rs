@@ -134,13 +134,23 @@ pub mod wire {
 
 // ─────────────────────────────── device ──────────────────────────────────
 
-/// Be a compliant N2K node without owning a transport: NAME arbitration and
-/// the ISO/product/config responder, all [`Frame`]-in/[`Frame`]-out.
+/// Be a compliant N2K node without owning a transport, all [`Frame`]-in /
+/// [`Frame`]-out — the caller owns the bus.
 ///
-/// Populated in Phase 4 from the extracted `address_claim` + `nmea_responder`
-/// components as `device::{Name, Claimer, Responder}`.
+/// [`Name`] builds the 64-bit ISO NAME; [`Claimer`] is the address-claim state
+/// machine (NAME arbitration). The response builders — [`ProductInfo`] (PGN
+/// 126996) and the [`pgn_list_frames`] / [`iso_ack_frame`] / [`heartbeat_frame`]
+/// helpers — emit the frames a node answers discovery with; the caller drives
+/// them from its own event loop (as the socketcan gateway and the motion quirk
+/// both do).
 #[cfg(feature = "node")]
-pub mod device {}
+pub mod device {
+    pub use canboat_io::address_claim::{AddressClaim as Claimer, ClaimState};
+    pub use canboat_io::name::Name;
+    pub use canboat_io::nmea_responder::{
+        ProductInfo, heartbeat_frame, iso_ack_frame, pgn_list_frames,
+    };
+}
 
 // ─────────────────────────────── bridge ──────────────────────────────────
 

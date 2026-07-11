@@ -260,6 +260,22 @@ first-class path. Expose the ready-made readers under `io`.
 `Responder`, all `Frame`-in/`Frame`-out, transport-agnostic. Hide the internals. (Feature
 flag is `node`; the module is `device` per the naming decision.)
 
+> **Status (done):** `device::{Name, Claimer, ClaimState, ProductInfo, pgn_list_frames,
+> iso_ack_frame, heartbeat_frame}`.
+> - **`Name`** is a NEW builder for the 64-bit ISO 11783-5 NAME (`canboat-io::name`). It
+>   consolidates the **two** hand-rolled `build_name` bit-packers (the socketcan gateway and
+>   the motion quirk), both now refactored onto it — the duplication is gone. An equivalence
+>   test locks `Name::to_u64()` byte-identical to both original packings so no device's
+>   on-bus NAME (hence its claim arbitration) shifts.
+> - **`Claimer`** = re-export of `AddressClaim` (+ `ClaimState`); added `AddressClaim::for_name(&Name, preferred)`
+>   as the ergonomic Name↔claimer bridge.
+> - **`Responder`: dropped as a *type*.** The responder is a set of frame builders
+>   (`ProductInfo` for 126996, plus `pgn_list_frames`/`iso_ack_frame`/`heartbeat_frame`),
+>   and both real callers drive them from their own event loop — a stateful `Responder`
+>   struct would be speculative API nobody uses. Exposed the primitives instead. No 126998
+>   config-info builder exists yet; add one with a real consumer. Smaller surface, honest.
+> Snapshots re-blessed; all green except the pre-existing golden.
+
 **Phase 5 — `bridge` (the big one).** Move `crates/canboat/src/{server,n2kd}` into
 `canboat-bridge`. Untangle the binary plumbing identified in the feasibility pass:
 - replace the `clap::Args` config with a plain `BridgeConfig`;

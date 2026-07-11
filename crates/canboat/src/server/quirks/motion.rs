@@ -95,10 +95,10 @@ const BG_RATE_LSB_RAD_S: f64 = 3.125e-8;
 /// ISO NAME fields identifying the H5000 Motion Sensor personality. The
 /// class/function are *not* the Hercules acceptance gate (that is the
 /// Product Code below), but a faithful twin still presents them.
-const MFG_BANDG: u64 = 381;
-const DEVICE_FUNCTION: u64 = 140; // "Ownship Attitude"
-const DEVICE_CLASS: u64 = 60; // Navigation
-const INDUSTRY_MARINE: u64 = 4;
+const MFG_BANDG: u16 = 381;
+const DEVICE_FUNCTION: u8 = 140; // "Ownship Attitude"
+const DEVICE_CLASS: u8 = 60; // Navigation
+const INDUSTRY_MARINE: u16 = 4; // proprietary-PGN header industry code
 
 /// Preferred source address. The real unit was seen at 24; if it's taken
 /// the claim state machine picks the lowest free one. Kept non-zero so the
@@ -320,15 +320,14 @@ impl Motion {
 /// The 64-bit ISO NAME for the Motion Sensor personality. The Unique
 /// Number is derived from the host machine id so it is stable per host and
 /// distinct from a real unit's (avoiding a NAME clash if both are present).
+/// Marine industry group and arbitrary-address-capable are the builder's
+/// defaults.
 fn build_name() -> u64 {
-    let unique = (canboat_core::os::get_machine_id() as u64) & 0x1f_ffff;
-    let arbitrary: u64 = 1;
-    unique
-        | (MFG_BANDG << 21)
-        | (DEVICE_FUNCTION << 40)
-        | (DEVICE_CLASS << 49)
-        | (INDUSTRY_MARINE << 60)
-        | (arbitrary << 63)
+    let unique = canboat_core::os::get_machine_id() as u32;
+    canboat_io::name::Name::new(MFG_BANDG, unique)
+        .device_function(DEVICE_FUNCTION)
+        .device_class(DEVICE_CLASS)
+        .to_u64()
 }
 
 /// The 11-bit manufacturer code from a proprietary PGN's first two header
@@ -368,7 +367,8 @@ fn transcode_rate(scx_count: i32) -> i32 {
 /// laid out by hand: a 2-byte mfr/industry header, then three
 /// `{ key|len<<12 (u16 LE), value (i32 LE) }` entries (len 4 bytes each).
 fn build_130824_payload(roll: i32, pitch: i32, yaw: i32) -> Vec<u8> {
-    let header: u16 = (MFG_BANDG as u16) | (0b11 << 11) | ((INDUSTRY_MARINE as u16) << 13);
+    // Proprietary header: manufacturer(11) | reserved(2 = 0b11) | industry(3).
+    let header: u16 = MFG_BANDG | (0b11 << 11) | (INDUSTRY_MARINE << 13);
     let mut v = Vec::with_capacity(2 + 3 * 6);
     v.extend_from_slice(&header.to_le_bytes());
     for (key, count) in [
@@ -553,7 +553,7 @@ mod tests {
     fn ignores_non_furuno_6dof() {
         // header_manufacturer guards the fixed-offset field read.
         assert_eq!(header_manufacturer(&[0x3f, 0x9f]), Some(MFG_FURUNO));
-        assert_eq!(header_manufacturer(&[0x7d, 0x99]), Some(MFG_BANDG as u16));
+        assert_eq!(header_manufacturer(&[0x7d, 0x99]), Some(MFG_BANDG));
         assert_eq!(header_manufacturer(&[0x00]), None);
     }
 

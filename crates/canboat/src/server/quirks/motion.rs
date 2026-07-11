@@ -504,7 +504,10 @@ mod tests {
         let gain = SCX_RATE_LSB_RAD_S / BG_RATE_LSB_RAD_S;
         assert_eq!(transcode_rate(1000), (1000.0 * gain).round() as i32);
         assert_eq!(transcode_rate(-1000), -(1000.0 * gain).round() as i32);
-        assert!(gain > 100.0, "sanity: a mid-hundreds gain, never the ×10 trap");
+        assert!(
+            gain > 100.0,
+            "sanity: a mid-hundreds gain, never the ×10 trap"
+        );
         assert_eq!(transcode_rate(0), 0);
         // A full-scale i32 input saturates rather than wrapping/panicking.
         assert_eq!(transcode_rate(i32::MAX), i32::MAX);

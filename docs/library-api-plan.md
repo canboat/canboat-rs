@@ -242,6 +242,19 @@ first-class path. Expose the ready-made readers under `io`.
 **Phase 3 — `wire`.** Mostly re-export; `canboat-wire` is already clean. Rename into
 `wire::` namespace; hide anything not in §2.
 
+> **Status (done — no new code):** satisfied by the Phase 0 curation. `canboat::wire`
+> exposes exactly `Hello`, `HelloError`, `WirePgn`, `PgnIndex`, `pgn_id_hash`,
+> `append_frame`, `decode_frame`, `try_read_frame`, `MAX_FRAME_LEN`, `FrameError` — the §2
+> set plus the two error types the fns return. It hides `canboat-wire`'s `MAGIC`,
+> `WIRE_VERSION`, and the `WireField`/`WireValue`/`WireOverrides` inner structure. The only
+> in-repo consumers (`Hello`, `WirePgn`, `append_frame`) are all in the exposed set.
+> Verified against the blessed `+wire` snapshot.
+>
+> **Deferred:** tightening `canboat-wire`'s own surface (e.g. `MAGIC`/`WIRE_VERSION` →
+> `pub(crate)`) with the other sub-crate lockdowns — `WireField` can't shrink while
+> `WirePgn.fields` is public, and merrimac (separate repo) isn't built here to catch a
+> break. Done at migration time.
+
 **Phase 4 — `node` (module `device`).** Promote the already-extracted `address_claim` +
 `nmea_responder` (from the motion-quirk work) into the `device::` API: `Name`, `Claimer`,
 `Responder`, all `Frame`-in/`Frame`-out, transport-agnostic. Hide the internals. (Feature

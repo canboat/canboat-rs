@@ -35,17 +35,19 @@ decode   = ["dep:canboat-core"]            # sans-I/O core: schema, decode, enco
 io       = ["decode", "dep:canboat-io"]    # byte-source readers (read::*Reader)
 wire     = ["decode", "dep:canboat-wire"]  # cross-process WirePgn / Hello handshake
 node     = ["decode", "dep:canboat-io"]    # device::{Name, Claimer, Responder}
-bridge   = ["io", "wire", "node"]          # live bus (stub until Phase 5)
+bridge   = ["io", "wire", "node"]          # live-bus facade module (stub until the Bridge API lands)
 nmea0183 = ["decode"]                      # output::write_nmea0183
 ais      = ["decode"]                      # output::write_ais
 
 # ── the CLI (not part of the public library surface) ──
+# `canboat-bridge` hosts the server/n2kd subcommand implementations (lifted out
+# of this crate); the CLI dispatches into it.
 cli = [
     "decode", "io", "wire", "bridge", "nmea0183", "ais",
+    "dep:canboat-bridge",
     "dep:canboat-cli", "dep:clap", "dep:env_logger", "dep:anyhow",
     "dep:serde", "dep:serde_json", "dep:tokio", "dep:crossterm",
     "dep:ratatui", "dep:futures", "dep:chrono", "dep:indexmap",
-    "dep:world_magnetic_model",
 ]
 
 [dependencies]
@@ -57,6 +59,7 @@ canboat-wire = { workspace = true, optional = true }
 log          = { workspace = true }
 
 # CLI layer — optional, enabled only by the `cli` feature.
+canboat-bridge = { workspace = true, optional = true }
 canboat-cli  = { workspace = true, optional = true }
 anyhow       = { workspace = true, optional = true }
 clap         = { workspace = true, optional = true }
@@ -71,8 +74,3 @@ indexmap     = { workspace = true, optional = true }
 futures      = { workspace = true, optional = true }
 # Local-time formatting for the tui file browser (cross-platform).
 chrono       = { version = "0.4", optional = true, default-features = false, features = ["clock"] }
-world_magnetic_model = { version = "0.4.0", optional = true }
-
-[build-dependencies]
-# Capture the git short SHA (+ dirty flag) for the analyzer version banner.
-vergen-gitcl = { version = "1", default-features = false }

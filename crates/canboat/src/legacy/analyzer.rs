@@ -157,8 +157,12 @@ fn run_cli(cli: Cli) -> Result<()> {
     // "n2kd", in which case n2kd still wants the banner.
     let suppress_banner = cli.fixtime.as_deref().is_some_and(|s| !s.contains("n2kd"));
     if cli.json && !suppress_banner {
-        writeln!(out, "{}", crate::build_info::version_banner(cli.si, cli.nv))
-            .context("writing JSON banner")?;
+        writeln!(
+            out,
+            "{}",
+            canboat_bridge::build_info::version_banner(cli.si, cli.nv)
+        )
+        .context("writing JSON banner")?;
     }
 
     let forced_format = cli.format.as_deref().map(parse_format_flag).transpose()?;

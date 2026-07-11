@@ -104,7 +104,7 @@ pub fn nmea0183_filter_set(source: u8, sentence: &str, muted: bool) -> String {
 /// rest is `0xff` padding. See [`nmea0183_filter_set`] for the Set form.
 pub fn nmea0183_filter_request() -> String {
     let data = [
-        crate::n2kd::nmea_filter::FILTER_FN_REQUEST,
+        canboat_bridge::n2kd::nmea_filter::FILTER_FN_REQUEST,
         0xff,
         0xff,
         0xff,
@@ -134,11 +134,11 @@ pub fn override_set(
 ) -> String {
     format_plain(
         7,
-        crate::n2kd::overrides::PGN_PGN_OVERRIDE,
+        canboat_bridge::n2kd::overrides::PGN_PGN_OVERRIDE,
         TUI_SRC,
         255,
         &override_payload(
-            crate::n2kd::overrides::OV_FN_SET,
+            canboat_bridge::n2kd::overrides::OV_FN_SET,
             src,
             pgn,
             interval_ms,
@@ -153,11 +153,11 @@ pub fn override_set(
 pub fn override_delete(src: u8, pgn: u32) -> String {
     format_plain(
         7,
-        crate::n2kd::overrides::PGN_PGN_OVERRIDE,
+        canboat_bridge::n2kd::overrides::PGN_PGN_OVERRIDE,
         TUI_SRC,
         255,
         &override_payload(
-            crate::n2kd::overrides::OV_FN_DELETE,
+            canboat_bridge::n2kd::overrides::OV_FN_DELETE,
             src,
             pgn,
             0,
@@ -170,11 +170,11 @@ pub fn override_delete(src: u8, pgn: u32) -> String {
 /// PLAIN line for the override control PGN (262658), **Request** form:
 /// ask the server to (re-)send the current override state.
 pub fn override_request() -> String {
-    let mut data = vec![crate::n2kd::overrides::OV_FN_REQUEST];
+    let mut data = vec![canboat_bridge::n2kd::overrides::OV_FN_REQUEST];
     data.resize(12, 0xff);
     format_plain(
         7,
-        crate::n2kd::overrides::PGN_PGN_OVERRIDE,
+        canboat_bridge::n2kd::overrides::PGN_PGN_OVERRIDE,
         TUI_SRC,
         255,
         &data,
@@ -238,8 +238,8 @@ mod tests {
         let line = nmea0183_filter_request();
         assert_eq!(no_ts(&line), "7,262657,0,255,8,02,ff,ff,ff,ff,ff,ff,ff");
         let frame = canboat_core::format::parse_plain(&line).unwrap();
-        assert!(crate::n2kd::nmea_filter::is_request_frame(&frame));
-        assert!(!crate::n2kd::nmea_filter::is_set_frame(&frame));
+        assert!(canboat_bridge::n2kd::nmea_filter::is_request_frame(&frame));
+        assert!(!canboat_bridge::n2kd::nmea_filter::is_set_frame(&frame));
     }
 
     #[test]
@@ -274,7 +274,7 @@ mod tests {
     fn override_request_is_a_request_frame() {
         let line = override_request();
         let frame = canboat_core::format::parse_plain(&line).unwrap();
-        assert!(crate::n2kd::overrides::is_request_frame(&frame));
-        assert!(!crate::n2kd::overrides::is_set_frame(&frame));
+        assert!(canboat_bridge::n2kd::overrides::is_request_frame(&frame));
+        assert!(!canboat_bridge::n2kd::overrides::is_set_frame(&frame));
     }
 }

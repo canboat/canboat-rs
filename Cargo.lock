@@ -180,6 +180,7 @@ name = "canboat"
 version = "0.6.0"
 dependencies = [
  "anyhow",
+ "canboat-bridge",
  "canboat-cli",
  "canboat-core",
  "canboat-io",
@@ -195,6 +196,22 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+]
+
+[[package]]
+name = "canboat-bridge"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "canboat-cli",
+ "canboat-core",
+ "canboat-io",
+ "canboat-wire",
+ "clap",
+ "env_logger",
+ "log",
+ "serde",
+ "serde_json",
  "vergen-gitcl",
  "world_magnetic_model",
 ]

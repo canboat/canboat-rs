@@ -290,6 +290,25 @@ Keep the CLI `canboat server` working by having the bin build a `BridgeConfig` f
 and call the same API. Verify: `canboat server` behaves identically (n2kd parity harness
 green).
 
+> **Status — Phase 5 is decomposed; sub-step 5a done.** At 8,807 lines across 21 files this
+> phase can't be one commit. Sub-steps:
+> - **5a — the move (DONE).** New `canboat-bridge` crate; `git mv`'d `server/`, `n2kd/`,
+>   `build_info.rs`, and the vergen `build.rs` into it. `server`/`n2kd` reference each other
+>   and `build_info` via `crate::` (all stayed valid inside the new crate); the bin's ~20
+>   refs into `n2kd::{overrides,nmea_filter,app}` / `server::{Args,run}` and the legacy
+>   analyzer's `build_info` were repointed at `canboat_bridge::…`. Deps `world_magnetic_model`
+>   + vergen moved off the bin onto the new crate; the bin's `cli` feature now pulls
+>   `canboat-bridge`. **Behaviour-preserving:** no logic touched. Verified — clean build,
+>   clippy `-D warnings`, tests green (core 198 / io 44 / **bridge 81** / bin 54 + integration),
+>   `canboat server --help` works, facade public API unchanged (bridge module still a stub).
+>   The `canboat-bridge` crate still carries `clap` (the `Args`) — removed in 5b.
+> - **5b — `BridgeConfig`** (declap): plain config struct; clap `Args` becomes a `From` in
+>   the bin. Removes `clap` from the bridge lib.
+> - **5c — split core / serving + the `Bridge` type**; wire the facade `bridge` module.
+> - **5d — `ServeHandle` / `shutdown`** replacing the leaked accept threads.
+> - **5e — remove in-lib `env_logger::init`; inject the config-dir.**
+> Facade `bridge` module stays a stub until 5c so no half-built API is exposed.
+
 **Phase 6 — Prove it with `merrimac-rs`.** See §5.
 
 **Phase 7 — Lock & document.** Finalize the `public-api.txt` snapshot, `deny(missing_docs)`,

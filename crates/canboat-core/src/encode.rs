@@ -7,8 +7,10 @@
 //! [`PgnDatabase::encode_by_pgn`] (by id / by number), or
 //! [`PgnDatabase::encode_for`] with a generated `pgn::…` constant, which
 //! hand back a [`PgnBuilder`] for a specific schema PGN variant. Set
-//! field values by name/id ([`push`](PgnBuilder::push)) or by a
-//! compile-checked `field::…` constant ([`set`](PgnBuilder::set)),
+//! field values by a compile-checked `field::…` constant
+//! ([`push`](PgnBuilder::push) — the O(1) default) or by schema name
+//! ([`push_by_name`](PgnBuilder::push_by_name)), mirroring the decode
+//! side's [`DecodedPgn::field`] / [`DecodedPgn::field_by_name`];
 //! then [`build`](PgnBuilder::build) packs them at their schema bit
 //! offsets — LSB-first, exactly the layout [`crate::bits::extract_bits`]
 //! reads back — and returns a [`RawFrame`]. Because the result is a
@@ -242,35 +244,62 @@ impl PgnBuilder {
         self
     }
 
-    /// Set a field by schema name (`"Wind Speed"`) or id (`"windSpeed"`).
+    /// Set a field by its generated [`FieldRef`] constant
+    /// (`canboat_core::field::wind_data::WIND_ANGLE`) — the compile-checked,
+    /// `O(1)` path, and the recommended default. The exact mirror of the
+    /// decode side's [`DecodedPgn::field`](crate::DecodedPgn::field): index
+    /// by the field's schema `order` (one array load), with a debug-only
+    /// assert that the constant belongs to this builder's PGN — a `&str`
+    /// compare, free in release builds, no scan and no hashing.
+    ///
+    /// The value scales in the builder's unit system: the constant points at
+    /// the SI schema, but a field's `order` is identical across unit schemas,
+    /// so the builder's own [`FieldInfo`] (in its units) does the staging.
     pub fn push(
         &mut self,
-        field: &str,
+        field: FieldRef,
         value: impl Into<EncodeValue>,
     ) -> Result<&mut Self, EncodeError> {
-        let idx = self.find_field(field)?;
+        debug_assert_eq!(
+            field.pgn.id, self.pgn.id,
+            "FieldRef/PGN mismatch: a `{}` field ref was used on a `{}` builder",
+            field.pgn.id, self.pgn.id,
+        );
+        let idx = (field.field.order as usize)
+            .checked_sub(1)
+            .filter(|&i| i < self.pgn.fields.len())
+            .ok_or(EncodeError::NoSuchField {
+                pgn_id: self.pgn.id,
+                field: field.field.id.to_string(),
+            })?;
         let staged = self.stage_value(&self.pgn.fields[idx], value.into())?;
         self.staged[idx] = Some(staged);
         Ok(self)
     }
 
-    /// Set a field by its generated [`FieldRef`] constant
-    /// (`canboat_core::field::wind_data::WIND_ANGLE`) — the compile-checked
-    /// counterpart to [`Self::push`]. Resolves by the field's `id` against
-    /// this builder's PGN, so the value scales in the builder's unit system
-    /// (the constant itself points at the SI schema).
-    pub fn set(
+    /// Set a field by schema **name** (`"Wind Speed"`) — an `O(n)` scan, for
+    /// callers without a [`FieldRef`] constant (runtime-chosen or
+    /// config-driven fields). The mirror of
+    /// [`DecodedPgn::field_by_name`](crate::DecodedPgn::field_by_name).
+    /// Prefer [`push`](Self::push) with a generated constant wherever the
+    /// field is known at compile time: it is O(1) and a typo fails the build
+    /// instead of returning [`EncodeError::NoSuchField`] at runtime.
+    pub fn push_by_name(
         &mut self,
-        field: FieldRef,
+        field: &str,
         value: impl Into<EncodeValue>,
     ) -> Result<&mut Self, EncodeError> {
-        self.push(field.field.id, value)
+        let idx = self.find_by_name(field)?;
+        let staged = self.stage_value(&self.pgn.fields[idx], value.into())?;
+        self.staged[idx] = Some(staged);
+        Ok(self)
     }
 
     /// Set a field from a textual value, coercing per the field's type
-    /// (numbers, `0x`-hex, lookup labels). For CLI `FIELD=VALUE` args.
+    /// (numbers, `0x`-hex, lookup labels). For CLI `FIELD=VALUE` args, where
+    /// `FIELD` may be the schema name (`"Wind Speed"`) or id (`"windSpeed"`).
     pub fn push_arg(&mut self, field: &str, value: &str) -> Result<&mut Self, EncodeError> {
-        let idx = self.find_field(field)?;
+        let idx = self.find_by_name_or_id(field)?;
         let f = &self.pgn.fields[idx];
         let ev = coerce_arg(f, value)?;
         let staged = self.stage_value(f, ev)?;
@@ -333,7 +362,20 @@ impl PgnBuilder {
         self.pgn
     }
 
-    fn find_field(&self, key: &str) -> Result<usize, EncodeError> {
+    /// Field index by schema name only (for [`push_by_name`](Self::push_by_name)).
+    fn find_by_name(&self, name: &str) -> Result<usize, EncodeError> {
+        self.pgn
+            .fields
+            .iter()
+            .position(|f| f.name == name)
+            .ok_or_else(|| EncodeError::NoSuchField {
+                pgn_id: self.pgn.id,
+                field: name.to_string(),
+            })
+    }
+
+    /// Field index by schema name or id (for CLI [`push_arg`](Self::push_arg)).
+    fn find_by_name_or_id(&self, key: &str) -> Result<usize, EncodeError> {
         self.pgn
             .fields
             .iter()
@@ -734,7 +776,7 @@ mod tests {
             .encode_for(crate::pgn::ISO_REQUEST)
             .priority(6)
             .destination(255)
-            .set(crate::field::iso_request::PGN, 126996u32)
+            .push(crate::field::iso_request::PGN, 126996u32)
             .unwrap()
             .build()
             .unwrap();
@@ -777,15 +819,15 @@ mod tests {
         let db = db();
         let frame = db
             .encode_for(crate::pgn::WIND_DATA)
-            .set(wd::SID, 7)
+            .push(wd::SID, 7)
             .unwrap()
-            .set(wd::WIND_SPEED, 5.23)
+            .push(wd::WIND_SPEED, 5.23)
             .unwrap()
-            .set(wd::WIND_ANGLE, 1.5)
+            .push(wd::WIND_ANGLE, 1.5)
             .unwrap()
             // The lookup *label* stays a string — value-name constants are
             // out of scope for now.
-            .set(wd::REFERENCE, EncodeValue::Lookup("Apparent".into()))
+            .push(wd::REFERENCE, EncodeValue::Lookup("Apparent".into()))
             .unwrap()
             .build()
             .unwrap();
@@ -819,7 +861,7 @@ mod tests {
         assert!(matches!(
             db().encode("windData")
                 .unwrap()
-                .push("Reference", EncodeValue::Lookup("Nonsense".into())),
+                .push_by_name("Reference", EncodeValue::Lookup("Nonsense".into())),
             Err(EncodeError::UnknownLookupLabel { .. })
         ));
     }
@@ -827,7 +869,7 @@ mod tests {
     #[test]
     fn no_such_field_and_pgn() {
         assert!(matches!(
-            db().encode("isoRequest").unwrap().push("Nope", 1),
+            db().encode("isoRequest").unwrap().push_by_name("Nope", 1),
             Err(EncodeError::NoSuchField { .. })
         ));
         assert!(matches!(
@@ -842,7 +884,7 @@ mod tests {
         let frame = db()
             .encode("productInformation")
             .unwrap()
-            .set(MODEL_ID, "SCX-20")
+            .push(MODEL_ID, "SCX-20")
             .unwrap()
             .build()
             .unwrap();
@@ -859,7 +901,7 @@ mod tests {
         let frame = db()
             .encode("configurationInformation")
             .unwrap()
-            .set(DESC1, "Helm Station")
+            .push(DESC1, "Helm Station")
             .unwrap()
             .build()
             .unwrap();
@@ -876,7 +918,7 @@ mod tests {
         let frame = db()
             .encode("navicoAsciiIdentifier")
             .unwrap()
-            .set(IDENTIFIER, "BOW")
+            .push(IDENTIFIER, "BOW")
             .unwrap()
             .build()
             .unwrap();
@@ -896,7 +938,7 @@ mod tests {
         let frame = db()
             .encode("isoTransportProtocolDataTransfer")
             .unwrap()
-            .set(DATA, payload.clone())
+            .push(DATA, payload.clone())
             .unwrap()
             .build()
             .unwrap();
@@ -915,7 +957,7 @@ mod tests {
         let frame = db()
             .encode("garminAutopilotHeadingToSteer")
             .unwrap()
-            .set(HTS, 1.5)
+            .push(HTS, 1.5)
             .unwrap()
             .build()
             .unwrap();
@@ -933,7 +975,7 @@ mod tests {
         let frame = db()
             .encode("simnetDataSourceSelection")
             .unwrap()
-            .set(SOURCE, name)
+            .push(SOURCE, name)
             .unwrap()
             .build()
             .unwrap();
@@ -955,19 +997,19 @@ mod tests {
             .encode("simnetKeyValue")
             .unwrap()
             .destination(255)
-            .push("Address", EncodeValue::Int(255))
+            .push_by_name("Address", EncodeValue::Int(255))
             .unwrap()
-            .push("Instance", EncodeValue::Int(255))
+            .push_by_name("Instance", EncodeValue::Int(255))
             .unwrap()
-            .push("Network Group", EncodeValue::Int(1))
+            .push_by_name("Network Group", EncodeValue::Int(1))
             .unwrap()
-            .push("Source", EncodeValue::Int(255))
+            .push_by_name("Source", EncodeValue::Int(255))
             .unwrap()
-            .push("Key", EncodeValue::Int(9983))
+            .push_by_name("Key", EncodeValue::Int(9983))
             .unwrap()
-            .push("Operation", EncodeValue::Int(1))
+            .push_by_name("Operation", EncodeValue::Int(1))
             .unwrap()
-            .push("Value", EncodeValue::Bytes(vec![0x04]))
+            .push_by_name("Value", EncodeValue::Bytes(vec![0x04]))
             .unwrap()
             .build()
             .unwrap();
@@ -987,7 +1029,7 @@ mod tests {
         assert!(matches!(
             db().encode("simnetKeyValue")
                 .unwrap()
-                .push("Value", EncodeValue::Int(4)),
+                .push_by_name("Value", EncodeValue::Int(4)),
             Err(EncodeError::TypeMismatch { .. })
         ));
     }

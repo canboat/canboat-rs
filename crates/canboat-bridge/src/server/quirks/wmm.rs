@@ -263,9 +263,9 @@ impl WmmQuirk {
                 // pipeline rewrites to canboat's live claimed address.
                 .source(ADDR_GLOBAL)
                 .timestamp(now_iso());
-            b.set(field::magnetic_variation::SOURCE, SOURCE_WMM_2025)?;
-            b.set(field::magnetic_variation::VARIATION, variation_rad)?;
-            b.set(
+            b.push(field::magnetic_variation::SOURCE, SOURCE_WMM_2025)?;
+            b.push(field::magnetic_variation::VARIATION, variation_rad)?;
+            b.push(
                 field::magnetic_variation::AGE_OF_SERVICE,
                 i64::from(age_days),
             )?;
@@ -333,10 +333,11 @@ mod tests {
     fn gnss_129029(lat_deg: f64, lon_deg: f64, days: u16) -> DecodedPgn {
         let db = PgnDatabase::embedded(Units::Si);
         let mut b = db.encode("gnssPositionData").unwrap().source(3);
-        b.set(field::gnss_position_data::DATE, i64::from(days))
+        b.push(field::gnss_position_data::DATE, i64::from(days))
             .unwrap();
-        b.set(field::gnss_position_data::LATITUDE, lat_deg).unwrap();
-        b.set(field::gnss_position_data::LONGITUDE, lon_deg)
+        b.push(field::gnss_position_data::LATITUDE, lat_deg)
+            .unwrap();
+        b.push(field::gnss_position_data::LONGITUDE, lon_deg)
             .unwrap();
         dec(&b.build().unwrap())
     }
@@ -352,9 +353,9 @@ mod tests {
     fn variation_127258(src: u8, source: u8) -> DecodedPgn {
         let db = PgnDatabase::embedded(Units::Si);
         let mut b = db.encode("magneticVariation").unwrap().source(src);
-        b.set(field::magnetic_variation::SOURCE, i64::from(source))
+        b.push(field::magnetic_variation::SOURCE, i64::from(source))
             .unwrap();
-        b.set(field::magnetic_variation::VARIATION, 0.05f64)
+        b.push(field::magnetic_variation::VARIATION, 0.05f64)
             .unwrap();
         dec(&b.build().unwrap())
     }

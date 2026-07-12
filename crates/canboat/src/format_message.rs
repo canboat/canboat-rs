@@ -13,13 +13,16 @@
 //! from a program:
 //!
 //! ```no_run
-//! use canboat_core::{PgnDatabase, Units};
+//! use canboat_core::{PgnDatabase, Units, field::iso_request};
 //! let db = PgnDatabase::embedded(Units::Metric);
 //! let frame = db.encode("isoRequest").unwrap()
 //!     .destination(0)
-//!     .push("PGN", 126996u32).unwrap()
+//!     .push(iso_request::PGN, 126996u32).unwrap() // O(1), compile-checked
 //!     .build().unwrap();
 //! ```
+//!
+//! On the CLI (`FIELD=VALUE`) the field is chosen at runtime, so the
+//! wrapper uses [`PgnBuilder::push_arg`] (name-or-id) instead.
 
 use std::io::Write as _;
 

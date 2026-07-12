@@ -174,14 +174,14 @@ fn build_scx20_product_info(src: u8) -> Option<RawFrame> {
             .destination(ADDR_GLOBAL)
             .timestamp(now_iso());
         use field::product_information as pi;
-        b.set(pi::NMEA2000_VERSION, SCX20_DB_VERSION)?;
-        b.set(pi::PRODUCT_CODE, SCX20_PRODUCT_CODE)?;
-        b.set(pi::MODEL_ID, SCX20_MODEL_ID)?;
-        b.set(pi::SOFTWARE_VERSION_CODE, SCX20_SOFTWARE_VERSION)?;
-        b.set(pi::MODEL_VERSION, SCX20_MODEL_VERSION)?;
-        b.set(pi::MODEL_SERIAL_CODE, SCX20_MODEL_SERIAL)?;
-        b.set(pi::CERTIFICATION_LEVEL, SCX20_CERTIFICATION_LEVEL)?;
-        b.set(pi::LOAD_EQUIVALENCY, SCX20_LOAD_EQUIVALENCY)?;
+        b.push(pi::NMEA2000_VERSION, SCX20_DB_VERSION)?;
+        b.push(pi::PRODUCT_CODE, SCX20_PRODUCT_CODE)?;
+        b.push(pi::MODEL_ID, SCX20_MODEL_ID)?;
+        b.push(pi::SOFTWARE_VERSION_CODE, SCX20_SOFTWARE_VERSION)?;
+        b.push(pi::MODEL_VERSION, SCX20_MODEL_VERSION)?;
+        b.push(pi::MODEL_SERIAL_CODE, SCX20_MODEL_SERIAL)?;
+        b.push(pi::CERTIFICATION_LEVEL, SCX20_CERTIFICATION_LEVEL)?;
+        b.push(pi::LOAD_EQUIVALENCY, SCX20_LOAD_EQUIVALENCY)?;
         b.build()
     };
     match build() {

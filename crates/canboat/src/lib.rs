@@ -11,30 +11,78 @@
 //!
 //! Everything below is in the baseline `decode` feature — no I/O, no threads.
 //! The pivot is [`Frame`] (a raw PGN on the wire) and [`Database`] (the
-//! compiled canboat schema). Encode a message, then decode it back:
+//! compiled canboat schema). Fields are addressed by a generated **`FieldId`
+//! constant** ([`ids::field`]) — the recommended path on both sides:
+//! [`PgnBuilder::push`] to encode, [`DecodedPgn::field`] to read back. It is
+//! `O(1)` (a single array index by the field's schema position) and
+//! compile-checked: a typo, or a field from the wrong PGN, fails the build
+//! instead of erroring at runtime.
 //!
 //! ```
 //! use canboat::{Database, EncodeValue, FieldValue, Units};
+//! use canboat::ids::field::wind_data as wd;
 //!
 //! let db = Database::embedded(Units::Metric);
 //!
 //! // Encode PGN 130306 "Wind Data": 5.23 m/s at 1.5 rad, apparent wind.
-//! // Fields are set by canboat name or id; unset fields (and proprietary
-//! // manufacturer/industry selectors) fall back to their schema defaults.
+//! // Unset fields (and proprietary manufacturer/industry selectors) fall
+//! // back to their schema defaults.
 //! let frame: canboat::Frame = db
 //!     .encode("windData")?
-//!     .push("Wind Speed", 5.23)?
-//!     .push("Wind Angle", 1.5)?
-//!     .push("Reference", EncodeValue::Lookup("Apparent".into()))?
+//!     .push(wd::WIND_SPEED, 5.23)?
+//!     .push(wd::WIND_ANGLE, 1.5)?
+//!     .push(wd::REFERENCE, EncodeValue::Lookup("Apparent".into()))?
 //!     .build()?;
 //! assert_eq!(frame.pgn, 130306);
 //!
-//! // Decode it back into named, typed fields.
+//! // Decode it back — the read side mirrors the write side.
 //! let decoded = db.decode(&frame).expect("valid frame decodes");
 //! assert_eq!(decoded.id, "windData");
-//! match &decoded.field_by_name("Reference").unwrap().value {
+//! match &decoded.field(wd::REFERENCE).unwrap().value {
 //!     FieldValue::Lookup { name, .. } => assert_eq!(*name, Some("Apparent")),
 //!     other => panic!("unexpected: {other:?}"),
+//! }
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! No constant to hand (the field is chosen at runtime — a config-driven
+//! encoder, a CLI arg)? Use the `*_by_name` twins,
+//! [`PgnBuilder::push_by_name`] and [`DecodedPgn::field_by_name`] — an `O(n)`
+//! scan by schema name, resolved at runtime rather than compile time:
+//!
+//! ```
+//! # use canboat::{Database, EncodeValue, Units};
+//! # let db = Database::embedded(Units::Metric);
+//! let frame = db
+//!     .encode("windData")?
+//!     .push_by_name("Wind Speed", 5.23)?
+//!     .push_by_name("Reference", EncodeValue::Lookup("Apparent".into()))?
+//!     .build()?;
+//! assert_eq!(db.decode(&frame).unwrap().field_by_name("Wind Speed").is_some(), true);
+//! # Ok::<(), Box<dyn std::error::Error>>(())
+//! ```
+//!
+//! ## Lookup (enum) fields
+//!
+//! A `LOOKUP` field carries a raw integer that maps to a label. Encode it by
+//! **label** ([`EncodeValue::Lookup`], shown above) or by **raw value**
+//! ([`EncodeValue::Int`]); on decode, [`FieldValue::Lookup`] gives you both
+//! the number and its resolved name, so you can match on whichever you have:
+//!
+//! ```
+//! # use canboat::{Database, EncodeValue, FieldValue, Units};
+//! # use canboat::ids::field::wind_data as wd;
+//! # let db = Database::embedded(Units::Metric);
+//! // Reference = 2 is "Apparent" — set the enum's raw value directly.
+//! let frame = db.encode("windData")?.push(wd::REFERENCE, EncodeValue::Int(2))?.build()?;
+//!
+//! let decoded = db.decode(&frame).unwrap();
+//! match &decoded.field(wd::REFERENCE).unwrap().value {
+//!     FieldValue::Lookup { value, name } => {
+//!         assert_eq!(*value, 2);                 // the raw enum value
+//!         assert_eq!(*name, Some("Apparent"));   // its schema label, if known
+//!     }
+//!     _ => unreachable!(),
 //! }
 //! # Ok::<(), Box<dyn std::error::Error>>(())
 //! ```

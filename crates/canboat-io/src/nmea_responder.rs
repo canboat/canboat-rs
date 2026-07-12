@@ -44,14 +44,14 @@ impl ProductInfo<'_> {
         let db = PgnDatabase::embedded(Units::Si);
         let build = || -> Result<RawFrame, canboat_core::encode::EncodeError> {
             let mut b = db.encode("productInformation")?.source(src);
-            b.set(pi::NMEA2000_VERSION, self.db_version)?;
-            b.set(pi::PRODUCT_CODE, self.product_code)?;
-            b.set(pi::MODEL_ID, self.model_id)?;
-            b.set(pi::SOFTWARE_VERSION_CODE, self.software_version)?;
-            b.set(pi::MODEL_VERSION, self.model_version)?;
-            b.set(pi::MODEL_SERIAL_CODE, self.model_serial)?;
-            b.set(pi::CERTIFICATION_LEVEL, self.certification_level)?;
-            b.set(pi::LOAD_EQUIVALENCY, self.load_equivalency)?;
+            b.push(pi::NMEA2000_VERSION, self.db_version)?;
+            b.push(pi::PRODUCT_CODE, self.product_code)?;
+            b.push(pi::MODEL_ID, self.model_id)?;
+            b.push(pi::SOFTWARE_VERSION_CODE, self.software_version)?;
+            b.push(pi::MODEL_VERSION, self.model_version)?;
+            b.push(pi::MODEL_SERIAL_CODE, self.model_serial)?;
+            b.push(pi::CERTIFICATION_LEVEL, self.certification_level)?;
+            b.push(pi::LOAD_EQUIVALENCY, self.load_equivalency)?;
             b.build()
         };
         match build() {

@@ -58,7 +58,7 @@ pub use quirks::QuirkKind;
 
 use std::io::{self, BufRead, BufReader, Read, Write};
 use std::net::Ipv4Addr;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -382,6 +382,12 @@ pub struct BridgeConfig {
     pub nmea0183_stdout: bool,
     pub no_nmea0183_rate_limit: bool,
     pub nmea0183_filter: Option<PathBuf>,
+    /// Directory holding the persistent state files (`overrides.json`,
+    /// `nmea0183-filter.json`). Unlike the CLI flag, the library does **not**
+    /// auto-discover a dir: `Some(path)` uses it, `None` disables persistence
+    /// (no overrides; no filter unless `nmea0183_filter` gives an explicit
+    /// path). The `canboat` binary resolves the systemd/home default and
+    /// passes an explicit path here.
     pub config_dir: Option<PathBuf>,
     pub nmea0183_filter_port: u16,
     pub overrides_port: u16,
@@ -512,45 +518,10 @@ struct OpenedSource {
     claim_addr: Option<Arc<std::sync::atomic::AtomicU8>>,
 }
 
-/// Resolve the directory holding the server's persistent state files.
-/// An explicit `--config-dir` wins; otherwise prefer `/etc/default/canboat`
-/// when it's writable (the systemd/root case) and fall back to
-/// `$HOME/.local/canboat`. The engines themselves create the dir on first
-/// save, so this only needs to pick the path.
-fn resolve_config_dir(explicit: Option<&Path>) -> PathBuf {
-    if let Some(p) = explicit {
-        return p.to_path_buf();
-    }
-    let system = PathBuf::from("/etc/default/canboat");
-    if dir_is_writable(&system) {
-        return system;
-    }
-    if let Ok(home) = std::env::var("HOME") {
-        return PathBuf::from(home).join(".local/canboat");
-    }
-    system
-}
-
-/// `true` when `dir` can be created (if needed) and written to — probed
-/// with a temp file that's removed immediately.
-fn dir_is_writable(dir: &Path) -> bool {
-    if std::fs::create_dir_all(dir).is_err() {
-        return false;
-    }
-    let probe = dir.join(".canboat-write-test");
-    match std::fs::OpenOptions::new()
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&probe)
-    {
-        Ok(_) => {
-            let _ = std::fs::remove_file(&probe);
-            true
-        }
-        Err(_) => false,
-    }
-}
+// Config-dir *discovery* (the `/etc/default/canboat` vs `~/.local/canboat`
+// filesystem probe) is deliberately NOT here: it's a binary concern, so it
+// lives in the `canboat` bin's `server` handler. The library takes an
+// explicit `BridgeConfig.config_dir` (or `None` to disable persistence).
 
 fn open_source(config: &BridgeConfig) -> Result<OpenedSource> {
     if let Some(path) = config.actisense.as_deref() {

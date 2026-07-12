@@ -351,9 +351,17 @@ green).
 >   (governing principle #1). Verified: a unit test binds a stream server, connects, trips the
 >   flag, and asserts the port re-binds; the A/B server parity re-ran byte-identical on all six
 >   ports (the non-blocking poll is transparent to output).
-> - **5e — inject the config-dir** (the `/etc/default/canboat` write-probe in
->   `resolve_config_dir`) instead of auto-discovering; the `env_logger::init` removal is
->   already done in 5b.
+> - **5e — inject the config-dir (DONE).** The `/etc/default/canboat` → `~/.local/canboat`
+>   write-probe moved *out* of the library into the `canboat` binary's `server` handler
+>   (`resolve_config_dir`/`dir_is_writable` now live in `crates/canboat/src/main.rs`): probing
+>   the filesystem to *find* a dir is a binary concern. The library takes an explicit
+>   `BridgeConfig.config_dir` — `Some(path)` uses it, `None` disables persistence (no
+>   overrides; no filter unless `nmea0183_filter` gives an explicit path). Path selection is a
+>   pure `state_file_paths(config_dir, explicit_filter)` helper (unit-tested for all three
+>   cases). CLI behaviour is unchanged: the bin probes when `--config-dir` is absent, so
+>   `canboat server` still resolves `~/.local/canboat` by default (verified by log), and the
+>   A/B server parity stayed byte-identical on all six ports. The `env_logger::init` removal
+>   was already done in 5b. **Phase 5 is complete.**
 > Facade `bridge` module was a stub until 5c; it now re-exports the real `Bridge` API.
 >
 > **5c is done (supervised).** It restructured the 330-line `run()` on the hot pipeline

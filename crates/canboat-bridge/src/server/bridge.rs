@@ -25,6 +25,7 @@
 //! The CLI `canboat server` is exactly `Bridge::new(config).serve().run()`,
 //! so the daemon and an embedding library share one code path.
 
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU8};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
@@ -85,6 +86,26 @@ pub struct Bridge {
     /// thread spawned by [`Bridge::spawn`].
     tcp_joins: Vec<thread::JoinHandle<()>>,
     pipeline_join: Option<thread::JoinHandle<()>>,
+}
+
+/// Decide which persistent-state files to read from the config. Pure: no
+/// filesystem access, no probing — that stays in the binary. Returns
+/// `(nmea0183-filter path, overrides path)`, each `None` when that feature
+/// is off:
+///
+/// * an explicit `nmea0183_filter` path always wins for the filter, even
+///   with no config dir;
+/// * otherwise both files live under `config_dir`;
+/// * `config_dir == None` (and no explicit filter) means persistence is off.
+fn state_file_paths(
+    config_dir: Option<&Path>,
+    explicit_filter: Option<&Path>,
+) -> (Option<PathBuf>, Option<PathBuf>) {
+    let filter = explicit_filter
+        .map(Path::to_path_buf)
+        .or_else(|| config_dir.map(|d| d.join("nmea0183-filter.json")));
+    let overrides = config_dir.map(|d| d.join("overrides.json"));
+    (filter, overrides)
 }
 
 impl Bridge {
@@ -219,39 +240,42 @@ impl Bridge {
         }
 
         // Persistent server state (0183 mute rules + PGN-rate overrides)
-        // lives in a shared config dir, both features on by default. An
-        // empty/absent file is a no-op, so a default install is unaffected.
-        let cfg_dir = super::resolve_config_dir(config.config_dir.as_deref());
-        let filter_path = config
-            .nmea0183_filter
-            .clone()
-            .unwrap_or_else(|| cfg_dir.join("nmea0183-filter.json"));
-        let nmea_filter = match crate::n2kd::nmea_filter::NmeaFilter::load(&filter_path) {
-            Ok(f) => {
-                log::info!(
-                    "NMEA 0183 per-device filter loaded from {}",
-                    filter_path.display()
-                );
-                Some(Arc::new(Mutex::new(f)))
-            }
-            Err(e) => {
-                log::warn!("NMEA 0183 filter disabled: {e:#}");
-                None
-            }
+        // lives in the caller-supplied config dir. The library never probes
+        // the filesystem to *find* a dir — that is the binary's job (the CLI
+        // resolves `/etc/default/canboat` vs `~/.local/canboat` before
+        // constructing the config). `config_dir == None` here means
+        // persistence is off: no overrides, and no filter unless an explicit
+        // `nmea0183_filter` path is given. An empty/absent file is a no-op,
+        // so a default install with a dir set is unaffected.
+        let (filter_path, overrides_path) = state_file_paths(
+            config.config_dir.as_deref(),
+            config.nmea0183_filter.as_deref(),
+        );
+        let nmea_filter = match filter_path {
+            Some(path) => match crate::n2kd::nmea_filter::NmeaFilter::load(&path) {
+                Ok(f) => {
+                    log::info!("NMEA 0183 per-device filter loaded from {}", path.display());
+                    Some(Arc::new(Mutex::new(f)))
+                }
+                Err(e) => {
+                    log::warn!("NMEA 0183 filter disabled: {e:#}");
+                    None
+                }
+            },
+            None => None,
         };
-        let overrides_path = cfg_dir.join("overrides.json");
-        let overrides = match crate::n2kd::overrides::OverrideEngine::load(&overrides_path) {
-            Ok(engine) => {
-                log::info!(
-                    "PGN-rate overrides loaded from {}",
-                    overrides_path.display()
-                );
-                Some(Arc::new(Mutex::new(engine)))
-            }
-            Err(e) => {
-                log::warn!("PGN-rate overrides disabled: {e:#}");
-                None
-            }
+        let overrides = match overrides_path {
+            Some(path) => match crate::n2kd::overrides::OverrideEngine::load(&path) {
+                Ok(engine) => {
+                    log::info!("PGN-rate overrides loaded from {}", path.display());
+                    Some(Arc::new(Mutex::new(engine)))
+                }
+                Err(e) => {
+                    log::warn!("PGN-rate overrides disabled: {e:#}");
+                    None
+                }
+            },
+            None => None,
         };
 
         Ok(Self {
@@ -577,5 +601,47 @@ impl Drop for Bridge {
     /// a second `Bridge` on the same ports).
     fn drop(&mut self) {
         self.shutdown();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::state_file_paths;
+    use std::path::{Path, PathBuf};
+
+    #[test]
+    fn no_config_dir_disables_persistence() {
+        // The library never probes: `None` means off — no filter, no overrides.
+        let (filter, overrides) = state_file_paths(None, None);
+        assert_eq!(filter, None);
+        assert_eq!(overrides, None);
+    }
+
+    #[test]
+    fn config_dir_places_both_files() {
+        let (filter, overrides) = state_file_paths(Some(Path::new("/etc/default/canboat")), None);
+        assert_eq!(
+            filter,
+            Some(PathBuf::from("/etc/default/canboat/nmea0183-filter.json"))
+        );
+        assert_eq!(
+            overrides,
+            Some(PathBuf::from("/etc/default/canboat/overrides.json"))
+        );
+    }
+
+    #[test]
+    fn explicit_filter_wins_and_stands_alone() {
+        // An explicit filter path loads even with no config dir; overrides
+        // stay off (they have no explicit-path escape hatch).
+        let (filter, overrides) = state_file_paths(None, Some(Path::new("/custom/f.json")));
+        assert_eq!(filter, Some(PathBuf::from("/custom/f.json")));
+        assert_eq!(overrides, None);
+
+        // With both, the explicit filter still wins; overrides come from the dir.
+        let (filter, overrides) =
+            state_file_paths(Some(Path::new("/cfg")), Some(Path::new("/custom/f.json")));
+        assert_eq!(filter, Some(PathBuf::from("/custom/f.json")));
+        assert_eq!(overrides, Some(PathBuf::from("/cfg/overrides.json")));
     }
 }

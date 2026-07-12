@@ -849,64 +849,121 @@ mod imp {
         when_ms: u64,
     }
 
-    /// Read one CAN frame plus its kernel SO_TIMESTAMP. `Ok(None)` means
-    /// the socket has no more frames ready right now.
-    fn recv_frame(fd: i32) -> std::io::Result<Option<RecvFrame>> {
-        let mut raw = [0u8; 16]; // struct can_frame
-        let mut ctrl = [0u8; 64];
-        // SAFETY: pointers refer to live local buffers for the duration
-        // of the call; recvmsg only writes within them.
-        unsafe {
-            let mut iov = libc::iovec {
-                iov_base: raw.as_mut_ptr() as *mut libc::c_void,
-                iov_len: raw.len(),
-            };
-            let mut msg: libc::msghdr = std::mem::zeroed();
-            msg.msg_iov = &mut iov;
-            msg.msg_iovlen = 1;
-            msg.msg_control = ctrl.as_mut_ptr() as *mut libc::c_void;
-            msg.msg_controllen = ctrl.len() as _;
+    /// How many CAN frames one `recvmmsg` syscall reads at most. A busy
+    /// NMEA 2000 bus delivers fast-packet PGNs in back-to-back bursts;
+    /// draining a whole burst per syscall (instead of one `recvmsg` per
+    /// frame) is where the RX-path syscall savings come from.
+    const RX_BATCH: usize = 64;
 
-            let n = libc::recvmsg(fd, &mut msg, 0);
-            if n < 0 {
-                let e = std::io::Error::last_os_error();
-                return match e.raw_os_error() {
-                    Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => Ok(None),
-                    Some(code) if code == libc::EINTR => Ok(None),
-                    _ => Err(e),
+    /// Reusable `recvmmsg` scratch: `RX_BATCH` CAN-frame + control-buffer
+    /// slots, plus the `iovec`/`mmsghdr` arrays that point into them.
+    /// Boxed and never moved after construction so those interior raw
+    /// pointers stay valid across calls; [`RxBatch::prepare`] re-wires
+    /// them (and resets the kernel-written lengths) before every call.
+    struct RxBatch {
+        frames: [[u8; 16]; RX_BATCH], // struct can_frame per slot
+        ctrls: [[u8; 64]; RX_BATCH],  // SO_TIMESTAMP cmsg per slot
+        iovecs: [libc::iovec; RX_BATCH],
+        msgs: [libc::mmsghdr; RX_BATCH],
+    }
+
+    impl RxBatch {
+        fn new() -> Box<RxBatch> {
+            // SAFETY: `iovec`/`mmsghdr` are C POD; an all-zero state is
+            // valid (null pointers), and `prepare` wires every pointer
+            // and length before the buffer is ever handed to the kernel.
+            unsafe { Box::new(std::mem::zeroed()) }
+        }
+
+        /// Point each `mmsghdr` at its slot's frame + control buffers and
+        /// reset the fields the kernel overwrites (`msg_controllen`,
+        /// `msg_flags`, `msg_len`). Must run before each `recvmmsg`.
+        fn prepare(&mut self) {
+            for i in 0..RX_BATCH {
+                self.iovecs[i] = libc::iovec {
+                    iov_base: self.frames[i].as_mut_ptr() as *mut libc::c_void,
+                    iov_len: self.frames[i].len(),
                 };
+                let hdr = &mut self.msgs[i].msg_hdr;
+                hdr.msg_name = std::ptr::null_mut();
+                hdr.msg_namelen = 0;
+                hdr.msg_iov = &mut self.iovecs[i];
+                hdr.msg_iovlen = 1;
+                hdr.msg_control = self.ctrls[i].as_mut_ptr() as *mut libc::c_void;
+                hdr.msg_controllen = self.ctrls[i].len() as _;
+                hdr.msg_flags = 0;
+                self.msgs[i].msg_len = 0;
             }
-            if (n as usize) < raw.len() {
-                return Ok(None);
-            }
+        }
 
+        /// Decode slot `i` (valid only for `i < ` the count a preceding
+        /// `recv_batch` returned) into a [`RecvFrame`]. `None` on a short
+        /// datagram — anything below a full `struct can_frame`.
+        fn parse(&self, i: usize) -> Option<RecvFrame> {
+            if (self.msgs[i].msg_len as usize) < 16 {
+                return None;
+            }
+            let raw = &self.frames[i];
             let mut when = 0u64;
-            let mut cmsg = libc::CMSG_FIRSTHDR(&msg);
-            while !cmsg.is_null() {
-                let c = &*cmsg;
-                if c.cmsg_level == libc::SOL_SOCKET && c.cmsg_type == libc::SCM_TIMESTAMP {
-                    let mut tv: libc::timeval = std::mem::zeroed();
-                    std::ptr::copy_nonoverlapping(
-                        libc::CMSG_DATA(cmsg),
-                        &mut tv as *mut _ as *mut u8,
-                        std::mem::size_of::<libc::timeval>(),
-                    );
-                    when = tv.tv_sec as u64 * 1000 + (tv.tv_usec as u64) / 1000;
+            // SAFETY: `msg_hdr` describes the control buffer the kernel
+            // just filled for this slot; walk it for the RX timestamp.
+            unsafe {
+                let msg: *const libc::msghdr = &self.msgs[i].msg_hdr;
+                let mut cmsg = libc::CMSG_FIRSTHDR(msg);
+                while !cmsg.is_null() {
+                    let c = &*cmsg;
+                    if c.cmsg_level == libc::SOL_SOCKET && c.cmsg_type == libc::SCM_TIMESTAMP {
+                        let mut tv: libc::timeval = std::mem::zeroed();
+                        std::ptr::copy_nonoverlapping(
+                            libc::CMSG_DATA(cmsg),
+                            &mut tv as *mut _ as *mut u8,
+                            std::mem::size_of::<libc::timeval>(),
+                        );
+                        when = tv.tv_sec as u64 * 1000 + (tv.tv_usec as u64) / 1000;
+                    }
+                    cmsg = libc::CMSG_NXTHDR(msg, cmsg);
                 }
-                cmsg = libc::CMSG_NXTHDR(&msg, cmsg);
             }
-
             let id = u32::from_ne_bytes([raw[0], raw[1], raw[2], raw[3]]);
             let dlc = raw[4] as usize;
             let mut data = [0u8; 8];
             data.copy_from_slice(&raw[8..16]);
-            Ok(Some(RecvFrame {
+            Some(RecvFrame {
                 id,
                 dlc: dlc.min(8),
                 data,
                 when_ms: when,
-            }))
+            })
         }
+    }
+
+    /// One `recvmmsg` call, filling `batch` with up to `RX_BATCH` frames
+    /// (each with its kernel SO_TIMESTAMP). Returns the number of frames
+    /// read; `Ok(0)` means the socket is drained right now (EAGAIN).
+    /// Non-blocking via `MSG_DONTWAIT` so it never stalls the claim
+    /// timers even though `poll` already reported readability.
+    fn recv_batch(fd: i32, batch: &mut RxBatch) -> std::io::Result<usize> {
+        batch.prepare();
+        // SAFETY: `msgs` is a live array of `RX_BATCH` wired-up mmsghdrs;
+        // the kernel writes only within the buffers `prepare` pointed at.
+        let n = unsafe {
+            libc::recvmmsg(
+                fd,
+                batch.msgs.as_mut_ptr(),
+                RX_BATCH as libc::c_uint,
+                libc::MSG_DONTWAIT,
+                std::ptr::null_mut(),
+            )
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            return match e.raw_os_error() {
+                Some(code) if code == libc::EAGAIN || code == libc::EWOULDBLOCK => Ok(0),
+                Some(code) if code == libc::EINTR => Ok(0),
+                _ => Err(e),
+            };
+        }
+        Ok(n as usize)
     }
 
     /// Translate an incoming single-frame CAN message. Drives the
@@ -1080,6 +1137,9 @@ mod imp {
         // canboat-pipeline can then run with `pre_coalesced = true`
         // and skip a second reassembly pass.
         let mut reasm = Reassembler::new();
+        // Reused across the whole thread lifetime: one `recvmmsg` scratch
+        // buffer so the RX drain allocates nothing per wakeup.
+        let mut rx_batch = RxBatch::new();
         let mut last_frame = now_ms();
         let timeout_ms = config.timeout_secs.saturating_mul(1000);
 
@@ -1162,47 +1222,60 @@ mod imp {
                 tx_drain_one(&sock, &mut tx_buf);
             }
 
-            // 6. Drain RX up to a batch budget; yield then so the claim
-            //    timers keep advancing on a busy bus.
+            // 6. Drain RX in `recvmmsg` batches up to a per-wakeup budget;
+            //    yield then so the claim timers keep advancing on a busy
+            //    bus. Reading a whole batch per syscall also lets the
+            //    downstream relay coalesce its wakeups: the batch's frames
+            //    land in `frames_tx` back-to-back, so a greedy-draining
+            //    consumer parks once per batch rather than once per frame.
             if pfd.revents & libc::POLLIN != 0 {
                 last_frame = now_ms();
-                let mut budget = 256;
-                while budget > 0 {
-                    budget -= 1;
-                    match recv_frame(fd) {
-                        Ok(Some(rx)) => {
-                            if rx.id & CAN_ERR_FLAG != 0 {
-                                continue;
-                            }
-                            // NMEA 2000 is always 29-bit extended. CAN 1.0
-                            // standard frames (11-bit, no EFF flag) cannot
-                            // be N2K, so skip them rather than reinterpret
-                            // the low 11 bits as a degenerate 29-bit id.
-                            if rx.id & CAN_EFF_FLAG == 0 {
-                                continue;
-                            }
-                            let mut bus = Bus {
-                                tx_buf: &mut tx_buf,
-                                frames_tx: &frames_tx,
-                            };
-                            handle_frame(
-                                &mut bus,
-                                &mut claimer,
-                                &mut reasm,
-                                rx.id & CAN_EFF_MASK,
-                                &rx.data[..rx.dlc],
-                                if rx.when_ms != 0 {
-                                    rx.when_ms
-                                } else {
-                                    now_ms()
-                                },
-                            );
-                        }
-                        Ok(None) => break,
+                let mut budget: i64 = 4096;
+                loop {
+                    let n = match recv_batch(fd, &mut rx_batch) {
+                        Ok(0) => break,
+                        Ok(n) => n,
                         Err(e) => {
-                            log::error!("socketcan recvmsg: {e}");
+                            log::error!("socketcan recvmmsg: {e}");
                             return;
                         }
+                    };
+                    for i in 0..n {
+                        let Some(rx) = rx_batch.parse(i) else {
+                            continue;
+                        };
+                        if rx.id & CAN_ERR_FLAG != 0 {
+                            continue;
+                        }
+                        // NMEA 2000 is always 29-bit extended. CAN 1.0
+                        // standard frames (11-bit, no EFF flag) cannot
+                        // be N2K, so skip them rather than reinterpret
+                        // the low 11 bits as a degenerate 29-bit id.
+                        if rx.id & CAN_EFF_FLAG == 0 {
+                            continue;
+                        }
+                        let mut bus = Bus {
+                            tx_buf: &mut tx_buf,
+                            frames_tx: &frames_tx,
+                        };
+                        handle_frame(
+                            &mut bus,
+                            &mut claimer,
+                            &mut reasm,
+                            rx.id & CAN_EFF_MASK,
+                            &rx.data[..rx.dlc],
+                            if rx.when_ms != 0 {
+                                rx.when_ms
+                            } else {
+                                now_ms()
+                            },
+                        );
+                    }
+                    budget -= n as i64;
+                    // Socket drained (short batch) or budget spent: let the
+                    // loop re-poll so claim/heartbeat timers advance.
+                    if n < RX_BATCH || budget <= 0 {
+                        break;
                     }
                 }
             }

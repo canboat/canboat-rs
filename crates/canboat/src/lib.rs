@@ -7,6 +7,13 @@
 //! [`Frame`] ⇆ [`DecodedPgn`] (decode) and [`PgnBuilder`] → [`Frame`]
 //! (encode). See `docs/library-api-plan.md` for the full design.
 //!
+//! canboat is the fruit of reverse-engineering NMEA 2000 — a closed,
+//! pay-to-read standard — out on the water since 2009. This crate embeds the
+//! whole distilled result: **nearly 600 PGN message definitions** across some
+//! 350 PGNs — over 220 standardized, plus 370-odd *company-specific* variants
+//! spanning ~25 manufacturers (Simrad, Furuno, Garmin, Raymarine, B&G, …) —
+//! and it both decodes **and** encodes every one of them.
+//!
 //! # Quick start
 //!
 //! Everything below is in the baseline `decode` feature — no I/O, no threads.

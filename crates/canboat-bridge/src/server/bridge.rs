@@ -331,19 +331,22 @@ impl Bridge {
     /// is stamped with the live claimed address (as the pipeline does for a
     /// quirk's own-node emission); an explicit `src` passes through
     /// untouched. Errors when the bridge has no writable device backend.
-    pub fn transmit(&self, mut frame: RawFrame) -> Result<()> {
-        let sender = self
-            .device_sender
-            .as_ref()
-            .ok_or_else(|| anyhow!("bridge has no writable device backend to transmit on"))?;
-        if (frame.src == 0 || frame.src == canboat_core::ADDR_GLOBAL)
-            && let Some(addr) = self.claimed_address()
-        {
-            frame.src = addr;
-        }
-        sender
-            .send_frame(frame)
-            .map_err(|_| anyhow!("device writer is gone (backend disconnected)"))
+    pub fn transmit(&self, frame: RawFrame) -> Result<()> {
+        self.transmitter()
+            .ok_or_else(|| anyhow!("bridge has no writable device backend to transmit on"))?
+            .transmit(frame)
+    }
+
+    /// A cloneable, `Send` handle that transmits onto the bus with the
+    /// same claimed-source stamping as [`Bridge::transmit`]. Extract it
+    /// before moving the `Bridge` elsewhere (e.g. into a thread that keeps
+    /// the pipeline alive) so another task can still inject frames.
+    /// `None` when the bridge has no writable device backend.
+    pub fn transmitter(&self) -> Option<Transmitter> {
+        self.device_sender.as_ref().map(|sender| Transmitter {
+            sender: sender.clone(),
+            claim_addr: self.claim_addr.clone(),
+        })
     }
 
     /// Start encoding a message for `pgn`, to be finished with `.build()`
@@ -591,6 +594,42 @@ impl Bridge {
                 filter: self.nmea_filter.clone(),
             },
         )
+    }
+}
+
+/// A cloneable transmit handle detached from a [`Bridge`] (see
+/// [`Bridge::transmitter`]). Holds the device writer and the live claimed
+/// address, so it can inject frames with the bridge's source-stamping
+/// after the `Bridge` itself has been moved away.
+#[derive(Clone)]
+pub struct Transmitter {
+    sender: FrameSender,
+    claim_addr: Option<Arc<AtomicU8>>,
+}
+
+impl Transmitter {
+    /// Inject a frame onto the bus. A frame left at `src` 0 /
+    /// [`ADDR_GLOBAL`](canboat_core::ADDR_GLOBAL) is stamped with the live
+    /// claimed address; an explicit `src` passes through untouched. See
+    /// [`Bridge::transmit`], whose behaviour this mirrors exactly.
+    pub fn transmit(&self, mut frame: RawFrame) -> Result<()> {
+        if (frame.src == 0 || frame.src == canboat_core::ADDR_GLOBAL)
+            && let Some(addr) = self.claimed_address()
+        {
+            frame.src = addr;
+        }
+        self.sender
+            .send_frame(frame)
+            .map_err(|_| anyhow!("device writer is gone (backend disconnected)"))
+    }
+
+    /// The live claimed ISO source address, if currently a valid unicast
+    /// address. `None` otherwise. Mirrors [`Bridge::claimed_address`].
+    pub fn claimed_address(&self) -> Option<u8> {
+        self.claim_addr
+            .as_ref()
+            .map(|a| a.load(std::sync::atomic::Ordering::Relaxed))
+            .filter(|&a| a != canboat_core::ADDR_GLOBAL && a != canboat_core::ADDR_NULL)
     }
 }
 

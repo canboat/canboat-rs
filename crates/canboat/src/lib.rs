@@ -187,7 +187,7 @@ pub mod device {
 /// ```
 #[cfg(feature = "bridge")]
 pub mod bridge {
-    pub use canboat_bridge::server::{Bridge, BridgeConfig, QuirkKind as Quirk};
+    pub use canboat_bridge::server::{Bridge, BridgeConfig, QuirkKind as Quirk, Transmitter};
 }
 
 // ─────────────────────────────── prelude ─────────────────────────────────

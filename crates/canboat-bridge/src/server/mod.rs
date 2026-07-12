@@ -53,7 +53,7 @@ mod quirks;
 mod snapshot;
 mod tcp;
 
-pub use bridge::Bridge;
+pub use bridge::{Bridge, Transmitter};
 pub use quirks::QuirkKind;
 
 use std::io::{self, BufRead, BufReader, Read, Write};

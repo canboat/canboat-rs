@@ -24,11 +24,15 @@
 //!
 //! Scope: every self-contained field type encodes — the numeric,
 //! enum/lookup, PGN/MMSI, `FLOAT`, `ISO_NAME`, `BINARY` and all four
-//! string families (`STRING_FIX`/`LZ`/`LAU`). The only fields left are
-//! the PGN 126208 group-function *dynamic* types (`VARIABLE`,
-//! `DYNAMIC_FIELD_KEY`/`LENGTH`/`VALUE`), whose width/shape is set by
-//! sibling fields at decode time and so can't be defaulted in isolation;
-//! an unset one returns [`EncodeError::NotFixedLength`].
+//! string families (`STRING_FIX`/`LZ`/`LAU`). The key/value family
+//! ([`DynamicFieldKey`](FieldType::DynamicFieldKey) /
+//! [`DynamicFieldValue`](FieldType::DynamicFieldValue), e.g. PGN 130845
+//! `simnetKeyValue`) encodes when set explicitly: the KEY is a
+//! fixed-width scalar (set it as an `Int`), and the VALUE takes its bytes
+//! verbatim (set it as `Bytes` — the caller owns matching the width the
+//! resolved key expects). Left unset, the VALUE and the PGN 126208
+//! group-function types (`VARIABLE`, `DYNAMIC_FIELD_LENGTH`) can't be
+//! defaulted in isolation and return [`EncodeError::NotFixedLength`].
 
 use std::error::Error;
 use std::fmt;
@@ -349,6 +353,14 @@ impl MessageBuilder {
             Some(FieldType::StringLz) => stage_string_lz(f, v),
             Some(FieldType::StringLau) => stage_string_lau(f, v),
             Some(FieldType::Binary) => stage_binary(f, v),
+            // DYNAMIC_FIELD_VALUE (the value slot of a key/value PGN like
+            // 130845) has no schema `BitLength` — its width is set by the
+            // sibling KEY at decode time, so it can't be defaulted, but the
+            // caller *can* supply the already-encoded value bytes. Written
+            // verbatim (variable length); the caller owns matching the
+            // width the resolved key expects. The sibling KEY field is a
+            // fixed-width scalar, so it takes the normal `Int` path below.
+            Some(FieldType::DynamicFieldValue) => stage_dynamic_value(f, v),
             _ => Ok(Staged::Scalar(self.value_to_raw(f, v)?)),
         }
     }
@@ -560,6 +572,22 @@ fn stage_binary(f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
         bytes.resize(want, 0);
     }
     Ok(Staged::Bytes(bytes))
+}
+
+/// Stage a `DYNAMIC_FIELD_VALUE` field: the caller-supplied value bytes,
+/// written verbatim. Unlike `BINARY` this field carries no declared
+/// `BitLength` (its width comes from the resolved sibling KEY), so there
+/// is nothing to pad to — the bytes are the value. Only `Bytes` (or an
+/// explicit `NotAvailable` → empty) is meaningful here.
+fn stage_dynamic_value(f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
+    match v {
+        EncodeValue::Bytes(b) => Ok(Staged::Bytes(b)),
+        EncodeValue::NotAvailable => Ok(Staged::Bytes(Vec::new())),
+        _ => Err(EncodeError::TypeMismatch {
+            field: f.name,
+            expected: "value bytes for a dynamic (key/value) field",
+        }),
+    }
 }
 
 fn default_raw(f: &FieldInfo) -> u64 {
@@ -914,6 +942,54 @@ mod tests {
             Some(crate::FieldValue::IsoName { value, .. }) => assert_eq!(*value, name),
             other => panic!("expected iso name, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn simnet_key_value_encodes_key_and_value() {
+        // PGN 130845 simnetKeyValue is a key/value PGN: the KEY is a
+        // fixed 24-bit DYNAMIC_FIELD_KEY (set as a raw Int) and the VALUE
+        // is a DYNAMIC_FIELD_VALUE whose bytes are written verbatim. This
+        // is the frame merrimac sends to set Simrad display night mode
+        // (key 9983, value 0x04).
+        let frame = db()
+            .message("simnetKeyValue")
+            .unwrap()
+            .destination(255)
+            .push("Address", EncodeValue::Int(255))
+            .unwrap()
+            .push("Instance", EncodeValue::Int(255))
+            .unwrap()
+            .push("Network Group", EncodeValue::Int(1))
+            .unwrap()
+            .push("Source", EncodeValue::Int(255))
+            .unwrap()
+            .push("Key", EncodeValue::Int(9983))
+            .unwrap()
+            .push("Operation", EncodeValue::Int(1))
+            .unwrap()
+            .push("Value", EncodeValue::Bytes(vec![0x04]))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(frame.pgn, 130845);
+        // 6 header bytes (11+2+3+8+8+8+8 = 48 bits) + 3 key + 1 op + 1 value.
+        assert_eq!(frame.data.len(), 11);
+        // Manufacturer Code (match 1857) + Industry Code (match 4) auto-fill.
+        // Key 9983 = 0x26FF, little-endian 24-bit at bytes 6..9.
+        assert_eq!(&frame.data[6..9], &[0xff, 0x26, 0x00]);
+        assert_eq!(frame.data[9], 0x01); // Operation = Set
+        assert_eq!(frame.data[10], 0x04); // Value byte, verbatim
+    }
+
+    #[test]
+    fn dynamic_field_value_rejects_non_bytes() {
+        // The value slot has no declared width; a scalar can't be sized.
+        assert!(matches!(
+            db().message("simnetKeyValue")
+                .unwrap()
+                .push("Value", EncodeValue::Int(4)),
+            Err(EncodeError::TypeMismatch { .. })
+        ));
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod canboat::bridge
 pub use canboat::bridge::Bridge
 pub use canboat::bridge::BridgeConfig
 pub use canboat::bridge::Quirk
+pub use canboat::bridge::Transmitter
 pub mod canboat::device
 pub use canboat::device::ClaimState
 pub use canboat::device::Claimer

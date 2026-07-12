@@ -316,18 +316,27 @@ green).
 >   `env_logger::init` moved out of `run` into the bin's `Server` handler (host owns
 >   logging). Verified: clap-free lib build, `canboat server --help` intact, clippy clean,
 >   tests green (bridge 72 lib / 81 with `cli`; only the pre-existing golden fails).
-> - **5c — split core / serving + the `Bridge` type** (NOT STARTED; the hard one). The
->   tap point is known: in `server/pipeline.rs::run`, every decoded record passes through a
->   single `let decoded = Arc::new(decoded);` right after `db.decode(&assembled)` — add an
->   optional `decoded_tx: Option<mpsc::Sender<Arc<DecodedPgn>>>` to the pipeline (None =
->   today's behaviour, zero cost) and send a clone there. Then `server::run` gets
->   restructured into `Bridge`: `open_source` + build `Hubs` + spawn `pipeline::run` on a
->   thread with the tap wired → `Bridge::decoded()` returns the `Receiver`; `transmit()`
->   uses the existing `device_sender`; `serve(Ports)` spawns the TCP listeners (lifted out
->   of the current inline block in `run`). `run(config)` then becomes a thin
->   `Bridge::from(config).serve_all().wait()` so there is ONE code path. Finally the facade
->   `bridge` feature depends on `canboat-bridge` (clap-free after 5b) and re-exports
->   `Bridge`/`BridgeConfig`/`Input`/`Quirk`/`Ports`.
+> - **5c — split core / serving + the `Bridge` type (DONE).** The tap point landed exactly
+>   as scoped: `Hubs` gained `decoded_tx: Option<mpsc::Sender<Arc<DecodedPgn>>>`, and
+>   `pipeline::run` sends an `Arc::clone` there right after `let decoded = Arc::new(decoded)`
+>   (before quirk synthesis, so every record — synthetics included on loop-back — is tapped
+>   exactly once; `None` costs one `is_some` per record). `server::run`'s 330-line body moved
+>   into a new `server/bridge.rs` `Bridge` type: `Bridge::new(config)` builds the core (open
+>   source, stdin loopback, config-dir filter/overrides load, request engine) and starts
+>   nothing; `decoded()` installs the tap and returns the `Receiver`; `serve()` spawns the
+>   2597–2606 listeners (verbatim move of the inline spawns); `transmit()`/`message()` inject
+>   via `device_sender` (stamping the claimed src); `spawn()` runs the pipeline on a thread
+>   (Bridge stays alive to transmit/`wait()`), `run()` drives it in place. The CLI `run(config)`
+>   is now `Bridge::new(config)?.serve()?; bridge.run()` — **one code path**. The helper fns
+>   (`open_source`, `install_stdin_loopback`, `resolve_config_dir`, `OpenedSource`) stayed in
+>   `server/mod.rs`, reached from the `bridge` submodule as ancestor-private items. Facade
+>   `bridge` feature now pulls `dep:canboat-bridge` (verified: no clap/tokio/ratatui) and
+>   re-exports `bridge::{Bridge, BridgeConfig, Quirk}`. Verified: pipeline tap unit test;
+>   stdin→NMEA (`$BBHDM`); TCP analyzer-port serve (banner + streamed JSON); `no_run` facade
+>   doctest; public-api snapshot re-blessed (+3 re-export lines — the method/field surface is
+>   in canboat-bridge, locked separately in P7); `make precommit` fully green. **Still open in
+>   5c-scope but deferred:** the richer `Input`/`Ports`/`ServeConfig` builder sugar (today the
+>   whole `BridgeConfig` drives both `new` and `serve`); add when merrimac (P6) shows the need.
 > - **5d — `ServeHandle` / `shutdown`** replacing the leaked accept threads (today `run`
 >   deliberately leaks them and relies on process exit). Each TCP listener needs a stop
 >   signal; the `Bridge` returns a handle whose drop/`shutdown()` closes the listeners so
@@ -335,12 +344,14 @@ green).
 > - **5e — inject the config-dir** (the `/etc/default/canboat` write-probe in
 >   `resolve_config_dir`) instead of auto-discovering; the `env_logger::init` removal is
 >   already done in 5b.
-> Facade `bridge` module stays a stub until 5c so no half-built API is exposed.
+> Facade `bridge` module was a stub until 5c; it now re-exports the real `Bridge` API.
 >
-> **Why 5c+ was NOT done in the overnight autonomous run:** it restructures the 340-line
-> `run()` on the hot pipeline path, and full correctness needs the **Pi n2kd parity
-> harness** (C-vs-Rust), which can't run here. A subtle break there wouldn't show in the
-> local test suite. Left at the clean, verified 5b state instead.
+> **5c is done (supervised).** It restructured the 330-line `run()` on the hot pipeline
+> path; local verification (unit tap test + stdin→NMEA + TCP serve smoke + green precommit)
+> passed, but **byte-for-byte parity still wants the Pi n2kd harness** (C-vs-Rust) before
+> the branch is trusted on the boat. 5d (`ServeHandle`/shutdown — today the accept threads
+> are still leaked) and 5e (config-dir injection — the `BridgeConfig.config_dir` field
+> exists but `resolve_config_dir` still auto-probes when it's `None`) remain.
 
 **Phase 6 — Prove it with `merrimac-rs`.** See §5.
 

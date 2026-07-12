@@ -35,7 +35,7 @@ decode   = ["dep:canboat-core"]            # sans-I/O core: schema, decode, enco
 io       = ["decode", "dep:canboat-io"]    # byte-source readers (read::*Reader)
 wire     = ["decode", "dep:canboat-wire"]  # cross-process WirePgn / Hello handshake
 node     = ["decode", "dep:canboat-io"]    # device::{Name, Claimer, Responder}
-bridge   = ["io", "wire", "node"]          # live-bus facade module (stub until the Bridge API lands)
+bridge   = ["io", "wire", "node", "dep:canboat-bridge"]  # live-bus: Bridge + BridgeConfig + serving
 nmea0183 = ["decode"]                      # output::write_nmea0183
 ais      = ["decode"]                      # output::write_ais
 

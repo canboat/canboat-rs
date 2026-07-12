@@ -21,6 +21,9 @@ pub use canboat::ReassemblyError
 pub use canboat::SCHEMA_HASH
 pub use canboat::Units
 pub mod canboat::bridge
+pub use canboat::bridge::Bridge
+pub use canboat::bridge::BridgeConfig
+pub use canboat::bridge::Quirk
 pub mod canboat::device
 pub use canboat::device::ClaimState
 pub use canboat::device::Claimer

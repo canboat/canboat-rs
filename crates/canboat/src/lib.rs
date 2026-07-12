@@ -154,13 +154,41 @@ pub mod device {
 
 // ─────────────────────────────── bridge ──────────────────────────────────
 
-/// The live CAN bus, fully assembled: own a socketcan interface (or a custom
-/// [`FrameSource`](read)), claim an address, apply quirks, and expose an
-/// in-process [`DecodedPgn`] stream plus an optional TCP serving layer.
+/// The live CAN bus, fully assembled: own a socketcan interface (or another
+/// [`FrameSource`](read) via a device backend), claim an address, apply
+/// quirks, and expose an in-process [`DecodedPgn`] stream plus an optional
+/// TCP serving layer (the 2597–2606 ports the `canboat server` daemon opens).
 ///
-/// Populated in Phase 5 by lifting `server` + `n2kd` into `canboat-bridge`.
+/// [`Bridge::new`] builds the core; [`Bridge::decoded`] taps the decoded
+/// stream, [`Bridge::serve`] opens the TCP ports, and [`Bridge::spawn`] (or
+/// the blocking [`Bridge::run`]) starts the bus. [`BridgeConfig`] is the
+/// plain, clap-free config; [`Quirk`] selects a bus value-add.
+///
+/// ```no_run
+/// use canboat::bridge::{Bridge, BridgeConfig};
+///
+/// # fn main() -> anyhow::Result<()> {
+/// // Own a SocketCAN interface, tap the decoded stream, and re-serve the
+/// // 2597–2606 TCP ports so other LAN consumers keep working.
+/// let mut config = BridgeConfig::default();
+/// config.socketcan = Some("can0".into());
+///
+/// let mut bridge = Bridge::new(config)?;
+/// let decoded = bridge.decoded(); // Receiver<Arc<DecodedPgn>>
+/// bridge.serve()?;
+/// bridge.spawn()?; // pipeline runs on a background thread
+///
+/// for pgn in decoded.iter() {
+///     println!("{} from {}", pgn.pgn, pgn.src);
+/// }
+/// bridge.wait();
+/// # Ok(())
+/// # }
+/// ```
 #[cfg(feature = "bridge")]
-pub mod bridge {}
+pub mod bridge {
+    pub use canboat_bridge::server::{Bridge, BridgeConfig, QuirkKind as Quirk};
+}
 
 // ─────────────────────────────── prelude ─────────────────────────────────
 

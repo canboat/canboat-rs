@@ -9,7 +9,7 @@
 //! * an **in-process decoded stream** ([`Bridge::decoded`]) — a
 //!   `Receiver<Arc<DecodedPgn>>` fed straight off the pipeline, so a host
 //!   process reads N2K without a TCP hop;
-//! * a **transmit path** ([`Bridge::transmit`] / [`Bridge::message`]) that
+//! * a **transmit path** ([`Bridge::transmit`] / [`Bridge::encode`]) that
 //!   injects a frame with the bridge's claimed source address;
 //! * the **optional TCP serving layer** ([`Bridge::serve`]) — the same
 //!   2597–2606 ports the standalone `canboat server` opens, so other
@@ -351,12 +351,9 @@ impl Bridge {
 
     /// Start encoding a message for `pgn`, to be finished with `.build()`
     /// and handed to [`Bridge::transmit`]. Convenience for
-    /// `bridge.database().message_by_pgn(pgn)`.
-    pub fn message(
-        &self,
-        pgn: u32,
-    ) -> Result<canboat_core::MessageBuilder, canboat_core::EncodeError> {
-        self.db.message_by_pgn(pgn)
+    /// `bridge.database().encode_by_pgn(pgn)`.
+    pub fn encode(&self, pgn: u32) -> Result<canboat_core::PgnBuilder, canboat_core::EncodeError> {
+        self.db.encode_by_pgn(pgn)
     }
 
     /// The live claimed ISO source address, if the backend exposes one

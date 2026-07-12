@@ -43,7 +43,7 @@ impl ProductInfo<'_> {
         use field::product_information as pi;
         let db = PgnDatabase::embedded(Units::Si);
         let build = || -> Result<RawFrame, canboat_core::encode::EncodeError> {
-            let mut b = db.message("productInformation")?.source(src);
+            let mut b = db.encode("productInformation")?.source(src);
             b.set(pi::NMEA2000_VERSION, self.db_version)?;
             b.set(pi::PRODUCT_CODE, self.product_code)?;
             b.set(pi::MODEL_ID, self.model_id)?;

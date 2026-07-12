@@ -4,7 +4,7 @@
 //!
 //! This is the single crate an external consumer depends on. Its public
 //! surface is deliberately small and feature-gated; think in terms of
-//! [`Frame`] ⇆ [`DecodedPgn`] (decode) and [`MessageBuilder`] → [`Frame`]
+//! [`Frame`] ⇆ [`DecodedPgn`] (decode) and [`PgnBuilder`] → [`Frame`]
 //! (encode). See `docs/library-api-plan.md` for the full design.
 //!
 //! # Quick start
@@ -22,7 +22,7 @@
 //! // Fields are set by canboat name or id; unset fields (and proprietary
 //! // manufacturer/industry selectors) fall back to their schema defaults.
 //! let frame: canboat::Frame = db
-//!     .message("windData")?
+//!     .encode("windData")?
 //!     .push("Wind Speed", 5.23)?
 //!     .push("Wind Angle", 1.5)?
 //!     .push("Reference", EncodeValue::Lookup("Apparent".into()))?
@@ -81,7 +81,7 @@ pub use canboat_core::{
     FieldValue,
     FramePacketType,
     // encode (outbound)
-    MessageBuilder,
+    PgnBuilder,
     // schema & database
     PgnDatabase as Database,
     RAWFRAME_MAX_SIZE as FRAME_MAX_SIZE,

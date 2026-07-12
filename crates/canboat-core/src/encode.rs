@@ -3,13 +3,13 @@
 //! Encode a PGN from field values into a wire [`RawFrame`] — the
 //! inverse of [`crate::decode`].
 //!
-//! The entry point is [`PgnDatabase::message`] /
-//! [`PgnDatabase::message_by_pgn`] (by id / by number), or
-//! [`PgnDatabase::message_for`] with a generated `pgn::…` constant, which
-//! hand back a [`MessageBuilder`] for a specific schema PGN variant. Set
-//! field values by name/id ([`push`](MessageBuilder::push)) or by a
-//! compile-checked `field::…` constant ([`set`](MessageBuilder::set)),
-//! then [`build`](MessageBuilder::build) packs them at their schema bit
+//! The entry point is [`PgnDatabase::encode`] /
+//! [`PgnDatabase::encode_by_pgn`] (by id / by number), or
+//! [`PgnDatabase::encode_for`] with a generated `pgn::…` constant, which
+//! hand back a [`PgnBuilder`] for a specific schema PGN variant. Set
+//! field values by name/id ([`push`](PgnBuilder::push)) or by a
+//! compile-checked `field::…` constant ([`set`](PgnBuilder::set)),
+//! then [`build`](PgnBuilder::build) packs them at their schema bit
 //! offsets — LSB-first, exactly the layout [`crate::bits::extract_bits`]
 //! reads back — and returns a [`RawFrame`]. Because the result is a
 //! `RawFrame`, any [`crate::format`] writer (PLAIN, YDWG02, Actisense,
@@ -123,7 +123,7 @@ pub enum EncodeError {
     /// No PGN with this number in the schema.
     NoSuchPgn(u32),
     /// This PGN number has several schema variants; use
-    /// [`PgnDatabase::message`] with the specific id.
+    /// [`PgnDatabase::encode`] with the specific id.
     AmbiguousPgn { pgn: u32, variants: usize },
     /// No field with this name/id in the PGN.
     NoSuchField { pgn_id: &'static str, field: String },
@@ -182,8 +182,8 @@ impl fmt::Display for EncodeError {
 impl Error for EncodeError {}
 
 /// Fluent builder for one PGN message. Created via
-/// [`PgnDatabase::message`] / [`PgnDatabase::message_by_pgn`].
-pub struct MessageBuilder {
+/// [`PgnDatabase::encode`] / [`PgnDatabase::encode_by_pgn`].
+pub struct PgnBuilder {
     db: &'static PgnDatabase,
     pgn: &'static PgnInfo,
     prio: u8,
@@ -205,9 +205,9 @@ enum Staged {
     Bytes(Vec<u8>),
 }
 
-impl MessageBuilder {
+impl PgnBuilder {
     /// Construct for a resolved PGN variant. Crate-internal; callers go
-    /// through [`PgnDatabase::message`].
+    /// through [`PgnDatabase::encode`].
     pub(crate) fn for_pgn(db: &'static PgnDatabase, pgn: &'static PgnInfo) -> Self {
         Self {
             db,
@@ -731,7 +731,7 @@ mod tests {
         // The canboat `format-message` example: request Product Info
         // (126996 = 0x1F014) → PGN 59904, data 14 f0 01.
         let frame = db()
-            .message_for(crate::pgn::ISO_REQUEST)
+            .encode_for(crate::pgn::ISO_REQUEST)
             .priority(6)
             .destination(255)
             .set(crate::field::iso_request::PGN, 126996u32)
@@ -747,9 +747,9 @@ mod tests {
     #[test]
     fn ambiguous_pgn_number_is_rejected() {
         // 59904 is unique; 126208 (group function) has several variants.
-        assert!(db().message_by_pgn(59904).is_ok());
+        assert!(db().encode_by_pgn(59904).is_ok());
         assert!(matches!(
-            db().message_by_pgn(126208),
+            db().encode_by_pgn(126208),
             Err(EncodeError::AmbiguousPgn { pgn: 126208, .. })
         ));
     }
@@ -759,7 +759,7 @@ mod tests {
         // Encoding with no fields set still produces a schema-length
         // frame (defaults fill in), and match_value selector fields are
         // auto-populated so the variant stays valid.
-        let frame = db().message_for(crate::pgn::ISO_REQUEST).build();
+        let frame = db().encode_for(crate::pgn::ISO_REQUEST).build();
         // isoRequest has a single PGN field with no match_value; unset →
         // not-available (all ones), 3 bytes.
         let f = frame.unwrap();
@@ -776,7 +776,7 @@ mod tests {
         use crate::field::wind_data as wd;
         let db = db();
         let frame = db
-            .message_for(crate::pgn::WIND_DATA)
+            .encode_for(crate::pgn::WIND_DATA)
             .set(wd::SID, 7)
             .unwrap()
             .set(wd::WIND_SPEED, 5.23)
@@ -817,7 +817,7 @@ mod tests {
     #[test]
     fn unknown_lookup_label_is_rejected() {
         assert!(matches!(
-            db().message("windData")
+            db().encode("windData")
                 .unwrap()
                 .push("Reference", EncodeValue::Lookup("Nonsense".into())),
             Err(EncodeError::UnknownLookupLabel { .. })
@@ -827,11 +827,11 @@ mod tests {
     #[test]
     fn no_such_field_and_pgn() {
         assert!(matches!(
-            db().message("isoRequest").unwrap().push("Nope", 1),
+            db().encode("isoRequest").unwrap().push("Nope", 1),
             Err(EncodeError::NoSuchField { .. })
         ));
         assert!(matches!(
-            db().message("notAPgnId"),
+            db().encode("notAPgnId"),
             Err(EncodeError::NoSuchPgnId(_))
         ));
     }
@@ -840,7 +840,7 @@ mod tests {
     fn string_fix_round_trips() {
         use crate::field::product_information::MODEL_ID;
         let frame = db()
-            .message("productInformation")
+            .encode("productInformation")
             .unwrap()
             .set(MODEL_ID, "SCX-20")
             .unwrap()
@@ -857,7 +857,7 @@ mod tests {
     fn string_lau_round_trips() {
         use crate::field::configuration_information::INSTALLATION_DESCRIPTION1 as DESC1;
         let frame = db()
-            .message("configurationInformation")
+            .encode("configurationInformation")
             .unwrap()
             .set(DESC1, "Helm Station")
             .unwrap()
@@ -874,7 +874,7 @@ mod tests {
     fn string_lz_round_trips() {
         use crate::field::navico_ascii_identifier::IDENTIFIER;
         let frame = db()
-            .message("navicoAsciiIdentifier")
+            .encode("navicoAsciiIdentifier")
             .unwrap()
             .set(IDENTIFIER, "BOW")
             .unwrap()
@@ -894,7 +894,7 @@ mod tests {
         use crate::field::iso_transport_protocol_data_transfer::DATA;
         let payload = vec![0xde_u8, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
         let frame = db()
-            .message("isoTransportProtocolDataTransfer")
+            .encode("isoTransportProtocolDataTransfer")
             .unwrap()
             .set(DATA, payload.clone())
             .unwrap()
@@ -913,7 +913,7 @@ mod tests {
         // so it survives a round-trip within f32 precision.
         use crate::field::garmin_autopilot_heading_to_steer::HEADING_TO_STEER as HTS;
         let frame = db()
-            .message("garminAutopilotHeadingToSteer")
+            .encode("garminAutopilotHeadingToSteer")
             .unwrap()
             .set(HTS, 1.5)
             .unwrap()
@@ -931,7 +931,7 @@ mod tests {
         use crate::field::simnet_data_source_selection::SOURCE;
         let name: u64 = 0xC078_8C00_E7E0_4364;
         let frame = db()
-            .message("simnetDataSourceSelection")
+            .encode("simnetDataSourceSelection")
             .unwrap()
             .set(SOURCE, name)
             .unwrap()
@@ -952,7 +952,7 @@ mod tests {
         // is the frame merrimac sends to set Simrad display night mode
         // (key 9983, value 0x04).
         let frame = db()
-            .message("simnetKeyValue")
+            .encode("simnetKeyValue")
             .unwrap()
             .destination(255)
             .push("Address", EncodeValue::Int(255))
@@ -985,7 +985,7 @@ mod tests {
     fn dynamic_field_value_rejects_non_bytes() {
         // The value slot has no declared width; a scalar can't be sized.
         assert!(matches!(
-            db().message("simnetKeyValue")
+            db().encode("simnetKeyValue")
                 .unwrap()
                 .push("Value", EncodeValue::Int(4)),
             Err(EncodeError::TypeMismatch { .. })
@@ -997,7 +997,7 @@ mod tests {
         // The 126208 group-function dynamic types can't be defaulted in
         // isolation; an unset one is a descriptive error, not wrong bytes.
         let err = db()
-            .message("nmeaRequestGroupFunction")
+            .encode("nmeaRequestGroupFunction")
             .and_then(|b| b.build());
         assert!(
             matches!(err, Err(EncodeError::NotFixedLength(_))),

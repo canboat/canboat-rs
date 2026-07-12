@@ -76,7 +76,7 @@ canboat
 │
 │   // schema & database
 │   Database               // was PgnDatabase. ::embedded(Units) -> &'static; .decode(&Frame),
-│                          //   .message(pgn), .field(pgn,field)->FieldId, .lookup(..)
+│                          //   .encode(pgn), .field(pgn,field)->FieldId, .lookup(..)
 │   Units { Si, Metric }
 │   FieldId                // was FieldRef. THE single field-addressing type: carries the
 │                          //   &'static schema refs, so it drives decode-access, encode,
@@ -101,7 +101,7 @@ canboat
 │   DecodeError
 │
 │   // encode (outbound) — persona #4
-│   MessageBuilder         // db.message(pgn).set(FieldId, EncodeValue).build() -> Frame
+│   PgnBuilder             // db.encode(pgn).set(FieldId, EncodeValue).build() -> Frame
 │   EncodeValue, EncodeError
 │
 │   // formatters — persona #3 (DecodedPgn -> bytes/text)
@@ -155,7 +155,7 @@ canboat
       //   decoded() -> Receiver<DecodedPgn>     in-process stream (persona #1)
       //   raw()     -> Receiver<Frame>          (optional, for BYO-decode)
       //   transmit(Frame)                       inject with the claimed src
-      //   message(pgn) -> MessageBuilder        convenience for transmit
+      //   encode(pgn) -> PgnBuilder             convenience for transmit
       //   serve(Ports) -> io::Result<ServeHandle>   spawn 2597..2606 for other consumers
       //   shutdown()                            stop reader + listeners cleanly
 ```
@@ -391,7 +391,7 @@ port is mostly *deletion*:
    no possible mismatch. merrimac's `Message`/interest-index/`Accumulator` layer
    downstream is source-agnostic and unchanged.
 3. **Replace outbound.** `src/n2k/builder.rs` `RawN2K::build()` PLAIN-text path → 
-   `bridge.message(pgn).set(..).build()` + `bridge.transmit(..)`. merrimac stops stamping
+   `bridge.encode(pgn).set(..).build()` + `bridge.transmit(..)`. merrimac stops stamping
    `src = 0xFF`: as the real bridge it is address-claimed, so its transmits (and the
    MasterBus→N2K bridge in `src/masterbus/mod.rs:1170`) carry a proper source.
 4. **Collapse the duplicate schema.** Delete merrimac's hand-rolled `N2kDefinitions`

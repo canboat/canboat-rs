@@ -257,7 +257,7 @@ impl WmmQuirk {
         let build = || -> Result<RawFrame, canboat_core::encode::EncodeError> {
             let mut b = self
                 .db
-                .message("magneticVariation")?
+                .encode("magneticVariation")?
                 .priority(7)
                 // Emit as "my own node": ADDR_GLOBAL is the sentinel the
                 // pipeline rewrites to canboat's live claimed address.
@@ -332,7 +332,7 @@ mod tests {
     /// the remainder are left at their not-available defaults.
     fn gnss_129029(lat_deg: f64, lon_deg: f64, days: u16) -> DecodedPgn {
         let db = PgnDatabase::embedded(Units::Si);
-        let mut b = db.message("gnssPositionData").unwrap().source(3);
+        let mut b = db.encode("gnssPositionData").unwrap().source(3);
         b.set(field::gnss_position_data::DATE, i64::from(days))
             .unwrap();
         b.set(field::gnss_position_data::LATITUDE, lat_deg).unwrap();
@@ -351,7 +351,7 @@ mod tests {
     /// A 127258 from `src` reporting variation `Source` = `source`.
     fn variation_127258(src: u8, source: u8) -> DecodedPgn {
         let db = PgnDatabase::embedded(Units::Si);
-        let mut b = db.message("magneticVariation").unwrap().source(src);
+        let mut b = db.encode("magneticVariation").unwrap().source(src);
         b.set(field::magnetic_variation::SOURCE, i64::from(source))
             .unwrap();
         b.set(field::magnetic_variation::VARIATION, 0.05f64)

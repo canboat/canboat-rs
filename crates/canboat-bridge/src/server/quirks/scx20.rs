@@ -42,7 +42,7 @@ const MIN_SYNTH_GAP: Duration = Duration::from_secs(1);
 /// The Setting Tool keys its device-list entry on Model ID and Cert
 /// Level, so this single captured set covers every unit's discovery
 /// needs even though Model Serial Code would naturally differ. They are
-/// encoded through the schema-driven [`canboat_core::encode::MessageBuilder`]
+/// encoded through the schema-driven [`canboat_core::encode::PgnBuilder`]
 /// (see [`build_scx20_product_info`]).
 ///
 /// The DB Version is the raw field value (`res 0.001` → 2100 = "2.100").
@@ -168,7 +168,7 @@ fn build_scx20_product_info(src: u8) -> Option<RawFrame> {
     let db = PgnDatabase::embedded(Units::Si);
     let build = || -> Result<RawFrame, EncodeError> {
         let mut b = db
-            .message("productInformation")?
+            .encode("productInformation")?
             .priority(6)
             .source(src)
             .destination(ADDR_GLOBAL)
@@ -248,7 +248,7 @@ mod tests {
     }
 
     /// The exact 134-byte PGN 126996 payload captured from a real SCX-20
-    /// (`samples/scx20-setting-tool-start.raw`). The MessageBuilder output
+    /// (`samples/scx20-setting-tool-start.raw`). The PgnBuilder output
     /// must reproduce this byte-for-byte or the impersonation drifts from
     /// what the Setting Tool recorded — string fields NUL-padded and all.
     const CAPTURED_PRODUCT_INFO: [u8; 134] = captured_product_info();
@@ -278,7 +278,7 @@ mod tests {
 
     #[test]
     fn built_product_info_matches_captured_payload() {
-        // The whole point of routing through MessageBuilder: it must still
+        // The whole point of routing through PgnBuilder: it must still
         // reproduce the captured payload exactly. If any byte drifts (a
         // schema change, a padding change), the discovery workaround
         // silently breaks — this catches it.

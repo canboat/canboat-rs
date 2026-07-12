@@ -29,7 +29,7 @@ pub mod units;
 
 pub use db::{PgnDatabase, Units};
 pub use decode::{DecodeError, DecodedField, DecodedPgn, FieldValue};
-pub use encode::{EncodeError, EncodeValue, MessageBuilder};
+pub use encode::{EncodeError, EncodeValue, PgnBuilder};
 pub use frame::{ADDR_GLOBAL, ADDR_NULL, FASTPACKET_MAX_SIZE, RAWFRAME_MAX_SIZE, RawFrame};
 pub use from_json::json_to_decoded;
 pub use reassembly::{FramePacketType, Reassembled, Reassembler, ReassemblyError};

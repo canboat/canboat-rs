@@ -14,7 +14,7 @@ pub use canboat::FieldId
 pub use canboat::FieldValue
 pub use canboat::Frame
 pub use canboat::FramePacketType
-pub use canboat::MessageBuilder
+pub use canboat::PgnBuilder
 pub use canboat::Reassembled
 pub use canboat::Reassembler
 pub use canboat::ReassemblyError

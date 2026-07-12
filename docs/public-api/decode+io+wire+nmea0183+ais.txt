@@ -20,6 +20,13 @@ pub use canboat::Reassembler
 pub use canboat::ReassemblyError
 pub use canboat::SCHEMA_HASH
 pub use canboat::Units
+pub mod canboat::bus
+pub use canboat::bus::DeviceHandle
+pub use canboat::bus::DeviceWriterGone
+pub use canboat::bus::FrameSender
+pub fn canboat::bus::open_ikonvert(&str, u32) -> core::io::error::Result<canboat_io::device::DeviceHandle>
+pub fn canboat::bus::open_ngt1(&str, u32) -> core::io::error::Result<canboat_io::device::DeviceHandle>
+pub fn canboat::bus::open_socketcan(&str, u8) -> core::io::error::Result<canboat_io::device::DeviceHandle>
 pub mod canboat::ids
 pub use canboat::ids::field
 pub use canboat::ids::pgn

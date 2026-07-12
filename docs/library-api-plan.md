@@ -337,10 +337,20 @@ green).
 >   in canboat-bridge, locked separately in P7); `make precommit` fully green. **Still open in
 >   5c-scope but deferred:** the richer `Input`/`Ports`/`ServeConfig` builder sugar (today the
 >   whole `BridgeConfig` drives both `new` and `serve`); add when merrimac (P6) shows the need.
-> - **5d — `ServeHandle` / `shutdown`** replacing the leaked accept threads (today `run`
->   deliberately leaks them and relies on process exit). Each TCP listener needs a stop
->   signal; the `Bridge` returns a handle whose drop/`shutdown()` closes the listeners so
->   ports can rebind.
+> - **5d — shutdown / port release (DONE).** The leaked accept threads are gone. A shared
+>   `accept_until(name, listener, stop: Option<Arc<AtomicBool>>, on_accept)` helper (in
+>   `n2kd/serving/tcp.rs`) replaces the seven hand-rolled `loop { listener.accept() }` bodies:
+>   with `stop = Some(flag)` it sets the listener non-blocking and polls every 200 ms, and on
+>   the flag it returns — dropping the listener, so the port frees immediately. `stop = None`
+>   keeps the exact old blocking-accept behaviour, which the standalone `n2kd` daemon passes
+>   (it runs to process exit). `Bridge` holds one `serve_stop` flag wired into every `serve()`
+>   listener; `Bridge::shutdown()` (also run on `Drop`, idempotent) stops the supervisor, trips
+>   the flag, and joins the accept threads; `run()`/`wait()` call it on teardown. **Deliberately
+>   NOT a returned `ServeHandle` type** — the `Bridge` owns its serving and tears it down, which
+>   is what an embedder (merrimac) wants; a standalone handle would be surface nobody holds
+>   (governing principle #1). Verified: a unit test binds a stream server, connects, trips the
+>   flag, and asserts the port re-binds; the A/B server parity re-ran byte-identical on all six
+>   ports (the non-blocking poll is transparent to output).
 > - **5e — inject the config-dir** (the `/etc/default/canboat` write-probe in
 >   `resolve_config_dir`) instead of auto-discovering; the `env_logger::init` removal is
 >   already done in 5b.

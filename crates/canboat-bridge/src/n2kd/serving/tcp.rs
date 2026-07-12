@@ -26,15 +26,70 @@
 //! the application level anyway.
 
 use std::io::Write;
-use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
+use std::net::{Ipv4Addr, Shutdown, SocketAddr, SocketAddrV4, TcpListener, TcpStream};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::thread::{self, JoinHandle};
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 
 use canboat_core::snapshot::SnapshotStore;
 
 use super::Hub;
+
+/// How often a shutdown-aware accept loop wakes to re-check its stop flag.
+/// A new connection is accepted within this interval of arriving; a handful
+/// of idle listeners polling this slowly costs nothing.
+pub(crate) const ACCEPT_POLL: Duration = Duration::from_millis(200);
+
+/// Run `listener`'s accept loop, invoking `on_accept` for each blocking
+/// client socket, until told to stop.
+///
+/// * `stop = Some(flag)` — the listener is switched to non-blocking and the
+///   loop polls every [`ACCEPT_POLL`], returning (and dropping the listener,
+///   so the port can be re-bound) once the flag is set. This is the flag
+///   [`crate::server::Bridge::shutdown`] trips to release its served ports.
+/// * `stop = None` — the loop blocks on `accept()` forever, the historical
+///   behaviour the `n2kd` daemon relies on (it runs until process exit).
+pub(crate) fn accept_until(
+    name: &str,
+    listener: TcpListener,
+    stop: Option<Arc<AtomicBool>>,
+    mut on_accept: impl FnMut(TcpStream, SocketAddr),
+) {
+    if stop.is_some()
+        && let Err(e) = listener.set_nonblocking(true)
+    {
+        log::error!("{name}: set_nonblocking failed ({e}); port will not be shutdown-aware");
+    }
+    loop {
+        if let Some(s) = &stop
+            && s.load(Ordering::Relaxed)
+        {
+            log::info!("{name} server shutting down (port released)");
+            return;
+        }
+        match listener.accept() {
+            Ok((stream, peer)) => {
+                // A socket accepted from a non-blocking listener can itself
+                // be non-blocking on some platforms; the client handlers all
+                // expect blocking I/O, so force it back.
+                if stop.is_some() {
+                    let _ = stream.set_nonblocking(false);
+                }
+                on_accept(stream, peer);
+            }
+            Err(ref e) if stop.is_some() && e.kind() == std::io::ErrorKind::WouldBlock => {
+                thread::sleep(ACCEPT_POLL);
+            }
+            Err(e) => {
+                log::error!("{name} accept failed: {e}");
+                return;
+            }
+        }
+    }
+}
 
 /// One-shot header sent to every CSV (R/W) client on connect. Matches
 /// the line the canboat C reader binaries (`actisense-serial`,
@@ -52,13 +107,14 @@ pub fn spawn_snapshot(
     port: u16,
     store: Arc<SnapshotStore>,
     header: Option<&'static [u8]>,
+    stop: Option<Arc<AtomicBool>>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding snapshot TCP port {}:{}", bind, port))?;
     log::info!("snapshot server listening on {}:{}", bind, port);
     Ok(thread::Builder::new()
         .name("snapshot-accept".into())
-        .spawn(move || snapshot_accept(listener, store, header))
+        .spawn(move || snapshot_accept(listener, store, header, stop))
         .expect("spawn snapshot accept"))
 }
 
@@ -66,22 +122,16 @@ fn snapshot_accept(
     listener: TcpListener,
     store: Arc<SnapshotStore>,
     header: Option<&'static [u8]>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("snapshot accept failed: {e}");
-                return;
-            }
-        };
+    accept_until("snapshot", listener, stop, |stream, peer| {
         log::info!("snapshot client connected: {peer}");
         let s = store.clone();
         thread::Builder::new()
             .name("snapshot-client".into())
             .spawn(move || run_snapshot_client(stream, s, header))
             .ok();
-    }
+    });
 }
 
 fn run_snapshot_client(
@@ -124,32 +174,30 @@ pub fn spawn_ais_snapshot(
     bind: Ipv4Addr,
     port: u16,
     store: Arc<SnapshotStore>,
+    stop: Option<Arc<AtomicBool>>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding ais TCP port {}:{}", bind, port))?;
     log::info!("ais server listening on {}:{}", bind, port);
     Ok(thread::Builder::new()
         .name("ais-accept".into())
-        .spawn(move || ais_snapshot_accept(listener, store))
+        .spawn(move || ais_snapshot_accept(listener, store, stop))
         .expect("spawn ais accept"))
 }
 
-fn ais_snapshot_accept(listener: TcpListener, store: Arc<SnapshotStore>) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("ais accept failed: {e}");
-                return;
-            }
-        };
+fn ais_snapshot_accept(
+    listener: TcpListener,
+    store: Arc<SnapshotStore>,
+    stop: Option<Arc<AtomicBool>>,
+) {
+    accept_until("ais", listener, stop, |stream, peer| {
         log::info!("ais client connected: {peer}");
         let s = store.clone();
         thread::Builder::new()
             .name("ais-client".into())
             .spawn(move || run_ais_snapshot_client(stream, s))
             .ok();
-    }
+    });
 }
 
 fn run_ais_snapshot_client(mut stream: TcpStream, store: Arc<SnapshotStore>) {
@@ -177,13 +225,14 @@ pub fn spawn_stream_server(
     port: u16,
     hub: Arc<Hub>,
     header: Option<&'static [u8]>,
+    stop: Option<Arc<AtomicBool>>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding {name} TCP port {}:{}", bind, port))?;
     log::info!("{name} server listening on {}:{} (RO)", bind, port);
     Ok(thread::Builder::new()
         .name(format!("{name}-accept"))
-        .spawn(move || stream_accept(name, listener, hub, header))
+        .spawn(move || stream_accept(name, listener, hub, header, stop))
         .expect("spawn stream accept"))
 }
 
@@ -192,22 +241,16 @@ fn stream_accept(
     listener: TcpListener,
     hub: Arc<Hub>,
     header: Option<&'static [u8]>,
+    stop: Option<Arc<AtomicBool>>,
 ) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("{name} accept failed: {e}");
-                return;
-            }
-        };
+    accept_until(name, listener, stop, |stream, peer| {
         log::info!("{name} client connected: {peer}");
         let h = hub.clone();
         thread::Builder::new()
             .name(format!("{name}-client"))
             .spawn(move || run_stream_client(name, stream, h, header))
             .ok();
-    }
+    });
 }
 
 fn run_stream_client(
@@ -256,4 +299,59 @@ fn run_stream_client(
     }
     // Closing the write side drops the fd and ends the client.
     drop(stream);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::net::TcpStream;
+    use std::sync::atomic::AtomicBool;
+
+    /// A shutdown-aware listener drops its socket when the stop flag trips,
+    /// so the port is immediately re-bindable — the core of Bridge shutdown
+    /// (no more leaked accept threads holding ports open).
+    #[test]
+    fn shutdown_aware_listener_releases_its_port() {
+        // Grab an OS-assigned free port, then let go of it.
+        let port = TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+            .unwrap()
+            .local_addr()
+            .unwrap()
+            .port();
+
+        let stop = Arc::new(AtomicBool::new(false));
+        let hub = Arc::new(Hub::new());
+        let join = spawn_stream_server(
+            "test",
+            Ipv4Addr::LOCALHOST,
+            port,
+            hub,
+            None,
+            Some(stop.clone()),
+        )
+        .expect("bind test stream server");
+
+        // The port accepts connections while serving.
+        let mut connected = false;
+        for _ in 0..100 {
+            if TcpStream::connect((Ipv4Addr::LOCALHOST, port)).is_ok() {
+                connected = true;
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        assert!(connected, "server should accept connections while running");
+
+        // Trip the flag; the accept loop must exit and drop the listener.
+        stop.store(true, Ordering::Relaxed);
+        join.join().expect("accept thread joins after shutdown");
+
+        // Port is free again — a fresh bind succeeds.
+        let rebind = TcpListener::bind(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port));
+        assert!(
+            rebind.is_ok(),
+            "port must be re-bindable after shutdown: {:?}",
+            rebind.err()
+        );
+    }
 }

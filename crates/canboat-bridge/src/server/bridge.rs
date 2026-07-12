@@ -77,6 +77,10 @@ pub struct Bridge {
     /// Optional in-process decoded tap (installed by [`Bridge::decoded`]).
     decoded_tx: Option<mpsc::Sender<Arc<DecodedPgn>>>,
 
+    /// Shutdown flag shared with every [`Bridge::serve`] accept loop. Set by
+    /// [`Bridge::shutdown`] (and `Drop`); each loop then drops its listener,
+    /// releasing the port so a later `Bridge` can re-bind it.
+    serve_stop: Arc<AtomicBool>,
     /// TCP accept threads spawned by [`Bridge::serve`], and the pipeline
     /// thread spawned by [`Bridge::spawn`].
     tcp_joins: Vec<thread::JoinHandle<()>>,
@@ -270,6 +274,7 @@ impl Bridge {
             overrides,
             inject,
             decoded_tx: None,
+            serve_stop: Arc::new(AtomicBool::new(false)),
             tcp_joins: Vec::new(),
             pipeline_join: None,
         })
@@ -338,20 +343,21 @@ impl Bridge {
     }
 
     /// Spawn the TCP serving layer — the 2597–2606 ports named in the
-    /// config (any port `0` is skipped). Idempotent per call: each call
-    /// spawns another listener set, so call it once. The listeners run
-    /// until process exit (a real shutdown handle lands with the
-    /// `ServeHandle` work). Safe to call before or after
-    /// [`Bridge::spawn`]; the CLI serves first so no early frames are
-    /// dropped for a client that connects at startup.
+    /// config (any port `0` is skipped). Call once. Each listener is wired
+    /// to the bridge's shutdown flag, so [`Bridge::shutdown`] (or dropping
+    /// the bridge) closes them all and frees the ports. Safe to call before
+    /// or after [`Bridge::spawn`]; the CLI serves first so no early frames
+    /// are dropped for a client that connects at startup.
     pub fn serve(&mut self) -> Result<()> {
         let config = &self.config;
+        let stop = || Some(self.serve_stop.clone());
         if let Some(store) = self.snapshot.as_ref() {
             self.tcp_joins.push(serving_tcp::spawn_snapshot(
                 config.bind,
                 config.snapshot_port,
                 store.core(),
                 Some(self.banner),
+                stop(),
             )?);
         }
         // Write-only input port (`SERVER_INPUT_STREAM`): clients write
@@ -365,6 +371,7 @@ impl Bridge {
                 config.bind,
                 config.input_port,
                 Some(inject),
+                stop(),
             )?);
         }
         // Raw output stream: every coalesced frame as a PLAIN line under a
@@ -376,6 +383,7 @@ impl Bridge {
                 config.raw_port,
                 self.raw_hub.clone(),
                 Some(serving_tcp::CANBOAT_FORMAT_FAST_HEADER),
+                stop(),
             )?);
         }
         if config.nmea0183_port != 0 {
@@ -387,6 +395,7 @@ impl Bridge {
                 config.nmea0183_port,
                 self.nmea_hub.clone(),
                 None,
+                stop(),
             )?);
         }
         if config.analyzer_port != 0 {
@@ -398,6 +407,7 @@ impl Bridge {
                 config.analyzer_port,
                 self.analyzer_hub.clone(),
                 Some(self.banner),
+                stop(),
             )?);
         }
         if config.ais_port != 0 {
@@ -406,6 +416,7 @@ impl Bridge {
                     config.bind,
                     config.ais_port,
                     store.core(),
+                    stop(),
                 )?);
             } else {
                 log::warn!(
@@ -421,6 +432,7 @@ impl Bridge {
                 config.bind,
                 config.analyzer_binary_port,
                 self.bin_hub.clone(),
+                stop(),
             )?);
         }
         // Dedicated bidirectional control port for the PGN 262657 filter
@@ -433,6 +445,7 @@ impl Bridge {
                 config.nmea0183_filter_port,
                 filter.clone(),
                 self.json_opts.clone(),
+                stop(),
             )?);
         }
         // Dedicated bidirectional control port for the PGN 262658 override
@@ -447,6 +460,7 @@ impl Bridge {
                 engine.clone(),
                 self.device_sender.clone(),
                 self.json_opts.clone(),
+                stop(),
             )?);
         }
         Ok(())
@@ -470,16 +484,15 @@ impl Bridge {
     }
 
     /// Drive the pipeline on the *current* thread until the frame source
-    /// closes, then stop the reconnect supervisor. This is the blocking
-    /// entry the CLI `canboat server` uses.
+    /// closes, then tear everything down (stop the reconnect supervisor and
+    /// close the served ports). This is the blocking entry the CLI `canboat
+    /// server` uses.
     pub fn run(mut self) -> Result<()> {
         let frames_rx = self.take_source()?;
         let hubs = self.build_hubs();
         let (db, pre_coalesced, json_opts, nmea) = self.pipeline_inputs();
         pipeline::run(db, frames_rx, hubs, pre_coalesced, json_opts, nmea);
-        if let Some(s) = self.supervisor.take() {
-            s.shutdown();
-        }
+        self.shutdown();
         Ok(())
     }
 
@@ -499,15 +512,31 @@ impl Bridge {
         Ok(())
     }
 
-    /// Block until a [`spawn`](Bridge::spawn)ed pipeline finishes (the
-    /// frame source closed), then stop the reconnect supervisor. No-op if
-    /// the pipeline was never spawned.
+    /// Block until a [`spawn`](Bridge::spawn)ed pipeline finishes (the frame
+    /// source closed), then tear everything down. No-op if the pipeline was
+    /// never spawned.
     pub fn wait(&mut self) {
         if let Some(join) = self.pipeline_join.take() {
             let _ = join.join();
         }
+        self.shutdown();
+    }
+
+    /// Stop the bus and release the served ports: signal the reconnect
+    /// supervisor to stop (which closes the frame source, draining a
+    /// [`spawn`](Bridge::spawn)ed pipeline), trip every [`serve`](Bridge::serve)
+    /// accept loop, and join the accept threads so their listeners are
+    /// dropped and the ports can be re-bound. Idempotent; also run on `Drop`.
+    /// Does not join a spawned pipeline thread — use [`wait`](Bridge::wait)
+    /// for that.
+    pub fn shutdown(&mut self) {
         if let Some(s) = self.supervisor.take() {
             s.shutdown();
+        }
+        self.serve_stop
+            .store(true, std::sync::atomic::Ordering::Relaxed);
+        for join in self.tcp_joins.drain(..) {
+            let _ = join.join();
         }
     }
 
@@ -538,5 +567,15 @@ impl Bridge {
                 filter: self.nmea_filter.clone(),
             },
         )
+    }
+}
+
+impl Drop for Bridge {
+    /// A dropped `Bridge` releases its served ports: [`Bridge::shutdown`] is
+    /// idempotent, so this is a safety net for the case where the caller
+    /// dropped the bridge without an explicit shutdown (e.g. a test binding
+    /// a second `Bridge` on the same ports).
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }

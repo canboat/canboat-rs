@@ -43,15 +43,15 @@ impl ProductInfo<'_> {
         use field::product_information as pi;
         let db = PgnDatabase::embedded(Units::Si);
         let build = || -> Result<RawFrame, canboat_core::encode::EncodeError> {
-            let mut b = db.message("productInformation")?.source(src);
-            b.set(pi::NMEA2000_VERSION, self.db_version)?;
-            b.set(pi::PRODUCT_CODE, self.product_code)?;
-            b.set(pi::MODEL_ID, self.model_id)?;
-            b.set(pi::SOFTWARE_VERSION_CODE, self.software_version)?;
-            b.set(pi::MODEL_VERSION, self.model_version)?;
-            b.set(pi::MODEL_SERIAL_CODE, self.model_serial)?;
-            b.set(pi::CERTIFICATION_LEVEL, self.certification_level)?;
-            b.set(pi::LOAD_EQUIVALENCY, self.load_equivalency)?;
+            let mut b = db.encode("productInformation")?.source(src);
+            b.push(pi::NMEA2000_VERSION, self.db_version)?;
+            b.push(pi::PRODUCT_CODE, self.product_code)?;
+            b.push(pi::MODEL_ID, self.model_id)?;
+            b.push(pi::SOFTWARE_VERSION_CODE, self.software_version)?;
+            b.push(pi::MODEL_VERSION, self.model_version)?;
+            b.push(pi::MODEL_SERIAL_CODE, self.model_serial)?;
+            b.push(pi::CERTIFICATION_LEVEL, self.certification_level)?;
+            b.push(pi::LOAD_EQUIVALENCY, self.load_equivalency)?;
             b.build()
         };
         match build() {
@@ -130,12 +130,12 @@ mod tests {
         assert_eq!(f.data.len(), 134);
         let d = PgnDatabase::embedded(Units::Si).decode(&f).unwrap();
         assert_eq!(
-            d.field_ref(field::product_information::PRODUCT_CODE)
+            d.field(field::product_information::PRODUCT_CODE)
                 .and_then(|x| x.value.as_i64()),
             Some(21488)
         );
         assert_eq!(
-            d.field_ref(field::product_information::MODEL_ID)
+            d.field(field::product_information::MODEL_ID)
                 .and_then(|x| x.value.as_str()),
             Some("H5000 Motion Sensor")
         );

@@ -375,60 +375,34 @@ pub struct DecodedPgn {
 }
 
 impl DecodedPgn {
-    /// Look up a non-repeating field by its pre-resolved
-    /// [`crate::FieldHandle`]. Returns `None` when the field wasn't
-    /// decoded in this payload (truncated, NotAvailable filtered by
-    /// the decoder, etc.).
+    /// Look up a non-repeating field by [`crate::FieldRef`] — a generated
+    /// constant (`canboat_core::field::wind_data::WIND_ANGLE`) or one
+    /// resolved at runtime via [`crate::PgnDatabase::field`]. Returns
+    /// `None` when the field wasn't decoded in this payload (truncated,
+    /// NotAvailable filtered by the decoder, etc.).
     ///
-    /// `O(1)`: one array load + bounds check.
+    /// `O(1)`: index by the field's schema `order`, one array load plus a
+    /// bounds check. The `FieldRef` carries its own PGN, so a debug-only
+    /// assert catches a constant used against the wrong record; it's a
+    /// `&str` compare, free in release builds — no hashing on this path.
     #[inline]
-    pub fn field(&self, h: &crate::FieldHandle) -> Option<&DecodedField> {
-        // Debug-only: catch handles that were minted against a
-        // different PGN id than the record was decoded under. Free
-        // in release builds.
-        debug_assert!(
-            h.pgn_id_hash == crate::db::djb2_hash_str(self.id),
-            "FieldHandle/PGN mismatch: handle was minted for a different PGN id ({} != {})",
-            h.pgn_id_hash,
-            crate::db::djb2_hash_str(self.id),
+    pub fn field(&self, f: crate::FieldRef) -> Option<&DecodedField> {
+        debug_assert_eq!(
+            f.pgn.id, self.id,
+            "FieldRef/PGN mismatch: a `{}` field ref was used on a `{}` record",
+            f.pgn.id, self.id,
         );
-        self.field_unchecked(h)
-    }
-
-    /// Same as [`Self::field`] but skips the debug assert — useful
-    /// for callers that intentionally use a single handle across
-    /// multiple PGN ids (rare).
-    #[inline]
-    pub fn field_unchecked(&self, h: &crate::FieldHandle) -> Option<&DecodedField> {
-        let idx_slot = (h.field_order as usize).checked_sub(1)?;
-        if idx_slot >= self.index_by_order.len() {
-            return None;
-        }
-        let idx = self.index_by_order[idx_slot];
+        let idx_slot = (f.field.order as usize).checked_sub(1)?;
+        let idx = *self.index_by_order.get(idx_slot)?;
         if idx < 0 {
             return None;
         }
         self.fields.get(idx as usize)
     }
 
-    /// Look up a non-repeating field by its generated [`crate::FieldRef`]
-    /// constant (`canboat_core::field::wind_data::WIND_ANGLE`). `O(1)` by
-    /// schema order — the compile-checked, handle-free counterpart to
-    /// [`Self::field_by_name`]: no string scan, no pre-resolved handle to
-    /// wire up. Debug-asserts (via [`Self::field`]) that the ref's PGN
-    /// matches this record, so passing a constant from the wrong PGN is
-    /// caught in debug builds.
-    #[inline]
-    pub fn field_ref(&self, f: crate::FieldRef) -> Option<&DecodedField> {
-        self.field(&crate::FieldHandle {
-            field_order: f.field.order,
-            pgn_id_hash: crate::db::djb2_hash_str(f.pgn.id),
-        })
-    }
-
     /// Look up a top-level field by name. `O(n)` linear scan over
     /// the decoded fields — fine for callers that don't have a
-    /// pre-resolved [`crate::FieldHandle`] (e.g. AIS encoders that
+    /// [`crate::FieldRef`] constant (e.g. AIS encoders that
     /// would otherwise need dozens of handles), since records
     /// typically have well under 20 fields. Faster than the
     /// JSON-substring-search alternative by a wide margin.

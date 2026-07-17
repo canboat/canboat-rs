@@ -221,6 +221,11 @@ pub struct Hubs {
     /// overrides on first sight (PGN 60928) and forgets one the bus NAKs
     /// (PGN 126208 Acknowledge). `None` when the config dir is unwritable.
     pub overrides: Option<Arc<Mutex<crate::n2kd::overrides::OverrideEngine>>>,
+    /// Optional in-process tap. When `Some`, every decoded record is
+    /// forwarded here (an `Arc` refcount bump, no deep clone) for an
+    /// embedding consumer — this is what backs [`crate::server::Bridge::decoded`].
+    /// `None`, the CLI default, costs one `Option::is_some` per record.
+    pub decoded_tx: Option<std::sync::mpsc::Sender<Arc<canboat_core::DecodedPgn>>>,
 }
 
 /// NMEA 0183 output options for [`run`], bundled to keep the entry
@@ -297,7 +302,7 @@ pub fn run(
     let mut raw_line = String::with_capacity(256);
     let mut json_line = String::with_capacity(1024);
     let mut rl = crate::n2kd::nmea0183::RateLimiter::new(nmea0183_rate_limit);
-    let handles = crate::n2kd::decoded::Handles::new(db);
+    let handles = crate::n2kd::decoded::Handles::new();
 
     // Quirk synthesisers can produce extra `RawFrame`s in response to
     // an inbound bus frame. We re-feed them through this same loop so
@@ -415,6 +420,15 @@ pub fn run(
         // then hold a refcount bump instead of a deep clone.
         let decoded = Arc::new(decoded);
 
+        // In-process tap for an embedding consumer (`Bridge::decoded`).
+        // A closed or lagging receiver must never stall the bus loop, so
+        // the send is best-effort. Placed before quirk synthesis so a
+        // synthetic frame is tapped once, when it loops back through here
+        // as a normal decode — every record is seen exactly once.
+        if let Some(tx) = hubs.decoded_tx.as_ref() {
+            let _ = tx.send(Arc::clone(&decoded));
+        }
+
         // Quirk shim: inspect the decoded PGN, maybe synthesise. Working
         // from the decoded record (rather than a raw pre-reassembly frame)
         // lets quirks read typed, named fields and act on fast-packet PGNs
@@ -483,7 +497,7 @@ pub fn run(
                 }
             } else if decoded.pgn == 126208 {
                 use canboat_core::field::nmea_acknowledge_group_function as ack;
-                let field_int = |f| decoded.field_ref(f).and_then(|d| d.value.as_i64());
+                let field_int = |f| decoded.field(f).and_then(|d| d.value.as_i64());
                 if field_int(ack::FUNCTION_CODE) == Some(2) {
                     let pgn_err = field_int(ack::PGN_ERROR_CODE).unwrap_or(0);
                     let iv_err =
@@ -587,4 +601,75 @@ pub fn run(
     analyzer_batch.flush();
     bin_batch.flush();
     out.flush().ok();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::mpsc;
+
+    /// Build a `Hubs` with all broadcast hubs idle and the given decoded
+    /// tap — the minimal shape for driving the pipeline in a test.
+    fn tapped_hubs(decoded_tx: mpsc::Sender<Arc<canboat_core::DecodedPgn>>) -> Hubs {
+        Hubs {
+            raw: Arc::new(Hub::new()),
+            nmea: Arc::new(Hub::new()),
+            analyzer: Arc::new(Hub::new()),
+            bin: Arc::new(BinHub::new()),
+            snapshot: None,
+            engine: Arc::new(RequestEngine::new()),
+            quirks: crate::server::quirks::Quirks::new(Vec::new()),
+            device_sender: None,
+            claim_addr: None,
+            overrides: None,
+            decoded_tx: Some(decoded_tx),
+        }
+    }
+
+    /// The `decoded_tx` tap (backing `Bridge::decoded`) forwards every
+    /// decoded record exactly once, and stays silent — costing nothing —
+    /// when it is `None`.
+    #[test]
+    fn decoded_tap_forwards_each_record() {
+        let db = canboat_core::PgnDatabase::embedded(canboat_core::Units::Metric);
+        let (frames_tx, frames_rx) = mpsc::channel();
+        let (tap_tx, tap_rx) = mpsc::channel();
+
+        // One 8-byte ISO Address Claim (PGN 60928, single-frame) — decodes
+        // without reassembly, so drive the loop in pre-coalesced mode.
+        let claim =
+            canboat_core::RawFrame::new(None, 6, 60928, 0x21, 0xFF, [1, 2, 3, 4, 5, 6, 7, 8]);
+        frames_tx.send(claim).unwrap();
+        drop(frames_tx); // close the source so `run` returns
+
+        let pre_coalesced = Arc::new(AtomicBool::new(true));
+        let handle = std::thread::spawn(move || {
+            run(
+                db,
+                frames_rx,
+                tapped_hubs(tap_tx),
+                pre_coalesced,
+                JsonOptions {
+                    include_empty: false,
+                    name_value: true,
+                    debug: false,
+                    camel_case: canboat_core::output::CamelCase::Off,
+                },
+                Nmea0183Options {
+                    emit_stdout: false,
+                    rate_limit: true,
+                    filter: None,
+                },
+            )
+        });
+
+        let decoded = tap_rx
+            .recv()
+            .expect("the tap should receive the decoded record");
+        assert_eq!(decoded.pgn, 60928);
+        assert_eq!(decoded.src, 0x21);
+        // Exactly one record, then end-of-stream when the pipeline drains.
+        assert!(tap_rx.recv().is_err(), "tap should see only the one record");
+        handle.join().unwrap();
+    }
 }

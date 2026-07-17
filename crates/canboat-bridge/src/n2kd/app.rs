@@ -183,11 +183,14 @@ pub fn run(args: Args) -> Result<()> {
         // format header on the JSON or 0183 streams. The status and
         // raw-input ports stay n2kd-local: no `serving` equivalent for
         // status, and raw-input carries the filter control channel.
+        // The daemon runs until process exit, so its listeners pass
+        // `stop = None`: block on accept forever, no shutdown handle.
         serving_tcp::spawn_stream_server(
             "json-stream",
             bind_addr,
             cli.port + 1,
             Arc::clone(&hub.json_hub),
+            None,
             None,
         )?;
         serving_tcp::spawn_stream_server(
@@ -196,10 +199,11 @@ pub fn run(args: Args) -> Result<()> {
             cli.port + 2,
             Arc::clone(&hub.nmea_hub),
             None,
+            None,
         )?;
         spawn_raw_input_listener(bind_addr, cli.port + 3, cli.output_copy && !cli.restrict)?;
-        serving_tcp::spawn_ais_snapshot(bind_addr, cli.port + 4, Arc::clone(&hub.cache))?;
-        serving_tcp::spawn_snapshot(bind_addr, cli.port, Arc::clone(&hub.cache), None)?;
+        serving_tcp::spawn_ais_snapshot(bind_addr, cli.port + 4, Arc::clone(&hub.cache), None)?;
+        serving_tcp::spawn_snapshot(bind_addr, cli.port, Arc::clone(&hub.cache), None, None)?;
         spawn_status_listener(bind_addr, cli.port + 5, Arc::clone(&hub))?;
     }
     // Default-on like canboat C; `-r` / `--restrict` and the explicit

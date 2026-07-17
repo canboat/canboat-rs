@@ -15,6 +15,7 @@ pub mod analyze;
 pub mod container;
 pub mod device;
 pub mod fastpacket;
+pub mod name;
 pub mod nmea_responder;
 pub mod stream;
 

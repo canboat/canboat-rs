@@ -74,10 +74,8 @@ fn units_from_code(c: u8) -> canboat_core::Units {
 pub const MAX_FRAME_LEN: usize = 1 << 20;
 
 /// djb2 hash of a schema `Id` string — the on-wire identity of a PGN
-/// variant. Matches the hash [`canboat_core::FieldHandle`] already uses
-/// for the same purpose, so the notion of "which PGN" is consistent
-/// across the codebase. Both peers hash their own schema's ids with
-/// this function, so the value only has to be *stable*, not canonical.
+/// variant. Both peers hash their own schema's ids with this function,
+/// so the value only has to be *stable*, not canonical.
 #[inline]
 pub fn pgn_id_hash(id: &str) -> u64 {
     let mut h: u64 = 5381;

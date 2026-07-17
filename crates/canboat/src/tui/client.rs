@@ -117,12 +117,12 @@ fn line_pgn(line: &str) -> Option<u32> {
 /// (262657). A line we can't parse falls through to the bus path — the
 /// safe default, since the input port simply ignores a non-frame.
 fn line_is_filter_control(line: &str) -> bool {
-    line_pgn(line) == Some(crate::n2kd::nmea_filter::PGN_NMEA0183_FILTER)
+    line_pgn(line) == Some(canboat_bridge::n2kd::nmea_filter::PGN_NMEA0183_FILTER)
 }
 
 /// `true` when a PLAIN line targets the override control PGN (262658).
 fn line_is_overrides_control(line: &str) -> bool {
-    line_pgn(line) == Some(crate::n2kd::overrides::PGN_PGN_OVERRIDE)
+    line_pgn(line) == Some(canboat_bridge::n2kd::overrides::PGN_PGN_OVERRIDE)
 }
 
 /// Build the writer channels and return the shared [`Writer`] plus the
@@ -754,7 +754,7 @@ async fn overrides_writer_task(
     mut rx: mpsc::UnboundedReceiver<String>,
     state: Arc<Mutex<AppState>>,
 ) {
-    let mut poll = tokio::time::interval(crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL);
+    let mut poll = tokio::time::interval(canboat_bridge::n2kd::nmea_filter::FILTER_REPORT_INTERVAL);
     poll.tick().await;
     loop {
         let mut line = tokio::select! {
@@ -776,7 +776,7 @@ async fn overrides_writer_task(
 }
 
 /// Writer half of the filter control connection: drains `Set` lines from
-/// the UI and, on every [`crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL`]
+/// the UI and, on every [`canboat_bridge::n2kd::nmea_filter::FILTER_REPORT_INTERVAL`]
 /// tick, sends a `Request` so the server re-reports — catching sources /
 /// sentences observed since its last answer. The server also reports
 /// unprompted on connect and after each `Set`, so the poll only exists
@@ -786,7 +786,7 @@ async fn filter_writer_task(
     mut rx: mpsc::UnboundedReceiver<String>,
     state: Arc<Mutex<AppState>>,
 ) {
-    let mut poll = tokio::time::interval(crate::n2kd::nmea_filter::FILTER_REPORT_INTERVAL);
+    let mut poll = tokio::time::interval(canboat_bridge::n2kd::nmea_filter::FILTER_REPORT_INTERVAL);
     // The first tick is immediate and redundant with the server's
     // connect-time report — consume it so the first real poll is one
     // full interval out.

@@ -3,13 +3,15 @@
 //! Encode a PGN from field values into a wire [`RawFrame`] — the
 //! inverse of [`crate::decode`].
 //!
-//! The entry point is [`PgnDatabase::message`] /
-//! [`PgnDatabase::message_by_pgn`] (by id / by number), or
-//! [`PgnDatabase::message_for`] with a generated `pgn::…` constant, which
-//! hand back a [`MessageBuilder`] for a specific schema PGN variant. Set
-//! field values by name/id ([`push`](MessageBuilder::push)) or by a
-//! compile-checked `field::…` constant ([`set`](MessageBuilder::set)),
-//! then [`build`](MessageBuilder::build) packs them at their schema bit
+//! The entry point is [`PgnDatabase::encode`] /
+//! [`PgnDatabase::encode_by_pgn`] (by id / by number), or
+//! [`PgnDatabase::encode_for`] with a generated `pgn::…` constant, which
+//! hand back a [`PgnBuilder`] for a specific schema PGN variant. Set
+//! field values by a compile-checked `field::…` constant
+//! ([`push`](PgnBuilder::push) — the O(1) default) or by schema name
+//! ([`push_by_name`](PgnBuilder::push_by_name)), mirroring the decode
+//! side's [`DecodedPgn::field`] / [`DecodedPgn::field_by_name`];
+//! then [`build`](PgnBuilder::build) packs them at their schema bit
 //! offsets — LSB-first, exactly the layout [`crate::bits::extract_bits`]
 //! reads back — and returns a [`RawFrame`]. Because the result is a
 //! `RawFrame`, any [`crate::format`] writer (PLAIN, YDWG02, Actisense,
@@ -24,11 +26,15 @@
 //!
 //! Scope: every self-contained field type encodes — the numeric,
 //! enum/lookup, PGN/MMSI, `FLOAT`, `ISO_NAME`, `BINARY` and all four
-//! string families (`STRING_FIX`/`LZ`/`LAU`). The only fields left are
-//! the PGN 126208 group-function *dynamic* types (`VARIABLE`,
-//! `DYNAMIC_FIELD_KEY`/`LENGTH`/`VALUE`), whose width/shape is set by
-//! sibling fields at decode time and so can't be defaulted in isolation;
-//! an unset one returns [`EncodeError::NotFixedLength`].
+//! string families (`STRING_FIX`/`LZ`/`LAU`). The key/value family
+//! ([`DynamicFieldKey`](FieldType::DynamicFieldKey) /
+//! [`DynamicFieldValue`](FieldType::DynamicFieldValue), e.g. PGN 130845
+//! `simnetKeyValue`) encodes when set explicitly: the KEY is a
+//! fixed-width scalar (set it as an `Int`), and the VALUE takes its bytes
+//! verbatim (set it as `Bytes` — the caller owns matching the width the
+//! resolved key expects). Left unset, the VALUE and the PGN 126208
+//! group-function types (`VARIABLE`, `DYNAMIC_FIELD_LENGTH`) can't be
+//! defaulted in isolation and return [`EncodeError::NotFixedLength`].
 
 use std::error::Error;
 use std::fmt;
@@ -119,7 +125,7 @@ pub enum EncodeError {
     /// No PGN with this number in the schema.
     NoSuchPgn(u32),
     /// This PGN number has several schema variants; use
-    /// [`PgnDatabase::message`] with the specific id.
+    /// [`PgnDatabase::encode`] with the specific id.
     AmbiguousPgn { pgn: u32, variants: usize },
     /// No field with this name/id in the PGN.
     NoSuchField { pgn_id: &'static str, field: String },
@@ -178,8 +184,8 @@ impl fmt::Display for EncodeError {
 impl Error for EncodeError {}
 
 /// Fluent builder for one PGN message. Created via
-/// [`PgnDatabase::message`] / [`PgnDatabase::message_by_pgn`].
-pub struct MessageBuilder {
+/// [`PgnDatabase::encode`] / [`PgnDatabase::encode_by_pgn`].
+pub struct PgnBuilder {
     db: &'static PgnDatabase,
     pgn: &'static PgnInfo,
     prio: u8,
@@ -201,9 +207,9 @@ enum Staged {
     Bytes(Vec<u8>),
 }
 
-impl MessageBuilder {
+impl PgnBuilder {
     /// Construct for a resolved PGN variant. Crate-internal; callers go
-    /// through [`PgnDatabase::message`].
+    /// through [`PgnDatabase::encode`].
     pub(crate) fn for_pgn(db: &'static PgnDatabase, pgn: &'static PgnInfo) -> Self {
         Self {
             db,
@@ -238,35 +244,62 @@ impl MessageBuilder {
         self
     }
 
-    /// Set a field by schema name (`"Wind Speed"`) or id (`"windSpeed"`).
+    /// Set a field by its generated [`FieldRef`] constant
+    /// (`canboat_core::field::wind_data::WIND_ANGLE`) — the compile-checked,
+    /// `O(1)` path, and the recommended default. The exact mirror of the
+    /// decode side's [`DecodedPgn::field`](crate::DecodedPgn::field): index
+    /// by the field's schema `order` (one array load), with a debug-only
+    /// assert that the constant belongs to this builder's PGN — a `&str`
+    /// compare, free in release builds, no scan and no hashing.
+    ///
+    /// The value scales in the builder's unit system: the constant points at
+    /// the SI schema, but a field's `order` is identical across unit schemas,
+    /// so the builder's own [`FieldInfo`] (in its units) does the staging.
     pub fn push(
         &mut self,
-        field: &str,
+        field: FieldRef,
         value: impl Into<EncodeValue>,
     ) -> Result<&mut Self, EncodeError> {
-        let idx = self.find_field(field)?;
+        debug_assert_eq!(
+            field.pgn.id, self.pgn.id,
+            "FieldRef/PGN mismatch: a `{}` field ref was used on a `{}` builder",
+            field.pgn.id, self.pgn.id,
+        );
+        let idx = (field.field.order as usize)
+            .checked_sub(1)
+            .filter(|&i| i < self.pgn.fields.len())
+            .ok_or(EncodeError::NoSuchField {
+                pgn_id: self.pgn.id,
+                field: field.field.id.to_string(),
+            })?;
         let staged = self.stage_value(&self.pgn.fields[idx], value.into())?;
         self.staged[idx] = Some(staged);
         Ok(self)
     }
 
-    /// Set a field by its generated [`FieldRef`] constant
-    /// (`canboat_core::field::wind_data::WIND_ANGLE`) — the compile-checked
-    /// counterpart to [`Self::push`]. Resolves by the field's `id` against
-    /// this builder's PGN, so the value scales in the builder's unit system
-    /// (the constant itself points at the SI schema).
-    pub fn set(
+    /// Set a field by schema **name** (`"Wind Speed"`) — an `O(n)` scan, for
+    /// callers without a [`FieldRef`] constant (runtime-chosen or
+    /// config-driven fields). The mirror of
+    /// [`DecodedPgn::field_by_name`](crate::DecodedPgn::field_by_name).
+    /// Prefer [`push`](Self::push) with a generated constant wherever the
+    /// field is known at compile time: it is O(1) and a typo fails the build
+    /// instead of returning [`EncodeError::NoSuchField`] at runtime.
+    pub fn push_by_name(
         &mut self,
-        field: FieldRef,
+        field: &str,
         value: impl Into<EncodeValue>,
     ) -> Result<&mut Self, EncodeError> {
-        self.push(field.field.id, value)
+        let idx = self.find_by_name(field)?;
+        let staged = self.stage_value(&self.pgn.fields[idx], value.into())?;
+        self.staged[idx] = Some(staged);
+        Ok(self)
     }
 
     /// Set a field from a textual value, coercing per the field's type
-    /// (numbers, `0x`-hex, lookup labels). For CLI `FIELD=VALUE` args.
+    /// (numbers, `0x`-hex, lookup labels). For CLI `FIELD=VALUE` args, where
+    /// `FIELD` may be the schema name (`"Wind Speed"`) or id (`"windSpeed"`).
     pub fn push_arg(&mut self, field: &str, value: &str) -> Result<&mut Self, EncodeError> {
-        let idx = self.find_field(field)?;
+        let idx = self.find_by_name_or_id(field)?;
         let f = &self.pgn.fields[idx];
         let ev = coerce_arg(f, value)?;
         let staged = self.stage_value(f, ev)?;
@@ -329,7 +362,20 @@ impl MessageBuilder {
         self.pgn
     }
 
-    fn find_field(&self, key: &str) -> Result<usize, EncodeError> {
+    /// Field index by schema name only (for [`push_by_name`](Self::push_by_name)).
+    fn find_by_name(&self, name: &str) -> Result<usize, EncodeError> {
+        self.pgn
+            .fields
+            .iter()
+            .position(|f| f.name == name)
+            .ok_or_else(|| EncodeError::NoSuchField {
+                pgn_id: self.pgn.id,
+                field: name.to_string(),
+            })
+    }
+
+    /// Field index by schema name or id (for CLI [`push_arg`](Self::push_arg)).
+    fn find_by_name_or_id(&self, key: &str) -> Result<usize, EncodeError> {
         self.pgn
             .fields
             .iter()
@@ -349,6 +395,14 @@ impl MessageBuilder {
             Some(FieldType::StringLz) => stage_string_lz(f, v),
             Some(FieldType::StringLau) => stage_string_lau(f, v),
             Some(FieldType::Binary) => stage_binary(f, v),
+            // DYNAMIC_FIELD_VALUE (the value slot of a key/value PGN like
+            // 130845) has no schema `BitLength` — its width is set by the
+            // sibling KEY at decode time, so it can't be defaulted, but the
+            // caller *can* supply the already-encoded value bytes. Written
+            // verbatim (variable length); the caller owns matching the
+            // width the resolved key expects. The sibling KEY field is a
+            // fixed-width scalar, so it takes the normal `Int` path below.
+            Some(FieldType::DynamicFieldValue) => stage_dynamic_value(f, v),
             _ => Ok(Staged::Scalar(self.value_to_raw(f, v)?)),
         }
     }
@@ -562,6 +616,22 @@ fn stage_binary(f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
     Ok(Staged::Bytes(bytes))
 }
 
+/// Stage a `DYNAMIC_FIELD_VALUE` field: the caller-supplied value bytes,
+/// written verbatim. Unlike `BINARY` this field carries no declared
+/// `BitLength` (its width comes from the resolved sibling KEY), so there
+/// is nothing to pad to — the bytes are the value. Only `Bytes` (or an
+/// explicit `NotAvailable` → empty) is meaningful here.
+fn stage_dynamic_value(f: &FieldInfo, v: EncodeValue) -> Result<Staged, EncodeError> {
+    match v {
+        EncodeValue::Bytes(b) => Ok(Staged::Bytes(b)),
+        EncodeValue::NotAvailable => Ok(Staged::Bytes(Vec::new())),
+        _ => Err(EncodeError::TypeMismatch {
+            field: f.name,
+            expected: "value bytes for a dynamic (key/value) field",
+        }),
+    }
+}
+
 fn default_raw(f: &FieldInfo) -> u64 {
     let bl = f.bit_length.unwrap_or(0);
     // A variant-selector field: emit the value that identifies this PGN.
@@ -703,10 +773,10 @@ mod tests {
         // The canboat `format-message` example: request Product Info
         // (126996 = 0x1F014) → PGN 59904, data 14 f0 01.
         let frame = db()
-            .message_for(crate::pgn::ISO_REQUEST)
+            .encode_for(crate::pgn::ISO_REQUEST)
             .priority(6)
             .destination(255)
-            .set(crate::field::iso_request::PGN, 126996u32)
+            .push(crate::field::iso_request::PGN, 126996u32)
             .unwrap()
             .build()
             .unwrap();
@@ -719,9 +789,9 @@ mod tests {
     #[test]
     fn ambiguous_pgn_number_is_rejected() {
         // 59904 is unique; 126208 (group function) has several variants.
-        assert!(db().message_by_pgn(59904).is_ok());
+        assert!(db().encode_by_pgn(59904).is_ok());
         assert!(matches!(
-            db().message_by_pgn(126208),
+            db().encode_by_pgn(126208),
             Err(EncodeError::AmbiguousPgn { pgn: 126208, .. })
         ));
     }
@@ -731,7 +801,7 @@ mod tests {
         // Encoding with no fields set still produces a schema-length
         // frame (defaults fill in), and match_value selector fields are
         // auto-populated so the variant stays valid.
-        let frame = db().message_for(crate::pgn::ISO_REQUEST).build();
+        let frame = db().encode_for(crate::pgn::ISO_REQUEST).build();
         // isoRequest has a single PGN field with no match_value; unset →
         // not-available (all ones), 3 bytes.
         let f = frame.unwrap();
@@ -748,16 +818,16 @@ mod tests {
         use crate::field::wind_data as wd;
         let db = db();
         let frame = db
-            .message_for(crate::pgn::WIND_DATA)
-            .set(wd::SID, 7)
+            .encode_for(crate::pgn::WIND_DATA)
+            .push(wd::SID, 7)
             .unwrap()
-            .set(wd::WIND_SPEED, 5.23)
+            .push(wd::WIND_SPEED, 5.23)
             .unwrap()
-            .set(wd::WIND_ANGLE, 1.5)
+            .push(wd::WIND_ANGLE, 1.5)
             .unwrap()
             // The lookup *label* stays a string — value-name constants are
             // out of scope for now.
-            .set(wd::REFERENCE, EncodeValue::Lookup("Apparent".into()))
+            .push(wd::REFERENCE, EncodeValue::Lookup("Apparent".into()))
             .unwrap()
             .build()
             .unwrap();
@@ -789,9 +859,9 @@ mod tests {
     #[test]
     fn unknown_lookup_label_is_rejected() {
         assert!(matches!(
-            db().message("windData")
+            db().encode("windData")
                 .unwrap()
-                .push("Reference", EncodeValue::Lookup("Nonsense".into())),
+                .push_by_name("Reference", EncodeValue::Lookup("Nonsense".into())),
             Err(EncodeError::UnknownLookupLabel { .. })
         ));
     }
@@ -799,11 +869,11 @@ mod tests {
     #[test]
     fn no_such_field_and_pgn() {
         assert!(matches!(
-            db().message("isoRequest").unwrap().push("Nope", 1),
+            db().encode("isoRequest").unwrap().push_by_name("Nope", 1),
             Err(EncodeError::NoSuchField { .. })
         ));
         assert!(matches!(
-            db().message("notAPgnId"),
+            db().encode("notAPgnId"),
             Err(EncodeError::NoSuchPgnId(_))
         ));
     }
@@ -812,15 +882,15 @@ mod tests {
     fn string_fix_round_trips() {
         use crate::field::product_information::MODEL_ID;
         let frame = db()
-            .message("productInformation")
+            .encode("productInformation")
             .unwrap()
-            .set(MODEL_ID, "SCX-20")
+            .push(MODEL_ID, "SCX-20")
             .unwrap()
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
         assert_eq!(
-            d.field_ref(MODEL_ID).and_then(|f| f.value.as_str()),
+            d.field(MODEL_ID).and_then(|f| f.value.as_str()),
             Some("SCX-20")
         );
     }
@@ -829,15 +899,15 @@ mod tests {
     fn string_lau_round_trips() {
         use crate::field::configuration_information::INSTALLATION_DESCRIPTION1 as DESC1;
         let frame = db()
-            .message("configurationInformation")
+            .encode("configurationInformation")
             .unwrap()
-            .set(DESC1, "Helm Station")
+            .push(DESC1, "Helm Station")
             .unwrap()
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
         assert_eq!(
-            d.field_ref(DESC1).and_then(|f| f.value.as_str()),
+            d.field(DESC1).and_then(|f| f.value.as_str()),
             Some("Helm Station")
         );
     }
@@ -846,15 +916,15 @@ mod tests {
     fn string_lz_round_trips() {
         use crate::field::navico_ascii_identifier::IDENTIFIER;
         let frame = db()
-            .message("navicoAsciiIdentifier")
+            .encode("navicoAsciiIdentifier")
             .unwrap()
-            .set(IDENTIFIER, "BOW")
+            .push(IDENTIFIER, "BOW")
             .unwrap()
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
         assert_eq!(
-            d.field_ref(IDENTIFIER).and_then(|f| f.value.as_str()),
+            d.field(IDENTIFIER).and_then(|f| f.value.as_str()),
             Some("BOW")
         );
     }
@@ -866,14 +936,14 @@ mod tests {
         use crate::field::iso_transport_protocol_data_transfer::DATA;
         let payload = vec![0xde_u8, 0xad, 0xbe, 0xef, 0x01, 0x02, 0x03];
         let frame = db()
-            .message("isoTransportProtocolDataTransfer")
+            .encode("isoTransportProtocolDataTransfer")
             .unwrap()
-            .set(DATA, payload.clone())
+            .push(DATA, payload.clone())
             .unwrap()
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
-        match d.field_ref(DATA).map(|f| &f.value) {
+        match d.field(DATA).map(|f| &f.value) {
             Some(crate::FieldValue::Binary(v)) => assert_eq!(v, &payload),
             other => panic!("expected binary, got {other:?}"),
         }
@@ -885,14 +955,14 @@ mod tests {
         // so it survives a round-trip within f32 precision.
         use crate::field::garmin_autopilot_heading_to_steer::HEADING_TO_STEER as HTS;
         let frame = db()
-            .message("garminAutopilotHeadingToSteer")
+            .encode("garminAutopilotHeadingToSteer")
             .unwrap()
-            .set(HTS, 1.5)
+            .push(HTS, 1.5)
             .unwrap()
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
-        let got = d.field_ref(HTS).and_then(|f| f.value.as_f64()).unwrap();
+        let got = d.field(HTS).and_then(|f| f.value.as_f64()).unwrap();
         assert!((got - 1.5).abs() < 1e-6, "got {got}");
     }
 
@@ -903,17 +973,65 @@ mod tests {
         use crate::field::simnet_data_source_selection::SOURCE;
         let name: u64 = 0xC078_8C00_E7E0_4364;
         let frame = db()
-            .message("simnetDataSourceSelection")
+            .encode("simnetDataSourceSelection")
             .unwrap()
-            .set(SOURCE, name)
+            .push(SOURCE, name)
             .unwrap()
             .build()
             .unwrap();
         let d = db().decode(&frame).unwrap();
-        match d.field_ref(SOURCE).map(|f| &f.value) {
+        match d.field(SOURCE).map(|f| &f.value) {
             Some(crate::FieldValue::IsoName { value, .. }) => assert_eq!(*value, name),
             other => panic!("expected iso name, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn simnet_key_value_encodes_key_and_value() {
+        // PGN 130845 simnetKeyValue is a key/value PGN: the KEY is a
+        // fixed 24-bit DYNAMIC_FIELD_KEY (set as a raw Int) and the VALUE
+        // is a DYNAMIC_FIELD_VALUE whose bytes are written verbatim. This
+        // is the frame merrimac sends to set Simrad display night mode
+        // (key 9983, value 0x04).
+        let frame = db()
+            .encode("simnetKeyValue")
+            .unwrap()
+            .destination(255)
+            .push_by_name("Address", EncodeValue::Int(255))
+            .unwrap()
+            .push_by_name("Instance", EncodeValue::Int(255))
+            .unwrap()
+            .push_by_name("Network Group", EncodeValue::Int(1))
+            .unwrap()
+            .push_by_name("Source", EncodeValue::Int(255))
+            .unwrap()
+            .push_by_name("Key", EncodeValue::Int(9983))
+            .unwrap()
+            .push_by_name("Operation", EncodeValue::Int(1))
+            .unwrap()
+            .push_by_name("Value", EncodeValue::Bytes(vec![0x04]))
+            .unwrap()
+            .build()
+            .unwrap();
+        assert_eq!(frame.pgn, 130845);
+        // 6 header bytes (11+2+3+8+8+8+8 = 48 bits) + 3 key + 1 op + 1 value.
+        assert_eq!(frame.data.len(), 11);
+        // Manufacturer Code (match 1857) + Industry Code (match 4) auto-fill.
+        // Key 9983 = 0x26FF, little-endian 24-bit at bytes 6..9.
+        assert_eq!(&frame.data[6..9], &[0xff, 0x26, 0x00]);
+        assert_eq!(frame.data[9], 0x01); // Operation = Set
+        assert_eq!(frame.data[10], 0x04); // Value byte, verbatim
+    }
+
+    #[test]
+    fn dynamic_field_value_rejects_non_bytes() {
+        // The value slot has no declared width; a scalar can't be sized.
+        assert!(matches!(
+            db().encode("simnetKeyValue")
+                .unwrap()
+                .push_by_name("Value", EncodeValue::Int(4)),
+            Err(EncodeError::TypeMismatch { .. })
+        ));
     }
 
     #[test]
@@ -921,7 +1039,7 @@ mod tests {
         // The 126208 group-function dynamic types can't be defaulted in
         // isolation; an unset one is a descriptive error, not wrong bytes.
         let err = db()
-            .message("nmeaRequestGroupFunction")
+            .encode("nmeaRequestGroupFunction")
             .and_then(|b| b.build());
         assert!(
             matches!(err, Err(EncodeError::NotFixedLength(_))),

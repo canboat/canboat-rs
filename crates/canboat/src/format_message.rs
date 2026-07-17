@@ -8,24 +8,27 @@
 //! hand-maintained subset — because the whole schema is embedded.
 //!
 //! The library equivalent (and the thing this is a thin wrapper over) is
-//! [`canboat_core::PgnDatabase::message`] →
-//! [`canboat_core::MessageBuilder`]. Anything you can do here you can do
+//! [`canboat_core::PgnDatabase::encode`] →
+//! [`canboat_core::PgnBuilder`]. Anything you can do here you can do
 //! from a program:
 //!
 //! ```no_run
-//! use canboat_core::{PgnDatabase, Units};
+//! use canboat_core::{PgnDatabase, Units, field::iso_request};
 //! let db = PgnDatabase::embedded(Units::Metric);
-//! let frame = db.message("isoRequest").unwrap()
+//! let frame = db.encode("isoRequest").unwrap()
 //!     .destination(0)
-//!     .push("PGN", 126996u32).unwrap()
+//!     .push(iso_request::PGN, 126996u32).unwrap() // O(1), compile-checked
 //!     .build().unwrap();
 //! ```
+//!
+//! On the CLI (`FIELD=VALUE`) the field is chosen at runtime, so the
+//! wrapper uses [`PgnBuilder::push_arg`] (name-or-id) instead.
 
 use std::io::Write as _;
 
 use anyhow::bail;
 use canboat_core::format::{actisense_ascii, ebl, plain, ydwg02};
-use canboat_core::{MessageBuilder, PgnDatabase, PgnInfo, Units};
+use canboat_core::{PgnBuilder, PgnDatabase, PgnInfo, Units};
 
 #[derive(Debug, clap::Args)]
 #[command(disable_help_flag = true)]
@@ -137,10 +140,10 @@ pub fn run(args: Args) -> anyhow::Result<()> {
 
 /// Resolve a PGN argument (number if all-digits, else schema id) into a
 /// builder against `db`.
-fn resolve(db: &'static PgnDatabase, pgn: &str) -> anyhow::Result<MessageBuilder> {
+fn resolve(db: &'static PgnDatabase, pgn: &str) -> anyhow::Result<PgnBuilder> {
     match pgn.parse::<u32>() {
-        Ok(num) => Ok(db.message_by_pgn(num)?),
-        Err(_) => Ok(db.message(pgn)?),
+        Ok(num) => Ok(db.encode_by_pgn(num)?),
+        Err(_) => Ok(db.encode(pgn)?),
     }
 }
 

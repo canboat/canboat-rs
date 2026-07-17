@@ -15,12 +15,12 @@
 //!
 //! The handler bodies mirror `nmea0183.rs` line-for-line — same
 //! sentences, same field formats — but pull values via
-//! [`canboat_core::FieldHandle`] in `O(1)` instead of via substring
+//! [`canboat_core::FieldRef`] in `O(1)` instead of via substring
 //! scans through a JSON line.
 
 use std::time::Instant;
 
-use canboat_core::{DecodedPgn, FieldHandle, FieldValue, PgnDatabase};
+use canboat_core::{DecodedPgn, FieldRef, FieldValue};
 
 use crate::n2kd::nmea0183::RateLimiter;
 
@@ -29,84 +29,87 @@ const MS_TO_KNOTS: f64 = 1.943_84;
 /// m/s → km/h.
 const MS_TO_KMH: f64 = 3.6;
 
-/// All `FieldHandle`s the struct-path needs. Built once at startup
-/// from the same `PgnDatabase` the decoder uses, then shared
-/// (immutably) across every decode/convert pair for the rest of the
-/// process. ~30 handles × 16 bytes each is essentially free vs. the
-/// JSON-parse savings.
+/// The [`FieldRef`]s the struct-path reads. Each is a generated
+/// compile-time constant (`canboat_core::field::…`), so this is just a
+/// named bundle of them — no runtime resolution, no per-record cost.
 pub struct Handles {
     // PGN 127250 Vessel Heading.
-    vh_heading: FieldHandle,
-    vh_deviation: FieldHandle,
-    vh_variation: FieldHandle,
-    vh_reference: FieldHandle,
+    vh_heading: FieldRef,
+    vh_deviation: FieldRef,
+    vh_variation: FieldRef,
+    vh_reference: FieldRef,
     // PGN 130306 Wind Data.
-    wd_wind_speed: FieldHandle,
-    wd_wind_angle: FieldHandle,
-    wd_reference: FieldHandle,
+    wd_wind_speed: FieldRef,
+    wd_wind_angle: FieldRef,
+    wd_reference: FieldRef,
     // PGN 129026 SOG / COG.
-    sc_sog: FieldHandle,
-    sc_cog: FieldHandle,
+    sc_sog: FieldRef,
+    sc_cog: FieldRef,
     // PGN 127245 Rudder.
-    ru_position: FieldHandle,
+    ru_position: FieldRef,
     // PGN 128259 Speed.
-    sp_speed_water_referenced: FieldHandle,
+    sp_speed_water_referenced: FieldRef,
     // PGN 128267 Water Depth.
-    wd_depth: FieldHandle,
-    wd_offset: FieldHandle,
+    wd_depth: FieldRef,
+    wd_offset: FieldRef,
     // PGN 128275 Distance Log.
-    dl_log: FieldHandle,
-    dl_trip_log: FieldHandle,
+    dl_log: FieldRef,
+    dl_trip_log: FieldRef,
     // PGN 129029 GNSS Position Data.
-    gp_lat: FieldHandle,
-    gp_lon: FieldHandle,
-    gp_date: FieldHandle,
-    gp_time: FieldHandle,
+    gp_lat: FieldRef,
+    gp_lon: FieldRef,
+    gp_date: FieldRef,
+    gp_time: FieldRef,
     // PGN 129539 GNSS DOPs. canboat.json has HDOP/VDOP/TDOP — no
     // PDOP field is defined, so the JSON path's `json::value("PDOP")`
     // always returned None. We model the same here by simply
     // emitting an empty PDOP slot in the GSA sentence.
-    dops_actual_mode: FieldHandle,
-    dops_hdop: FieldHandle,
-    dops_vdop: FieldHandle,
+    dops_actual_mode: FieldRef,
+    dops_hdop: FieldRef,
+    dops_vdop: FieldRef,
     // PGN 130311 Environmental Parameters.
-    env_temp_source: FieldHandle,
-    env_temp: FieldHandle,
+    env_temp_source: FieldRef,
+    env_temp: FieldRef,
 }
 
 impl Handles {
-    /// Resolve every handle this module uses from the generated field
-    /// constants. Infallible: each [`canboat_core::FieldRef`] is a
-    /// compile-checked (PGN, field) pair, so a `canboat.json` rename
+    /// Bundle the field refs this module uses. Each [`canboat_core::FieldRef`]
+    /// is a compile-checked (PGN, field) constant, so a `canboat.json` rename
     /// breaks the build here instead of returning a runtime `None`.
-    pub fn new(db: &PgnDatabase) -> Self {
+    pub fn new() -> Self {
         use canboat_core::field as f;
         Self {
-            vh_heading: db.handle(f::vessel_heading::HEADING),
-            vh_deviation: db.handle(f::vessel_heading::DEVIATION),
-            vh_variation: db.handle(f::vessel_heading::VARIATION),
-            vh_reference: db.handle(f::vessel_heading::REFERENCE),
-            wd_wind_speed: db.handle(f::wind_data::WIND_SPEED),
-            wd_wind_angle: db.handle(f::wind_data::WIND_ANGLE),
-            wd_reference: db.handle(f::wind_data::REFERENCE),
-            sc_sog: db.handle(f::cog_sog_rapid_update::SOG),
-            sc_cog: db.handle(f::cog_sog_rapid_update::COG),
-            ru_position: db.handle(f::rudder::POSITION),
-            sp_speed_water_referenced: db.handle(f::speed::SPEED_WATER_REFERENCED),
-            wd_depth: db.handle(f::water_depth::DEPTH),
-            wd_offset: db.handle(f::water_depth::OFFSET),
-            dl_log: db.handle(f::distance_log::LOG),
-            dl_trip_log: db.handle(f::distance_log::TRIP_LOG),
-            gp_lat: db.handle(f::gnss_position_data::LATITUDE),
-            gp_lon: db.handle(f::gnss_position_data::LONGITUDE),
-            gp_date: db.handle(f::gnss_position_data::DATE),
-            gp_time: db.handle(f::gnss_position_data::TIME),
-            dops_actual_mode: db.handle(f::gnss_dops::ACTUAL_MODE),
-            dops_hdop: db.handle(f::gnss_dops::HDOP),
-            dops_vdop: db.handle(f::gnss_dops::VDOP),
-            env_temp_source: db.handle(f::environmental_parameters::TEMPERATURE_SOURCE),
-            env_temp: db.handle(f::environmental_parameters::TEMPERATURE),
+            vh_heading: f::vessel_heading::HEADING,
+            vh_deviation: f::vessel_heading::DEVIATION,
+            vh_variation: f::vessel_heading::VARIATION,
+            vh_reference: f::vessel_heading::REFERENCE,
+            wd_wind_speed: f::wind_data::WIND_SPEED,
+            wd_wind_angle: f::wind_data::WIND_ANGLE,
+            wd_reference: f::wind_data::REFERENCE,
+            sc_sog: f::cog_sog_rapid_update::SOG,
+            sc_cog: f::cog_sog_rapid_update::COG,
+            ru_position: f::rudder::POSITION,
+            sp_speed_water_referenced: f::speed::SPEED_WATER_REFERENCED,
+            wd_depth: f::water_depth::DEPTH,
+            wd_offset: f::water_depth::OFFSET,
+            dl_log: f::distance_log::LOG,
+            dl_trip_log: f::distance_log::TRIP_LOG,
+            gp_lat: f::gnss_position_data::LATITUDE,
+            gp_lon: f::gnss_position_data::LONGITUDE,
+            gp_date: f::gnss_position_data::DATE,
+            gp_time: f::gnss_position_data::TIME,
+            dops_actual_mode: f::gnss_dops::ACTUAL_MODE,
+            dops_hdop: f::gnss_dops::HDOP,
+            dops_vdop: f::gnss_dops::VDOP,
+            env_temp_source: f::environmental_parameters::TEMPERATURE_SOURCE,
+            env_temp: f::environmental_parameters::TEMPERATURE,
         }
+    }
+}
+
+impl Default for Handles {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -264,22 +267,19 @@ impl RateLimiter {
 fn vessel_heading(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     // NMEA 0183 is defined in degrees; ask for degrees and let the core
     // convert from the stream's schema unit (deg for Metric, rad for SI).
-    let Some(heading) = decoded
-        .field(&h.vh_heading)
-        .and_then(|f| f.as_f64_in("deg"))
-    else {
+    let Some(heading) = decoded.field(h.vh_heading).and_then(|f| f.as_f64_in("deg")) else {
         return;
     };
     let reference = decoded
-        .field(&h.vh_reference)
+        .field(h.vh_reference)
         .and_then(|f| f.value.lookup_value())
         .map(|v| v as i64)
         .unwrap_or(-1);
     let dev = decoded
-        .field(&h.vh_deviation)
+        .field(h.vh_deviation)
         .and_then(|f| f.as_f64_in("deg"));
     let var = decoded
-        .field(&h.vh_variation)
+        .field(h.vh_variation)
         .and_then(|f| f.as_f64_in("deg"));
     if let (Some(d), Some(v)) = (dev, var)
         && reference == 1
@@ -307,19 +307,19 @@ fn vessel_heading(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) 
 
 fn wind_data(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     let Some(speed) = decoded
-        .field(&h.wd_wind_speed)
+        .field(h.wd_wind_speed)
         .and_then(|f| f.value.as_f64())
     else {
         return;
     };
     let Some(angle) = decoded
-        .field(&h.wd_wind_angle)
+        .field(h.wd_wind_angle)
         .and_then(|f| f.as_f64_in("deg"))
     else {
         return;
     };
     let reference = decoded
-        .field(&h.wd_reference)
+        .field(h.wd_reference)
         .and_then(|f| f.value.lookup_value())
         .map(|v| v as i64)
         .unwrap_or(-1);
@@ -336,10 +336,10 @@ fn wind_data(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
 }
 
 fn sog_cog(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles, rl: &mut RateLimiter) {
-    let Some(sog) = decoded.field(&h.sc_sog).and_then(|f| f.value.as_f64()) else {
+    let Some(sog) = decoded.field(h.sc_sog).and_then(|f| f.value.as_f64()) else {
         return;
     };
-    let Some(cog) = decoded.field(&h.sc_cog).and_then(|f| f.as_f64_in("deg")) else {
+    let Some(cog) = decoded.field(h.sc_cog).and_then(|f| f.as_f64_in("deg")) else {
         return;
     };
     // Cache the last (sog, cog) for the position handler's RMC
@@ -359,7 +359,7 @@ fn sog_cog(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles, rl: &mu
 
 fn rudder(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     let Some(pos) = decoded
-        .field(&h.ru_position)
+        .field(h.ru_position)
         .and_then(|f| f.as_f64_in("deg"))
     else {
         return;
@@ -369,7 +369,7 @@ fn rudder(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
 
 fn water_speed(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     let Some(s) = decoded
-        .field(&h.sp_speed_water_referenced)
+        .field(h.sp_speed_water_referenced)
         .and_then(|f| f.value.as_f64())
     else {
         return;
@@ -382,10 +382,10 @@ fn water_speed(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
 }
 
 fn water_depth(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
-    let Some(depth) = decoded.field(&h.wd_depth).and_then(|f| f.value.as_f64()) else {
+    let Some(depth) = decoded.field(h.wd_depth).and_then(|f| f.value.as_f64()) else {
         return;
     };
-    let offset = decoded.field(&h.wd_offset).and_then(|f| f.value.as_f64());
+    let offset = decoded.field(h.wd_offset).and_then(|f| f.value.as_f64());
     let body = match offset {
         Some(o) => format!("DPT,{:.1},{:.1}", depth, o),
         None => format!("DPT,{:.1},", depth),
@@ -395,10 +395,10 @@ fn water_depth(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
 
 fn distance_log(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     const M_TO_NM: f64 = 1.0 / 1852.0;
-    let Some(log) = decoded.field(&h.dl_log).and_then(|f| f.value.as_f64()) else {
+    let Some(log) = decoded.field(h.dl_log).and_then(|f| f.value.as_f64()) else {
         return;
     };
-    let Some(trip) = decoded.field(&h.dl_trip_log).and_then(|f| f.value.as_f64()) else {
+    let Some(trip) = decoded.field(h.dl_trip_log).and_then(|f| f.value.as_f64()) else {
         return;
     };
     create(
@@ -411,7 +411,7 @@ fn distance_log(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
 fn environmental(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     // MTW only fires for the Water Temperature sub-type (source == 0).
     let Some(source) = decoded
-        .field(&h.env_temp_source)
+        .field(h.env_temp_source)
         .and_then(|f| f.value.lookup_value())
     else {
         return;
@@ -424,7 +424,7 @@ fn environmental(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     // canboat's `t < 173.15` magnitude heuristic, which only existed
     // because the JSON path couldn't tell which unit the number was in —
     // the declared stream units (via the analyzer banner) now settle it.
-    let Some(celsius) = decoded.field(&h.env_temp).and_then(|f| f.as_f64_in("C")) else {
+    let Some(celsius) = decoded.field(h.env_temp).and_then(|f| f.as_f64_in("C")) else {
         return;
     };
     create(out, src, &format!("MTW,{celsius:.1},C"));
@@ -432,7 +432,7 @@ fn environmental(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
 
 fn gps_dop(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     let mode: String = decoded
-        .field(&h.dops_actual_mode)
+        .field(h.dops_actual_mode)
         .and_then(|f| f.value.lookup_value())
         .and_then(|n| char::from_digit(n as u32, 10))
         .map(|c| c.to_string())
@@ -442,12 +442,12 @@ fn gps_dop(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
     // GSA slot is always empty. Match that.
     let pdop = String::new();
     let hdop = decoded
-        .field(&h.dops_hdop)
+        .field(h.dops_hdop)
         .and_then(|f| f.value.as_f64())
         .map(|v| format!("{v:.2}"))
         .unwrap_or_default();
     let vdop = decoded
-        .field(&h.dops_vdop)
+        .field(h.dops_vdop)
         .and_then(|f| f.value.as_f64())
         .map(|v| format!("{v:.2}"))
         .unwrap_or_default();
@@ -459,10 +459,10 @@ fn gps_dop(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles) {
 }
 
 fn position(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles, rl: &RateLimiter) {
-    let Some(lat) = decoded.field(&h.gp_lat).and_then(|f| f.value.as_f64()) else {
+    let Some(lat) = decoded.field(h.gp_lat).and_then(|f| f.value.as_f64()) else {
         return;
     };
-    let Some(lon) = decoded.field(&h.gp_lon).and_then(|f| f.value.as_f64()) else {
+    let Some(lon) = decoded.field(h.gp_lon).and_then(|f| f.value.as_f64()) else {
         return;
     };
     // Round to 7 decimal degrees BEFORE the degree-minute split so
@@ -474,7 +474,7 @@ fn position(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles, rl: &R
     let (lat_str, lat_hem) = latlon_to_nmea(lat, true);
     let (lon_str, lon_hem) = latlon_to_nmea(lon, false);
     let time_str = decoded
-        .field(&h.gp_time)
+        .field(h.gp_time)
         .and_then(|f| match &f.value {
             FieldValue::Time { seconds, .. } => Some(*seconds),
             _ => None,
@@ -488,7 +488,7 @@ fn position(out: &mut String, src: u8, decoded: &DecodedPgn, h: &Handles, rl: &R
         })
         .unwrap_or_default();
     let date_str = decoded
-        .field(&h.gp_date)
+        .field(h.gp_date)
         .and_then(|f| match &f.value {
             FieldValue::Date(d) => Some(*d),
             _ => None,

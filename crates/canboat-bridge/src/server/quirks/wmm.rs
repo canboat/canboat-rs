@@ -183,8 +183,8 @@ impl WmmQuirk {
     /// Learn lat/lon from a position PGN's latitude/longitude fields
     /// (skips the not-available sentinel).
     fn observe_position(&mut self, d: &DecodedPgn, lat_field: FieldRef, lon_field: FieldRef) {
-        let lat = d.field_ref(lat_field).and_then(|f| f.value.as_f64());
-        let lon = d.field_ref(lon_field).and_then(|f| f.value.as_f64());
+        let lat = d.field(lat_field).and_then(|f| f.value.as_f64());
+        let lon = d.field(lon_field).and_then(|f| f.value.as_f64());
         if let (Some(lat), Some(lon)) = (lat, lon) {
             self.last_pos = Some((lat, lon));
         }
@@ -192,7 +192,7 @@ impl WmmQuirk {
 
     /// Learn the date (N2K days since 1970) from a PGN's date field.
     fn observe_date(&mut self, d: &DecodedPgn, date_field: FieldRef) {
-        if let Some(days) = d.field_ref(date_field).and_then(|f| f.value.as_i64())
+        if let Some(days) = d.field(date_field).and_then(|f| f.value.as_i64())
             && let Ok(days) = u16::try_from(days)
         {
             self.last_days = Some(days);
@@ -203,7 +203,7 @@ impl WmmQuirk {
     /// return the one-shot PGN 126208 "stop transmitting 127258".
     fn maybe_request_stop(&mut self, d: &DecodedPgn) -> Option<RawFrame> {
         let source = d
-            .field_ref(field::magnetic_variation::SOURCE)
+            .field(field::magnetic_variation::SOURCE)
             .and_then(|f| f.value.as_i64())?;
         if !OLDER_WMM.contains(&source) || !self.asked_stop.insert(d.src) {
             return None;
@@ -257,15 +257,15 @@ impl WmmQuirk {
         let build = || -> Result<RawFrame, canboat_core::encode::EncodeError> {
             let mut b = self
                 .db
-                .message("magneticVariation")?
+                .encode("magneticVariation")?
                 .priority(7)
                 // Emit as "my own node": ADDR_GLOBAL is the sentinel the
                 // pipeline rewrites to canboat's live claimed address.
                 .source(ADDR_GLOBAL)
                 .timestamp(now_iso());
-            b.set(field::magnetic_variation::SOURCE, SOURCE_WMM_2025)?;
-            b.set(field::magnetic_variation::VARIATION, variation_rad)?;
-            b.set(
+            b.push(field::magnetic_variation::SOURCE, SOURCE_WMM_2025)?;
+            b.push(field::magnetic_variation::VARIATION, variation_rad)?;
+            b.push(
                 field::magnetic_variation::AGE_OF_SERVICE,
                 i64::from(age_days),
             )?;
@@ -332,11 +332,12 @@ mod tests {
     /// the remainder are left at their not-available defaults.
     fn gnss_129029(lat_deg: f64, lon_deg: f64, days: u16) -> DecodedPgn {
         let db = PgnDatabase::embedded(Units::Si);
-        let mut b = db.message("gnssPositionData").unwrap().source(3);
-        b.set(field::gnss_position_data::DATE, i64::from(days))
+        let mut b = db.encode("gnssPositionData").unwrap().source(3);
+        b.push(field::gnss_position_data::DATE, i64::from(days))
             .unwrap();
-        b.set(field::gnss_position_data::LATITUDE, lat_deg).unwrap();
-        b.set(field::gnss_position_data::LONGITUDE, lon_deg)
+        b.push(field::gnss_position_data::LATITUDE, lat_deg)
+            .unwrap();
+        b.push(field::gnss_position_data::LONGITUDE, lon_deg)
             .unwrap();
         dec(&b.build().unwrap())
     }
@@ -351,10 +352,10 @@ mod tests {
     /// A 127258 from `src` reporting variation `Source` = `source`.
     fn variation_127258(src: u8, source: u8) -> DecodedPgn {
         let db = PgnDatabase::embedded(Units::Si);
-        let mut b = db.message("magneticVariation").unwrap().source(src);
-        b.set(field::magnetic_variation::SOURCE, i64::from(source))
+        let mut b = db.encode("magneticVariation").unwrap().source(src);
+        b.push(field::magnetic_variation::SOURCE, i64::from(source))
             .unwrap();
-        b.set(field::magnetic_variation::VARIATION, 0.05f64)
+        b.push(field::magnetic_variation::VARIATION, 0.05f64)
             .unwrap();
         dec(&b.build().unwrap())
     }
@@ -386,7 +387,7 @@ mod tests {
         // Read the Source field back: WMM 2025.
         let d = q.db.decode(emitted[0]).unwrap();
         assert_eq!(
-            d.field_ref(field::magnetic_variation::SOURCE)
+            d.field(field::magnetic_variation::SOURCE)
                 .and_then(|f| f.value.as_i64()),
             Some(SOURCE_WMM_2025)
         );
@@ -442,7 +443,7 @@ mod tests {
         let got =
             q.db.decode(frame)
                 .unwrap()
-                .field_ref(field::magnetic_variation::VARIATION)
+                .field(field::magnetic_variation::VARIATION)
                 .and_then(|f| f.value.as_f64())
                 .unwrap();
         assert!((got - want).abs() <= 1e-4, "want {want}, got {got}");

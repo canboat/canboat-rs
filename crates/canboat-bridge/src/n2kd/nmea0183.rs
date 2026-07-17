@@ -19,7 +19,9 @@
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
-use canboat_core::{DecodedPgn, PgnDatabase};
+use canboat_core::DecodedPgn;
+#[cfg(test)]
+use canboat_core::PgnDatabase;
 
 use crate::n2kd::decoded::{self, Handles};
 
@@ -126,7 +128,7 @@ pub fn convert_decoded(
 /// once against the embedded schema.
 fn handles() -> &'static Handles {
     static HANDLES: OnceLock<Handles> = OnceLock::new();
-    HANDLES.get_or_init(|| Handles::new(PgnDatabase::embedded(canboat_core::Units::Metric)))
+    HANDLES.get_or_init(Handles::new)
 }
 
 #[cfg(test)]

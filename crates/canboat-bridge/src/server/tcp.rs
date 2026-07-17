@@ -20,7 +20,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{Ipv4Addr, Shutdown, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -55,6 +55,7 @@ pub struct InjectPoint {
 }
 
 use crate::n2kd::serving::BinHub;
+use crate::n2kd::serving::tcp::accept_until;
 
 // Nagle's algorithm is deliberately left ENABLED on every client
 // socket (no `set_nodelay`). These are telemetry streams, not
@@ -80,6 +81,7 @@ pub fn spawn_input_server(
     bind: Ipv4Addr,
     port: u16,
     inject: Option<InjectPoint>,
+    stop: Option<Arc<AtomicBool>>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding {name} TCP port {}:{}", bind, port))?;
@@ -91,19 +93,17 @@ pub fn spawn_input_server(
     log::info!("{name} server listening on {}:{} ({mode})", bind, port);
     Ok(thread::Builder::new()
         .name(format!("{name}-accept"))
-        .spawn(move || input_accept(name, listener, inject))
+        .spawn(move || input_accept(name, listener, inject, stop))
         .expect("spawn input accept"))
 }
 
-fn input_accept(name: &'static str, listener: TcpListener, inject: Option<InjectPoint>) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("{name} accept failed: {e}");
-                return;
-            }
-        };
+fn input_accept(
+    name: &'static str,
+    listener: TcpListener,
+    inject: Option<InjectPoint>,
+    stop: Option<Arc<AtomicBool>>,
+) {
+    accept_until(name, listener, stop, |stream, peer| {
         log::info!("{name} client connected: {peer}");
         let inj = inject.clone();
         thread::Builder::new()
@@ -117,7 +117,7 @@ fn input_accept(name: &'static str, listener: TcpListener, inject: Option<Inject
                 run_inbound_reader(name, stream, inj);
             })
             .ok();
-    }
+    });
 }
 
 fn run_inbound_reader(name: &'static str, stream: TcpStream, inject: Option<InjectPoint>) {
@@ -256,6 +256,7 @@ pub fn spawn_filter_control_server(
     port: u16,
     filter: Arc<Mutex<NmeaFilter>>,
     json_opts: JsonOptions,
+    stop: Option<Arc<AtomicBool>>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding filter-control TCP port {}:{}", bind, port))?;
@@ -266,7 +267,7 @@ pub fn spawn_filter_control_server(
     );
     Ok(thread::Builder::new()
         .name("filter-control-accept".into())
-        .spawn(move || filter_control_accept(listener, filter, json_opts))
+        .spawn(move || filter_control_accept(listener, filter, json_opts, stop))
         .expect("spawn filter-control accept"))
 }
 
@@ -274,15 +275,9 @@ fn filter_control_accept(
     listener: TcpListener,
     filter: Arc<Mutex<NmeaFilter>>,
     json_opts: JsonOptions,
+    stop: Option<Arc<AtomicBool>>,
 ) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("filter-control accept failed: {e}");
-                return;
-            }
-        };
+    accept_until("filter-control", listener, stop, |stream, peer| {
         log::info!("filter-control client connected: {peer}");
         let f = filter.clone();
         let opts = json_opts.clone();
@@ -290,7 +285,7 @@ fn filter_control_accept(
             .name("filter-control-client".into())
             .spawn(move || run_filter_control_client(stream, f, opts))
             .ok();
-    }
+    });
 }
 
 fn run_filter_control_client(
@@ -416,6 +411,7 @@ pub fn spawn_overrides_control_server(
     engine: Arc<Mutex<OverrideEngine>>,
     device_sender: Option<FrameSender>,
     json_opts: JsonOptions,
+    stop: Option<Arc<AtomicBool>>,
 ) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding overrides-control TCP port {}:{}", bind, port))?;
@@ -426,7 +422,7 @@ pub fn spawn_overrides_control_server(
     );
     Ok(thread::Builder::new()
         .name("overrides-control-accept".into())
-        .spawn(move || overrides_control_accept(listener, engine, device_sender, json_opts))
+        .spawn(move || overrides_control_accept(listener, engine, device_sender, json_opts, stop))
         .expect("spawn overrides-control accept"))
 }
 
@@ -435,15 +431,9 @@ fn overrides_control_accept(
     engine: Arc<Mutex<OverrideEngine>>,
     device_sender: Option<FrameSender>,
     json_opts: JsonOptions,
+    stop: Option<Arc<AtomicBool>>,
 ) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("overrides-control accept failed: {e}");
-                return;
-            }
-        };
+    accept_until("overrides-control", listener, stop, |stream, peer| {
         log::info!("overrides-control client connected: {peer}");
         let e = engine.clone();
         let sender = device_sender.clone();
@@ -452,7 +442,7 @@ fn overrides_control_accept(
             .name("overrides-control-client".into())
             .spawn(move || run_overrides_control_client(stream, e, sender, opts))
             .ok();
-    }
+    });
 }
 
 fn run_overrides_control_client(
@@ -547,32 +537,30 @@ fn send_override_report(
 /// A client MUST read and verify the `Hello` first: the schema hash is
 /// what proves both ends share byte-identical field indices, without
 /// which the per-field `order` numbers on the wire are meaningless.
-pub fn spawn_binary_stream(bind: Ipv4Addr, port: u16, hub: Arc<BinHub>) -> Result<JoinHandle<()>> {
+pub fn spawn_binary_stream(
+    bind: Ipv4Addr,
+    port: u16,
+    hub: Arc<BinHub>,
+    stop: Option<Arc<AtomicBool>>,
+) -> Result<JoinHandle<()>> {
     let listener = TcpListener::bind(SocketAddrV4::new(bind, port))
         .with_context(|| format!("binding binary TCP port {}:{}", bind, port))?;
     log::info!("binary analyzer server listening on {}:{} (RO)", bind, port);
     Ok(thread::Builder::new()
         .name("binary-accept".into())
-        .spawn(move || binary_accept(listener, hub))
+        .spawn(move || binary_accept(listener, hub, stop))
         .expect("spawn binary accept"))
 }
 
-fn binary_accept(listener: TcpListener, hub: Arc<BinHub>) {
-    loop {
-        let (stream, peer) = match listener.accept() {
-            Ok(s) => s,
-            Err(e) => {
-                log::error!("binary accept failed: {e}");
-                return;
-            }
-        };
+fn binary_accept(listener: TcpListener, hub: Arc<BinHub>, stop: Option<Arc<AtomicBool>>) {
+    accept_until("binary", listener, stop, |stream, peer| {
         log::info!("binary client connected: {peer}");
         let h = hub.clone();
         thread::Builder::new()
             .name("binary-client".into())
             .spawn(move || run_binary_client(stream, h))
             .ok();
-    }
+    });
 }
 
 fn run_binary_client(mut stream: TcpStream, hub: Arc<BinHub>) {

@@ -77,6 +77,18 @@ impl AddressClaim {
         }
     }
 
+    /// A claimer for a built [`Name`](crate::name::Name), preferring source
+    /// address `preferred` and taking the NAME's own arbitrary-address-capable
+    /// bit. The ergonomic pairing of [`Name`](crate::name::Name) and this
+    /// state machine.
+    pub fn for_name(name: &crate::name::Name, preferred: u8) -> Self {
+        Self::new(
+            name.to_u64(),
+            preferred,
+            name.is_arbitrary_address_capable(),
+        )
+    }
+
     /// A disabled (passive-sniff) claimer that never takes an address.
     pub fn disabled(name: u64) -> Self {
         Self {

@@ -17,6 +17,10 @@
 #   - msrv:   `cargo check` with the workspace's declared rust-version.
 #   - clippy: -D warnings, all targets.
 #   - fmt:    rustfmt check.
+#   - docs:   generate the `canboat` facade rustdoc for each supported
+#             library feature set with -D warnings, so a broken intra-doc
+#             link or an undocumented public item fails the build. Mirrors
+#             the feature sets locked by scripts/check-public-api.sh.
 name: CI
 
 on:
@@ -155,3 +159,34 @@ jobs:
 
       - name: Check formatting
         run: cargo fmt --all --check
+
+  docs:
+    name: Docs
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo & target
+        uses: Swatinem/rust-cache@v2
+
+      # Build the facade docs for each supported library feature set. A
+      # broken intra-doc link or a missing doc (the crate denies
+      # missing_docs under `decode`) fails the build. The feature sets
+      # match scripts/check-public-api.sh so the documented surface tracks
+      # the locked public surface.
+      - name: Generate library rustdoc (-D warnings)
+        env:
+          RUSTDOCFLAGS: "-D warnings"
+        run: |
+          for set in \
+            "decode" \
+            "decode,io,wire,nmea0183,ais" \
+            "decode,io,wire,node,bridge,nmea0183,ais"; do
+            echo "::group::cargo doc --features $set"
+            cargo doc --no-deps -p canboat --no-default-features --features "$set" --locked
+            echo "::endgroup::"
+          done

@@ -249,13 +249,33 @@ fn run_session(
     // Main: pump frames from the active session into the stable
     // outer channel. Exits when the device's frames_rx closes
     // (device died) or when `stop` is set.
-    while let Ok(frame) = handle.frames_rx.recv() {
+    //
+    // Greedy drain: block once, then forward everything already queued
+    // via `try_recv` before parking again. The device worker reads the
+    // bus in `recvmmsg` batches and hands us the frames back-to-back, so
+    // this parks (and wakes the outer consumer) roughly once per batch
+    // instead of once per frame — the bulk of the RX-path context-switch
+    // and futex churn on a busy bus.
+    'pump: while let Ok(frame) = handle.frames_rx.recv() {
         if stop.load(Ordering::Relaxed) {
             break;
         }
         if frames_tx.send(frame).is_err() {
             // Outer consumer is gone — supervisor will exit too.
             break;
+        }
+        loop {
+            match handle.frames_rx.try_recv() {
+                Ok(frame) => {
+                    if frames_tx.send(frame).is_err() {
+                        break 'pump;
+                    }
+                }
+                // Nothing more queued right now — go back to blocking.
+                Err(mpsc::TryRecvError::Empty) => break,
+                // Device session ended — let the outer `recv` observe it.
+                Err(mpsc::TryRecvError::Disconnected) => break 'pump,
+            }
         }
     }
 

@@ -34,9 +34,11 @@ use std::time::Instant;
 
 use canboat_core::{DecodedPgn, RawFrame};
 
-/// clap derives `ValueEnum` so the user types e.g. `--quirk scx20`.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, clap::ValueEnum)]
-#[clap(rename_all = "kebab-case")]
+/// Under the `cli` feature clap derives `ValueEnum` so the user types e.g.
+/// `--quirk scx20`; the enum itself is always available for `BridgeConfig`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[cfg_attr(feature = "cli", clap(rename_all = "kebab-case"))]
 pub enum QuirkKind {
     /// Furuno SCX-20: fabricate its PGN 126996 Product Information when
     /// the bus asks (its firmware sometimes "forgets" to answer, breaking

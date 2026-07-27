@@ -1,5 +1,45 @@
 # Changelog
 
+## [1.0.0](https://github.com/canboat/canboat-rs/compare/v0.6.0...v1.0.0) (2026-07-27)
+
+
+### ⚠ BREAKING CHANGES
+
+* **encode:** make push() take a FieldId; add push_by_name()
+* **encode:** rename MessageBuilder -> PgnBuilder, db.message* -> encode*
+
+### Features
+
+* **bridge:** shutdown-aware TCP listeners + Bridge::shutdown (P5d) ([693116c](https://github.com/canboat/canboat-rs/commit/693116cf5aec3f048798064ce2188e7e8d9b5e75))
+* **bridge:** split pipeline core from serving behind a Bridge type (P5c) ([96603ee](https://github.com/canboat/canboat-rs/commit/96603eef4e7a784353a134479b698550a64b5109))
+* **bus:** direct NGT-1 / iKonvert / SocketCAN link access ([184b8b5](https://github.com/canboat/canboat-rs/commit/184b8b5823261f8706931609583fc52398eb7e1b))
+* **canboat:** Phase 0 — facade lib skeleton + feature-gated surface ([adab1d2](https://github.com/canboat/canboat-rs/commit/adab1d2cc20860b27b3935cf49b512942650261c))
+* **core:** Phase 1 — collapse FieldHandle into FieldId; curate decode surface ([96ca702](https://github.com/canboat/canboat-rs/commit/96ca7022c0d0fb6552ede9da394ad2ae21a48e46))
+* **core:** Phase 2 — FrameSource seam + Decoder; read module in the facade ([94ded06](https://github.com/canboat/canboat-rs/commit/94ded06658fcc2d59584027d03c6035364f50af8))
+* **encode:** DYNAMIC_FIELD_VALUE encoding + a detachable Transmitter ([54c7370](https://github.com/canboat/canboat-rs/commit/54c737018aa1df68bd023e1376d2449ac8f17114))
+* **io:** Phase 4 — device:: node API (Name builder, Claimer, responder primitives) ([67db052](https://github.com/canboat/canboat-rs/commit/67db052219f4425a7806aea29d8ec4af07e828b0))
+* **schema:** bump CANBOAT_REF to 167a1ef (B&G 130824 roll/pitch/yaw rates) ([b12fbff](https://github.com/canboat/canboat-rs/commit/b12fbff780b8d1dc70cd912c8fb04314a403ccbd))
+* **server:** add --quirk motion to impersonate a B&G H5000 Motion Sensor ([9c2861f](https://github.com/canboat/canboat-rs/commit/9c2861f887e00fefcd78db1a00043b2a6a62f979))
+* single canboat facade crate with a feature-gated library API ([d0f7f24](https://github.com/canboat/canboat-rs/commit/d0f7f24a41b1274f63b71f08703539554523858f))
+* **socketcan:** manage the CAN link lifecycle via netlink ([206c74d](https://github.com/canboat/canboat-rs/commit/206c74d531ef3235ec4f38f1de462cfb9e95d95c))
+* **socketcan:** manage the CAN link lifecycle via netlink ([e53d4cc](https://github.com/canboat/canboat-rs/commit/e53d4ccf8fe6facd01e414d29c257551807f88bd))
+
+
+### Bug Fixes
+
+* **motion:** read 130842 yaw as 32-bit; B&G 130824 rate = N2K ROT resolution ([f4a4243](https://github.com/canboat/canboat-rs/commit/f4a42438e03c4d7766aa5ec12f4ca28b4580b1b0))
+
+
+### Performance Improvements
+
+* **socketcan:** batch RX with recvmmsg and coalesce relay wakeups ([100db30](https://github.com/canboat/canboat-rs/commit/100db30fba312613f97db04dccefd3a91533d4e9))
+
+
+### Code Refactoring
+
+* **encode:** make push() take a FieldId; add push_by_name() ([8507ed5](https://github.com/canboat/canboat-rs/commit/8507ed5c28e4679ae350168f251ffea6d433d394))
+* **encode:** rename MessageBuilder -&gt; PgnBuilder, db.message* -&gt; encode* ([88b47cb](https://github.com/canboat/canboat-rs/commit/88b47cbefb725d0fcd4459436a38648a87284f2f))
+
 ## [0.6.0](https://github.com/canboat/canboat-rs/compare/v0.5.0...v0.6.0) (2026-07-10)
 
 
